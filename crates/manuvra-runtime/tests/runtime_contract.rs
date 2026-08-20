@@ -8,9 +8,8 @@ use serde_json::{Value, json};
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::Barrier;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -34,6 +33,31 @@ struct DelayedSessionAdapter {
 struct SetupTrackingAdapter {
     calls: Arc<AtomicUsize>,
     timeout: bool,
+}
+struct SequenceRaceAdapter {
+    observation_started: Mutex<Option<mpsc::SyncSender<()>>>,
+    observation_release: Barrier,
+}
+
+impl TargetAdapter for SequenceRaceAdapter {
+    fn targets(&self) -> Vec<TargetDescriptor> {
+        FakeAdapter.targets()
+    }
+
+    fn invoke(
+        &self,
+        context: &AdapterContext,
+        operation: &AdapterOperation,
+        cancellation: Arc<AtomicBool>,
+    ) -> AdapterReply {
+        if operation.command == "observe.screenshot"
+            && let Some(started) = self.observation_started.lock().unwrap().take()
+        {
+            started.send(()).unwrap();
+            self.observation_release.wait();
+        }
+        FakeAdapter.invoke(context, operation, cancellation)
+    }
 }
 
 impl TargetAdapter for SetupTrackingAdapter {
@@ -911,7 +935,28 @@ fn adapter_panic_becomes_terminal_internal_error_and_releases_admission() {
 
 #[test]
 fn concurrent_observation_discloses_sequence_race() {
-    let harness = Harness::new();
+    let root = tempfile::tempdir().unwrap();
+    let temporary = root.path().join("tmp");
+    let config = root.path().join("config");
+    let (observation_started, observation_admitted) = mpsc::sync_channel(0);
+    let adapter = Arc::new(SequenceRaceAdapter {
+        observation_started: Mutex::new(Some(observation_started)),
+        observation_release: Barrier::new(2),
+    });
+    let harness = Harness {
+        _root: root,
+        config: config.clone(),
+        runtime: Arc::new(
+            Runtime::new(
+                RuntimeConfig {
+                    temporary_root: temporary,
+                    config_root: config,
+                },
+                vec![adapter.clone()],
+            )
+            .unwrap(),
+        ),
+    };
     let actor = harness.open("chrome_fake_1", "actor");
     let observer = harness.open("chrome_fake_1", "observer");
     let runtime = harness.runtime.clone();
@@ -925,12 +970,15 @@ fn concurrent_observation_discloses_sequence_race() {
             1_000,
         )
     });
-    thread::sleep(Duration::from_millis(5));
+    observation_admitted
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
     let click = harness.invoke(
         "concurrent-click",
         "action.click",
         json!({"session_id": actor, "locator": {"kind": "semantic", "name": "Save"}}),
     );
+    adapter.observation_release.wait();
     assert_eq!(click.value["outcome"], "observed");
     let observed = observation.join().unwrap();
     assert_eq!(observed.value["observation_status"], "concurrent");
