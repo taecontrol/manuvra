@@ -17,8 +17,10 @@ jobs:
           persist-credentials: false
       - name: Audit, install, verify, and uninstall
         run: |
-          brew audit --strict --online Formula/manuvra.rb
-          brew install --formula Formula/manuvra.rb
+          brew tap --custom-remote taecontrol/tap "$GITHUB_WORKSPACE"
+          brew trust --formula taecontrol/tap/manuvra
+          brew audit --strict --online --tap taecontrol/tap
+          brew install --formula taecontrol/tap/manuvra
           test "$(manuvra commands list --limit 1 | wc -c)" -le 4096
           test "$(manuvra daemon status | wc -c)" -le 4096
           codesign --verify --deep --strict --verbose=2 "$(brew --prefix manuvra)/libexec/Manuvra.app"
