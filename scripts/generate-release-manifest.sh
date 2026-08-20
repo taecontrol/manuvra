@@ -19,7 +19,7 @@ while (($#)); do
 done
 [[ -n "$source_root" && -n "$output" ]] || usage
 source_root=$(cd "$source_root" && pwd -P)
-[[ $(uname -m) == arm64 ]] || { echo "Manuvra v0.1.0 supports Apple Silicon only" >&2; exit 3; }
+[[ $(uname -m) == arm64 ]] || { echo "Manuvra supports Apple Silicon only" >&2; exit 3; }
 
 version=$(awk -F '"' '/^version = / { print $2; exit }' "$source_root/Cargo.toml")
 [[ -n "$version" ]] || { echo "workspace version is missing" >&2; exit 3; }

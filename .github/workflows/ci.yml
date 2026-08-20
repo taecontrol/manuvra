@@ -65,8 +65,9 @@ jobs:
           test "$("$prefix/bin/manuvra" daemon status | wc -c)" -le 4096
       - name: Deterministic source archive
         run: |
+          version=$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)
           first=$(mktemp -d)
           second=$(mktemp -d)
-          scripts/create-source-archive.sh --version 0.1.0 --output "$first"
-          scripts/create-source-archive.sh --version 0.1.0 --output "$second"
-          cmp "$first/manuvra-0.1.0.tar.gz" "$second/manuvra-0.1.0.tar.gz"
+          scripts/create-source-archive.sh --version "$version" --output "$first"
+          scripts/create-source-archive.sh --version "$version" --output "$second"
+          cmp "$first/manuvra-$version.tar.gz" "$second/manuvra-$version.tar.gz"

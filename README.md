@@ -15,7 +15,7 @@ manuvra setup
 manuvra doctor
 ```
 
-An install or upgrade may require Accessibility and Screen Recording authorization again because the bundle is ad-hoc signed. `setup` opens the relevant System Settings panes but never changes macOS privacy data itself.
+An install or upgrade may require Accessibility and Screen Recording authorization again because the bundle is ad-hoc signed. `setup` opens the relevant System Settings panes but never changes macOS privacy data itself. When Manuvra is not listed yet, use **Add** in each pane and select the `.app` path reported as `installation.bundle` by `setup`, then enable its switch and rerun `manuvra doctor`.
 
 ## Agent workflow
 

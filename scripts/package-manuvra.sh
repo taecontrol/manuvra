@@ -22,9 +22,9 @@ else
   source_root=$(cd "$source_root" && pwd -P)
 fi
 [[ "$prefix" == /* ]] || { echo "--prefix must be absolute" >&2; exit 2; }
-[[ $(uname -m) == arm64 ]] || { echo "Manuvra v0.1.0 supports Apple Silicon only" >&2; exit 3; }
+[[ $(uname -m) == arm64 ]] || { echo "Manuvra supports Apple Silicon only" >&2; exit 3; }
 major=$(sw_vers -productVersion | cut -d. -f1)
-((major >= 26)) || { echo "Manuvra v0.1.0 requires macOS 26 or later" >&2; exit 3; }
+((major >= 26)) || { echo "Manuvra requires macOS 26 or later" >&2; exit 3; }
 
 temporary=$(mktemp -d)
 trap 'rm -rf "$temporary"' EXIT

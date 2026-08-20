@@ -246,12 +246,24 @@ fn launch_daemon() -> Result<Child, ClientError> {
             "daemon autostart is disabled".to_owned(),
         ));
     }
-    Command::new(Installation::current()?.daemon)
+    let installation = Installation::current()?;
+    daemon_launch_command(&installation)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .map_err(ClientError::Io)
+}
+
+fn daemon_launch_command(installation: &Installation) -> Command {
+    #[cfg(target_os = "macos")]
+    if let Some(bundle) = &installation.bundle {
+        let mut command = Command::new("/usr/bin/open");
+        command.args(["-g", "-n", "-a"]).arg(bundle);
+        return command;
+    }
+
+    Command::new(&installation.daemon)
 }
 
 pub struct DaemonSocket {
@@ -436,6 +448,56 @@ pub enum ClientError {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn installed_daemon_launches_through_its_bundle_identity() {
+        let installation = Installation {
+            executable: PathBuf::from("/opt/homebrew/bin/manuvra"),
+            daemon: PathBuf::from(
+                "/opt/homebrew/Cellar/manuvra/9.8.7/libexec/Manuvra.app/Contents/MacOS/manuvra-daemon",
+            ),
+            bundle: Some(PathBuf::from(
+                "/opt/homebrew/Cellar/manuvra/9.8.7/libexec/Manuvra.app",
+            )),
+            resources: PathBuf::from(
+                "/opt/homebrew/Cellar/manuvra/9.8.7/libexec/Manuvra.app/Contents/Resources",
+            ),
+            installed: true,
+        };
+        let command = daemon_launch_command(&installation);
+
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(command.get_program(), "/usr/bin/open");
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                [
+                    "-g",
+                    "-n",
+                    "-a",
+                    "/opt/homebrew/Cellar/manuvra/9.8.7/libexec/Manuvra.app"
+                ]
+            );
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(command.get_program(), installation.daemon);
+    }
+
+    #[test]
+    fn development_daemon_launches_directly() {
+        let installation = Installation {
+            executable: PathBuf::from("/work/target/debug/manuvra"),
+            daemon: PathBuf::from("/work/target/debug/manuvra-daemon"),
+            bundle: None,
+            resources: PathBuf::from("/work/resources"),
+            installed: false,
+        };
+        let command = daemon_launch_command(&installation);
+
+        assert_eq!(command.get_program(), installation.daemon);
+        assert_eq!(command.get_args().count(), 0);
+    }
 
     #[test]
     fn daemon_socket_owns_private_paths_and_excludes_a_second_daemon() {

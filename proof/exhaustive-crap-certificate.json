@@ -1,14 +1,14 @@
 {
   "schema": "manuvra/crap-certificate@1",
-  "version": "0.1.0",
-  "source_tree_sha256": "8abb6cf8bb4a73a72d75c57147bce7fce13bfcf6334266f78d6e50349c83be2b",
+  "version": "0.1.1",
+  "source_tree_sha256": "17783f9d5d3a26ca49e1cff0ee4d2c82daab60534b940b015591895e8e796e4b",
   "policy": {
     "threshold": 15,
     "missing_coverage": "pessimistic",
     "waivers": false
   },
   "tools": {
-    "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14) (Homebrew)",
     "cargo_crap": "cargo-crap 0.4.3",
     "cargo_llvm_cov": "cargo-llvm-cov 0.9.0"
   },
@@ -1843,8 +1843,18 @@
       {
         "language": "rust",
         "file": "crates/manuvra-cli/src/lib.rs",
+        "function": "daemon_launch_command",
+        "line": 258,
+        "complexity": 2.0,
+        "coverage": 100.0,
+        "coverage_missing": false,
+        "crap": 2.0
+      },
+      {
+        "language": "rust",
+        "file": "crates/manuvra-cli/src/lib.rs",
         "function": "DaemonSocket::bind",
-        "line": 266,
+        "line": 278,
         "complexity": 1.0,
         "coverage": 100.0,
         "coverage_missing": false,
@@ -1854,7 +1864,7 @@
         "language": "rust",
         "file": "crates/manuvra-cli/src/lib.rs",
         "function": "DaemonSocket::bind_at",
-        "line": 270,
+        "line": 282,
         "complexity": 9.0,
         "coverage": 100.0,
         "coverage_missing": false,
@@ -1864,7 +1874,7 @@
         "language": "rust",
         "file": "crates/manuvra-cli/src/lib.rs",
         "function": "DaemonSocket::incoming",
-        "line": 289,
+        "line": 301,
         "complexity": 1.0,
         "coverage": 0.0,
         "coverage_missing": false,
@@ -1874,7 +1884,7 @@
         "language": "rust",
         "file": "crates/manuvra-cli/src/lib.rs",
         "function": "DaemonSocket::try_clone_listener",
-        "line": 293,
+        "line": 305,
         "complexity": 1.0,
         "coverage": 100.0,
         "coverage_missing": false,
@@ -1884,7 +1894,7 @@
         "language": "rust",
         "file": "crates/manuvra-cli/src/lib.rs",
         "function": "DaemonSocket::verify_peer",
-        "line": 297,
+        "line": 309,
         "complexity": 1.0,
         "coverage": 100.0,
         "coverage_missing": false,
@@ -1894,7 +1904,7 @@
         "language": "rust",
         "file": "crates/manuvra-cli/src/lib.rs",
         "function": "DaemonSocket::drop",
-        "line": 303,
+        "line": 315,
         "complexity": 2.0,
         "coverage": 100.0,
         "coverage_missing": false,
@@ -1904,7 +1914,7 @@
         "language": "rust",
         "file": "crates/manuvra-cli/src/lib.rs",
         "function": "ensure_runtime_root",
-        "line": 310,
+        "line": 322,
         "complexity": 8.0,
         "coverage": 78.94736842105263,
         "coverage_missing": false,
@@ -1914,7 +1924,7 @@
         "language": "rust",
         "file": "crates/manuvra-cli/src/lib.rs",
         "function": "open_daemon_lock",
-        "line": 332,
+        "line": 344,
         "complexity": 6.0,
         "coverage": 78.94736842105263,
         "coverage_missing": false,
@@ -1924,7 +1934,7 @@
         "language": "rust",
         "file": "crates/manuvra-cli/src/lib.rs",
         "function": "acquire_lock",
-        "line": 352,
+        "line": 364,
         "complexity": 2.0,
         "coverage": 100.0,
         "coverage_missing": false,
@@ -1934,7 +1944,7 @@
         "language": "rust",
         "file": "crates/manuvra-cli/src/lib.rs",
         "function": "remove_stale_socket",
-        "line": 361,
+        "line": 373,
         "complexity": 5.0,
         "coverage": 100.0,
         "coverage_missing": false,
@@ -1944,7 +1954,7 @@
         "language": "rust",
         "file": "crates/manuvra-cli/src/lib.rs",
         "function": "validate_socket_metadata",
-        "line": 375,
+        "line": 387,
         "complexity": 4.0,
         "coverage": 63.63636363636363,
         "coverage_missing": false,
@@ -1954,7 +1964,7 @@
         "language": "rust",
         "file": "crates/manuvra-cli/src/lib.rs",
         "function": "socket_identity_matches",
-        "line": 388,
+        "line": 400,
         "complexity": 1.0,
         "coverage": 100.0,
         "coverage_missing": false,
@@ -1964,7 +1974,7 @@
         "language": "rust",
         "file": "crates/manuvra-cli/src/lib.rs",
         "function": "verify_peer",
-        "line": 395,
+        "line": 407,
         "complexity": 3.0,
         "coverage": 66.66666666666666,
         "coverage_missing": false,
@@ -1974,7 +1984,7 @@
         "language": "rust",
         "file": "crates/manuvra-cli/src/lib.rs",
         "function": "verify_peer",
-        "line": 412,
+        "line": 424,
         "complexity": 1.0,
         "coverage": 100.0,
         "coverage_missing": false,
@@ -2676,9 +2686,9 @@
         "function": "invoke",
         "line": 124,
         "complexity": 10.0,
-        "coverage": 76.0,
+        "coverage": 80.0,
         "coverage_missing": false,
-        "crap": 11.3824
+        "crap": 10.8
       },
       {
         "language": "rust",
@@ -2896,9 +2906,9 @@
         "function": "focused_window_snapshot",
         "line": 559,
         "complexity": 1.0,
-        "coverage": 42.857142857142854,
+        "coverage": 100.0,
         "coverage_missing": false,
-        "crap": 1.186588921282799
+        "crap": 1.0
       },
       {
         "language": "rust",
@@ -4646,9 +4656,9 @@
         "function": "ObservationFence::wait_for_quiet",
         "line": 121,
         "complexity": 6.0,
-        "coverage": 87.5,
+        "coverage": 100.0,
         "coverage_missing": false,
-        "crap": 6.0703125
+        "crap": 6.0
       },
       {
         "language": "rust",
@@ -5176,9 +5186,9 @@
         "function": "apply_wait_error",
         "line": 614,
         "complexity": 2.0,
-        "coverage": 75.0,
+        "coverage": 100.0,
         "coverage_missing": false,
-        "crap": 2.0625
+        "crap": 2.0
       },
       {
         "language": "rust",
@@ -6546,9 +6556,9 @@
         "function": "settle",
         "line": 1241,
         "complexity": 10.0,
-        "coverage": 71.42857142857143,
+        "coverage": 85.71428571428571,
         "coverage_missing": false,
-        "crap": 12.332361516034986
+        "crap": 10.291545189504374
       },
       {
         "language": "rust",
