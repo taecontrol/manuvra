@@ -4,7 +4,7 @@ Manuvra is a macOS command-line tool for coding agents that need to observe and 
 
 The first release supports Apple Silicon running macOS 26 or later. It is distributed as MIT-licensed source and compiled locally by Homebrew; it does not ship a notarized executable.
 
-Release proof is normally bound to the canonical source-tree SHA-256 and the immutable tagged release. Privileged Chrome and macOS coverage runs locally with real TCC grants; GitHub CI recomputes the production-function inventory and complexity from the public source and verifies the checked-in exhaustive no-waiver CRAP certificate. The v0.2.0 release is a one-time bootstrap exception authorized for validation against the published Homebrew installation: it omits the certificate and public summary, carries an explicit exception artifact, and does not relax proof requirements for later releases.
+Every commit accepted into `main` passes the reproducible release checks: formatting, linting, tests, source packaging, installed-resource verification, snapshot safety, and deterministic archive generation. Releases publish an exact `main` commit whose CI run succeeded. Permission-dependent behavior is validated separately against the published Homebrew installation because macOS consent and the installed bundle identity do not exist in hosted CI. The CRAP inventory remains visible in CI as an advisory code-health report rather than a release gate.
 
 ## Install
 
