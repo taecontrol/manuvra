@@ -52,7 +52,11 @@ manuvra setup
 manuvra doctor
 ```
 
-`doctor` reports the canonical installed bundle, build/resource agreement, CDHash, daemon state, and current Accessibility and Screen Recording dispositions without prompting or touching a target. `setup` opens only the missing System Settings privacy panes; the human grants permission. Manuvra never edits the TCC database. Because the bundle is ad-hoc signed, install, upgrade, or reinstall may require a new grant.
+In an interactive terminal, `doctor` and `setup` render concise human-readable status and next actions. Their redirected or piped output remains compact JSON. `manuvra doctor --json` and `manuvra setup --json` force JSON even in a terminal.
+
+`doctor` reports the canonical installed bundle, build/resource agreement, CDHash, daemon state, and current Accessibility, Screen & System Audio Recording, and Post Event dispositions without prompting, opening System Settings, or touching a target. Only an explicit `setup` asks macOS for permissions, and it asks from the responsible `manuvra-daemon` identity only when the corresponding preflight is false. It then rechecks every fact and opens the relevant privacy pane for residual manual work.
+
+The human grants permission. Manuvra never edits the TCC database, silently grants itself access, or guarantees that requesting access adds it to a privacy list. If Manuvra is absent, follow `setup`'s numbered instructions: click **Add**, select its reported canonical `Manuvra.app` bundle, enable it, and rerun `manuvra doctor`. A development layout reports no canonical bundle rather than inventing a path. Because the bundle is ad-hoc signed, install, upgrade, or reinstall may require a new grant.
 
 Inspect or stop the daemon without target work:
 

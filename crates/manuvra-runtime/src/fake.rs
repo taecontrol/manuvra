@@ -22,6 +22,27 @@ impl TargetAdapter for FakeAdapter {
         vec![fake_chrome(), fake_macos()]
     }
 
+    fn setup_permissions(
+        &self,
+        _deadline: std::time::Instant,
+    ) -> Option<Result<Value, crate::model::AdapterError>> {
+        let granted = json!({
+            "before_granted": true,
+            "prompt_requested": false,
+            "settings_opened": false,
+            "granted": true,
+            "freshly_granted": false,
+            "residual": false
+        });
+        Some(Ok(json!({
+            "permissions": {
+                "accessibility": granted,
+                "screen_recording": granted,
+                "post_event": granted
+            }
+        })))
+    }
+
     fn invoke(
         &self,
         context: &AdapterContext,

@@ -181,6 +181,24 @@ impl TargetAdapter for MacosAdapter {
         })
     }
 
+    fn setup_permissions(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Option<Result<Value, AdapterError>> {
+        Some(
+            permissions::setup_permissions(deadline).map_err(|error| match error {
+                permissions::SetupPermissionsError::Deadline => ax::adapter_error(
+                    "timed_out",
+                    "deadline elapsed during macOS permission setup",
+                ),
+                permissions::SetupPermissionsError::Settings(permission) => ax::adapter_error(
+                    "internal_error",
+                    &format!("failed to open System Settings for {permission}"),
+                ),
+            }),
+        )
+    }
+
     fn session_opened(
         &self,
         session: &AdapterSession,

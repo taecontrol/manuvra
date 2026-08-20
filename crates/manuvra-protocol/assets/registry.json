@@ -401,11 +401,11 @@
     {
       "id": "system.setup",
       "cli": ["setup"],
-      "summary": "Check the installed daemon identity and open only missing macOS privacy panes for human authorization.",
+      "summary": "Ask macOS for missing daemon permissions, recheck each fact, and guide any required human authorization.",
       "effect": "lifecycle",
       "authority": "none",
       "modes": [],
-      "default_timeout_ms": 5000,
+      "default_timeout_ms": 120000,
       "maximum_timeout_ms": 120000,
       "capabilities": [],
       "input_schema": "./schemas/command-inputs.schema.json#/$defs/empty",

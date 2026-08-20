@@ -31,6 +31,54 @@ struct DelayedSessionAdapter {
     opened: AtomicUsize,
     closed: Arc<AtomicUsize>,
 }
+struct SetupTrackingAdapter {
+    calls: Arc<AtomicUsize>,
+    timeout: bool,
+}
+
+impl TargetAdapter for SetupTrackingAdapter {
+    fn targets(&self) -> Vec<TargetDescriptor> {
+        Vec::new()
+    }
+
+    fn setup_permissions(
+        &self,
+        _deadline: std::time::Instant,
+    ) -> Option<Result<Value, AdapterError>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.timeout {
+            return Some(Err(AdapterError {
+                code: "timed_out".to_owned(),
+                message: Some("settings launch exhausted the command deadline".to_owned()),
+                details: None,
+            }));
+        }
+        let granted = json!({
+            "before_granted": true,
+            "prompt_requested": false,
+            "settings_opened": false,
+            "granted": true,
+            "freshly_granted": false,
+            "residual": false
+        });
+        Some(Ok(json!({
+            "permissions": {
+                "accessibility": granted,
+                "screen_recording": granted,
+                "post_event": granted
+            }
+        })))
+    }
+
+    fn invoke(
+        &self,
+        _context: &AdapterContext,
+        _operation: &AdapterOperation,
+        _cancellation: Arc<AtomicBool>,
+    ) -> AdapterReply {
+        panic!("setup adapter does not own session commands")
+    }
+}
 
 impl TargetAdapter for DelayedSessionAdapter {
     fn targets(&self) -> Vec<TargetDescriptor> {
@@ -1169,6 +1217,84 @@ fn every_observable_reply_in_contract_suite_is_bounded_json() {
         assert!(bytes.len() <= 4096);
         serde_json::from_slice::<Value>(&bytes).unwrap();
     }
+}
+
+#[test]
+fn system_setup_routes_to_the_permission_owner_and_returns_rechecked_facts() {
+    let harness = Harness::new();
+
+    let reply = harness.invoke("focused-setup", "system.setup", json!({}));
+
+    assert_eq!(reply.exit_code, 0);
+    validate_command_result("system.setup", &reply.value).unwrap();
+    for permission in ["accessibility", "screen_recording", "post_event"] {
+        let fact = &reply.value["permissions"][permission];
+        assert_eq!(fact["before_granted"], true);
+        assert_eq!(fact["prompt_requested"], false);
+        assert_eq!(fact["settings_opened"], false);
+        assert_eq!(fact["granted"], true);
+        assert_eq!(fact["freshly_granted"], false);
+        assert_eq!(fact["residual"], false);
+    }
+}
+
+#[test]
+fn system_setup_caches_installation_and_adapter_side_effects_by_request_id() {
+    let root = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runtime = Arc::new(
+        Runtime::new(
+            RuntimeConfig {
+                temporary_root: root.path().join("tmp"),
+                config_root: root.path().join("config"),
+            },
+            vec![Arc::new(SetupTrackingAdapter {
+                calls: calls.clone(),
+                timeout: false,
+            })],
+        )
+        .unwrap()
+        .with_setup_installation(json!({
+            "installed": true,
+            "bundle": "/opt/manuvra/Manuvra.app"
+        })),
+    );
+
+    let first = invoke(&runtime, "same-setup", "system.setup", json!({}), 1_000);
+    let replay = invoke(&runtime, "same-setup", "system.setup", json!({}), 1_000);
+
+    assert_eq!(first.value, replay.value);
+    assert_eq!(
+        first.value["installation"]["bundle"],
+        "/opt/manuvra/Manuvra.app"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn timed_out_system_setup_is_terminal_and_retry_does_not_replay_side_effects() {
+    let root = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runtime = Arc::new(
+        Runtime::new(
+            RuntimeConfig {
+                temporary_root: root.path().join("tmp"),
+                config_root: root.path().join("config"),
+            },
+            vec![Arc::new(SetupTrackingAdapter {
+                calls: calls.clone(),
+                timeout: true,
+            })],
+        )
+        .unwrap(),
+    );
+
+    let first = invoke(&runtime, "same-timeout", "system.setup", json!({}), 1_000);
+    let replay = invoke(&runtime, "same-timeout", "system.setup", json!({}), 1_000);
+
+    assert_eq!(error_code(&first), Some("timed_out"));
+    assert_eq!(first.value, replay.value);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]

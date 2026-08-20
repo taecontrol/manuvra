@@ -2,6 +2,8 @@ mod actions;
 mod artifacts;
 mod commands;
 pub mod fake;
+#[cfg(debug_assertions)]
+pub mod fake_diagnostics;
 mod model;
 mod observations;
 mod usage;
@@ -82,6 +84,8 @@ pub struct Runtime {
     pub(crate) daemon_instance: String,
     pub(crate) startup_removed: Vec<PathBuf>,
     pub(crate) startup_preserved: Vec<PathBuf>,
+    pub(crate) setup_installation: Value,
+    pub(crate) doctor_warnings: Vec<String>,
 }
 
 pub(crate) struct RuntimeState {
@@ -135,7 +139,22 @@ impl Runtime {
             daemon_instance,
             startup_removed: cleanup.removed,
             startup_preserved: cleanup.preserved,
+            setup_installation: json!({}),
+            doctor_warnings: Vec::new(),
         })
+    }
+
+    /// Binds daemon installation identity to setup replies before request ownership is claimed.
+    pub fn with_setup_installation(mut self, installation: Value) -> Self {
+        self.setup_installation = installation;
+        self
+    }
+
+    /// Binds deterministic debug-only doctor warnings before request ownership is claimed.
+    #[cfg(debug_assertions)]
+    pub fn with_doctor_warnings(mut self, warnings: Vec<String>) -> Self {
+        self.doctor_warnings = warnings;
+        self
     }
 
     pub fn targets(&self) -> Vec<TargetDescriptor> {
@@ -314,9 +333,9 @@ impl Runtime {
             CommandId::RequestCancel => self.cancel(invocation, started),
             CommandId::ArtifactExport => self.export(invocation, started),
             CommandId::SystemDoctor => self.doctor(invocation, started),
+            CommandId::SystemSetup => self.setup(invocation, started),
             CommandId::DaemonStatus
             | CommandId::DaemonStop
-            | CommandId::SystemSetup
             | CommandId::SystemMigrate
             | CommandId::SystemPurge => InvocationReply::error("command_unsupported", None),
             CommandId::ActionClick

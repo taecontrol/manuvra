@@ -8,7 +8,10 @@ use manuvra_protocol::{
     CONTROL_PROTOCOL, ControlAction, ControlRequest, ControlResponse, RpcRequest, RpcResponse,
     operational_error, read_frame, write_frame,
 };
+#[cfg(debug_assertions)]
 use manuvra_runtime::fake::FakeAdapter;
+#[cfg(debug_assertions)]
+use manuvra_runtime::fake_diagnostics::ConfiguredDiagnostics;
 use manuvra_runtime::{InteractionModule, Runtime, RuntimeConfig, TargetAdapter};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -46,7 +49,7 @@ impl Server {
         // cleanup. A losing concurrent daemon must never inspect or remove the live daemon's
         // session directories.
         let socket = DaemonSocket::bind()?;
-        let runtime = runtime()?;
+        let runtime = runtime(&installation)?;
         Self::with_bound_socket(socket, runtime, installation)
     }
 
@@ -232,13 +235,12 @@ fn spawn_connection(
     Ok(())
 }
 
-fn runtime() -> io::Result<Arc<Runtime>> {
-    let adapters: Vec<Arc<dyn TargetAdapter>> =
-        if cfg!(debug_assertions) && std::env::var_os("MANUVRA_TEST_FAKE_ADAPTER").is_some() {
-            vec![Arc::new(FakeAdapter)]
-        } else {
-            production_adapters()?
-        };
+fn runtime(installation: &Installation) -> io::Result<Arc<Runtime>> {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("MANUVRA_TEST_FAKE_ADAPTER").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        return debug_fake_runtime(installation);
+    }
+    let adapters = production_adapters()?;
     Runtime::new(
         RuntimeConfig {
             temporary_root: temporary_root(),
@@ -246,7 +248,44 @@ fn runtime() -> io::Result<Arc<Runtime>> {
         },
         adapters,
     )
-    .map(Arc::new)
+    .map(|runtime| Arc::new(runtime.with_setup_installation(installation.identity())))
+    .map_err(io::Error::other)
+}
+
+#[cfg(debug_assertions)]
+fn debug_fake_runtime(installation: &Installation) -> io::Result<Arc<Runtime>> {
+    let configured = match std::env::var_os("MANUVRA_TEST_DIAGNOSTICS_CONFIG") {
+        Some(path) => Some(
+            ConfiguredDiagnostics::load(Path::new(&path), &temporary_root())
+                .map_err(io::Error::other)?,
+        ),
+        None => None,
+    };
+    let adapters: Vec<Arc<dyn TargetAdapter>> = configured
+        .as_ref()
+        .map(|scenario| vec![scenario.adapter.clone()])
+        .unwrap_or_else(|| vec![Arc::new(FakeAdapter)]);
+    let setup_installation = configured
+        .as_ref()
+        .map(|scenario| scenario.installation.clone())
+        .unwrap_or_else(|| installation.identity());
+    let doctor_warnings = configured
+        .map(|scenario| scenario.doctor_warnings)
+        .unwrap_or_default();
+    Runtime::new(
+        RuntimeConfig {
+            temporary_root: temporary_root(),
+            config_root: config_root(),
+        },
+        adapters,
+    )
+    .map(|runtime| {
+        Arc::new(
+            runtime
+                .with_setup_installation(setup_installation)
+                .with_doctor_warnings(doctor_warnings),
+        )
+    })
     .map_err(io::Error::other)
 }
 
