@@ -27,7 +27,7 @@ Follow the numbered instructions printed by `setup`. When Manuvra is absent from
 npx skills add taecontrol/manuvra
 ```
 
-That installs the agent skill from this repository. Load it when the work is observing or controlling an exact local Chrome or macOS window on Apple Silicon running macOS 26 or later.
+Use that skill when an agent must observe or control an exact local Chrome or macOS window on Apple Silicon running macOS 26 or later.
 
 ```bash
 manuvra targets
