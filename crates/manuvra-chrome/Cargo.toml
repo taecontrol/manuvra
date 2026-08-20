@@ -1,0 +1,19 @@
+[package]
+name = "manuvra-chrome"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+base64.workspace = true
+manuvra-runtime = { path = "../manuvra-runtime" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tungstenite.workspace = true
+
+[dev-dependencies]
+manuvra-protocol = { path = "../manuvra-protocol" }
+tempfile.workspace = true

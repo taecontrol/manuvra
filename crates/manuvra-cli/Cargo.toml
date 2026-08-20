@@ -1,0 +1,31 @@
+[package]
+name = "manuvra-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "manuvra"
+path = "src/main.rs"
+
+[[bin]]
+name = "manuvra-daemon"
+path = "src/daemon.rs"
+
+[dependencies]
+clap.workspace = true
+manuvra-protocol = { path = "../manuvra-protocol" }
+manuvra-chrome = { path = "../manuvra-chrome" }
+manuvra-macos = { path = "../manuvra-macos" }
+manuvra-runtime = { path = "../manuvra-runtime" }
+libc.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true
+tempfile.workspace = true

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>com.taecontrol.manuvra</string>
+  <key>CFBundleName</key>
+  <string>Manuvra</string>
+  <key>CFBundleDisplayName</key>
+  <string>Manuvra</string>
+  <key>CFBundleExecutable</key>
+  <string>manuvra-daemon</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>@VERSION@</string>
+  <key>CFBundleVersion</key>
+  <string>@VERSION@</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>26.0</string>
+  <key>LSUIElement</key>
+  <true/>
+</dict>
+</plist>

@@ -1,0 +1,500 @@
+use serde_json::{Value, json};
+use std::collections::VecDeque;
+use std::io;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+use tungstenite::stream::MaybeTlsStream;
+use tungstenite::{Message, WebSocket, connect};
+
+const SOCKET_POLL: Duration = Duration::from_millis(10);
+const MAX_EVENTS: usize = 10_000;
+const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+pub struct JournalEvent {
+    pub cursor: u64,
+    pub action_sequence: u64,
+    pub received_ms: u64,
+    pub message: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct JournalSnapshot {
+    pub events: Vec<JournalEvent>,
+    pub overflowed: bool,
+    pub last_cursor: u64,
+}
+
+#[derive(Debug)]
+struct Journal {
+    started: Instant,
+    next_cursor: u64,
+    bytes: usize,
+    overflowed: bool,
+    events: VecDeque<JournalEvent>,
+}
+
+impl Default for Journal {
+    fn default() -> Self {
+        Self {
+            started: Instant::now(),
+            next_cursor: 1,
+            bytes: 0,
+            overflowed: false,
+            events: VecDeque::new(),
+        }
+    }
+}
+
+impl Journal {
+    fn record(&mut self, message: Value, action_sequence: u64) {
+        let bytes = serde_json::to_vec(&message).map_or(MAX_EVENT_BYTES + 1, |value| value.len());
+        if self.events.len() >= MAX_EVENTS || self.bytes.saturating_add(bytes) > MAX_EVENT_BYTES {
+            self.overflowed = true;
+            return;
+        }
+        let event = JournalEvent {
+            cursor: self.next_cursor,
+            action_sequence,
+            received_ms: self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            message,
+        };
+        self.next_cursor += 1;
+        self.bytes += bytes;
+        self.events.push_back(event);
+    }
+
+    fn cursor(&self) -> u64 {
+        self.next_cursor.saturating_sub(1)
+    }
+
+    fn snapshot_since(&self, cursor: u64) -> JournalSnapshot {
+        JournalSnapshot {
+            events: self
+                .events
+                .iter()
+                .filter(|event| event.cursor > cursor)
+                .cloned()
+                .collect(),
+            overflowed: self.overflowed,
+            last_cursor: self.cursor(),
+        }
+    }
+}
+
+struct Request {
+    method: String,
+    params: Value,
+    deadline: Instant,
+    cancellation: Arc<AtomicBool>,
+    reply: SyncSender<CommandOutcome>,
+}
+
+#[derive(Debug, Clone)]
+pub enum CommandOutcome {
+    Confirmed(Value),
+    Rejected(Value),
+    NotSent(String),
+    Unknown(String),
+}
+
+impl CommandOutcome {
+    pub fn result(self) -> Result<Value, CommandFailure> {
+        match self {
+            Self::Confirmed(response) => Ok(response.get("result").cloned().unwrap_or(Value::Null)),
+            Self::Rejected(response) => Err(CommandFailure::Rejected(response)),
+            Self::NotSent(message) => Err(CommandFailure::NotSent(message)),
+            Self::Unknown(message) => Err(CommandFailure::Unknown(message)),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CommandFailure {
+    #[error("CDP rejected the command")]
+    Rejected(Value),
+    #[error("CDP command was not sent: {0}")]
+    NotSent(String),
+    #[error("CDP command may have been sent: {0}")]
+    Unknown(String),
+}
+
+pub struct CdpClient {
+    sender: Sender<Request>,
+    journal: Arc<(Mutex<Journal>, Condvar)>,
+    action_sequence: Arc<AtomicU64>,
+    disconnected: Arc<AtomicBool>,
+}
+
+impl CdpClient {
+    pub fn connect(url: String, observe: bool) -> Result<Arc<Self>, String> {
+        let (sender, receiver) = mpsc::channel();
+        let journal = Arc::new((Mutex::new(Journal::default()), Condvar::new()));
+        let action_sequence = Arc::new(AtomicU64::new(0));
+        let disconnected = Arc::new(AtomicBool::new(false));
+        let mut socket = connect(&url)
+            .map_err(|error| format!("WebSocket connection failed: {error}"))?
+            .0;
+        configure_timeout(&mut socket, SOCKET_POLL)?;
+        let client = Arc::new(Self {
+            sender,
+            journal: journal.clone(),
+            action_sequence: action_sequence.clone(),
+            disconnected: disconnected.clone(),
+        });
+        thread::Builder::new()
+            .name("manuvra-cdp".to_owned())
+            .spawn(move || {
+                worker(
+                    &mut socket,
+                    receiver,
+                    journal,
+                    action_sequence,
+                    disconnected,
+                    observe,
+                )
+            })
+            .map_err(|error| format!("CDP worker spawn failed: {error}"))?;
+        Ok(client)
+    }
+
+    pub fn command(
+        &self,
+        method: impl Into<String>,
+        params: Value,
+        deadline: Instant,
+        cancellation: Arc<AtomicBool>,
+    ) -> CommandOutcome {
+        if self.disconnected.load(Ordering::SeqCst) {
+            return CommandOutcome::NotSent("connection is disconnected".to_owned());
+        }
+        if cancellation.load(Ordering::SeqCst) || Instant::now() >= deadline {
+            return CommandOutcome::NotSent("cancelled or timed out before queueing".to_owned());
+        }
+        let (reply, receive) = mpsc::sync_channel(1);
+        let request = Request {
+            method: method.into(),
+            params,
+            deadline,
+            cancellation: cancellation.clone(),
+            reply,
+        };
+        if self.sender.send(request).is_err() {
+            return CommandOutcome::NotSent("connection worker stopped".to_owned());
+        }
+        loop {
+            if let Ok(outcome) = receive.recv_timeout(Duration::from_millis(2)) {
+                return outcome;
+            }
+            if cancellation.load(Ordering::SeqCst) {
+                return CommandOutcome::Unknown("cancelled while awaiting CDP reply".to_owned());
+            }
+            if Instant::now() >= deadline {
+                return CommandOutcome::Unknown(
+                    "deadline expired while awaiting CDP reply".to_owned(),
+                );
+            }
+        }
+    }
+
+    pub fn set_action_sequence(&self, sequence: u64) {
+        self.action_sequence.store(sequence, Ordering::SeqCst);
+    }
+
+    pub fn cursor(&self) -> u64 {
+        self.journal.0.lock().expect("CDP journal").cursor()
+    }
+
+    pub fn snapshot_since(&self, cursor: u64) -> JournalSnapshot {
+        self.journal
+            .0
+            .lock()
+            .expect("CDP journal")
+            .snapshot_since(cursor)
+    }
+
+    pub fn is_disconnected(&self) -> bool {
+        self.disconnected.load(Ordering::SeqCst)
+    }
+
+    pub fn wait_for_journal_change(&self, cursor: u64, timeout: Duration) {
+        let guard = self.journal.0.lock().expect("CDP journal");
+        if guard.cursor() != cursor || guard.overflowed {
+            return;
+        }
+        let _ = self.journal.1.wait_timeout(guard, timeout);
+    }
+}
+
+fn worker(
+    socket: &mut WebSocket<MaybeTlsStream<std::net::TcpStream>>,
+    receiver: Receiver<Request>,
+    journal: Arc<(Mutex<Journal>, Condvar)>,
+    action_sequence: Arc<AtomicU64>,
+    disconnected: Arc<AtomicBool>,
+    observe: bool,
+) {
+    let mut next_id = 1_u64;
+    if observe && initialize(socket, &journal, &action_sequence, &mut next_id).is_err() {
+        disconnected.store(true, Ordering::SeqCst);
+        return;
+    }
+    loop {
+        match receiver.try_recv() {
+            Ok(request) => {
+                let outcome = execute(
+                    socket,
+                    request.method,
+                    request.params,
+                    request.deadline,
+                    &request.cancellation,
+                    &journal,
+                    &action_sequence,
+                    &mut next_id,
+                );
+                let _ = request.reply.send(outcome);
+            }
+            Err(TryRecvError::Empty) => match read_message(socket) {
+                Ok(Some(value)) => record_event(&journal, &action_sequence, value),
+                Ok(None) => {}
+                Err(_) => {
+                    disconnected.store(true, Ordering::SeqCst);
+                    break;
+                }
+            },
+            Err(TryRecvError::Disconnected) => break,
+        }
+    }
+}
+
+fn initialize(
+    socket: &mut WebSocket<MaybeTlsStream<std::net::TcpStream>>,
+    journal: &Arc<(Mutex<Journal>, Condvar)>,
+    action_sequence: &Arc<AtomicU64>,
+    next_id: &mut u64,
+) -> Result<(), String> {
+    let cancellation = Arc::new(AtomicBool::new(false));
+    for (method, params) in [
+        ("Page.enable", json!({})),
+        ("Page.setLifecycleEventsEnabled", json!({"enabled": true})),
+        ("DOM.enable", json!({})),
+        ("Accessibility.enable", json!({})),
+        ("Network.enable", json!({})),
+        ("Runtime.enable", json!({})),
+        ("Log.enable", json!({})),
+    ] {
+        let outcome = execute(
+            socket,
+            method.to_owned(),
+            params,
+            Instant::now() + Duration::from_secs(2),
+            &cancellation,
+            journal,
+            action_sequence,
+            next_id,
+        );
+        if !matches!(outcome, CommandOutcome::Confirmed(_)) {
+            return Err(format!("CDP initialization failed at {method}"));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute(
+    socket: &mut WebSocket<MaybeTlsStream<std::net::TcpStream>>,
+    method: String,
+    params: Value,
+    deadline: Instant,
+    cancellation: &Arc<AtomicBool>,
+    journal: &Arc<(Mutex<Journal>, Condvar)>,
+    action_sequence: &Arc<AtomicU64>,
+    next_id: &mut u64,
+) -> CommandOutcome {
+    if cancellation.load(Ordering::SeqCst) || Instant::now() >= deadline {
+        return CommandOutcome::NotSent("cancelled or timed out before send".to_owned());
+    }
+    let id = *next_id;
+    *next_id = next_id.saturating_add(1);
+    let message = json!({"id": id, "method": method, "params": params});
+    if let Err(error) = socket.send(Message::Text(message.to_string().into())) {
+        return CommandOutcome::NotSent(format!("WebSocket send failed: {error}"));
+    }
+    loop {
+        if cancellation.load(Ordering::SeqCst) {
+            return CommandOutcome::Unknown("cancelled after send".to_owned());
+        }
+        if Instant::now() >= deadline {
+            return CommandOutcome::Unknown("deadline expired after send".to_owned());
+        }
+        match read_message(socket) {
+            Ok(Some(value)) if value.get("id").and_then(Value::as_u64) == Some(id) => {
+                return if value.get("error").is_some() {
+                    CommandOutcome::Rejected(value)
+                } else {
+                    CommandOutcome::Confirmed(value)
+                };
+            }
+            Ok(Some(value)) if value.get("method").is_some() => {
+                record_event(journal, action_sequence, value);
+            }
+            Ok(Some(_)) | Ok(None) => {}
+            Err(error) => return CommandOutcome::Unknown(error),
+        }
+    }
+}
+
+fn record_event(
+    journal: &Arc<(Mutex<Journal>, Condvar)>,
+    action_sequence: &Arc<AtomicU64>,
+    value: Value,
+) {
+    journal
+        .0
+        .lock()
+        .expect("CDP journal")
+        .record(value, action_sequence.load(Ordering::SeqCst));
+    journal.1.notify_all();
+}
+
+fn read_message(
+    socket: &mut WebSocket<MaybeTlsStream<std::net::TcpStream>>,
+) -> Result<Option<Value>, String> {
+    match socket.read() {
+        Ok(Message::Text(text)) => serde_json::from_str(&text)
+            .map(Some)
+            .map_err(|error| format!("invalid CDP JSON: {error}")),
+        Ok(Message::Ping(payload)) => {
+            socket
+                .send(Message::Pong(payload))
+                .map_err(|error| format!("CDP pong failed: {error}"))?;
+            Ok(None)
+        }
+        Ok(Message::Close(_)) => Err("CDP connection closed".to_owned()),
+        Ok(_) => Ok(None),
+        Err(tungstenite::Error::Io(error)) if is_timeout(&error) => Ok(None),
+        Err(error) => Err(format!("CDP read failed: {error}")),
+    }
+}
+
+fn configure_timeout(
+    socket: &mut WebSocket<MaybeTlsStream<std::net::TcpStream>>,
+    timeout: Duration,
+) -> Result<(), String> {
+    match socket.get_mut() {
+        MaybeTlsStream::Plain(stream) => stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|error| format!("CDP timeout configuration failed: {error}")),
+        _ => Err("CDP endpoint unexpectedly negotiated TLS".to_owned()),
+    }
+}
+
+fn is_timeout(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
+}
+
+pub fn event_method(event: &JournalEvent) -> Option<&str> {
+    event.message.get("method").and_then(Value::as_str)
+}
+
+pub fn event_params(event: &JournalEvent) -> &Value {
+    event.message.get("params").unwrap_or(&Value::Null)
+}
+
+pub fn is_log_event(event: &JournalEvent) -> bool {
+    matches!(
+        event_method(event),
+        Some("Runtime.consoleAPICalled" | "Runtime.exceptionThrown" | "Log.entryAdded")
+    )
+}
+
+pub fn is_relevant_event(event: &JournalEvent) -> bool {
+    event_method(event).is_some_and(|method| {
+        method.starts_with("DOM.")
+            || method.starts_with("Accessibility.")
+            || matches!(
+                method,
+                "Page.frameNavigated"
+                    | "Page.frameAttached"
+                    | "Page.frameDetached"
+                    | "Page.lifecycleEvent"
+                    | "Page.domContentEventFired"
+                    | "Page.loadEventFired"
+                    | "Network.requestWillBeSent"
+                    | "Network.loadingFinished"
+                    | "Network.loadingFailed"
+            )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use tungstenite::accept;
+
+    #[test]
+    fn disconnect_after_send_is_unknown_and_never_replayed() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut socket = accept(stream).unwrap();
+            let first = socket.read().unwrap();
+            assert!(matches!(first, Message::Text(_)));
+            socket.close(None).unwrap();
+        });
+        let client =
+            CdpClient::connect(format!("ws://{address}/devtools/page/test"), false).unwrap();
+        let outcome = client.command(
+            "Runtime.evaluate",
+            json!({"expression": "40+2"}),
+            Instant::now() + Duration::from_secs(1),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(matches!(outcome, CommandOutcome::Unknown(_)));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn cancellation_before_a_queued_send_is_not_sent() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let _socket = accept(stream).unwrap();
+            thread::sleep(Duration::from_millis(30));
+        });
+        let client =
+            CdpClient::connect(format!("ws://{address}/devtools/page/test"), false).unwrap();
+        let cancellation = Arc::new(AtomicBool::new(true));
+        let outcome = client.command(
+            "Runtime.evaluate",
+            json!({}),
+            Instant::now() + Duration::from_secs(1),
+            cancellation,
+        );
+        assert!(matches!(outcome, CommandOutcome::NotSent(_)));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn journal_overflow_is_explicit_and_never_looks_complete() {
+        let mut journal = Journal::default();
+        for index in 0..=MAX_EVENTS {
+            journal.record(
+                json!({"method": "DOM.childNodeInserted", "index": index}),
+                7,
+            );
+        }
+        let snapshot = journal.snapshot_since(0);
+        assert!(snapshot.overflowed);
+        assert_eq!(snapshot.events.len(), MAX_EVENTS);
+    }
+}

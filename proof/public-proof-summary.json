@@ -1,0 +1,54 @@
+{
+  "schema": "manuvra/public-proof-summary@1",
+  "version": "0.1.0",
+  "source_tree_sha256": "b9eb9c21fd45cfd55996cf61018de4b7c9460e5500015d81121c01719b6f6766",
+  "build_id": "d4b9cc6e3f07a08696bd34e26c70db7497cee4d3a9f110292f727255ca133055",
+  "formula_sha256": "c669cba92aadb5371adcb21c402048ff987905870e3ef2c6750d714a79dba18d",
+  "environment": {
+    "os": "macOS 26.5.2",
+    "architecture": "arm64",
+    "rust": "rustc 1.95.0 (59807616e 2026-04-14)",
+    "homebrew": "Homebrew 6.0.18"
+  },
+  "journeys": {
+    "chrome_background": {
+      "attempts": 50,
+      "first_attempt_successes": 50,
+      "wrong_target": 0,
+      "hangs": 0,
+      "orphaned_leases": 0,
+      "orphaned_session_directories": 0
+    },
+    "native_background": {
+      "attempts": 50,
+      "first_attempt_successes": 50,
+      "wrong_target": 0,
+      "hangs": 0,
+      "orphaned_leases": 0,
+      "orphaned_session_directories": 0
+    },
+    "native_foreground": {
+      "attempts": 50,
+      "first_attempt_successes": 50,
+      "wrong_target": 0,
+      "hangs": 0,
+      "orphaned_leases": 0,
+      "orphaned_session_directories": 0
+    }
+  },
+  "latency_p95_ms": {
+    "raw_query": 99,
+    "dispatch": 101,
+    "capture": 128,
+    "total": 627
+  },
+  "lifecycle": "pass",
+  "privacy": "pass",
+  "crap": {
+    "threshold": 15,
+    "maximum": 15.0,
+    "offenders": 0,
+    "missing_coverage": 1
+  },
+  "local_evidence_sha256": "55034cff7d62a1da536a89007833d3b934218b78257c08b0ea0550bae4dc25dd"
+}

@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://manuvra.local/schema/artifact-manifest/1",
+  "title": "Manuvra session artifact manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "session_id", "target_id", "generation", "lifetime", "session_directory", "artifacts"],
+  "properties": {
+    "schema": { "const": "manuvra/artifact-manifest@1" },
+    "session_id": { "type": "string", "pattern": "^s_[A-Za-z0-9]+$" },
+    "target_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "generation": { "type": "integer", "minimum": 1 },
+    "lifetime": { "const": "until_session_close" },
+    "session_directory": { "type": "string", "pattern": "^/", "maxLength": 1024 },
+    "artifacts": { "type": "array", "items": { "$ref": "#/$defs/artifact" } }
+  },
+  "$defs": {
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "kind", "absolute_path", "media_type", "bytes", "sha256", "complete", "request_id", "action_sequence", "created_at", "lifetime"],
+      "properties": {
+        "artifact_id": { "type": "string", "pattern": "^a_[A-Za-z0-9]+$" },
+        "kind": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+        "absolute_path": { "type": "string", "pattern": "^/", "maxLength": 1024 },
+        "media_type": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "complete": { "const": true },
+        "request_id": { "type": ["string", "null"], "maxLength": 128 },
+        "action_sequence": { "type": ["integer", "null"], "minimum": 1 },
+        "created_at": { "type": "string", "format": "date-time" },
+        "lifetime": { "const": "until_session_close" }
+      }
+    }
+  }
+}

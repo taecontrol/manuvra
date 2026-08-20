@@ -1,0 +1,86 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Semantic version without v
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-26
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install declared Rust and proof tools
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup default 1.95.0
+          brew install jq
+          cargo install cargo-crap --version 0.4.3 --locked
+          cargo install cargo-llvm-cov --version 0.9.0 --locked
+      - name: Validate exact release input
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)" = "$VERSION"
+          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
+          ! git rev-parse --verify --quiet "refs/tags/v$VERSION"
+          ! gh release view "v$VERSION" >/dev/null 2>&1
+          scripts/verify-proof-certificate.sh proof/exhaustive-crap-certificate.json
+          cargo run --locked -p manuvra-protocol --example validate-proof -- proof/public-proof-summary.json proof/public-summary.schema.json
+          digest=$(scripts/source-tree-digest.sh)
+          jq -e --arg version "$VERSION" --arg digest "$digest" '.version == $version and .source_tree_sha256 == $digest' proof/public-proof-summary.json
+          conclusion=$(gh run list --workflow ci.yml --commit "$GITHUB_SHA" --status completed --limit 1 --json conclusion --jq '.[0].conclusion')
+          test "$conclusion" = success
+      - name: Build deterministic source assets
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          first=$(mktemp -d)
+          second=$(mktemp -d)
+          scripts/create-source-archive.sh --version "$VERSION" --output "$first"
+          scripts/create-source-archive.sh --version "$VERSION" --output "$second"
+          cmp "$first/manuvra-$VERSION.tar.gz" "$second/manuvra-$VERSION.tar.gz"
+          mkdir release-assets
+          cp "$first/manuvra-$VERSION.tar.gz" "$first/manuvra-$VERSION.tar.gz.sha256" release-assets/
+          cp proof/public-proof-summary.json release-assets/public-proof-summary.json
+          cp proof/exhaustive-crap-certificate.json release-assets/exhaustive-crap-certificate.json
+      - name: Publish immutable source release
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/v$VERSION" -f "sha=$GITHUB_SHA"
+          gh release create "v$VERSION" release-assets/* --draft --verify-tag --title "Manuvra v$VERSION" --notes "MIT source release for source-built Homebrew installation. No executable binary is attached."
+          gh release edit "v$VERSION" --draft=false
+      - name: Open exact Homebrew tap update
+        env:
+          VERSION: ${{ inputs.version }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          sha=$(awk '{print $1}' "release-assets/manuvra-$VERSION.tar.gz.sha256")
+          tap=$(mktemp -d)
+          git clone "https://x-access-token:$HOMEBREW_TAP_TOKEN@github.com/taecontrol/homebrew-tap.git" "$tap"
+          branch="manuvra-$VERSION"
+          git -C "$tap" switch -c "$branch"
+          mkdir -p "$tap/Formula"
+          sed -e "s/@VERSION@/$VERSION/g" -e "s/@SHA256@/$sha/g" packaging/manuvra.rb.template > "$tap/Formula/manuvra.rb"
+          git -C "$tap" add Formula/manuvra.rb
+          git -C "$tap" -c user.name='taecontrol release automation' -c user.email='actions@users.noreply.github.com' commit -m "manuvra $VERSION"
+          git -C "$tap" push origin "$branch"
+          GH_TOKEN="$HOMEBREW_TAP_TOKEN" gh pr create --repo taecontrol/homebrew-tap --head "$branch" --base main --title "manuvra $VERSION" --body "Source-only formula update for immutable Manuvra v$VERSION."
+          GH_TOKEN="$HOMEBREW_TAP_TOKEN" gh pr merge --repo taecontrol/homebrew-tap "$branch" --auto --squash

@@ -1,0 +1,317 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://manuvra.local/schema/command-inputs/1",
+  "title": "Manuvra command inputs",
+  "$defs": {
+    "empty": { "type": "object", "additionalProperties": false },
+    "migrate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["from"],
+      "properties": { "from": { "const": "computer-use" } }
+    },
+    "purge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["all", "yes"],
+      "properties": { "all": { "const": true }, "yes": { "type": "boolean" } }
+    },
+    "session_id": { "type": "string", "pattern": "^s_[A-Za-z0-9]+$", "maxLength": 64 },
+    "mode": { "enum": ["background", "foreground"] },
+    "semantic_locator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": { "const": "semantic" },
+        "role": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "text": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "identifier": { "type": "string", "minLength": 1, "maxLength": 256 }
+      },
+      "anyOf": [
+        { "required": ["role"] },
+        { "required": ["name"] },
+        { "required": ["text"] },
+        { "required": ["identifier"] }
+      ]
+    },
+    "ref_locator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "ref"],
+      "properties": {
+        "kind": { "const": "ref" },
+        "ref": { "type": "string", "pattern": "^e_[A-Za-z0-9_-]+$", "maxLength": 256 }
+      }
+    },
+    "point_locator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "x", "y", "frame_token"],
+      "properties": {
+        "kind": { "const": "point" },
+        "x": { "type": "number", "minimum": 0 },
+        "y": { "type": "number", "minimum": 0 },
+        "frame_token": { "type": "string", "pattern": "^f_[A-Za-z0-9_-]+$", "maxLength": 256 }
+      }
+    },
+    "locator": {
+      "oneOf": [
+        { "$ref": "#/$defs/semantic_locator" },
+        { "$ref": "#/$defs/ref_locator" },
+        { "$ref": "#/$defs/point_locator" }
+      ]
+    },
+    "ax_value": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["type", "value"], "properties": { "type": { "const": "null" }, "value": { "type": "null" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "value"], "properties": { "type": { "const": "boolean" }, "value": { "type": "boolean" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "value"], "properties": { "type": { "const": "number" }, "value": { "type": "number" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "value"], "properties": { "type": { "enum": ["string", "url"] }, "value": { "type": "string", "maxLength": 1048576 } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "x", "y"], "properties": { "type": { "const": "point" }, "x": { "type": "number" }, "y": { "type": "number" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "width", "height"], "properties": { "type": { "const": "size" }, "width": { "type": "number" }, "height": { "type": "number" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "x", "y", "width", "height"], "properties": { "type": { "const": "rect" }, "x": { "type": "number" }, "y": { "type": "number" }, "width": { "type": "number" }, "height": { "type": "number" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "location", "length"], "properties": { "type": { "const": "range" }, "location": { "type": "integer", "minimum": 0 }, "length": { "type": "integer", "minimum": 0 } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "ref"], "properties": { "type": { "const": "element" }, "ref": { "type": "string", "pattern": "^e_[A-Za-z0-9_-]+$" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "value"], "properties": { "type": { "const": "array" }, "value": { "type": "array", "maxItems": 1024, "items": { "$ref": "#/$defs/ax_value" } } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "value"], "properties": { "type": { "const": "dictionary" }, "value": { "type": "object", "maxProperties": 1024, "additionalProperties": { "$ref": "#/$defs/ax_value" } } } }
+      ]
+    },
+    "commands_list": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cursor": { "type": ["string", "null"], "maxLength": 256 },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 10, "default": 10 }
+      }
+    },
+    "commands_get": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command"],
+      "properties": { "command": { "type": "string", "minLength": 1, "maxLength": 64 } }
+    },
+    "commands_schema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command", "side"],
+      "properties": {
+        "command": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "side": { "enum": ["input", "result"] }
+      }
+    },
+    "commands_errors": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code"],
+      "properties": { "code": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$", "maxLength": 64 } }
+    },
+    "commands_usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["action"],
+      "properties": {
+        "action": { "enum": ["enable", "show", "export", "reset", "disable"] },
+        "destination": { "type": "string", "minLength": 1, "maxLength": 1024 }
+      },
+      "if": { "properties": { "action": { "const": "export" } }, "required": ["action"] },
+      "then": { "required": ["destination"] }
+    },
+    "targets": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "enum": ["chrome", "macos"] },
+        "cursor": { "type": ["string", "null"], "maxLength": 256 },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 10, "default": 10 }
+      }
+    },
+    "open": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_id"],
+      "properties": {
+        "target_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "role": { "enum": ["actor", "observer"], "default": "actor" },
+        "mode": { "$ref": "#/$defs/mode", "default": "background" },
+        "lease_ttl_ms": { "type": "integer", "minimum": 10000, "maximum": 600000, "default": 120000 }
+      }
+    },
+    "close": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id"],
+      "properties": {
+        "session_id": { "$ref": "#/$defs/session_id" },
+        "cancel_running": { "type": "boolean", "default": false }
+      }
+    },
+    "lease": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id", "action"],
+      "properties": {
+        "session_id": { "$ref": "#/$defs/session_id" },
+        "action": { "enum": ["acquire", "renew", "release"] },
+        "ttl_ms": { "type": "integer", "minimum": 10000, "maximum": 600000 }
+      }
+    },
+    "click": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id", "locator"],
+      "properties": {
+        "session_id": { "$ref": "#/$defs/session_id" },
+        "locator": { "$ref": "#/$defs/locator" },
+        "button": { "enum": ["left", "middle", "right"], "default": "left" },
+        "count": { "type": "integer", "minimum": 1, "maximum": 3, "default": 1 },
+        "mode": { "$ref": "#/$defs/mode" }
+      }
+    },
+    "type": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id", "locator", "text"],
+      "properties": {
+        "session_id": { "$ref": "#/$defs/session_id" },
+        "locator": { "$ref": "#/$defs/locator" },
+        "text": { "type": "string", "maxLength": 1048576 },
+        "replace": { "type": "boolean", "default": false },
+        "mode": { "$ref": "#/$defs/mode" }
+      }
+    },
+    "press": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id", "key"],
+      "properties": {
+        "session_id": { "$ref": "#/$defs/session_id" },
+        "key": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "locator": { "$ref": "#/$defs/locator" },
+        "mode": { "$ref": "#/$defs/mode" }
+      }
+    },
+    "scroll": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id", "delta_x", "delta_y"],
+      "properties": {
+        "session_id": { "$ref": "#/$defs/session_id" },
+        "locator": { "$ref": "#/$defs/locator" },
+        "delta_x": { "type": "number", "minimum": -100000, "maximum": 100000 },
+        "delta_y": { "type": "number", "minimum": -100000, "maximum": 100000 },
+        "mode": { "$ref": "#/$defs/mode" }
+      }
+    },
+    "navigate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id", "url"],
+      "properties": {
+        "session_id": { "$ref": "#/$defs/session_id" },
+        "url": { "type": "string", "format": "uri", "maxLength": 8192 },
+        "mode": { "$ref": "#/$defs/mode" }
+      }
+    },
+    "observe_query": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id", "semantic"],
+      "properties": {
+        "session_id": { "$ref": "#/$defs/session_id" },
+        "semantic": { "$ref": "#/$defs/semantic_locator" },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 5, "default": 5 }
+      }
+    },
+    "session_only": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id"],
+      "properties": { "session_id": { "$ref": "#/$defs/session_id" } }
+    },
+    "observe_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id", "kind"],
+      "properties": {
+        "session_id": { "$ref": "#/$defs/session_id" },
+        "kind": { "enum": ["logs", "events", "diagnostics", "timings", "manifest"] }
+      }
+    },
+    "raw_cdp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id", "intent", "method", "params"],
+      "properties": {
+        "session_id": { "$ref": "#/$defs/session_id" },
+        "intent": { "enum": ["query", "action"] },
+        "method": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_]*\\.[A-Za-z][A-Za-z0-9_]*$", "maxLength": 128 },
+        "params": { "type": "object" },
+        "mode": { "$ref": "#/$defs/mode" }
+      }
+    },
+    "raw_ax_get": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id", "ref", "attribute"],
+      "properties": {
+        "session_id": { "$ref": "#/$defs/session_id" },
+        "ref": { "type": "string", "pattern": "^e_[A-Za-z0-9_-]+$" },
+        "attribute": { "type": "string", "minLength": 1, "maxLength": 128 }
+      }
+    },
+    "raw_ax_set": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id", "ref", "attribute", "value"],
+      "properties": {
+        "session_id": { "$ref": "#/$defs/session_id" },
+        "ref": { "type": "string", "pattern": "^e_[A-Za-z0-9_-]+$" },
+        "attribute": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "value": { "$ref": "#/$defs/ax_value" },
+        "mode": { "$ref": "#/$defs/mode" }
+      }
+    },
+    "raw_ax_perform": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id", "ref", "action"],
+      "properties": {
+        "session_id": { "$ref": "#/$defs/session_id" },
+        "ref": { "type": "string", "pattern": "^e_[A-Za-z0-9_-]+$" },
+        "action": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "mode": { "$ref": "#/$defs/mode" }
+      }
+    },
+    "cancel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id", "request_id"],
+      "properties": {
+        "session_id": { "$ref": "#/$defs/session_id" },
+        "request_id": { "type": "string", "minLength": 1, "maxLength": 128 }
+      }
+    },
+    "export": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id", "destination"],
+      "properties": {
+        "session_id": { "$ref": "#/$defs/session_id" },
+        "artifact_ids": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "pattern": "^a_[A-Za-z0-9]+$" } },
+        "all": { "type": "boolean", "default": false },
+        "destination": { "type": "string", "minLength": 1, "maxLength": 1024 }
+      },
+      "oneOf": [{ "required": ["artifact_ids"] }, { "required": ["all"], "properties": { "all": { "const": true } } }]
+    },
+    "doctor": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "session_id": { "$ref": "#/$defs/session_id" },
+        "target_id": { "type": "string", "minLength": 1, "maxLength": 128 }
+      }
+    }
+  }
+}

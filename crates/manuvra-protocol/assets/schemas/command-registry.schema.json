@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://manuvra.local/schema/command-registry/1",
+  "title": "Manuvra command registry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["registry_version", "wire_protocol", "binary", "minimum_macos", "operational_stdout_max_bytes", "error_catalog", "help_baseline", "commands"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "registry_version": { "type": "string", "const": "1.0.0" },
+    "wire_protocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["major", "minor"],
+      "properties": {
+        "major": { "type": "integer", "const": 1 },
+        "minor": { "type": "integer", "const": 0 }
+      }
+    },
+    "binary": { "type": "string", "const": "manuvra" },
+    "minimum_macos": { "type": "string", "const": "26.0" },
+    "operational_stdout_max_bytes": { "type": "integer", "const": 4096 },
+    "error_catalog": { "type": "string", "const": "./error-catalog.json" },
+    "help_baseline": { "type": "string", "const": "./agent-help.md" },
+    "commands": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/command" }
+    }
+  },
+  "$defs": {
+    "command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "cli", "summary", "effect", "authority", "modes", "default_timeout_ms", "maximum_timeout_ms", "capabilities", "input_schema", "result_schema", "examples", "since"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z][a-z0-9]*(\\.[a-z][a-z0-9_]*)+$" },
+        "cli": { "type": "array", "minItems": 1, "items": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" } },
+        "summary": { "type": "string", "minLength": 1, "maxLength": 180 },
+        "effect": { "enum": ["read", "mutate", "declared", "lifecycle", "coordination", "durable_write"] },
+        "authority": { "enum": ["none", "session", "observer", "actor"] },
+        "modes": { "type": "array", "uniqueItems": true, "items": { "enum": ["background", "foreground"] } },
+        "default_timeout_ms": { "type": "integer", "minimum": 50, "maximum": 120000 },
+        "maximum_timeout_ms": { "type": "integer", "const": 120000 },
+        "capabilities": { "type": "array", "uniqueItems": true, "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$" } },
+        "input_schema": { "type": "string" },
+        "result_schema": { "type": "string" },
+        "examples": {
+          "type": "array", "minItems": 1, "maxItems": 4,
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["cli", "input"],
+            "properties": {
+              "cli": { "type": "string", "minLength": 1, "maxLength": 512 },
+              "input": { "type": "object" }
+            }
+          }
+        },
+        "since": { "type": "string", "const": "1.0.0" }
+      }
+    }
+  }
+}

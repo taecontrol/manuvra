@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://manuvra.local/schema/usage/1",
+  "title": "Manuvra local aggregate raw usage",
+  "description": "The complete allowed durable usage-statistics shape. No per-invocation or target data is permitted.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "counters"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "counters": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["backend", "operation", "intent", "outcome", "count"],
+        "properties": {
+          "backend": { "enum": ["cdp", "ax"] },
+          "operation": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_.:-]*$", "maxLength": 128 },
+          "intent": { "type": ["string", "null"], "enum": ["query", "action", null] },
+          "outcome": { "enum": ["completed", "not_performed", "uncertain"] },
+          "count": { "type": "integer", "minimum": 1 }
+        }
+      }
+    }
+  }
+}

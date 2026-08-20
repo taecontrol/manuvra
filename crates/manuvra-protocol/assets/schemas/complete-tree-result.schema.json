@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://manuvra.local/schema/complete-tree-result/1",
+  "title": "Manuvra complete tree result",
+  "type": "object",
+  "additionalProperties": false,
+  "x-max-serialized-utf8-bytes": 4096,
+  "required": ["schema", "request_id", "session_id", "target_id", "complete", "tree_path", "sha256", "node_count", "ref_epoch", "action_sequence_before", "action_sequence_after", "observation_status", "manifest_path"],
+  "properties": {
+    "schema": { "const": "manuvra/complete-tree-result@1" },
+    "request_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "session_id": { "type": "string", "pattern": "^s_[A-Za-z0-9]+$" },
+    "target_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "complete": { "const": true },
+    "tree_path": { "type": "string", "pattern": "^/", "maxLength": 1024 },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "node_count": { "type": "integer", "minimum": 1 },
+    "ref_epoch": { "type": "string", "pattern": "^r_[A-Za-z0-9]+$" },
+    "action_sequence_before": { "type": "integer", "minimum": 0 },
+    "action_sequence_after": { "type": "integer", "minimum": 0 },
+    "observation_status": { "enum": ["stable", "concurrent"] },
+    "manifest_path": { "type": "string", "pattern": "^/", "maxLength": 1024 }
+  }
+}

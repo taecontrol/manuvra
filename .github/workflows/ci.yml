@@ -1,0 +1,72 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install declared Rust and scanners
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup default 1.95.0
+          brew install gitleaks jq
+          cargo install cargo-crap --version 0.4.3 --locked
+          cargo install cargo-llvm-cov --version 0.9.0 --locked
+      - name: Format and lint
+        run: |
+          make fmt
+          make lint
+      - name: Reproducible tests
+        run: |
+          make test
+      - name: Source-bound exhaustive CRAP proof
+        if: github.event_name == 'push'
+        run: |
+          make verify-proof PROOF_CERTIFICATE=proof/exhaustive-crap-certificate.json
+          cargo run --locked -p manuvra-protocol --example validate-proof -- proof/public-proof-summary.json proof/public-summary.schema.json
+          test "$(jq -r '.source_tree_sha256' proof/public-proof-summary.json)" = "$(scripts/source-tree-digest.sh)"
+      - name: Pull-request coverage inventory
+        if: github.event_name == 'pull_request'
+        run: |
+          set +e
+          make crap CRAP_REPORT=target/pr-crap-report.json
+          status=$?
+          set -e
+          test -s target/pr-crap-report.json
+          test "$status" -eq 0 -o "$status" -eq 2
+          echo "The exhaustive privileged certificate is regenerated before updating main."
+      - name: Public snapshot safety
+        run: |
+          snapshot=$(mktemp -d)
+          scripts/create-public-snapshot.sh --output "$snapshot" --initialize
+      - name: Package and verify installed resources
+        run: |
+          prefix=$(mktemp -d)
+          scripts/package-manuvra.sh --prefix "$prefix"
+          codesign --verify --deep --strict --verbose=2 "$prefix/libexec/Manuvra.app"
+          test "$("$prefix/bin/manuvra" commands list --limit 1 | wc -c)" -le 4096
+          test "$("$prefix/bin/manuvra" daemon status | wc -c)" -le 4096
+      - name: Deterministic source archive
+        run: |
+          first=$(mktemp -d)
+          second=$(mktemp -d)
+          scripts/create-source-archive.sh --version 0.1.0 --output "$first"
+          scripts/create-source-archive.sh --version 0.1.0 --output "$second"
+          cmp "$first/manuvra-0.1.0.tar.gz" "$second/manuvra-0.1.0.tar.gz"

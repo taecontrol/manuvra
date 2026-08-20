@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://manuvra.local/schema/config/1",
+  "title": "Manuvra durable user configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "raw_usage_enabled"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "raw_usage_enabled": { "type": "boolean", "default": false }
+  }
+}

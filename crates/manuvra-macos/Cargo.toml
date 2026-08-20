@@ -1,0 +1,24 @@
+[package]
+name = "manuvra-macos"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+manuvra-runtime = { path = "../manuvra-runtime" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2.workspace = true
+libc.workspace = true
+objc2.workspace = true
+objc2-app-kit.workspace = true
+objc2-core-foundation.workspace = true
+objc2-core-graphics.workspace = true
+objc2-foundation.workspace = true
+objc2-image-io.workspace = true
+objc2-screen-capture-kit.workspace = true

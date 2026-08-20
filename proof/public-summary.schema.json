@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://manuvra.dev/schema/public-proof-summary/1",
+  "title": "Manuvra redacted local proof summary",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "version", "source_tree_sha256", "build_id", "formula_sha256", "environment", "journeys", "latency_p95_ms", "lifecycle", "privacy", "crap", "local_evidence_sha256"],
+  "properties": {
+    "schema": { "const": "manuvra/public-proof-summary@1" },
+    "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "source_tree_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "build_id": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "formula_sha256": { "description": "SHA-256 of the source formula template in the tested source tree", "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "environment": { "type": "object" },
+    "journeys": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["chrome_background", "native_background", "native_foreground"],
+      "properties": {
+        "chrome_background": { "$ref": "#/$defs/journey" },
+        "native_background": { "$ref": "#/$defs/journey" },
+        "native_foreground": { "$ref": "#/$defs/journey" }
+      }
+    },
+    "latency_p95_ms": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["raw_query", "dispatch", "capture", "total"],
+      "properties": {
+        "raw_query": { "type": "integer", "maximum": 150 },
+        "dispatch": { "type": "integer", "maximum": 150 },
+        "capture": { "type": "integer", "maximum": 250 },
+        "total": { "type": "integer", "maximum": 1000 }
+      }
+    },
+    "lifecycle": { "const": "pass" },
+    "privacy": { "const": "pass" },
+    "crap": { "type": "object", "additionalProperties": false, "required": ["threshold", "maximum", "offenders", "missing_coverage"], "properties": { "threshold": { "const": 15 }, "maximum": { "type": "number", "maximum": 15 }, "offenders": { "const": 0 }, "missing_coverage": { "type": "integer", "minimum": 0 } } },
+    "local_evidence_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+  },
+  "$defs": {
+    "journey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attempts", "first_attempt_successes", "wrong_target", "hangs", "orphaned_leases", "orphaned_session_directories"],
+      "properties": {
+        "attempts": { "const": 50 },
+        "first_attempt_successes": { "type": "integer", "minimum": 49, "maximum": 50 },
+        "wrong_target": { "const": 0 },
+        "hangs": { "const": 0 },
+        "orphaned_leases": { "const": 0 },
+        "orphaned_session_directories": { "const": 0 }
+      }
+    }
+  }
+}

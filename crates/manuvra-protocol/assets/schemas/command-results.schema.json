@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://manuvra.local/schema/command-results/1",
+  "title": "Manuvra non-action command results",
+  "x-max-serialized-utf8-bytes": 4096,
+  "$defs": {
+    "absolute_path": { "type": "string", "pattern": "^/", "maxLength": 1024 },
+    "daemon_status": { "type": "object" },
+    "setup": { "type": "object", "additionalProperties": false, "required": ["opened", "missing", "installation"], "properties": { "opened": { "type": "array", "items": { "type": "string" } }, "missing": { "type": "array", "items": { "type": "string" } }, "installation": { "type": "object" } } },
+    "migrate": { "type": "object", "additionalProperties": false, "required": ["source", "destination", "copied", "source_preserved"], "properties": { "source": { "$ref": "#/$defs/absolute_path" }, "destination": { "$ref": "#/$defs/absolute_path" }, "copied": { "type": "boolean" }, "source_preserved": { "const": true } } },
+    "purge": { "type": "object", "additionalProperties": false, "required": ["removed", "retained_exports"], "properties": { "removed": { "type": "array", "items": { "$ref": "#/$defs/absolute_path" } }, "retained_exports": { "const": true } } },
+    "registry_page": {
+      "type": "object", "additionalProperties": false,
+      "required": ["registry_version", "commands", "next_cursor"],
+      "properties": {
+        "registry_version": { "const": "1.0.0" },
+        "commands": { "type": "array", "maxItems": 10, "items": { "type": "object" } },
+        "next_cursor": { "type": ["string", "null"], "maxLength": 256 }
+      }
+    },
+    "command_help": {
+      "type": "object", "additionalProperties": false,
+      "required": ["command", "summary", "when_to_use", "effects", "authority", "modes", "defaults", "input_schema", "result_schema", "errors", "examples"],
+      "properties": {
+        "command": { "type": "string", "maxLength": 64 }, "summary": { "type": "string", "maxLength": 180 }, "when_to_use": { "type": "string", "maxLength": 512 },
+        "effects": { "type": "string", "maxLength": 256 }, "authority": { "type": "string", "maxLength": 32 }, "modes": { "type": "array", "maxItems": 2, "items": { "type": "string" } },
+        "defaults": { "type": "object" }, "input_schema": { "$ref": "#/$defs/schema_pointer" }, "result_schema": { "$ref": "#/$defs/schema_pointer" },
+        "errors": { "type": "array", "maxItems": 16, "items": { "type": "string", "maxLength": 64 } }, "examples": { "type": "array", "maxItems": 4, "items": { "type": "string", "maxLength": 512 } }
+      }
+    },
+    "schema_pointer": {
+      "type": "object", "additionalProperties": false, "required": ["absolute_path", "sha256", "json_pointer"],
+      "properties": { "absolute_path": { "$ref": "#/$defs/absolute_path" }, "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }, "json_pointer": { "type": ["string", "null"] } }
+    },
+    "error_help": {
+      "type": "object", "additionalProperties": false, "required": ["code", "meaning", "effects", "retry", "recovery"],
+      "properties": { "code": { "type": "string" }, "meaning": { "type": "string" }, "effects": { "enum": ["none", "possible", "confirmed", "depends"] }, "retry": { "type": "string" }, "recovery": { "type": "string" } }
+    },
+    "usage_result": {
+      "type": "object", "additionalProperties": false, "required": ["action", "enabled", "usage_path", "export_path", "warning"],
+      "properties": { "action": { "enum": ["enable", "show", "export", "reset", "disable"] }, "enabled": { "type": "boolean" }, "usage_path": { "$ref": "#/$defs/absolute_path" }, "export_path": { "oneOf": [{ "$ref": "#/$defs/absolute_path" }, { "type": "null" }] }, "warning": { "type": ["string", "null"] } }
+    },
+    "target_page": {
+      "type": "object", "additionalProperties": false, "required": ["targets", "next_cursor"],
+      "properties": {
+        "targets": { "type": "array", "maxItems": 10, "items": { "type": "object", "required": ["target_id", "generation", "kind", "capabilities", "actor_lease"], "properties": { "target_id": { "type": "string" }, "generation": { "type": "integer", "minimum": 1 }, "kind": { "enum": ["chrome", "macos"] }, "capabilities": { "type": "array", "items": { "type": "string" } }, "actor_lease": { "enum": ["available", "held"] } } } },
+        "next_cursor": { "type": ["string", "null"], "maxLength": 256 }
+      }
+    },
+    "session": {
+      "type": "object", "additionalProperties": false, "required": ["session_id", "target_id", "target_generation", "role", "mode", "state", "lease"],
+      "properties": { "session_id": { "type": "string" }, "target_id": { "type": "string" }, "target_generation": { "type": "integer" }, "role": { "enum": ["actor", "observer"] }, "mode": { "enum": ["background", "foreground"] }, "state": { "const": "active" }, "lease": { "type": ["object", "null"] } }
+    },
+    "closed": { "type": "object", "additionalProperties": false, "required": ["session_id", "closed", "artifacts_removed"], "properties": { "session_id": { "type": "string" }, "closed": { "const": true }, "artifacts_removed": { "const": true } } },
+    "lease": { "type": "object", "additionalProperties": false, "required": ["session_id", "state", "ttl_ms", "expires_at"], "properties": { "session_id": { "type": "string" }, "state": { "enum": ["held", "released", "expired"] }, "ttl_ms": { "type": ["integer", "null"] }, "expires_at": { "type": ["string", "null"], "format": "date-time" } } },
+    "query_result": {
+      "type": "object", "additionalProperties": false, "required": ["session_id", "target_id", "ref_epoch", "matches", "overflow_path", "action_sequence_before", "action_sequence_after", "observation_status"],
+      "properties": { "session_id": { "type": "string" }, "target_id": { "type": "string" }, "ref_epoch": { "type": "string" }, "matches": { "type": "array", "maxItems": 5, "items": { "$ref": "#/$defs/query_match" } }, "overflow_path": { "oneOf": [{ "$ref": "#/$defs/absolute_path" }, { "type": "null" }] }, "action_sequence_before": { "type": "integer" }, "action_sequence_after": { "type": "integer" }, "observation_status": { "enum": ["stable", "concurrent"] } }
+    },
+    "query_match": { "type": "object", "additionalProperties": false, "required": ["ref", "role", "name", "text", "identifier"], "properties": { "ref": { "type": "string", "maxLength": 256 }, "role": { "type": "string", "maxLength": 64 }, "name": { "type": ["string", "null"], "maxLength": 256 }, "text": { "type": ["string", "null"], "maxLength": 256 }, "identifier": { "type": ["string", "null"], "maxLength": 256 } } },
+    "screenshot_result": {
+      "type": "object", "additionalProperties": false, "required": ["session_id", "target_id", "screenshot_path", "frame_token", "width", "height", "sha256", "action_sequence_before", "action_sequence_after", "observation_status", "manifest_path"],
+      "properties": { "session_id": { "type": "string" }, "target_id": { "type": "string" }, "screenshot_path": { "$ref": "#/$defs/absolute_path" }, "frame_token": { "type": "string" }, "width": { "type": "integer", "minimum": 1 }, "height": { "type": "integer", "minimum": 1 }, "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }, "action_sequence_before": { "type": "integer" }, "action_sequence_after": { "type": "integer" }, "observation_status": { "enum": ["stable", "concurrent"] }, "manifest_path": { "$ref": "#/$defs/absolute_path" } }
+    },
+    "artifact_pointer": { "type": "object", "additionalProperties": false, "required": ["kind", "path", "sha256", "manifest_path"], "properties": { "kind": { "type": "string" }, "path": { "$ref": "#/$defs/absolute_path" }, "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }, "manifest_path": { "$ref": "#/$defs/absolute_path" } } },
+    "raw_result": { "type": "object", "additionalProperties": false, "required": ["session_id", "command", "intent", "delivery", "response_path", "timing_ms", "warning"], "properties": { "session_id": { "type": "string" }, "command": { "type": "string" }, "intent": { "type": ["string", "null"], "enum": ["query", "action", null] }, "delivery": { "enum": ["backend_rejected", "backend_confirmed", "unknown"] }, "response_path": { "$ref": "#/$defs/absolute_path" }, "timing_ms": { "type": "object" }, "warning": { "type": ["string", "null"] } } },
+    "raw_cdp_result": { "oneOf": [{ "$ref": "#/$defs/raw_result" }, { "$ref": "https://manuvra.local/schema/action-result/1" }] },
+    "cancel": { "type": "object", "additionalProperties": false, "required": ["request_id", "disposition"], "properties": { "request_id": { "type": "string" }, "disposition": { "enum": ["cancellation_requested", "already_terminal", "unknown_request"] } } },
+    "export": { "type": "object", "additionalProperties": false, "required": ["session_id", "destination", "files", "verified"], "properties": { "session_id": { "type": "string" }, "destination": { "$ref": "#/$defs/absolute_path" }, "files": { "type": "array", "items": { "type": "object" } }, "verified": { "const": true } } },
+    "doctor": { "type": "object", "additionalProperties": false, "required": ["host", "daemon", "permissions", "sessions", "warnings"], "properties": { "host": { "type": "object" }, "daemon": { "type": "object" }, "permissions": { "type": "object" }, "sessions": { "type": "array", "items": { "type": "object" } }, "warnings": { "type": "array", "items": { "type": "string" } } } }
+  }
+}

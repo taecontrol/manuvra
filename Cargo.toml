@@ -1,0 +1,37 @@
+[workspace]
+members = [
+  "crates/manuvra-chrome",
+  "crates/manuvra-macos",
+  "crates/manuvra-protocol",
+  "crates/manuvra-runtime",
+  "crates/manuvra-cli",
+]
+exclude = ["tools/crap-gate"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+
+[workspace.dependencies]
+base64 = "0.22"
+block2 = "0.6"
+clap = { version = "4.6", features = ["derive"] }
+libc = "0.2"
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", features = ["NSRunningApplication", "NSWorkspace"] }
+objc2-core-foundation = "0.3.2"
+objc2-core-graphics = { version = "0.3.2", features = ["CGEvent", "CGEventTypes", "CGImage", "CGRemoteOperation", "CGWindow"] }
+objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSDictionary", "NSError", "NSString"] }
+objc2-image-io = { version = "0.3.2", features = ["CGImageDestination", "objc2-core-graphics"] }
+objc2-screen-capture-kit = { version = "0.3.2", features = ["SCScreenshotManager", "SCShareableContent", "SCStream", "block2", "objc2-core-foundation", "objc2-core-graphics"] }
+rand = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tempfile = "3.27"
+thiserror = "2.0"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://manuvra.local/schema/error/1",
+  "title": "Manuvra typed operational error",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["code", "category", "phase", "effects", "retry", "message", "recovery_command", "help_command", "details_path"],
+  "properties": {
+    "code": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$", "maxLength": 64 },
+    "category": {
+      "enum": ["interface", "version", "host", "target", "session", "coordination", "capability", "resolution", "execution", "raw", "evidence", "durable_state", "internal"]
+    },
+    "phase": { "enum": ["transport", "validation", "preflight", "dispatch", "stabilization", "capture", "artifact", "cleanup"] },
+    "effects": { "enum": ["none", "possible", "confirmed"] },
+    "retry": { "enum": ["never", "immediate", "after_condition", "observe_then_decide"] },
+    "message": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "recovery_command": { "type": ["string", "null"], "maxLength": 512 },
+    "help_command": { "type": "string", "pattern": "^manuvra commands errors [a-z][a-z0-9_]*$", "maxLength": 128 },
+    "details_path": { "type": ["string", "null"], "pattern": "^/", "maxLength": 1024 }
+  }
+}

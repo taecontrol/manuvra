@@ -1,0 +1,19 @@
+[package]
+name = "manuvra-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+manuvra-protocol = { path = "../manuvra-protocol" }
+libc.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]

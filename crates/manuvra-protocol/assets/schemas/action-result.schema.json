@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://manuvra.local/schema/action-result/1",
+  "title": "Manuvra mutating action result",
+  "type": "object",
+  "additionalProperties": false,
+  "x-max-serialized-utf8-bytes": 4096,
+  "required": ["schema", "protocol_version", "registry_version", "request_id", "command", "session_id", "target_id", "action_sequence", "outcome", "delivery", "requested_mode", "effective_mode", "effect_verification", "observation", "timing_ms", "warnings", "error", "manifest_path"],
+  "properties": {
+    "schema": { "const": "manuvra/action-result@1" },
+    "protocol_version": { "const": "1.0" },
+    "registry_version": { "const": "1.0.0" },
+    "request_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "command": { "type": "string", "pattern": "^[a-z][a-z0-9]*(\\.[a-z][a-z0-9_]*)+$", "maxLength": 64 },
+    "session_id": { "type": "string", "pattern": "^s_[A-Za-z0-9]+$", "maxLength": 64 },
+    "target_id": { "type": ["string", "null"], "minLength": 1, "maxLength": 128 },
+    "action_sequence": { "type": ["integer", "null"], "minimum": 1 },
+    "outcome": { "enum": ["observed", "not_performed", "uncertain"] },
+    "delivery": { "enum": ["not_dispatched", "backend_rejected", "backend_confirmed", "unknown"] },
+    "requested_mode": { "enum": ["background", "foreground"] },
+    "effective_mode": { "type": ["string", "null"], "enum": ["background", "foreground", null] },
+    "effect_verification": { "const": "not_asserted" },
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "screenshot_path", "frame_token", "action_sequence_before", "action_sequence_after"],
+      "properties": {
+        "status": { "enum": ["captured", "not_attempted", "timed_out", "failed", "interrupted", "concurrent"] },
+        "screenshot_path": { "type": ["string", "null"], "pattern": "^/", "maxLength": 1024 },
+        "frame_token": { "type": ["string", "null"], "maxLength": 256 },
+        "action_sequence_before": { "type": ["integer", "null"], "minimum": 0 },
+        "action_sequence_after": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+    "timing_ms": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["queue", "preflight", "dispatch", "stabilize", "capture", "artifact", "total"],
+      "properties": {
+        "queue": { "type": "integer", "minimum": 0 },
+        "preflight": { "type": "integer", "minimum": 0 },
+        "dispatch": { "type": "integer", "minimum": 0 },
+        "stabilize": { "type": "integer", "minimum": 0 },
+        "capture": { "type": "integer", "minimum": 0 },
+        "artifact": { "type": "integer", "minimum": 0 },
+        "total": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "warnings": { "type": "array", "maxItems": 8, "uniqueItems": true, "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$", "maxLength": 64 } },
+    "error": { "oneOf": [{ "type": "null" }, { "$ref": "https://manuvra.local/schema/error/1" }] },
+    "manifest_path": { "type": ["string", "null"], "pattern": "^/", "maxLength": 1024 }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "outcome": { "const": "observed" } }, "required": ["outcome"] },
+      "then": {
+        "properties": {
+          "delivery": { "const": "backend_confirmed" },
+          "target_id": { "type": "string", "minLength": 1 },
+          "action_sequence": { "type": "integer", "minimum": 1 },
+          "effective_mode": { "enum": ["background", "foreground"] },
+          "observation": {
+            "properties": {
+              "status": { "const": "captured" },
+              "screenshot_path": { "type": "string", "pattern": "^/" },
+              "frame_token": { "type": "string", "minLength": 1 }
+            }
+          },
+          "error": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "outcome": { "const": "not_performed" } }, "required": ["outcome"] },
+      "then": {
+        "properties": {
+          "delivery": { "enum": ["not_dispatched", "backend_rejected"] },
+          "observation": { "properties": { "status": { "const": "not_attempted" }, "screenshot_path": { "type": "null" }, "frame_token": { "type": "null" } } },
+          "error": { "allOf": [{ "$ref": "https://manuvra.local/schema/error/1" }, { "properties": { "effects": { "const": "none" } } }] }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "outcome": { "const": "uncertain" } }, "required": ["outcome"] },
+      "then": {
+        "properties": {
+          "delivery": { "enum": ["backend_confirmed", "unknown"] },
+          "target_id": { "type": "string", "minLength": 1 },
+          "action_sequence": { "type": "integer", "minimum": 1 },
+          "error": { "$ref": "https://manuvra.local/schema/error/1" }
+        }
+      }
+    }
+  ]
+}
