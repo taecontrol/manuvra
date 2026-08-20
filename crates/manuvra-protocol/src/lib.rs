@@ -1035,7 +1035,25 @@ pub fn canonical_json(value: &Value) -> Value {
 }
 
 pub fn canonical_invocation_digest(invocation: &Invocation) -> String {
-    let value = serde_json::to_value(invocation).expect("serializable invocation");
+    #[derive(Serialize)]
+    struct RequestIdentity<'a> {
+        protocol: &'a ProtocolRange,
+        registry_version: &'a str,
+        build_digest: &'a str,
+        request_id: &'a str,
+        command: &'a str,
+        input: &'a Value,
+    }
+
+    let identity = RequestIdentity {
+        protocol: &invocation.protocol,
+        registry_version: &invocation.registry_version,
+        build_digest: &invocation.build_digest,
+        request_id: &invocation.request_id,
+        command: &invocation.command,
+        input: &invocation.input,
+    };
+    let value = serde_json::to_value(identity).expect("serializable invocation identity");
     let bytes = serde_json::to_vec(&canonical_json(&value)).expect("canonical json");
     sha256_hex(&bytes)
 }
@@ -1134,6 +1152,23 @@ mod tests {
         let left = json!({"b": 2, "a": {"z": 1, "x": 0}});
         let right = json!({"a": {"x": 0, "z": 1}, "b": 2});
         assert_eq!(canonical_json(&left), canonical_json(&right));
+    }
+
+    #[test]
+    fn invocation_digest_treats_deadline_as_budget_not_request_content() {
+        let original = Invocation::new("system.setup", json!({}), "same-request".to_owned(), 1_000);
+        let mut retry = original.clone();
+        retry.deadline_ms = 750;
+        assert_eq!(
+            canonical_invocation_digest(&original),
+            canonical_invocation_digest(&retry)
+        );
+
+        retry.command = "system.doctor".to_owned();
+        assert_ne!(
+            canonical_invocation_digest(&original),
+            canonical_invocation_digest(&retry)
+        );
     }
 
     #[test]

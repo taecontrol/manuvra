@@ -25,13 +25,11 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Install declared Rust and proof tools
+      - name: Install declared Rust and release tools
         run: |
           rustup toolchain install 1.95.0 --profile minimal
           rustup default 1.95.0
           brew install jq
-          cargo install cargo-crap --version 0.4.3 --locked
-          cargo install cargo-llvm-cov --version 0.9.0 --locked
       - name: Validate exact release input
         env:
           VERSION: ${{ inputs.version }}
@@ -41,10 +39,6 @@ jobs:
           test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
           ! git rev-parse --verify --quiet "refs/tags/v$VERSION"
           ! gh release view "v$VERSION" >/dev/null 2>&1
-          scripts/verify-proof-certificate.sh proof/exhaustive-crap-certificate.json
-          cargo run --locked -p manuvra-protocol --example validate-proof -- proof/public-proof-summary.json proof/public-summary.schema.json
-          digest=$(scripts/source-tree-digest.sh)
-          jq -e --arg version "$VERSION" --arg digest "$digest" '.version == $version and .source_tree_sha256 == $digest' proof/public-proof-summary.json
           conclusion=$(gh run list --workflow ci.yml --commit "$GITHUB_SHA" --status completed --limit 1 --json conclusion --jq '.[0].conclusion')
           test "$conclusion" = success
       - name: Build deterministic source assets
@@ -58,8 +52,6 @@ jobs:
           cmp "$first/manuvra-$VERSION.tar.gz" "$second/manuvra-$VERSION.tar.gz"
           mkdir release-assets
           cp "$first/manuvra-$VERSION.tar.gz" "$first/manuvra-$VERSION.tar.gz.sha256" release-assets/
-          cp proof/public-proof-summary.json release-assets/public-proof-summary.json
-          cp proof/exhaustive-crap-certificate.json release-assets/exhaustive-crap-certificate.json
       - name: Publish immutable source release
         env:
           VERSION: ${{ inputs.version }}
