@@ -422,6 +422,38 @@ fn offline_discovery_does_not_require_daemon() {
 }
 
 #[test]
+fn unknown_registry_identity_returns_catalogued_unknown_command() {
+    let root = tempfile::tempdir().unwrap();
+    for args in [
+        ["commands", "get", "common.press"].as_slice(),
+        ["commands", "schema", "common.press", "--side", "input"].as_slice(),
+    ] {
+        let output = Command::new(CLI)
+            .args(args)
+            .env("MANUVRA_TMPDIR", root.path().join("tmp"))
+            .env("MANUVRA_CONFIG_HOME", root.path().join("config"))
+            .env("MANUVRA_NO_AUTOSTART", "1")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.len() <= 4096);
+        assert_eq!(output.stdout.last(), Some(&b'\n'));
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["error"]["code"], "unknown_command");
+        assert_eq!(result["error"]["recovery_command"], "manuvra commands list");
+        assert_eq!(
+            result["error"]["help_command"],
+            "manuvra commands errors unknown_command"
+        );
+    }
+}
+
+#[test]
 fn daemon_control_drains_busy_sessions_and_stops_without_killing_work() {
     let harness = Harness::new();
     let actor = harness.open("chrome_fake_1", None);

@@ -39,6 +39,8 @@ manuvra export --session <session-id> --all --destination /absolute/output/path
 manuvra close --session <session-id>
 ```
 
+When a native window just appeared, identify its target without parsing IDs: list `manuvra targets --kind macos` before and after, exclude already-seen `target_id` values, `open` a remaining candidate, and confirm with `observe query` and/or `observe screenshot`. If it is the wrong window, `close` and try the next new ID.
+
 If any step fails, run the exact `help_command` in the returned error. If the result says effects are possible, observe before deciding whether to retry.
 
 ## Install, permissions, and daemon lifecycle
@@ -56,7 +58,9 @@ In an interactive terminal, `doctor` and `setup` render concise human-readable s
 
 `doctor` reports the canonical installed bundle, build/resource agreement, CDHash, daemon state, and current Accessibility, Screen & System Audio Recording, and Post Event dispositions without prompting, opening System Settings, or touching a target. Only an explicit `setup` asks macOS for permissions, and it asks from the responsible `manuvra-daemon` identity only when the corresponding preflight is false. It then rechecks every fact and opens the relevant privacy pane for residual manual work.
 
-The human grants permission. Manuvra never edits the TCC database, silently grants itself access, or guarantees that requesting access adds it to a privacy list. If Manuvra is absent, follow `setup`'s numbered instructions: click **Add**, select its reported canonical `Manuvra.app` bundle, enable it, and rerun `manuvra doctor`. A development layout reports no canonical bundle rather than inventing a path. Because the bundle is ad-hoc signed, install, upgrade, or reinstall may require a new grant.
+The human grants permission. Manuvra never edits the TCC database, silently grants itself access, or guarantees that requesting access adds it to a privacy list. If Manuvra is absent, follow `setup`'s numbered instructions: click **Add**, select its reported canonical `Manuvra.app` bundle, and enable it. After a first grant, close System Settings, run `manuvra daemon stop`, then follow the same `doctor` / `setup` / `doctor` sequence above. A grant that is still invisible is usually a live daemon that has not restarted. A development layout reports no canonical bundle rather than inventing a path. Because the bundle is ad-hoc signed, install, upgrade, or reinstall may require a new grant.
+
+Inspect adapter permission facts only on a successful `manuvra doctor` JSON object that contains `daemon.adapters`. If that array is missing, wait and rerun `doctor`. `manuvra daemon status` is not a doctor document.
 
 Inspect or stop the daemon without target work:
 
@@ -107,12 +111,12 @@ Configuration and exported evidence remain. To remove only enumerated Manuvra-ow
 manuvra --help
 manuvra click --help
 manuvra commands list
-manuvra commands get action.click
-manuvra commands schema action.click --side input
+manuvra commands get action.press
+manuvra commands schema action.press --side input
 manuvra commands errors foreground_required
 ```
 
-`commands get` explains when to use a command, effects, authority, modes, defaults, schemas, errors, recovery, and copyable examples. `commands schema` returns an absolute packaged file path and SHA-256 digest. Help works without a running daemon; dynamic target capabilities do not.
+Command IDs such as `action.press` and `system.commands.get` come from `manuvra commands list`. Capability IDs such as `common.press` are not command IDs. `commands get` explains when to use a command, effects, authority, modes, defaults, schemas, errors, recovery, and copyable examples. `commands schema` returns an absolute packaged file path and SHA-256 digest. Help works without a running daemon; dynamic target capabilities do not.
 
 ## Sessions, roles, and leases
 

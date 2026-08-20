@@ -421,7 +421,7 @@ fn main() {
                     cli.timeout_ms
                         .unwrap_or_else(|| command_default_timeout(id)),
                 ),
-                Err(message) => local_error("invalid_request", &message),
+                Err(error) => error.into_local_reply(),
             }
         });
     emit_and_exit(result.0, result.1, output);
@@ -538,17 +538,50 @@ enum BuiltCommand {
     },
 }
 
-fn build_command(command: Command) -> Result<BuiltCommand, String> {
+#[derive(Debug, PartialEq, Eq)]
+enum BuildError {
+    InvalidRequest(String),
+    UnknownCommand,
+}
+
+impl BuildError {
+    fn into_local_reply(self) -> (Value, i32) {
+        match self {
+            Self::InvalidRequest(message) => local_error("invalid_request", &message),
+            Self::UnknownCommand => {
+                let (error, exit) = operational_error("unknown_command", None);
+                (json!({"error": error}), exit)
+            }
+        }
+    }
+}
+
+impl From<String> for BuildError {
+    fn from(message: String) -> Self {
+        Self::InvalidRequest(message)
+    }
+}
+
+impl std::fmt::Display for BuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidRequest(message) => f.write_str(message),
+            Self::UnknownCommand => f.write_str("unregistered command identity"),
+        }
+    }
+}
+
+fn build_command(command: Command) -> Result<BuiltCommand, BuildError> {
     match command {
         Command::Commands { command } => build_commands(command),
-        Command::Observe { command } => build_observe(command),
-        Command::Raw { command } => build_raw(command),
+        Command::Observe { command } => build_observe(command).map_err(BuildError::from),
+        Command::Raw { command } => build_raw(command).map_err(BuildError::from),
         command @ (Command::Click { .. }
         | Command::Type { .. }
         | Command::Press { .. }
         | Command::Scroll { .. }
-        | Command::Navigate { .. }) => build_action(command),
-        command => build_direct(command),
+        | Command::Navigate { .. }) => build_action(command).map_err(BuildError::from),
+        command => build_direct(command).map_err(BuildError::from),
     }
 }
 
@@ -739,12 +772,13 @@ fn build_export(
     remote("artifact.export", value)
 }
 
-fn build_commands(command: CommandsCommand) -> Result<BuiltCommand, String> {
+fn build_commands(command: CommandsCommand) -> Result<BuiltCommand, BuildError> {
     match command {
-        CommandsCommand::List { cursor, limit } => build_command_list(cursor, limit),
+        CommandsCommand::List { cursor, limit } => {
+            build_command_list(cursor, limit).map_err(BuildError::from)
+        }
         CommandsCommand::Get { command } => {
-            let value =
-                command_help(&command).ok_or_else(|| format!("unknown command {command}"))?;
+            let value = registered_help(&command)?;
             Ok(local(
                 "system.commands.get",
                 json!({"command": command}),
@@ -752,7 +786,7 @@ fn build_commands(command: CommandsCommand) -> Result<BuiltCommand, String> {
             ))
         }
         CommandsCommand::Schema { command, side } => build_command_schema(&command, side),
-        CommandsCommand::Errors { code } => build_command_error(&code),
+        CommandsCommand::Errors { code } => build_command_error(&code).map_err(BuildError::from),
         CommandsCommand::Usage { action } => Ok(build_usage(action)),
     }
 }
@@ -777,16 +811,24 @@ fn build_command_list(cursor: Option<String>, limit: u64) -> Result<BuiltCommand
     ))
 }
 
-fn build_command_schema(command: &str, side: SchemaSide) -> Result<BuiltCommand, String> {
-    let descriptor =
-        command_descriptor(command).ok_or_else(|| format!("unknown command {command}"))?;
+fn registered_command(id: &str) -> Result<&'static Value, BuildError> {
+    command_descriptor(id).ok_or(BuildError::UnknownCommand)
+}
+
+fn registered_help(id: &str) -> Result<Value, BuildError> {
+    registered_command(id)?;
+    command_help(id).ok_or_else(|| BuildError::from("invalid installed command help".to_owned()))
+}
+
+fn build_command_schema(command: &str, side: SchemaSide) -> Result<BuiltCommand, BuildError> {
+    let descriptor = registered_command(command)?;
     let (key, side_name) = match side {
         SchemaSide::Input => ("input_schema", "input"),
         SchemaSide::Result => ("result_schema", "result"),
     };
     let reference = descriptor[key]
         .as_str()
-        .ok_or_else(|| "invalid installed schema pointer".to_owned())?;
+        .ok_or_else(|| BuildError::from("invalid installed schema pointer".to_owned()))?;
     let value = schema_pointer(reference).map_err(|error| error.to_string())?;
     Ok(local(
         "system.commands.schema",
@@ -1520,7 +1562,7 @@ mod tests {
     use std::collections::HashSet;
     use std::process::Command as ProcessCommand;
 
-    fn build(args: &[&str]) -> Result<BuiltCommand, String> {
+    fn build(args: &[&str]) -> Result<BuiltCommand, BuildError> {
         let cli = Cli::try_parse_from(std::iter::once("manuvra").chain(args.iter().copied()))
             .expect("valid CLI fixture");
         build_command(cli.command)
@@ -1742,10 +1784,27 @@ mod tests {
 
     #[test]
     fn local_builder_rejects_invalid_inputs() {
-        assert!(build(&["commands", "list", "--cursor", "bad"]).is_err());
-        assert!(build(&["commands", "get", "missing"]).is_err());
-        assert!(build(&["commands", "errors", "missing"]).is_err());
-        assert!(
+        assert!(matches!(
+            build(&["commands", "list", "--cursor", "bad"]),
+            Err(BuildError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            build(&["commands", "get", "missing"]),
+            Err(BuildError::UnknownCommand)
+        ));
+        assert!(matches!(
+            build(&["commands", "get", "common.press"]),
+            Err(BuildError::UnknownCommand)
+        ));
+        assert!(matches!(
+            build(&["commands", "schema", "common.press", "--side", "input"]),
+            Err(BuildError::UnknownCommand)
+        ));
+        assert!(matches!(
+            build(&["commands", "errors", "missing"]),
+            Err(BuildError::InvalidRequest(_))
+        ));
+        assert!(matches!(
             build(&[
                 "raw",
                 "cdp",
@@ -1757,10 +1816,10 @@ mod tests {
                 "x",
                 "--params",
                 "not-json"
-            ])
-            .is_err()
-        );
-        assert!(
+            ]),
+            Err(BuildError::InvalidRequest(_))
+        ));
+        assert!(matches!(
             build(&[
                 "raw",
                 "ax",
@@ -1773,9 +1832,9 @@ mod tests {
                 "AXValue",
                 "--value",
                 "not-json"
-            ])
-            .is_err()
-        );
+            ]),
+            Err(BuildError::InvalidRequest(_))
+        ));
     }
 
     #[test]
