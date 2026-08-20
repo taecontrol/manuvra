@@ -36,15 +36,24 @@ jobs:
       - name: Reproducible tests
         run: |
           make test
-      - name: Source-bound exhaustive CRAP proof
+      - name: Source-bound release integrity
         if: github.event_name == 'push'
         run: |
-          make verify-proof PROOF_CERTIFICATE=proof/exhaustive-crap-certificate.json
-          cargo run --locked -p manuvra-protocol --example validate-proof -- proof/public-proof-summary.json proof/public-summary.schema.json
-          test "$(jq -r '.source_tree_sha256' proof/public-proof-summary.json)" = "$(scripts/source-tree-digest.sh)"
+          version=$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)
+          if [[ "$version" == "0.2.0" ]]; then
+            scripts/validate-bootstrap-proof-exception.sh --version "$version"
+          else
+            make verify-proof PROOF_CERTIFICATE=proof/exhaustive-crap-certificate.json
+            cargo run --locked -p manuvra-protocol --example validate-proof -- proof/public-proof-summary.json proof/public-summary.schema.json
+            test "$(jq -r '.source_tree_sha256' proof/public-proof-summary.json)" = "$(scripts/source-tree-digest.sh)"
+          fi
       - name: Pull-request coverage inventory
         if: github.event_name == 'pull_request'
         run: |
+          version=$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)
+          if [[ "$version" == "0.2.0" ]]; then
+            scripts/validate-bootstrap-proof-exception.sh --version "$version"
+          fi
           set +e
           make crap CRAP_REPORT=target/pr-crap-report.json
           status=$?

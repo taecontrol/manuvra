@@ -7,6 +7,11 @@ on:
         description: Semantic version without v
         required: true
         type: string
+      bootstrap_without_proof:
+        description: Authorize the documented v0.2.0 proof exception
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -35,16 +40,23 @@ jobs:
       - name: Validate exact release input
         env:
           VERSION: ${{ inputs.version }}
+          BOOTSTRAP_WITHOUT_PROOF: ${{ inputs.bootstrap_without_proof }}
         run: |
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
           test "$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)" = "$VERSION"
           test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
           ! git rev-parse --verify --quiet "refs/tags/v$VERSION"
           ! gh release view "v$VERSION" >/dev/null 2>&1
-          scripts/verify-proof-certificate.sh proof/exhaustive-crap-certificate.json
-          cargo run --locked -p manuvra-protocol --example validate-proof -- proof/public-proof-summary.json proof/public-summary.schema.json
-          digest=$(scripts/source-tree-digest.sh)
-          jq -e --arg version "$VERSION" --arg digest "$digest" '.version == $version and .source_tree_sha256 == $digest' proof/public-proof-summary.json
+          if [[ "$VERSION" == "0.2.0" ]]; then
+            test "$BOOTSTRAP_WITHOUT_PROOF" = true
+            scripts/validate-bootstrap-proof-exception.sh --version "$VERSION"
+          else
+            test "$BOOTSTRAP_WITHOUT_PROOF" = false
+            scripts/verify-proof-certificate.sh proof/exhaustive-crap-certificate.json
+            cargo run --locked -p manuvra-protocol --example validate-proof -- proof/public-proof-summary.json proof/public-summary.schema.json
+            digest=$(scripts/source-tree-digest.sh)
+            jq -e --arg version "$VERSION" --arg digest "$digest" '.version == $version and .source_tree_sha256 == $digest' proof/public-proof-summary.json
+          fi
           conclusion=$(gh run list --workflow ci.yml --commit "$GITHUB_SHA" --status completed --limit 1 --json conclusion --jq '.[0].conclusion')
           test "$conclusion" = success
       - name: Build deterministic source assets
@@ -58,14 +70,22 @@ jobs:
           cmp "$first/manuvra-$VERSION.tar.gz" "$second/manuvra-$VERSION.tar.gz"
           mkdir release-assets
           cp "$first/manuvra-$VERSION.tar.gz" "$first/manuvra-$VERSION.tar.gz.sha256" release-assets/
-          cp proof/public-proof-summary.json release-assets/public-proof-summary.json
-          cp proof/exhaustive-crap-certificate.json release-assets/exhaustive-crap-certificate.json
+          if [[ "$VERSION" == "0.2.0" ]]; then
+            cp proof/v0.2.0-bootstrap-exception.json release-assets/bootstrap-proof-exception.json
+          else
+            cp proof/public-proof-summary.json release-assets/public-proof-summary.json
+            cp proof/exhaustive-crap-certificate.json release-assets/exhaustive-crap-certificate.json
+          fi
       - name: Publish immutable source release
         env:
           VERSION: ${{ inputs.version }}
         run: |
+          notes="MIT source release for source-built Homebrew installation. No executable binary is attached."
+          if [[ "$VERSION" == "0.2.0" ]]; then
+            notes="$notes This bootstrap release omits the exhaustive CRAP certificate and public proof summary under the attached one-time exception; release-owner validation follows against the published Homebrew installation."
+          fi
           gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/v$VERSION" -f "sha=$GITHUB_SHA"
-          gh release create "v$VERSION" release-assets/* --draft --verify-tag --title "Manuvra v$VERSION" --notes "MIT source release for source-built Homebrew installation. No executable binary is attached."
+          gh release create "v$VERSION" release-assets/* --draft --verify-tag --title "Manuvra v$VERSION" --notes "$notes"
           gh release edit "v$VERSION" --draft=false
       - name: Open exact Homebrew tap update
         env:

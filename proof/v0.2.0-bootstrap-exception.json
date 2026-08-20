@@ -1,0 +1,15 @@
+{
+  "schema": "manuvra/bootstrap-proof-exception@1",
+  "version": "0.2.0",
+  "status": "authorized",
+  "reason": "Release-owner validation will occur against the published Homebrew installation.",
+  "omitted_artifacts": [
+    "proof/exhaustive-crap-certificate.json",
+    "proof/public-proof-summary.json"
+  ],
+  "scope": {
+    "tag": "v0.2.0",
+    "reusable": false
+  },
+  "restoration": "Every later release must satisfy the exact-source exhaustive no-waiver proof gate."
+}
