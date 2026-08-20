@@ -24,6 +24,12 @@ Follow the numbered instructions printed by `setup`. When Manuvra is absent from
 ## Agent workflow
 
 ```bash
+npx skills add taecontrol/manuvra
+```
+
+That installs the agent skill from this repository. Load it when the work is observing or controlling an exact local Chrome or macOS window on Apple Silicon running macOS 26 or later.
+
+```bash
 manuvra targets
 manuvra open --target <target-id>
 manuvra observe screenshot --session <session-id>
