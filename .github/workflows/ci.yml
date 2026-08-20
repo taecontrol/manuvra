@@ -24,7 +24,7 @@ jobs:
           persist-credentials: false
       - name: Install declared Rust and scanners
         run: |
-          rustup toolchain install 1.95.0 --profile minimal
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
           rustup default 1.95.0
           brew install gitleaks jq
           cargo install cargo-crap --version 0.4.3 --locked

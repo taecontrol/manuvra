@@ -1,7 +1,7 @@
 {
   "schema": "manuvra/crap-certificate@1",
   "version": "0.1.0",
-  "source_tree_sha256": "b9eb9c21fd45cfd55996cf61018de4b7c9460e5500015d81121c01719b6f6766",
+  "source_tree_sha256": "8abb6cf8bb4a73a72d75c57147bce7fce13bfcf6334266f78d6e50349c83be2b",
   "policy": {
     "threshold": 15,
     "missing_coverage": "pessimistic",
