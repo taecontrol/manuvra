@@ -253,6 +253,8 @@ Every request has a caller-supplied or generated ID. To cancel from another invo
 manuvra cancel --session <session-id> --request-id <request-id>
 ```
 
+Reusing an ID requires the same command and input. A different timeout budget may be used for the retry because it bounds waiting rather than changing request identity; a matching completed request returns its cached terminal result.
+
 The cancellation reply only acknowledges the request. The original request's terminal result is authoritative. Before dispatch, cancellation or timeout proves no effects. After possible dispatch, the result is uncertain and requires observation.
 
 Mutations dispatch at most once and are never automatically replayed after timeout, cancellation, transport ambiguity, or daemon restart.

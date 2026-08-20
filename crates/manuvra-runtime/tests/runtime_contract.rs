@@ -1309,7 +1309,7 @@ fn system_setup_caches_installation_and_adapter_side_effects_by_request_id() {
     );
 
     let first = invoke(&runtime, "same-setup", "system.setup", json!({}), 1_000);
-    let replay = invoke(&runtime, "same-setup", "system.setup", json!({}), 1_000);
+    let replay = invoke(&runtime, "same-setup", "system.setup", json!({}), 750);
 
     assert_eq!(first.value, replay.value);
     assert_eq!(
