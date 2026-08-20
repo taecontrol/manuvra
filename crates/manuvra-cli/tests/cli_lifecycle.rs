@@ -15,18 +15,41 @@ struct Harness {
     _root: TempDir,
     temporary: PathBuf,
     config: PathBuf,
+    diagnostics_config: Option<PathBuf>,
+    evidence: Option<PathBuf>,
     daemon: Option<Child>,
 }
 
 impl Harness {
     fn new() -> Self {
+        Self::from_diagnostics(None)
+    }
+
+    fn configured(diagnostics: Value) -> Self {
+        Self::from_diagnostics(Some(diagnostics))
+    }
+
+    fn from_diagnostics(diagnostics: Option<Value>) -> Self {
         let root = tempfile::tempdir().unwrap();
         let temporary = root.path().join("tmp");
         let config = root.path().join("config");
+        fs::create_dir_all(&temporary).unwrap();
+        let evidence = diagnostics
+            .as_ref()
+            .map(|_| temporary.join("diagnostic-evidence.json"));
+        let diagnostics_config = diagnostics.map(|mut diagnostics| {
+            diagnostics["evidence_path"] =
+                Value::String(evidence.as_ref().unwrap().to_str().unwrap().to_owned());
+            let path = temporary.join("diagnostic-scenario.json");
+            fs::write(&path, serde_json::to_vec(&diagnostics).unwrap()).unwrap();
+            path
+        });
         let mut harness = Self {
             _root: root,
             temporary,
             config,
+            diagnostics_config,
+            evidence,
             daemon: None,
         };
         harness.start_daemon();
@@ -34,15 +57,18 @@ impl Harness {
     }
 
     fn start_daemon(&mut self) {
-        let child = Command::new(DAEMON)
+        let mut command = Command::new(DAEMON);
+        command
             .env("MANUVRA_TMPDIR", &self.temporary)
             .env("MANUVRA_CONFIG_HOME", &self.config)
             .env("MANUVRA_TEST_FAKE_ADAPTER", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        if let Some(config) = &self.diagnostics_config {
+            command.env("MANUVRA_TEST_DIAGNOSTICS_CONFIG", config);
+        }
+        let child = command.spawn().unwrap();
         self.daemon = Some(child);
         wait_for_socket(&self.socket_path());
         self.wait_for_daemon();
@@ -115,6 +141,10 @@ impl Harness {
     fn socket_path(&self) -> PathBuf {
         self.temporary.join("manuvra/runtime-v1/daemon.sock")
     }
+
+    fn evidence(&self) -> Value {
+        serde_json::from_slice(&fs::read(self.evidence.as_ref().unwrap()).unwrap()).unwrap()
+    }
 }
 
 impl Drop for Harness {
@@ -124,6 +154,134 @@ impl Drop for Harness {
             let _ = daemon.wait();
         }
     }
+}
+
+#[test]
+fn redirected_setup_uses_bounded_json_with_the_fake_permission_owner() {
+    let harness = Harness::new();
+
+    let setup = harness.success(&["setup"]);
+
+    manuvra_protocol::validate_command_result("system.setup", &setup).unwrap();
+    for permission in ["accessibility", "screen_recording", "post_event"] {
+        assert_eq!(setup["permissions"][permission]["granted"], true);
+        assert_eq!(setup["permissions"][permission]["prompt_requested"], false);
+        assert_eq!(setup["permissions"][permission]["settings_opened"], false);
+    }
+}
+
+fn permission_fact(before: bool, granted: bool, settings_opened: bool) -> Value {
+    serde_json::json!({
+        "before_granted": before,
+        "prompt_requested": !before,
+        "settings_opened": settings_opened,
+        "granted": granted,
+        "freshly_granted": !before && granted,
+        "residual": !granted
+    })
+}
+
+#[test]
+fn configured_diagnostics_fake_drives_public_setup_doctor_and_replay_without_external_effects() {
+    let harness = Harness::configured(serde_json::json!({
+        "permissions": {
+            "accessibility": permission_fact(false, false, true),
+            "screen_recording": permission_fact(true, true, false),
+            "post_event": permission_fact(false, true, false)
+        },
+        "installation": {
+            "installed": true,
+            "bundle": "/opt/homebrew/opt/manuvra/libexec/Manuvra.app"
+        },
+        "doctor_warnings": ["future_permission_warning"]
+    }));
+
+    let first = harness.success(&["setup", "--request-id", "configured-j5"]);
+    let replay = harness.success(&["setup", "--request-id", "configured-j5"]);
+
+    assert_eq!(first, replay);
+    assert_eq!(first["installation"]["installed"], true);
+    assert_eq!(
+        first["installation"]["bundle"],
+        "/opt/homebrew/opt/manuvra/libexec/Manuvra.app"
+    );
+    assert_eq!(
+        first["permissions"]["accessibility"]["before_granted"],
+        false
+    );
+    assert_eq!(
+        first["permissions"]["accessibility"]["settings_opened"],
+        true
+    );
+    assert_eq!(first["permissions"]["post_event"]["freshly_granted"], true);
+    let doctor = harness.success(&["doctor", "--json"]);
+    assert_eq!(
+        doctor["daemon"]["adapters"][0]["permissions"]["accessibility"],
+        false
+    );
+    assert_eq!(
+        doctor["daemon"]["adapters"][0]["permissions"]["post_event"],
+        true
+    );
+    assert!(
+        doctor["warnings"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::String("future_permission_warning".to_owned()))
+    );
+
+    let evidence = harness.evidence();
+    assert_eq!(evidence["setup_invocations"], 1);
+    assert_eq!(evidence["request_attempts"]["accessibility"], 1);
+    assert_eq!(evidence["request_attempts"]["screen_recording"], 0);
+    assert_eq!(evidence["request_attempts"]["post_event"], 1);
+    assert_eq!(evidence["rechecks"]["accessibility"], 1);
+    assert_eq!(evidence["rechecks"]["screen_recording"], 1);
+    assert_eq!(evidence["rechecks"]["post_event"], 1);
+    assert_eq!(evidence["pane_opens"]["accessibility"], 1);
+    assert_eq!(evidence["pane_opens"]["screen_recording"], 0);
+    assert_eq!(evidence["external_permission_api_calls"], 0);
+    assert_eq!(evidence["external_open_process_calls"], 0);
+}
+
+#[test]
+fn configured_diagnostics_fake_reports_development_bundle_null() {
+    let harness = Harness::configured(serde_json::json!({
+        "permissions": {
+            "accessibility": permission_fact(true, true, false),
+            "screen_recording": permission_fact(false, false, true),
+            "post_event": permission_fact(true, true, false)
+        },
+        "installation": {"installed": false, "bundle": null}
+    }));
+
+    let setup = harness.success(&["setup"]);
+
+    assert_eq!(setup["installation"]["installed"], false);
+    assert!(setup["installation"]["bundle"].is_null());
+    assert_eq!(setup["permissions"]["screen_recording"]["residual"], true);
+    assert_eq!(harness.evidence()["pane_opens"]["screen_recording"], 1);
+}
+
+#[test]
+fn malformed_diagnostics_fake_config_prevents_daemon_startup() {
+    let root = tempfile::tempdir().unwrap();
+    let temporary = root.path().join("tmp");
+    fs::create_dir_all(&temporary).unwrap();
+    let config = temporary.join("malformed.json");
+    fs::write(&config, br#"{"unexpected":true}"#).unwrap();
+
+    let output = Command::new(DAEMON)
+        .env("MANUVRA_TMPDIR", &temporary)
+        .env("MANUVRA_CONFIG_HOME", root.path().join("config"))
+        .env("MANUVRA_TEST_FAKE_ADAPTER", "1")
+        .env("MANUVRA_TEST_DIAGNOSTICS_CONFIG", config)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(70));
+    assert!(!temporary.join("manuvra/runtime-v1/daemon.sock").exists());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid fake diagnostics config"));
 }
 
 fn wait_for_socket(path: &Path) {

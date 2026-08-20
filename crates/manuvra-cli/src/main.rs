@@ -4,15 +4,14 @@ use manuvra_cli::{
     migrate_legacy, purge_owned_roots,
 };
 use manuvra_protocol::{
-    AGENT_HELP, Invocation, command_default_timeout_ms, command_descriptor, command_help,
-    encode_operational_line, error_meta, operational_error, registry_page, schema_pointer,
-    validate_command_input,
+    AGENT_HELP, Invocation, RpcResponse, command_default_timeout_ms, command_descriptor,
+    command_help, encode_operational_line, error_meta, operational_error, registry_page,
+    schema_pointer, validate_command_input,
 };
 use rand::Rng;
 use rand::distr::Alphanumeric;
 use serde_json::{Map, Value, json};
 use std::io::{self, IsTerminal, Write};
-use std::process::Command as ProcessCommand;
 
 #[derive(Parser)]
 #[command(name = "manuvra", version, long_about = AGENT_HELP)]
@@ -146,8 +145,13 @@ enum Command {
         session: Option<String>,
         #[arg(long = "target")]
         target_id: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
-    Setup,
+    Setup {
+        #[arg(long)]
+        json: bool,
+    },
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
@@ -401,26 +405,48 @@ enum RawIntent {
 
 fn main() {
     let cli = Cli::parse();
+    let output = diagnostic_output(&cli.command, io::stdout().is_terminal());
     let request_id = invocation_request_id(&cli.command, cli.request_id);
     let result =
-        execute_special(&cli.command).unwrap_or_else(|| match build_command(cli.command) {
-            Ok(BuiltCommand::Local { id, input, value }) => {
-                debug_assert!(validate_command_input(id, &input).is_ok());
-                (value, 0)
+        execute_special(&cli.command, request_id.clone(), cli.timeout_ms).unwrap_or_else(|| {
+            match build_command(cli.command) {
+                Ok(BuiltCommand::Local { id, input, value }) => {
+                    debug_assert!(validate_command_input(id, &input).is_ok());
+                    (value, 0)
+                }
+                Ok(BuiltCommand::Remote { id, input }) => invoke(
+                    id,
+                    input,
+                    request_id,
+                    cli.timeout_ms
+                        .unwrap_or_else(|| command_default_timeout(id)),
+                ),
+                Err(message) => local_error("invalid_request", &message),
             }
-            Ok(BuiltCommand::Remote { id, input }) => invoke(
-                id,
-                input,
-                request_id,
-                cli.timeout_ms
-                    .unwrap_or_else(|| command_default_timeout(id)),
-            ),
-            Err(message) => local_error("invalid_request", &message),
         });
-    emit_and_exit(result.0, result.1);
+    emit_and_exit(result.0, result.1, output);
 }
 
-fn execute_special(command: &Command) -> Option<(Value, i32)> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiagnosticOutput {
+    Json,
+    Doctor,
+    Setup,
+}
+
+fn diagnostic_output(command: &Command, terminal: bool) -> DiagnosticOutput {
+    match command {
+        Command::Doctor { json: false, .. } if terminal => DiagnosticOutput::Doctor,
+        Command::Setup { json: false } if terminal => DiagnosticOutput::Setup,
+        _ => DiagnosticOutput::Json,
+    }
+}
+
+fn execute_special(
+    command: &Command,
+    request_id: String,
+    timeout_ms: Option<u64>,
+) -> Option<(Value, i32)> {
     match command {
         Command::Daemon {
             command: DaemonCommand::Status,
@@ -428,7 +454,10 @@ fn execute_special(command: &Command) -> Option<(Value, i32)> {
         Command::Daemon {
             command: DaemonCommand::Stop,
         } => Some(control_result(daemon_stop())),
-        Command::Setup => Some(run_setup()),
+        Command::Setup { .. } => Some(run_setup(
+            request_id,
+            timeout_ms.unwrap_or_else(|| command_default_timeout("system.setup")),
+        )),
         Command::Migrate { .. } => Some(
             migrate_legacy()
                 .map(|value| (value, 0))
@@ -463,90 +492,8 @@ fn control_result(result: Result<Value, ClientError>) -> (Value, i32) {
     }
 }
 
-fn run_setup() -> (Value, i32) {
-    let (doctor, exit) = invoke("system.doctor", json!({}), new_request_id(), 5_000);
-    if exit != 0 {
-        return (doctor, exit);
-    }
-    finish_setup(doctor)
-}
-
-fn finish_setup(doctor: Value) -> (Value, i32) {
-    let missing = missing_permissions(&doctor);
-    let opened = match open_permission_panes(&missing) {
-        Ok(opened) => opened,
-        Err(permission) => {
-            return local_error(
-                "internal_error",
-                &format!("failed to open System Settings for {permission}"),
-            );
-        }
-    };
-    let installation = doctor["daemon"]["installation"].clone();
-    (
-        json!({"opened": opened, "missing": missing, "installation": installation}),
-        0,
-    )
-}
-
-fn open_permission_panes(missing: &[String]) -> Result<Vec<String>, String> {
-    missing
-        .iter()
-        .filter(|permission| permission_settings_url(permission).is_some())
-        .map(|permission| open_permission_pane(permission).map(|()| permission.clone()))
-        .collect()
-}
-
-fn open_permission_pane(permission: &str) -> Result<(), String> {
-    if settings_open_suppressed() {
-        return Ok(());
-    }
-    let url = permission_settings_url(permission).ok_or_else(|| permission.to_owned())?;
-    open_settings_url(url).ok_or_else(|| permission.to_owned())
-}
-
-fn settings_open_suppressed() -> bool {
-    cfg!(debug_assertions) && std::env::var_os("MANUVRA_TEST_NO_OPEN").is_some()
-}
-
-fn open_settings_url(url: &str) -> Option<()> {
-    ProcessCommand::new("/usr/bin/open")
-        .arg(url)
-        .status()
-        .ok()
-        .filter(|status| status.success())
-        .map(|_| ())
-}
-
-fn permission_settings_url(permission: &str) -> Option<&'static str> {
-    const PANES: &[(&str, &str)] = &[
-        (
-            "accessibility",
-            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
-        ),
-        (
-            "screen_recording",
-            "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
-        ),
-    ];
-    PANES
-        .iter()
-        .find(|(name, _)| *name == permission)
-        .map(|(_, url)| *url)
-}
-
-fn missing_permissions(doctor: &Value) -> Vec<String> {
-    let Some(adapters) = doctor["daemon"]["adapters"].as_array() else {
-        return Vec::new();
-    };
-    let Some(macos) = adapters.iter().find(|adapter| adapter["kind"] == "macos") else {
-        return Vec::new();
-    };
-    ["accessibility", "screen_recording"]
-        .into_iter()
-        .filter(|permission| macos["permissions"][permission] == false)
-        .map(str::to_owned)
-        .collect()
+fn run_setup(request_id: String, timeout_ms: u64) -> (Value, i32) {
+    invoke("system.setup", json!({}), request_id, timeout_ms)
 }
 
 fn run_purge(all: bool, yes: bool) -> (Value, i32) {
@@ -669,7 +616,11 @@ fn build_direct(command: Command) -> Result<BuiltCommand, String> {
             all,
             destination,
         } => Ok(build_export(session, artifact_ids, all, destination)),
-        Command::Doctor { session, target_id } => Ok(remote(
+        Command::Doctor {
+            session,
+            target_id,
+            json: _,
+        } => Ok(remote(
             "system.doctor",
             optional_pairs([
                 ("session_id", session.map(Value::String)),
@@ -677,7 +628,7 @@ fn build_direct(command: Command) -> Result<BuiltCommand, String> {
             ]),
         )),
         command @ (Command::Daemon { .. }
-        | Command::Setup
+        | Command::Setup { .. }
         | Command::Migrate { .. }
         | Command::Purge { .. }) => Ok(build_local_direct(command)),
         _ => unreachable!("routed command category"),
@@ -687,7 +638,7 @@ fn build_direct(command: Command) -> Result<BuiltCommand, String> {
 fn build_local_direct(command: Command) -> BuiltCommand {
     match command {
         Command::Daemon { command } => local(daemon_command_id(command), json!({}), Value::Null),
-        Command::Setup => local("system.setup", json!({}), Value::Null),
+        Command::Setup { .. } => local("system.setup", json!({}), Value::Null),
         Command::Migrate { source } => local(
             "system.migrate",
             json!({"from": legacy_source(source)}),
@@ -1082,42 +1033,78 @@ fn merge_object(destination: &mut Value, source: Value) {
 fn invoke(id: &'static str, input: Value, request_id: String, timeout_ms: u64) -> (Value, i32) {
     let invocation = Invocation::new(id, input, request_id, timeout_ms);
     match invoke_daemon(invocation) {
-        Ok(response) => match (response.result, response.error) {
-            (Some(mut result), None) => {
-                if id == "system.doctor"
-                    && let Err(error) = augment_doctor(&mut result)
-                {
-                    return local_error("internal_error", &error);
-                }
-                let exit = result_exit(&result);
-                (result, exit)
-            }
-            (_, Some(error)) => local_error("invalid_request", &error.message),
-            _ => local_error("internal_error", "daemon returned no result"),
-        },
-        Err(ClientError::Deadline) => local_error("timed_out", "request deadline expired"),
-        Err(error @ ClientError::Control(_, _)) => control_result(Err(error)),
-        Err(error) => local_error("internal_error", &error.to_string()),
+        Ok(response) => invoke_response(id, response),
+        Err(error) => invoke_error(error),
+    }
+}
+
+fn invoke_response(id: &'static str, response: RpcResponse) -> (Value, i32) {
+    match (response.result, response.error) {
+        (Some(result), None) => invoke_success(id, result),
+        (_, Some(error)) => local_error("invalid_request", &error.message),
+        _ => local_error("internal_error", "daemon returned no result"),
+    }
+}
+
+fn invoke_success(id: &'static str, mut result: Value) -> (Value, i32) {
+    if id == "system.doctor"
+        && let Err(error) = augment_doctor(&mut result)
+    {
+        return local_error("internal_error", &error);
+    }
+    let exit = result_exit(&result);
+    (result, exit)
+}
+
+fn invoke_error(error: ClientError) -> (Value, i32) {
+    if matches!(error, ClientError::Deadline) {
+        return local_error("timed_out", "request deadline expired");
+    }
+    invoke_non_deadline_error(error)
+}
+
+fn invoke_non_deadline_error(error: ClientError) -> (Value, i32) {
+    match error {
+        error @ ClientError::Control(_, _) => control_result(Err(error)),
+        error => local_error("internal_error", &error.to_string()),
     }
 }
 
 fn augment_doctor(result: &mut Value) -> Result<(), String> {
-    let installation = Installation::current().map_err(|error| error.to_string())?;
-    result["daemon"]["installation"] = installation.identity();
-    result["daemon"]["control"] = daemon_status().unwrap_or_else(|_| json!({"running": false}));
+    result["daemon"]["installation"] = current_installation_identity()?;
+    result["daemon"]["control"] = doctor_daemon_status();
     let legacy = legacy_config_root();
-    if legacy.exists() {
-        let warnings = result["warnings"]
-            .as_array_mut()
-            .ok_or_else(|| "doctor warnings are not an array".to_owned())?;
-        warnings.push(
-            format!(
-                "legacy_state_detected; run manuvra migrate --from computer-use; source={}",
-                legacy.display()
-            )
-            .into(),
-        );
+    append_legacy_warning(result, &legacy)
+}
+
+fn current_installation_identity() -> Result<Value, String> {
+    match Installation::current() {
+        Ok(installation) => Ok(installation.identity()),
+        Err(error) => Err(error.to_string()),
     }
+}
+
+fn doctor_daemon_status() -> Value {
+    match daemon_status() {
+        Ok(status) => status,
+        Err(_) => json!({"running": false}),
+    }
+}
+
+fn append_legacy_warning(result: &mut Value, legacy: &std::path::Path) -> Result<(), String> {
+    if !legacy.exists() {
+        return Ok(());
+    }
+    let Some(warnings) = result["warnings"].as_array_mut() else {
+        return Err("doctor warnings are not an array".to_owned());
+    };
+    warnings.push(
+        format!(
+            "legacy_state_detected; run manuvra migrate --from computer-use; source={}",
+            legacy.display()
+        )
+        .into(),
+    );
     Ok(())
 }
 
@@ -1141,13 +1128,330 @@ fn local_error(code: &str, message: &str) -> (Value, i32) {
     (json!({"error": error}), exit)
 }
 
-fn emit_and_exit(value: Value, exit: i32) -> ! {
-    let bytes = encode_operational_line(&value).unwrap_or_else(|_| {
-        let (fallback, _) = local_error("internal_result_overflow", "result exceeded 4096 bytes");
-        encode_operational_line(&fallback).expect("bounded overflow result")
-    });
+fn emit_and_exit(value: Value, exit: i32, output: DiagnosticOutput) -> ! {
+    let bytes = match output {
+        DiagnosticOutput::Json => encode_operational_line(&value).unwrap_or_else(|_| {
+            let (fallback, _) =
+                local_error("internal_result_overflow", "result exceeded 4096 bytes");
+            encode_operational_line(&fallback).expect("bounded overflow result")
+        }),
+        DiagnosticOutput::Doctor => render_doctor(&value).into_bytes(),
+        DiagnosticOutput::Setup => render_setup(&value).into_bytes(),
+    };
     io::stdout().write_all(&bytes).expect("stdout");
     std::process::exit(exit)
+}
+
+struct DoctorWarning {
+    display: String,
+    recovery: Option<String>,
+}
+
+impl DoctorWarning {
+    fn action_required(&self) -> bool {
+        self.recovery.is_some()
+    }
+}
+
+fn classify_doctor_warning(value: &Value) -> DoctorWarning {
+    let warning = value.as_str().unwrap_or("unknown_warning");
+    match warning {
+        "verified_orphans_removed" => DoctorWarning {
+            display: "[resolved] Verified orphan session state was removed safely.".to_owned(),
+            recovery: None,
+        },
+        "unverified_orphans_preserved" => DoctorWarning {
+            display: "[action required] Unverified orphan session state was preserved for safety."
+                .to_owned(),
+            recovery: Some(
+                "Preserve `manuvra doctor --json` output and report warning `unverified_orphans_preserved`; Manuvra will not delete unverified state automatically."
+                    .to_owned(),
+            ),
+        },
+        warning if warning.starts_with("legacy_state_detected;") => DoctorWarning {
+            display: format!("[action required] {warning}"),
+            recovery: legacy_warning_command(warning)
+                .map(|command| format!("Run `{command}`."))
+                .or_else(|| {
+                    Some(
+                        "Preserve `manuvra doctor --json` output and report warning `legacy_state_detected`."
+                            .to_owned(),
+                    )
+                }),
+        },
+        warning => DoctorWarning {
+            display: format!("[action required] {warning}"),
+            recovery: Some(format!(
+                "Preserve `manuvra doctor --json` output and report warning `{warning}`."
+            )),
+        },
+    }
+}
+
+fn legacy_warning_command(warning: &str) -> Option<&str> {
+    warning
+        .strip_prefix("legacy_state_detected;")?
+        .split(';')
+        .map(str::trim)
+        .find_map(|part| part.strip_prefix("run "))
+        .filter(|command| !command.is_empty())
+}
+
+fn render_doctor(value: &Value) -> String {
+    if let Some(error) = render_operational_error(value) {
+        return error;
+    }
+    let permissions = doctor_permissions(value);
+    let host_supported = value["host"]["supported"].as_bool().unwrap_or(false);
+    let daemon_running = value["daemon"]["control"]["running"]
+        .as_bool()
+        .unwrap_or(false);
+    let warnings = value["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(classify_doctor_warning)
+        .collect::<Vec<_>>();
+    let all_permissions = permissions
+        .iter()
+        .all(|(_, granted)| *granted == Some(true));
+    let actionable_warning = warnings.iter().any(DoctorWarning::action_required);
+    let ready = host_supported && daemon_running && all_permissions && !actionable_warning;
+    let mut lines = vec![format!(
+        "Manuvra doctor: {}",
+        if ready { "ready" } else { "action required" }
+    )];
+    lines.push(format!(
+        "Host: {} (requires macOS {})",
+        if host_supported {
+            "supported"
+        } else {
+            "unsupported"
+        },
+        value["host"]["minimum_macos"].as_str().unwrap_or("26.0")
+    ));
+    lines.push(format!(
+        "Daemon: {}",
+        if daemon_running {
+            "running"
+        } else {
+            "not running"
+        }
+    ));
+    lines.extend(render_installation(&value["daemon"]["installation"]));
+    lines.push("Permissions (manuvra-daemon):".to_owned());
+    for (name, granted) in permissions {
+        lines.push(format!(
+            "  [{}] {}",
+            match granted {
+                Some(true) => "granted",
+                Some(false) => "missing",
+                None => "unknown",
+            },
+            permission_label(name)
+        ));
+    }
+    let sessions = value["sessions"].as_array().cloned().unwrap_or_default();
+    lines.push(format!("Active sessions: {}", sessions.len()));
+    for session in sessions {
+        lines.push(format!(
+            "  {} -> {} ({}, {})",
+            session["session_id"].as_str().unwrap_or("unknown"),
+            session["target_id"].as_str().unwrap_or("unknown"),
+            session["role"].as_str().unwrap_or("unknown"),
+            session["mode"].as_str().unwrap_or("unknown")
+        ));
+    }
+    lines.push("Warnings:".to_owned());
+    if warnings.is_empty() {
+        lines.push("  none".to_owned());
+    } else {
+        lines.extend(
+            warnings
+                .iter()
+                .map(|warning| format!("  - {}", warning.display)),
+        );
+    }
+    lines.push("Next steps:".to_owned());
+    let mut step = 1;
+    if !host_supported {
+        lines.push(format!("  {step}. Run Manuvra on macOS 26 or later."));
+        step += 1;
+    }
+    if !daemon_running {
+        lines.push(format!(
+            "  {step}. Run `manuvra doctor` to start and recheck the daemon."
+        ));
+        step += 1;
+    }
+    if !all_permissions {
+        lines.push(format!(
+            "  {step}. Run `manuvra setup` to request missing permissions."
+        ));
+        step += 1;
+    }
+    for recovery in warnings
+        .iter()
+        .filter_map(|warning| warning.recovery.as_ref())
+    {
+        lines.push(format!("  {step}. {recovery}"));
+        step += 1;
+    }
+    if step == 1 {
+        lines.push("  none".to_owned());
+    }
+    lines.join("\n") + "\n"
+}
+
+fn render_setup(value: &Value) -> String {
+    if let Some(error) = render_operational_error(value) {
+        return error;
+    }
+    let residual = ["accessibility", "screen_recording", "post_event"]
+        .into_iter()
+        .filter(|permission| value["permissions"][permission]["residual"] == true)
+        .collect::<Vec<_>>();
+    let mut lines = vec![format!(
+        "Manuvra setup: {}",
+        if residual.is_empty() {
+            "permissions ready"
+        } else {
+            "manual action required"
+        }
+    )];
+    lines.extend(render_installation(&value["installation"]));
+    lines.push("Permissions (manuvra-daemon):".to_owned());
+    for permission in ["accessibility", "screen_recording", "post_event"] {
+        let fact = &value["permissions"][permission];
+        let state = if fact["granted"] == true && fact["freshly_granted"] == true {
+            "granted now"
+        } else if fact["granted"] == true {
+            "already granted"
+        } else if fact["settings_opened"] == true {
+            "request sent; System Settings opened"
+        } else if fact["prompt_requested"] == true {
+            "request sent; still missing"
+        } else {
+            "not available"
+        };
+        lines.push(format!("  [{}] {}", state, permission_label(permission)));
+    }
+    if residual.is_empty() {
+        lines.push(
+            "No permission prompt or System Settings pane was needed for already granted access."
+                .to_owned(),
+        );
+        lines.push("Next: run `manuvra doctor` to confirm overall readiness.".to_owned());
+        return lines.join("\n") + "\n";
+    }
+    lines.push(
+        "macOS consent is manual; Manuvra cannot grant itself access or add itself silently."
+            .to_owned(),
+    );
+    lines.push("Complete these steps:".to_owned());
+    let mut step = 1;
+    if residual.contains(&"accessibility") || residual.contains(&"post_event") {
+        lines.push(format!(
+            "  {step}. Open System Settings > Privacy & Security > Accessibility."
+        ));
+        step += 1;
+        lines.push(bundle_instruction(step, &value["installation"]));
+        step += 1;
+    }
+    if residual.contains(&"screen_recording") {
+        lines.push(format!(
+            "  {step}. Open System Settings > Privacy & Security > Screen & System Audio Recording."
+        ));
+        step += 1;
+        lines.push(bundle_instruction(step, &value["installation"]));
+        step += 1;
+    }
+    lines.push(format!("  {step}. Run `manuvra doctor` again."));
+    lines.join("\n") + "\n"
+}
+
+fn render_operational_error(value: &Value) -> Option<String> {
+    let error = value.get("error")?.as_object()?;
+    Some(format!(
+        "Manuvra error [{}]\n{}\nRecovery: `{}`\nHelp: `{}`\n",
+        error
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("Unknown error"),
+        error
+            .get("recovery_command")
+            .and_then(Value::as_str)
+            .unwrap_or("manuvra doctor"),
+        error
+            .get("help_command")
+            .and_then(Value::as_str)
+            .unwrap_or("manuvra --help")
+    ))
+}
+
+fn doctor_permissions(value: &Value) -> Vec<(&'static str, Option<bool>)> {
+    let macos = value["daemon"]["adapters"]
+        .as_array()
+        .and_then(|adapters| adapters.iter().find(|adapter| adapter["kind"] == "macos"));
+    ["accessibility", "screen_recording", "post_event"]
+        .into_iter()
+        .map(|permission| {
+            (
+                permission,
+                macos.and_then(|adapter| adapter["permissions"][permission].as_bool()),
+            )
+        })
+        .collect()
+}
+
+fn render_installation(installation: &Value) -> Vec<String> {
+    if installation["installed"] == true {
+        vec![
+            "Installation: installed bundle".to_owned(),
+            format!(
+                "Bundle: {}",
+                installation["bundle"]
+                    .as_str()
+                    .unwrap_or("path unavailable")
+            ),
+        ]
+    } else {
+        vec![
+            "Installation: development layout".to_owned(),
+            "Bundle: unavailable (development layouts have no canonical Manuvra.app path)"
+                .to_owned(),
+        ]
+    }
+}
+
+fn permission_label(permission: &str) -> &'static str {
+    match permission {
+        "accessibility" => "Accessibility",
+        "screen_recording" => "Screen & System Audio Recording",
+        "post_event" => "Post Event (Accessibility pane)",
+        _ => "Unknown permission",
+    }
+}
+
+fn bundle_instruction(step: usize, installation: &Value) -> String {
+    match (
+        installation["installed"].as_bool(),
+        installation["bundle"].as_str(),
+    ) {
+        (Some(true), Some(bundle)) => format!(
+            "  {step}. If Manuvra is absent, click Add, select `{bundle}`, then enable Manuvra."
+        ),
+        (Some(true), None) => format!(
+            "  {step}. The installed bundle path is unavailable; reinstall Manuvra, rerun `manuvra setup`, and use the exact path it reports before clicking Add."
+        ),
+        _ => format!(
+            "  {step}. Install the Manuvra.app bundle first; this development layout has no bundle path to add."
+        ),
+    }
 }
 
 fn new_request_id() -> String {
@@ -1518,5 +1822,179 @@ mod tests {
                 assert_eq!(actual_input, example["input"], "wrong input for {line}");
             }
         }
+    }
+
+    fn parsed_command(args: &[&str]) -> Command {
+        Cli::try_parse_from(std::iter::once("manuvra").chain(args.iter().copied()))
+            .unwrap()
+            .command
+    }
+
+    fn setup_fact(before: bool, requested: bool, granted: bool) -> Value {
+        json!({
+            "before_granted": before,
+            "prompt_requested": requested,
+            "settings_opened": false,
+            "granted": granted,
+            "freshly_granted": !before && granted,
+            "residual": !granted
+        })
+    }
+
+    fn setup_fixture(accessibility: Value, screen: Value, post_event: Value) -> Value {
+        json!({
+            "permissions": {
+                "accessibility": accessibility,
+                "screen_recording": screen,
+                "post_event": post_event
+            },
+            "installation": {}
+        })
+    }
+
+    fn doctor_fixture(granted: bool) -> Value {
+        json!({
+            "host": {"minimum_macos": "26.0", "supported": true},
+            "daemon": {
+                "installation": {
+                    "installed": true,
+                    "bundle": "/opt/homebrew/opt/manuvra/libexec/Manuvra.app"
+                },
+                "control": {"running": true},
+                "adapters": [{
+                    "kind": "macos",
+                    "permissions": {
+                        "accessibility": granted,
+                        "screen_recording": granted,
+                        "post_event": granted
+                    }
+                }]
+            },
+            "permissions": {"same_user_socket": true},
+            "sessions": [],
+            "warnings": []
+        })
+    }
+
+    #[test]
+    fn diagnostics_are_human_only_for_terminal_without_json_override() {
+        let doctor = parsed_command(&["doctor"]);
+        let doctor_json = parsed_command(&["doctor", "--json"]);
+        let setup = parsed_command(&["setup"]);
+        let setup_json = parsed_command(&["setup", "--json"]);
+        let targets = parsed_command(&["targets"]);
+
+        assert_eq!(diagnostic_output(&doctor, true), DiagnosticOutput::Doctor);
+        assert_eq!(diagnostic_output(&doctor, false), DiagnosticOutput::Json);
+        assert_eq!(
+            diagnostic_output(&doctor_json, true),
+            DiagnosticOutput::Json
+        );
+        assert_eq!(diagnostic_output(&setup, true), DiagnosticOutput::Setup);
+        assert_eq!(diagnostic_output(&setup, false), DiagnosticOutput::Json);
+        assert_eq!(diagnostic_output(&setup_json, true), DiagnosticOutput::Json);
+        assert_eq!(diagnostic_output(&targets, true), DiagnosticOutput::Json);
+    }
+
+    #[test]
+    fn doctor_renderer_covers_healthy_missing_and_operational_error_states() {
+        let healthy = render_doctor(&doctor_fixture(true));
+        assert!(healthy.contains("Manuvra doctor: ready"));
+        assert!(healthy.contains("[granted] Accessibility"));
+        assert!(healthy.contains("Next steps:\n  none"));
+
+        let mut missing = doctor_fixture(false);
+        missing["warnings"] = json!([
+            "legacy_state_detected; run manuvra migrate --from computer-use; source=/tmp/legacy"
+        ]);
+        let missing = render_doctor(&missing);
+        assert!(missing.contains("Manuvra doctor: action required"));
+        assert!(missing.contains("[missing] Screen & System Audio Recording"));
+        assert!(missing.contains("Run `manuvra setup`"));
+        assert!(missing.contains("legacy_state_detected"));
+        assert!(missing.contains("Run `manuvra migrate --from computer-use`."));
+
+        let (error, _) = local_error("timed_out", "daemon did not answer");
+        let rendered = render_doctor(&error);
+        assert!(rendered.contains("Manuvra error [timed_out]"));
+        assert!(rendered.contains("daemon did not answer"));
+        assert!(rendered.contains("Recovery: `"));
+        assert!(rendered.contains("Help: `manuvra commands errors timed_out`"));
+    }
+
+    #[test]
+    fn doctor_renderer_classifies_completed_and_preserved_orphan_cleanup() {
+        let mut completed = doctor_fixture(true);
+        completed["warnings"] = json!(["verified_orphans_removed"]);
+        let completed = render_doctor(&completed);
+        assert!(completed.contains("Manuvra doctor: ready"));
+        assert!(completed.contains("[resolved] Verified orphan session state was removed safely."));
+        assert!(completed.contains("Next steps:\n  none"));
+
+        let mut preserved = doctor_fixture(true);
+        preserved["warnings"] = json!(["unverified_orphans_preserved"]);
+        let preserved = render_doctor(&preserved);
+        assert!(preserved.contains("Manuvra doctor: action required"));
+        assert!(preserved.contains("Unverified orphan session state was preserved for safety."));
+        assert!(preserved.contains("Preserve `manuvra doctor --json` output"));
+        assert!(preserved.contains("Manuvra will not delete unverified state automatically."));
+    }
+
+    #[test]
+    fn setup_renderer_preserves_daemon_reported_pane_and_permission_states() {
+        let mut setup = setup_fixture(
+            setup_fact(false, true, false),
+            setup_fact(true, false, true),
+            setup_fact(false, true, false),
+        );
+        setup["permissions"]["accessibility"]["settings_opened"] = Value::Bool(true);
+        setup["permissions"]["post_event"]["settings_opened"] = Value::Bool(true);
+        setup["installation"] = json!({
+            "installed": true,
+            "bundle": "/opt/homebrew/opt/manuvra/libexec/Manuvra.app"
+        });
+
+        assert_eq!(
+            setup["permissions"]["accessibility"]["settings_opened"],
+            true
+        );
+        assert_eq!(setup["permissions"]["post_event"]["settings_opened"], true);
+        assert_eq!(
+            setup["permissions"]["screen_recording"]["settings_opened"],
+            false
+        );
+        manuvra_protocol::validate_command_result("system.setup", &setup).unwrap();
+        let rendered = render_setup(&setup);
+        assert!(rendered.contains("manual action required"));
+        assert!(rendered.contains("macOS consent is manual"));
+        assert!(rendered.contains("/opt/homebrew/opt/manuvra/libexec/Manuvra.app"));
+        assert!(rendered.contains("Run `manuvra doctor` again"));
+    }
+
+    #[test]
+    fn setup_all_granted_and_development_layout_never_invent_actions_or_bundle_path() {
+        let granted = setup_fact(true, false, true);
+        let ready = setup_fixture(granted.clone(), granted.clone(), granted);
+        let rendered = render_setup(&ready);
+        assert!(rendered.contains("permissions ready"));
+        assert!(rendered.contains("No permission prompt or System Settings pane was needed"));
+        assert!(!rendered.contains("Complete these steps"));
+
+        let residual = setup_fixture(
+            setup_fact(false, true, false),
+            setup_fact(true, false, true),
+            setup_fact(true, false, true),
+        );
+        let rendered = render_setup(&residual);
+        assert!(rendered.contains("development layouts have no canonical Manuvra.app path"));
+        assert!(rendered.contains("this development layout has no bundle path to add"));
+        assert!(!rendered.contains("/Applications/Manuvra.app"));
+
+        let mut installed_without_bundle = residual;
+        installed_without_bundle["installation"] = json!({"installed": true, "bundle": null});
+        let rendered = render_setup(&installed_without_bundle);
+        assert!(rendered.contains("installed bundle path is unavailable"));
+        assert!(rendered.contains("reinstall Manuvra"));
+        assert!(!rendered.contains("this development layout has no bundle path to add"));
     }
 }

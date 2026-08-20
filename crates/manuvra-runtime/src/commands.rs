@@ -616,9 +616,39 @@ impl Runtime {
                     "role": session.role,
                     "mode": session.mode,
                 })).collect::<Vec<_>>(),
-                "warnings": cleanup_warnings(&self.startup_removed, &self.startup_preserved),
+                "warnings": doctor_warnings(
+                    &self.startup_removed,
+                    &self.startup_preserved,
+                    &self.doctor_warnings,
+                ),
             })),
         )
+    }
+
+    pub(crate) fn setup(&self, invocation: &Invocation, started: Instant) -> InvocationReply {
+        if deadline_expired(invocation, started) {
+            return InvocationReply::error("timed_out", None);
+        }
+        if let Err(message) = Input::new(&invocation.input, &[]) {
+            return InvocationReply::error("invalid_request", Some(&message));
+        }
+        let deadline = started + Duration::from_millis(invocation.deadline_ms);
+        let result = self
+            .adapters
+            .iter()
+            .find_map(|adapter| adapter.setup_permissions(deadline));
+        let reply = match result {
+            Some(Ok(mut value)) => {
+                value["installation"] = self.setup_installation.clone();
+                InvocationReply::success(value)
+            }
+            Some(Err(error)) => InvocationReply::error(&error.code, error.message.as_deref()),
+            None => InvocationReply::error(
+                "command_unsupported",
+                Some("no adapter owns macOS permission setup"),
+            ),
+        };
+        enforce_deadline(invocation, started, reply)
     }
 
     fn session_directory(&self, session_id: &str) -> Result<std::path::PathBuf, InvocationReply> {
@@ -649,7 +679,7 @@ fn enforce_deadline(
     }
 }
 
-fn cleanup_warnings(removed: &[PathBuf], preserved: &[PathBuf]) -> Vec<String> {
+fn doctor_warnings(removed: &[PathBuf], preserved: &[PathBuf], injected: &[String]) -> Vec<String> {
     let mut warnings = Vec::new();
     if !removed.is_empty() {
         warnings.push("verified_orphans_removed".to_owned());
@@ -657,6 +687,7 @@ fn cleanup_warnings(removed: &[PathBuf], preserved: &[PathBuf]) -> Vec<String> {
     if !preserved.is_empty() {
         warnings.push("unverified_orphans_preserved".to_owned());
     }
+    warnings.extend_from_slice(injected);
     warnings
 }
 

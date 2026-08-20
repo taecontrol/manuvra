@@ -8,9 +8,8 @@ use serde_json::{Value, json};
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::Barrier;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -30,6 +29,79 @@ struct DeadlineDiscoveryAdapter;
 struct DelayedSessionAdapter {
     opened: AtomicUsize,
     closed: Arc<AtomicUsize>,
+}
+struct SetupTrackingAdapter {
+    calls: Arc<AtomicUsize>,
+    timeout: bool,
+}
+struct SequenceRaceAdapter {
+    observation_started: Mutex<Option<mpsc::SyncSender<()>>>,
+    observation_release: Barrier,
+}
+
+impl TargetAdapter for SequenceRaceAdapter {
+    fn targets(&self) -> Vec<TargetDescriptor> {
+        FakeAdapter.targets()
+    }
+
+    fn invoke(
+        &self,
+        context: &AdapterContext,
+        operation: &AdapterOperation,
+        cancellation: Arc<AtomicBool>,
+    ) -> AdapterReply {
+        if operation.command == "observe.screenshot"
+            && let Some(started) = self.observation_started.lock().unwrap().take()
+        {
+            started.send(()).unwrap();
+            self.observation_release.wait();
+        }
+        FakeAdapter.invoke(context, operation, cancellation)
+    }
+}
+
+impl TargetAdapter for SetupTrackingAdapter {
+    fn targets(&self) -> Vec<TargetDescriptor> {
+        Vec::new()
+    }
+
+    fn setup_permissions(
+        &self,
+        _deadline: std::time::Instant,
+    ) -> Option<Result<Value, AdapterError>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.timeout {
+            return Some(Err(AdapterError {
+                code: "timed_out".to_owned(),
+                message: Some("settings launch exhausted the command deadline".to_owned()),
+                details: None,
+            }));
+        }
+        let granted = json!({
+            "before_granted": true,
+            "prompt_requested": false,
+            "settings_opened": false,
+            "granted": true,
+            "freshly_granted": false,
+            "residual": false
+        });
+        Some(Ok(json!({
+            "permissions": {
+                "accessibility": granted,
+                "screen_recording": granted,
+                "post_event": granted
+            }
+        })))
+    }
+
+    fn invoke(
+        &self,
+        _context: &AdapterContext,
+        _operation: &AdapterOperation,
+        _cancellation: Arc<AtomicBool>,
+    ) -> AdapterReply {
+        panic!("setup adapter does not own session commands")
+    }
 }
 
 impl TargetAdapter for DelayedSessionAdapter {
@@ -863,7 +935,28 @@ fn adapter_panic_becomes_terminal_internal_error_and_releases_admission() {
 
 #[test]
 fn concurrent_observation_discloses_sequence_race() {
-    let harness = Harness::new();
+    let root = tempfile::tempdir().unwrap();
+    let temporary = root.path().join("tmp");
+    let config = root.path().join("config");
+    let (observation_started, observation_admitted) = mpsc::sync_channel(0);
+    let adapter = Arc::new(SequenceRaceAdapter {
+        observation_started: Mutex::new(Some(observation_started)),
+        observation_release: Barrier::new(2),
+    });
+    let harness = Harness {
+        _root: root,
+        config: config.clone(),
+        runtime: Arc::new(
+            Runtime::new(
+                RuntimeConfig {
+                    temporary_root: temporary,
+                    config_root: config,
+                },
+                vec![adapter.clone()],
+            )
+            .unwrap(),
+        ),
+    };
     let actor = harness.open("chrome_fake_1", "actor");
     let observer = harness.open("chrome_fake_1", "observer");
     let runtime = harness.runtime.clone();
@@ -877,12 +970,15 @@ fn concurrent_observation_discloses_sequence_race() {
             1_000,
         )
     });
-    thread::sleep(Duration::from_millis(5));
+    observation_admitted
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
     let click = harness.invoke(
         "concurrent-click",
         "action.click",
         json!({"session_id": actor, "locator": {"kind": "semantic", "name": "Save"}}),
     );
+    adapter.observation_release.wait();
     assert_eq!(click.value["outcome"], "observed");
     let observed = observation.join().unwrap();
     assert_eq!(observed.value["observation_status"], "concurrent");
@@ -1169,6 +1265,84 @@ fn every_observable_reply_in_contract_suite_is_bounded_json() {
         assert!(bytes.len() <= 4096);
         serde_json::from_slice::<Value>(&bytes).unwrap();
     }
+}
+
+#[test]
+fn system_setup_routes_to_the_permission_owner_and_returns_rechecked_facts() {
+    let harness = Harness::new();
+
+    let reply = harness.invoke("focused-setup", "system.setup", json!({}));
+
+    assert_eq!(reply.exit_code, 0);
+    validate_command_result("system.setup", &reply.value).unwrap();
+    for permission in ["accessibility", "screen_recording", "post_event"] {
+        let fact = &reply.value["permissions"][permission];
+        assert_eq!(fact["before_granted"], true);
+        assert_eq!(fact["prompt_requested"], false);
+        assert_eq!(fact["settings_opened"], false);
+        assert_eq!(fact["granted"], true);
+        assert_eq!(fact["freshly_granted"], false);
+        assert_eq!(fact["residual"], false);
+    }
+}
+
+#[test]
+fn system_setup_caches_installation_and_adapter_side_effects_by_request_id() {
+    let root = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runtime = Arc::new(
+        Runtime::new(
+            RuntimeConfig {
+                temporary_root: root.path().join("tmp"),
+                config_root: root.path().join("config"),
+            },
+            vec![Arc::new(SetupTrackingAdapter {
+                calls: calls.clone(),
+                timeout: false,
+            })],
+        )
+        .unwrap()
+        .with_setup_installation(json!({
+            "installed": true,
+            "bundle": "/opt/manuvra/Manuvra.app"
+        })),
+    );
+
+    let first = invoke(&runtime, "same-setup", "system.setup", json!({}), 1_000);
+    let replay = invoke(&runtime, "same-setup", "system.setup", json!({}), 1_000);
+
+    assert_eq!(first.value, replay.value);
+    assert_eq!(
+        first.value["installation"]["bundle"],
+        "/opt/manuvra/Manuvra.app"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn timed_out_system_setup_is_terminal_and_retry_does_not_replay_side_effects() {
+    let root = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runtime = Arc::new(
+        Runtime::new(
+            RuntimeConfig {
+                temporary_root: root.path().join("tmp"),
+                config_root: root.path().join("config"),
+            },
+            vec![Arc::new(SetupTrackingAdapter {
+                calls: calls.clone(),
+                timeout: true,
+            })],
+        )
+        .unwrap(),
+    );
+
+    let first = invoke(&runtime, "same-timeout", "system.setup", json!({}), 1_000);
+    let replay = invoke(&runtime, "same-timeout", "system.setup", json!({}), 1_000);
+
+    assert_eq!(error_code(&first), Some("timed_out"));
+    assert_eq!(first.value, replay.value);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]

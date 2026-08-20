@@ -6,7 +6,8 @@
   "$defs": {
     "absolute_path": { "type": "string", "pattern": "^/", "maxLength": 1024 },
     "daemon_status": { "type": "object" },
-    "setup": { "type": "object", "additionalProperties": false, "required": ["opened", "missing", "installation"], "properties": { "opened": { "type": "array", "items": { "type": "string" } }, "missing": { "type": "array", "items": { "type": "string" } }, "installation": { "type": "object" } } },
+    "setup_permission": { "type": "object", "additionalProperties": false, "required": ["before_granted", "prompt_requested", "settings_opened", "granted", "freshly_granted", "residual"], "properties": { "before_granted": { "type": "boolean" }, "prompt_requested": { "type": "boolean" }, "settings_opened": { "type": "boolean" }, "granted": { "type": "boolean" }, "freshly_granted": { "type": "boolean" }, "residual": { "type": "boolean" } } },
+    "setup": { "type": "object", "additionalProperties": false, "required": ["permissions", "installation"], "properties": { "permissions": { "type": "object", "additionalProperties": false, "required": ["accessibility", "screen_recording", "post_event"], "properties": { "accessibility": { "$ref": "#/$defs/setup_permission" }, "screen_recording": { "$ref": "#/$defs/setup_permission" }, "post_event": { "$ref": "#/$defs/setup_permission" } } }, "installation": { "type": "object" } } },
     "migrate": { "type": "object", "additionalProperties": false, "required": ["source", "destination", "copied", "source_preserved"], "properties": { "source": { "$ref": "#/$defs/absolute_path" }, "destination": { "$ref": "#/$defs/absolute_path" }, "copied": { "type": "boolean" }, "source_preserved": { "const": true } } },
     "purge": { "type": "object", "additionalProperties": false, "required": ["removed", "retained_exports"], "properties": { "removed": { "type": "array", "items": { "$ref": "#/$defs/absolute_path" } }, "retained_exports": { "const": true } } },
     "registry_page": {

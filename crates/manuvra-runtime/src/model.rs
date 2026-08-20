@@ -196,6 +196,14 @@ pub trait TargetAdapter: Send + Sync {
     fn diagnostics(&self) -> Value {
         Value::Null
     }
+    /// Requests host permissions owned by this adapter, if it has any.
+    ///
+    /// The default keeps adapters without host privacy permissions passive. Implementations must
+    /// preflight first, request only missing permissions before `deadline`, and return freshly
+    /// rechecked facts.
+    fn setup_permissions(&self, _deadline: Instant) -> Option<Result<Value, AdapterError>> {
+        None
+    }
     fn session_opened(
         &self,
         _session: &AdapterSession,

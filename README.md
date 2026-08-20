@@ -15,7 +15,11 @@ manuvra setup
 manuvra doctor
 ```
 
-An install or upgrade may require Accessibility and Screen Recording authorization again because the bundle is ad-hoc signed. `setup` opens the relevant System Settings panes but never changes macOS privacy data itself. When Manuvra is not listed yet, use **Add** in each pane and select the `.app` path reported as `installation.bundle` by `setup`, then enable its switch and rerun `manuvra doctor`.
+In a terminal, `doctor` and `setup` explain their results in plain language. Use `manuvra doctor --json` or `manuvra setup --json` for JSON explicitly; redirected and piped output remains compact JSON automatically.
+
+An install or upgrade may require Accessibility, Screen & System Audio Recording, and Post Event authorization again because the bundle is ad-hoc signed. An explicit `setup` asks macOS for only the missing permissions from the `manuvra-daemon` identity, rechecks the result, and opens the relevant privacy panes for any remaining manual work. macOS keeps consent under human control: Manuvra never edits the TCC database, silently grants itself access, or guarantees that a request will add it to a privacy list.
+
+Follow the numbered instructions printed by `setup`. When Manuvra is absent from a pane, click **Add**, select the exact `Manuvra.app` path shown as the bundle path, enable its switch, and rerun `manuvra doctor`. Development builds report that no canonical bundle path exists instead of inventing one.
 
 ## Agent workflow
 
