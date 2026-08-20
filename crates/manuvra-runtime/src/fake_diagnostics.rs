@@ -132,7 +132,7 @@ impl PermissionSet {
 
 impl PermissionFact {
     fn validate(&self, name: &str) -> Result<(), String> {
-        if self.prompt_requested != !self.before_granted {
+        if self.prompt_requested == self.before_granted {
             return Err(format!("{name} request fact contradicts its preflight"));
         }
         if self.freshly_granted != (!self.before_granted && self.granted) {
