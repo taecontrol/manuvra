@@ -33,7 +33,10 @@ npx skills add taecontrol/manuvra
 
 Use that skill when an agent must observe or control an exact local Chrome or macOS window on Apple Silicon running macOS 26 or later.
 
+Chrome tabs are discoverable only when loopback CDP is up. `manuvra chrome launch` starts or reuses a dedicated-profile instance; it does not open a site or touch the daily Chrome. `targets`, `doctor`, and `open` never start Chrome.
+
 ```bash
+manuvra chrome launch
 manuvra targets
 manuvra open --target <target-id>
 manuvra observe screenshot --session <session-id>
