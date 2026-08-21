@@ -86,7 +86,7 @@
     {
       "id": "target.list",
       "cli": ["targets"],
-      "summary": "Discover current Chrome and macOS targets and their dynamic capabilities.",
+      "summary": "Discover current Chrome and macOS targets, their presentation owner and title, and dynamic capabilities.",
       "effect": "read",
       "authority": "none",
       "modes": [],

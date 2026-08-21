@@ -125,6 +125,8 @@ impl Runtime {
                     "target_id": target.target_id,
                     "generation": target.generation,
                     "kind": target.kind,
+                    "owner": bounded_label(&target.owner),
+                    "title": target.title.as_deref().and_then(bounded_title),
                     "capabilities": target.capabilities,
                     "actor_lease": if held { "held" } else { "available" },
                 })
@@ -840,6 +842,15 @@ fn discovery_error(value: &Value) -> InvocationReply {
         })),
         None => InvocationReply::error("invalid_request", Some("unknown error code")),
     }
+}
+
+fn bounded_label(value: &str) -> String {
+    value.chars().take(256).collect()
+}
+
+fn bounded_title(value: &str) -> Option<String> {
+    let title = bounded_label(value);
+    (!title.is_empty()).then_some(title)
 }
 
 fn parse_cursor(input: &Input<'_>) -> Result<usize, InvocationReply> {

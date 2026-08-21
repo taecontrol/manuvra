@@ -66,11 +66,18 @@ impl DiscoveryState {
     }
 
     pub fn refresh_native(&mut self) -> Vec<TargetDescriptor> {
-        match native_windows() {
-            Ok(mut windows) => {
+        match window_server_windows() {
+            Ok(windows) => {
                 self.last_error = None;
-                self.retain_ax_only_windows(&mut windows);
-                self.apply(windows)
+                let ax_bounds = collect_ax_bounds(
+                    windows.iter().map(|window| window.pid).chain(
+                        self.records
+                            .values()
+                            .filter(|record| record.present)
+                            .map(|record| record.snapshot.pid),
+                    ),
+                );
+                self.apply_discovered(&windows, &ax_bounds)
             }
             Err(error) => {
                 self.last_error = Some(error);
@@ -79,7 +86,51 @@ impl DiscoveryState {
         }
     }
 
-    fn retain_ax_only_windows(&self, windows: &mut Vec<WindowSnapshot>) {
+    fn apply_discovered(
+        &mut self,
+        window_server: &[WindowSnapshot],
+        ax_bounds: &HashMap<i32, Vec<WindowBounds>>,
+    ) -> Vec<TargetDescriptor> {
+        // Presence stays with a still-living pid+window_id even when AX bounds
+        // have not caught up. Generation increments only after a true gap.
+        let mut listed = ax_agreed_windows(window_server, ax_bounds);
+        self.keep_known_window_server_windows(window_server, &mut listed);
+        self.retain_ax_only_windows(ax_bounds, &mut listed);
+        self.apply(listed)
+    }
+
+    fn keep_known_window_server_windows(
+        &self,
+        window_server: &[WindowSnapshot],
+        listed: &mut Vec<WindowSnapshot>,
+    ) {
+        let mut listed_ids = listed
+            .iter()
+            .map(WindowSnapshot::target_id)
+            .collect::<HashSet<_>>();
+        for snapshot in window_server {
+            let target_id = snapshot.target_id();
+            if listed_ids.contains(&target_id) {
+                continue;
+            }
+            let Some(record) = self.records.get(&target_id) else {
+                continue;
+            };
+            if record.present
+                && record.snapshot.pid == snapshot.pid
+                && record.snapshot.window_id == snapshot.window_id
+            {
+                listed_ids.insert(target_id);
+                listed.push(snapshot.clone());
+            }
+        }
+    }
+
+    fn retain_ax_only_windows(
+        &self,
+        ax_bounds: &HashMap<i32, Vec<WindowBounds>>,
+        windows: &mut Vec<WindowSnapshot>,
+    ) {
         let listed = windows
             .iter()
             .map(WindowSnapshot::target_id)
@@ -89,7 +140,8 @@ impl DiscoveryState {
             .values()
             .filter(|record| record.present && !listed.contains(&record.descriptor.target_id))
         {
-            let matches = crate::ax::application_window_bounds(record.snapshot.pid)
+            let matches = ax_bounds
+                .get(&record.snapshot.pid)
                 .map(|bounds| {
                     bounds
                         .iter()
@@ -97,7 +149,7 @@ impl DiscoveryState {
                         .count()
                 })
                 .unwrap_or(0);
-            if matches == 1 {
+            if matches == 1 && !listed_window_claims_bounds(windows, &record.snapshot) {
                 let mut snapshot = record.snapshot.clone();
                 snapshot.is_on_screen = false;
                 windows.push(snapshot);
@@ -147,6 +199,8 @@ impl DiscoveryState {
             let target_id = snapshot.target_id();
             match self.records.get_mut(&target_id) {
                 Some(record) if previously_present.contains(&target_id) => {
+                    record.descriptor.owner = snapshot.owner.clone();
+                    record.descriptor.title = snapshot.title.clone();
                     record.snapshot = snapshot;
                     record.present = true;
                 }
@@ -160,6 +214,8 @@ impl DiscoveryState {
                                 target_id,
                                 generation,
                                 kind: "macos".to_owned(),
+                                owner: snapshot.owner.clone(),
+                                title: snapshot.title.clone(),
                                 capabilities: CAPABILITIES
                                     .iter()
                                     .map(|capability| (*capability).to_owned())
@@ -195,19 +251,11 @@ impl WindowSnapshot {
     }
 }
 
-fn native_windows() -> Result<Vec<WindowSnapshot>, String> {
-    let windows = window_server_windows()?;
-    let mut ax_bounds = HashMap::<i32, Vec<WindowBounds>>::new();
-    for pid in windows
-        .iter()
-        .map(|window| window.pid)
-        .collect::<HashSet<_>>()
-    {
-        if let Ok(bounds) = crate::ax::application_window_bounds(pid) {
-            ax_bounds.insert(pid, bounds);
-        }
-    }
-    let exact: Vec<WindowSnapshot> = windows
+fn ax_agreed_windows(
+    windows: &[WindowSnapshot],
+    ax_bounds: &HashMap<i32, Vec<WindowBounds>>,
+) -> Vec<WindowSnapshot> {
+    windows
         .iter()
         .filter(|window| {
             ax_bounds
@@ -220,8 +268,25 @@ fn native_windows() -> Result<Vec<WindowSnapshot>, String> {
                 .unwrap_or(false)
         })
         .cloned()
-        .collect();
-    Ok(exact)
+        .collect()
+}
+
+fn collect_ax_bounds(pids: impl IntoIterator<Item = i32>) -> HashMap<i32, Vec<WindowBounds>> {
+    pids.into_iter()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .filter_map(|pid| {
+            crate::ax::application_window_bounds(pid)
+                .ok()
+                .map(|bounds| (pid, bounds))
+        })
+        .collect()
+}
+
+fn listed_window_claims_bounds(windows: &[WindowSnapshot], snapshot: &WindowSnapshot) -> bool {
+    windows.iter().any(|listed| {
+        listed.pid == snapshot.pid && crate::ax::same_bounds(listed.bounds, snapshot.bounds)
+    })
 }
 
 fn validate_cached_window(cached: &WindowSnapshot) -> Result<Option<WindowSnapshot>, String> {
@@ -296,8 +361,8 @@ fn decode_window(dictionary: &CFDictionary<CFString, CFType>) -> Option<WindowSn
         window_id: number(dictionary, unsafe { kCGWindowNumber })?
             .try_into()
             .ok()?,
-        owner: string(dictionary, unsafe { kCGWindowOwnerName })?,
-        title: string(dictionary, unsafe { kCGWindowName }).filter(|title| !title.is_empty()),
+        owner: present_label(string(dictionary, unsafe { kCGWindowOwnerName }))?,
+        title: present_label(string(dictionary, unsafe { kCGWindowName })),
         bounds: bounds(dictionary)?,
         is_on_screen: boolean(dictionary, unsafe { kCGWindowIsOnscreen }).unwrap_or(false),
     })
@@ -315,6 +380,10 @@ fn string(dictionary: &CFDictionary<CFString, CFType>, key: &CFString) -> Option
             .ok()?
             .to_string(),
     )
+}
+
+fn present_label(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.is_empty())
 }
 
 fn boolean(dictionary: &CFDictionary<CFString, CFType>, key: &CFString) -> Option<bool> {
@@ -343,19 +412,31 @@ mod tests {
     use super::*;
 
     fn window(pid: i32, window_id: u32, title: &str) -> WindowSnapshot {
+        window_at(pid, window_id, title, 10.0, 20.0)
+    }
+
+    fn window_at(pid: i32, window_id: u32, title: &str, x: f64, y: f64) -> WindowSnapshot {
         WindowSnapshot {
             pid,
             window_id,
             owner: "Fixture".to_owned(),
-            title: Some(title.to_owned()),
+            title: present_label(Some(title.to_owned())),
             bounds: WindowBounds {
-                x: 10.0,
-                y: 20.0,
+                x,
+                y,
                 width: 300.0,
                 height: 200.0,
             },
             is_on_screen: true,
         }
+    }
+
+    fn ax_of(window: &WindowSnapshot) -> HashMap<i32, Vec<WindowBounds>> {
+        HashMap::from([(window.pid, vec![window.bounds])])
+    }
+
+    fn ws(window: &WindowSnapshot) -> &[WindowSnapshot] {
+        std::slice::from_ref(window)
     }
 
     #[test]
@@ -376,5 +457,129 @@ mod tests {
         let targets = state.apply(vec![window(10, 20, "a"), window(11, 20, "b")]);
         assert_eq!(targets.len(), 2);
         assert_ne!(targets[0].target_id, targets[1].target_id);
+    }
+
+    #[test]
+    fn known_window_keeps_generation_when_ax_bounds_temporarily_disagree() {
+        // Living pid+window_id stays present while AX still reports the
+        // pre-move frame. Snapshot bounds come from current WindowServer.
+        let mut state = DiscoveryState::new();
+        let original = window_at(10, 20, "first", 10.0, 20.0);
+        let first = state.apply_discovered(ws(&original), &ax_of(&original));
+        let target_id = first[0].target_id.clone();
+        let generation = first[0].generation;
+
+        let moved = window_at(10, 20, "first", 1727.0, 64.0);
+        let during_mismatch = state.apply_discovered(ws(&moved), &ax_of(&original));
+        assert_eq!(during_mismatch.len(), 1);
+        assert_eq!(during_mismatch[0].target_id, target_id);
+        assert_eq!(during_mismatch[0].generation, generation);
+        let record = state
+            .record(&target_id, generation)
+            .expect("living WindowServer window must stay present");
+        assert_eq!(record.snapshot.bounds.x, 1727.0);
+        assert_eq!(record.snapshot.bounds.y, 64.0);
+
+        let recovered = state.apply_discovered(ws(&moved), &ax_of(&moved));
+        assert_eq!(recovered[0].target_id, target_id);
+        assert_eq!(recovered[0].generation, generation);
+    }
+
+    #[test]
+    fn unknown_window_without_ax_agreement_is_not_listed() {
+        let mut state = DiscoveryState::new();
+        let snapshot = window(10, 20, "first");
+        assert!(
+            state
+                .apply_discovered(ws(&snapshot), &HashMap::new())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn window_server_absence_then_reappearance_is_replacement() {
+        let mut state = DiscoveryState::new();
+        let snapshot = window(10, 20, "first");
+        let first = state.apply_discovered(ws(&snapshot), &ax_of(&snapshot));
+        assert!(state.apply_discovered(&[], &HashMap::new()).is_empty());
+        assert!(
+            state
+                .apply_discovered(ws(&snapshot), &HashMap::new())
+                .is_empty()
+        );
+        let again = state.apply_discovered(ws(&snapshot), &ax_of(&snapshot));
+        assert!(again[0].generation > first[0].generation);
+    }
+
+    #[test]
+    fn ax_only_window_keeps_generation_when_absent_from_window_server() {
+        let mut state = DiscoveryState::new();
+        let snapshot = window(10, 20, "first");
+        let first = state.apply_discovered(ws(&snapshot), &ax_of(&snapshot));
+        let hidden = state.apply_discovered(&[], &ax_of(&snapshot));
+        assert_eq!(hidden.len(), 1);
+        assert_eq!(hidden[0].target_id, first[0].target_id);
+        assert_eq!(hidden[0].generation, first[0].generation);
+        let record = state
+            .record(&first[0].target_id, first[0].generation)
+            .expect("unique AX match must keep the window");
+        assert!(!record.snapshot.is_on_screen);
+    }
+
+    #[test]
+    fn listed_descriptor_uses_snapshot_owner_and_title() {
+        let mut state = DiscoveryState::new();
+        let untitled = window(10, 21, "");
+        let targets = state.apply(vec![window(10, 20, "Notes"), untitled]);
+        let titled = targets
+            .iter()
+            .find(|target| target.title.as_deref() == Some("Notes"))
+            .expect("titled window");
+        assert_eq!(titled.owner, "Fixture");
+        let blank = targets
+            .iter()
+            .find(|target| target.title.is_none())
+            .expect("untitled window");
+        assert_eq!(blank.owner, "Fixture");
+        assert_eq!(blank.title, None);
+    }
+
+    #[test]
+    fn presentation_labels_refresh_without_changing_generation() {
+        let mut state = DiscoveryState::new();
+        let first = state.apply(vec![window(10, 20, "before")]);
+        let generation = first[0].generation;
+        let target_id = first[0].target_id.clone();
+        let updated = state.apply(vec![window(10, 20, "after")]);
+        assert_eq!(updated[0].target_id, target_id);
+        assert_eq!(updated[0].generation, generation);
+        assert_eq!(updated[0].owner, "Fixture");
+        assert_eq!(updated[0].title.as_deref(), Some("after"));
+    }
+
+    #[test]
+    fn empty_window_owner_or_title_is_absent() {
+        assert_eq!(present_label(None), None);
+        assert_eq!(present_label(Some(String::new())), None);
+        assert_eq!(
+            present_label(Some("Notes".to_owned())).as_deref(),
+            Some("Notes")
+        );
+    }
+
+    #[test]
+    fn different_window_id_is_a_new_target_not_a_kept_move() {
+        let mut state = DiscoveryState::new();
+        let original = window(10, 20, "first");
+        let first = state.apply_discovered(ws(&original), &ax_of(&original));
+        let replacement = window(10, 21, "second");
+        let after = state.apply_discovered(ws(&replacement), &ax_of(&replacement));
+        assert_eq!(after.len(), 1);
+        assert_ne!(after[0].target_id, first[0].target_id);
+        assert!(
+            state
+                .record(&first[0].target_id, first[0].generation)
+                .is_none()
+        );
     }
 }

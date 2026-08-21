@@ -312,7 +312,20 @@ fn representative_cli_lifecycle_has_bounded_results_and_durable_export() {
     assert_eq!(root_mode, 0o700);
 
     let targets = harness.success(&["targets"]);
-    assert_eq!(targets["targets"].as_array().unwrap().len(), 2);
+    let listed = targets["targets"].as_array().unwrap();
+    assert_eq!(listed.len(), 2);
+    let chrome = listed
+        .iter()
+        .find(|target| target["kind"] == "chrome")
+        .expect("chrome target");
+    let macos = listed
+        .iter()
+        .find(|target| target["kind"] == "macos")
+        .expect("macos target");
+    assert_eq!(chrome["owner"], "Chrome");
+    assert_eq!(chrome["title"], "Fake Chrome");
+    assert_eq!(macos["owner"], "Fake");
+    assert_eq!(macos["title"], "Fake Target");
     let actor = harness.open("chrome_fake_1", None);
     let observer = harness.open("chrome_fake_1", Some("observer"));
 
@@ -419,6 +432,38 @@ fn offline_discovery_does_not_require_daemon() {
     assert!(Path::new(schema["absolute_path"].as_str().unwrap()).is_file());
     let error = harness.success(&["commands", "errors", "foreground_required"]);
     assert_eq!(error["code"], "foreground_required");
+}
+
+#[test]
+fn unknown_registry_identity_returns_catalogued_unknown_command() {
+    let root = tempfile::tempdir().unwrap();
+    for args in [
+        ["commands", "get", "common.press"].as_slice(),
+        ["commands", "schema", "common.press", "--side", "input"].as_slice(),
+    ] {
+        let output = Command::new(CLI)
+            .args(args)
+            .env("MANUVRA_TMPDIR", root.path().join("tmp"))
+            .env("MANUVRA_CONFIG_HOME", root.path().join("config"))
+            .env("MANUVRA_NO_AUTOSTART", "1")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.len() <= 4096);
+        assert_eq!(output.stdout.last(), Some(&b'\n'));
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["error"]["code"], "unknown_command");
+        assert_eq!(result["error"]["recovery_command"], "manuvra commands list");
+        assert_eq!(
+            result["error"]["help_command"],
+            "manuvra commands errors unknown_command"
+        );
+    }
 }
 
 #[test]

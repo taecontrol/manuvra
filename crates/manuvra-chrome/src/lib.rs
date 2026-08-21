@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use transport::{CdpClient, JournalEvent, is_log_event};
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_millis(200);
+const CHROME_OWNER: &str = "Chrome";
 
 pub struct ChromeAdapter {
     endpoints: Vec<ChromeEndpoint>,
@@ -55,6 +56,7 @@ struct DiscoveredTarget {
     source_id: String,
     endpoint: ChromeEndpoint,
     websocket_path: String,
+    title: Option<String>,
 }
 
 impl ChromeAdapter {
@@ -535,11 +537,17 @@ fn discovered_target(
     };
     let websocket_path = websocket_path(websocket)?;
     let target_id = opaque_target_id(endpoint, source_id);
+    let title = item
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|title| !title.is_empty())
+        .map(str::to_owned);
     Ok(Some(DiscoveredTarget {
         target_id,
         source_id: source_id.to_owned(),
         endpoint: endpoint.clone(),
         websocket_path,
+        title,
     }))
 }
 
@@ -585,6 +593,8 @@ fn refresh_target(state: &mut State, discovered: DiscoveredTarget) {
                     target_id: discovered.target_id,
                     generation,
                     kind: "chrome".to_owned(),
+                    owner: CHROME_OWNER.to_owned(),
+                    title: discovered.title,
                     capabilities: chrome_capabilities(),
                 },
                 endpoint: discovered.endpoint,
@@ -597,6 +607,8 @@ fn refresh_target(state: &mut State, discovered: DiscoveredTarget) {
         );
     } else if let Some(target) = state.targets.get_mut(&discovered.target_id) {
         target.present = true;
+        target.descriptor.owner = CHROME_OWNER.to_owned();
+        target.descriptor.title = discovered.title;
     }
 }
 
@@ -684,6 +696,80 @@ mod tests {
     }
 
     #[test]
+    fn discovered_page_uses_list_title_and_chrome_owner() {
+        let endpoint = Endpoint::parse("127.0.0.1:9222").unwrap();
+        let titled = discovered_target(
+            &endpoint,
+            &json!({
+                "id": "page-1",
+                "title": "Inbox",
+                "type": "page",
+                "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/abc"
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(titled.title.as_deref(), Some("Inbox"));
+
+        let empty = discovered_target(
+            &endpoint,
+            &json!({
+                "id": "page-2",
+                "title": "",
+                "type": "page",
+                "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/def"
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(empty.title, None);
+
+        let missing = discovered_target(
+            &endpoint,
+            &json!({
+                "id": "page-3",
+                "type": "page",
+                "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/ghi"
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(missing.title, None);
+
+        let mut state = State {
+            next_generation: 1,
+            ..State::default()
+        };
+        refresh_target(&mut state, titled);
+        let descriptor = &state.targets.values().next().unwrap().descriptor;
+        assert_eq!(descriptor.owner, CHROME_OWNER);
+        assert_eq!(descriptor.title.as_deref(), Some("Inbox"));
+        assert_eq!(descriptor.generation, 1);
+    }
+
+    #[test]
+    fn chrome_title_refresh_does_not_advance_generation() {
+        let endpoint = Endpoint::parse("127.0.0.1:9222").unwrap();
+        let mut state = State {
+            next_generation: 1,
+            ..State::default()
+        };
+        let discovered = |title: &str| DiscoveredTarget {
+            target_id: "chrome_test".to_owned(),
+            source_id: "source".to_owned(),
+            endpoint: endpoint.clone(),
+            websocket_path: "/devtools/page/one".to_owned(),
+            title: Some(title.to_owned()),
+        };
+        refresh_target(&mut state, discovered("before"));
+        refresh_target(&mut state, discovered("after"));
+        let descriptor = &state.targets["chrome_test"].descriptor;
+        assert_eq!(descriptor.generation, 1);
+        assert_eq!(descriptor.owner, CHROME_OWNER);
+        assert_eq!(descriptor.title.as_deref(), Some("after"));
+    }
+
+    #[test]
     fn websocket_incarnation_change_advances_target_generation() {
         let endpoint = Endpoint::parse("127.0.0.1:9222").unwrap();
         let mut state = State {
@@ -695,6 +781,7 @@ mod tests {
             source_id: "source".to_owned(),
             endpoint: endpoint.clone(),
             websocket_path: path.to_owned(),
+            title: None,
         };
         refresh_target(&mut state, discovered("/devtools/page/one"));
         assert_eq!(state.targets["chrome_test"].descriptor.generation, 1);
@@ -715,6 +802,7 @@ mod tests {
             source_id: "source".to_owned(),
             endpoint: endpoint.clone(),
             websocket_path: "/devtools/page/one".to_owned(),
+            title: None,
         };
         refresh_target(&mut state, discovered());
         state.targets.get_mut("chrome_test").unwrap().present = false;

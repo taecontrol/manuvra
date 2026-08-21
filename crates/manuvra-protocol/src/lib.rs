@@ -1360,4 +1360,75 @@ mod tests {
         assert_eq!(digest.len(), 64);
         assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
     }
+
+    #[test]
+    fn target_page_requires_presentation_owner_and_title() {
+        let old_page = json!({
+            "targets": [{
+                "target_id": "chrome_example",
+                "generation": 1,
+                "kind": "chrome",
+                "capabilities": ["observation.screenshot"],
+                "actor_lease": "available"
+            }],
+            "next_cursor": null
+        });
+        let error = validate_command_result("target.list", &old_page)
+            .expect_err("pages without owner/title must fail required fields");
+        assert!(
+            error.contains("owner is required"),
+            "old page must fail for missing owner: {error}"
+        );
+
+        let mut page = json!({
+            "targets": [
+                {
+                    "target_id": "chrome_example",
+                    "generation": 1,
+                    "kind": "chrome",
+                    "owner": "Chrome",
+                    "title": "Inbox",
+                    "capabilities": ["observation.screenshot"],
+                    "actor_lease": "available"
+                },
+                {
+                    "target_id": "macos_example",
+                    "generation": 2,
+                    "kind": "macos",
+                    "owner": "TextEdit",
+                    "title": null,
+                    "capabilities": ["observation.screenshot"],
+                    "actor_lease": "held"
+                }
+            ],
+            "next_cursor": null
+        });
+        validate_command_result("target.list", &page).unwrap();
+
+        page["targets"][0]["owner"] = json!("");
+        let empty_owner = validate_command_result("target.list", &page)
+            .expect_err("empty owner must fail minLength");
+        assert!(
+            empty_owner.contains("too short"),
+            "empty owner must be rejected: {empty_owner}"
+        );
+
+        page["targets"][0]["owner"] = json!("Chrome");
+        page["targets"][0]["title"] = json!("");
+        let empty_title = validate_command_result("target.list", &page)
+            .expect_err("empty title must fail minLength");
+        assert!(
+            empty_title.contains("too short"),
+            "empty title must be rejected: {empty_title}"
+        );
+
+        page["targets"][0]["title"] = json!("Inbox");
+        page["targets"][0]["parsed_id"] = json!("no");
+        let extra =
+            validate_command_result("target.list", &page).expect_err("target items are closed");
+        assert!(
+            extra.contains("not allowed"),
+            "extra target keys must be rejected: {extra}"
+        );
+    }
 }

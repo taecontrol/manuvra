@@ -24,17 +24,19 @@ manuvra doctor
 
 Piped `doctor` and `setup` print JSON. In a terminal they print plain language unless you pass `--json`.
 
-`doctor` reports bundle, daemon, and permission state. It does not prompt or open System Settings. Only `setup` asks macOS for missing permissions, and only from the `manuvra-daemon` identity.
+`doctor` reports bundle, daemon, permission state, and codesign identity (`cdhash`, `authority`, `designated_requirement` on `daemon.installation`). It does not prompt or open System Settings. Only `setup` asks macOS for missing permissions, and only from the `manuvra-daemon` identity. A new CDHash is not a new grant identity when `authority` and `designated_requirement` stay the same.
 
-The human grants permission. Do not edit the TCC database, claim a silent grant, or skip the numbered instructions `setup` prints. If Manuvra is missing from a privacy pane, the human clicks **Add**, selects the exact `Manuvra.app` path `setup` reported, enables it, then you rerun `manuvra doctor`.
+The human grants permission. Do not edit the TCC database, create or trust a certificate, run `add-trusted-cert`, claim a silent grant, or skip the numbered instructions `setup` prints.
+
+If a permission is missing, enable the exact bundle path `doctor` printed. Other `Manuvra.app` copies share one TCC row for `com.taecontrol.manuvra` and stay missing; toggling Manuvra rebinds that row. Do not grant a `/tmp` prefix. Post Event is the Accessibility pane, not a third list. If Manuvra is absent from a pane, the human clicks **Add**, selects that exact path, and enables it.
+
+`brew install` needs no local certificate; grant that Homebrew app once. Homebrew stays ad-hoc, so `brew upgrade` may require a new grant. A local certificate is only if that machine will rebuild a local prefix and wants the grant to survive. The packager writes `prefix/libexec/Manuvra.app`; the project README names `~/Applications/Manuvra.app` as the recommended grant copy and the Keychain steps.
+
+After a first grant, the human closes System Settings. Then run `manuvra daemon stop` and repeat the `doctor` / `setup` / `doctor` path above. A grant that is still invisible is usually a live daemon that has not restarted.
 
 Ready when `doctor` reports the installed bundle, a usable daemon, and the permissions the next command needs. If `doctor` reports legacy development state, run the migrate command printed by `manuvra --help`.
 
-```bash
-manuvra daemon status
-```
-
-reports the daemon without touching a target.
+Read `daemon.adapters` only from a successful `manuvra doctor` JSON object that contains that array. If the array is missing, wait and rerun `doctor`. `manuvra daemon status` reports the daemon without touching a target; it is not a doctor document and does not carry adapters.
 
 ## Run a session
 
@@ -50,12 +52,14 @@ manuvra export --session <session-id> --all --destination /absolute/output/path
 manuvra close --session <session-id>
 ```
 
-1. `targets` lists the exact target and its current capabilities. Use that target ID.
+1. `targets` lists currently discoverable targets with presentation `owner` and `title`, plus capabilities. Choose by those labels when they uniquely identify the window or tab. Use the returned `target_id` as opaque; do not parse or reconstruct it.
 2. `open` returns a session ID. Default role is actor; default mode is `background`.
 3. Observe before the first mutation. Keep the session ID, element references, and `frame_token`.
-4. Perform one explicit action. For a locator, mode, or verb not shown here, run `manuvra <verb> --help` or `manuvra commands get`.
+4. Perform one explicit action. For a locator, mode, or verb not shown here, resolve the command ID from `manuvra commands list`, then run `manuvra <verb> --help` or `manuvra commands get <command-id>`. Do not pass a capability ID such as `common.press` to `commands get`.
 5. Read `outcome`, `delivery`, `observation`, and `error` together. Do not infer success from exit status or `delivery` alone.
 6. `export` anything that must survive, then `close`. `close` deletes all session artifacts.
+
+`owner` and `title` are presentation labels only. They are not identity. `title` may be JSON `null`. If title is JSON `null` or several targets share the same labels, fall back to the before/after probe: record macos `target_id` values from `manuvra targets --kind macos`; open or wait for the window; list macos targets again and keep only IDs that were not already recorded; `open` one remaining candidate and confirm with `observe query` and/or `observe screenshot`; if it is the wrong window, `close` and try the next new ID. Done when query or screenshot shows the intended window.
 
 Background never activates the target or injects global input. If the result is `foreground_required`, retry that invocation with `--mode foreground` only when visible activation is intended. The override does not change the session default.
 
@@ -71,13 +75,15 @@ If a command fails, run the exact `help_command` from the JSON error. If `effect
 
 ## Live catalog
 
+Command IDs come from the installed registry. Resolve them with `manuvra commands list` and inspect one with `manuvra commands get action.press`. Capability IDs such as `common.press` appear on a target; they are not command IDs. `system.commands.get` is the lookup command.
+
 Load these when you need a verb, flag, schema, or error that this file does not spell:
 
 ```bash
 manuvra --help
 manuvra commands list
-manuvra commands get <command-id>
-manuvra commands schema <id> --side input
+manuvra commands get action.press
+manuvra commands schema action.press --side input
 manuvra commands errors <code>
 manuvra <verb> --help
 ```

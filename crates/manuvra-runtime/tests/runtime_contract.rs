@@ -110,6 +110,8 @@ impl TargetAdapter for DelayedSessionAdapter {
             target_id: "chrome_delayed_session".to_owned(),
             generation: 1,
             kind: "chrome".to_owned(),
+            owner: "Chrome".to_owned(),
+            title: Some("Delayed".to_owned()),
             capabilities: vec![],
         }]
     }
@@ -180,6 +182,8 @@ impl TargetAdapter for PredispatchRejectingAdapter {
             target_id: "macos_predispatch_reject".to_owned(),
             generation: 1,
             kind: "macos".to_owned(),
+            owner: "Fixture".to_owned(),
+            title: Some("Predispatch".to_owned()),
             capabilities: ["common.press", "observation.screenshot"]
                 .into_iter()
                 .map(str::to_owned)
@@ -210,6 +214,8 @@ impl TargetAdapter for ReplacingAdapter {
             target_id: "chrome_replacing_1".to_owned(),
             generation: self.generation.load(Ordering::SeqCst),
             kind: "chrome".to_owned(),
+            owner: "Chrome".to_owned(),
+            title: Some("Replacing".to_owned()),
             capabilities: [
                 "common.click",
                 "observation.query",
@@ -411,6 +417,35 @@ fn unique() -> u128 {
 
 fn error_code(reply: &InvocationReply) -> Option<&str> {
     reply.value.get("error")?.get("code")?.as_str()
+}
+
+#[test]
+fn target_list_exposes_presentation_owner_and_title_for_chrome_and_macos() {
+    let harness = Harness::new();
+    let reply = harness.invoke("targets-labels", "target.list", json!({"limit": 10}));
+    let targets = reply.value["targets"].as_array().unwrap();
+    assert_eq!(targets.len(), 2);
+
+    let chrome = targets
+        .iter()
+        .find(|target| target["kind"] == "chrome")
+        .expect("chrome target");
+    let macos = targets
+        .iter()
+        .find(|target| target["kind"] == "macos")
+        .expect("macos target");
+
+    assert_eq!(chrome["owner"], "Chrome");
+    assert_eq!(chrome["title"], "Fake Chrome");
+    assert_eq!(macos["owner"], "Fake");
+    assert_eq!(macos["title"], "Fake Target");
+    for target in [chrome, macos] {
+        assert!(target["owner"].is_string(), "{target}");
+        assert!(
+            target.get("title").is_some(),
+            "title key must be present: {target}"
+        );
+    }
 }
 
 #[test]

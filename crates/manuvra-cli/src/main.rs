@@ -421,7 +421,7 @@ fn main() {
                     cli.timeout_ms
                         .unwrap_or_else(|| command_default_timeout(id)),
                 ),
-                Err(message) => local_error("invalid_request", &message),
+                Err(error) => error.into_local_reply(),
             }
         });
     emit_and_exit(result.0, result.1, output);
@@ -538,17 +538,50 @@ enum BuiltCommand {
     },
 }
 
-fn build_command(command: Command) -> Result<BuiltCommand, String> {
+#[derive(Debug, PartialEq, Eq)]
+enum BuildError {
+    InvalidRequest(String),
+    UnknownCommand,
+}
+
+impl BuildError {
+    fn into_local_reply(self) -> (Value, i32) {
+        match self {
+            Self::InvalidRequest(message) => local_error("invalid_request", &message),
+            Self::UnknownCommand => {
+                let (error, exit) = operational_error("unknown_command", None);
+                (json!({"error": error}), exit)
+            }
+        }
+    }
+}
+
+impl From<String> for BuildError {
+    fn from(message: String) -> Self {
+        Self::InvalidRequest(message)
+    }
+}
+
+impl std::fmt::Display for BuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidRequest(message) => f.write_str(message),
+            Self::UnknownCommand => f.write_str("unregistered command identity"),
+        }
+    }
+}
+
+fn build_command(command: Command) -> Result<BuiltCommand, BuildError> {
     match command {
         Command::Commands { command } => build_commands(command),
-        Command::Observe { command } => build_observe(command),
-        Command::Raw { command } => build_raw(command),
+        Command::Observe { command } => build_observe(command).map_err(BuildError::from),
+        Command::Raw { command } => build_raw(command).map_err(BuildError::from),
         command @ (Command::Click { .. }
         | Command::Type { .. }
         | Command::Press { .. }
         | Command::Scroll { .. }
-        | Command::Navigate { .. }) => build_action(command),
-        command => build_direct(command),
+        | Command::Navigate { .. }) => build_action(command).map_err(BuildError::from),
+        command => build_direct(command).map_err(BuildError::from),
     }
 }
 
@@ -739,12 +772,13 @@ fn build_export(
     remote("artifact.export", value)
 }
 
-fn build_commands(command: CommandsCommand) -> Result<BuiltCommand, String> {
+fn build_commands(command: CommandsCommand) -> Result<BuiltCommand, BuildError> {
     match command {
-        CommandsCommand::List { cursor, limit } => build_command_list(cursor, limit),
+        CommandsCommand::List { cursor, limit } => {
+            build_command_list(cursor, limit).map_err(BuildError::from)
+        }
         CommandsCommand::Get { command } => {
-            let value =
-                command_help(&command).ok_or_else(|| format!("unknown command {command}"))?;
+            let value = registered_help(&command)?;
             Ok(local(
                 "system.commands.get",
                 json!({"command": command}),
@@ -752,7 +786,7 @@ fn build_commands(command: CommandsCommand) -> Result<BuiltCommand, String> {
             ))
         }
         CommandsCommand::Schema { command, side } => build_command_schema(&command, side),
-        CommandsCommand::Errors { code } => build_command_error(&code),
+        CommandsCommand::Errors { code } => build_command_error(&code).map_err(BuildError::from),
         CommandsCommand::Usage { action } => Ok(build_usage(action)),
     }
 }
@@ -777,16 +811,24 @@ fn build_command_list(cursor: Option<String>, limit: u64) -> Result<BuiltCommand
     ))
 }
 
-fn build_command_schema(command: &str, side: SchemaSide) -> Result<BuiltCommand, String> {
-    let descriptor =
-        command_descriptor(command).ok_or_else(|| format!("unknown command {command}"))?;
+fn registered_command(id: &str) -> Result<&'static Value, BuildError> {
+    command_descriptor(id).ok_or(BuildError::UnknownCommand)
+}
+
+fn registered_help(id: &str) -> Result<Value, BuildError> {
+    registered_command(id)?;
+    command_help(id).ok_or_else(|| BuildError::from("invalid installed command help".to_owned()))
+}
+
+fn build_command_schema(command: &str, side: SchemaSide) -> Result<BuiltCommand, BuildError> {
+    let descriptor = registered_command(command)?;
     let (key, side_name) = match side {
         SchemaSide::Input => ("input_schema", "input"),
         SchemaSide::Result => ("result_schema", "result"),
     };
     let reference = descriptor[key]
         .as_str()
-        .ok_or_else(|| "invalid installed schema pointer".to_owned())?;
+        .ok_or_else(|| BuildError::from("invalid installed schema pointer".to_owned()))?;
     let value = schema_pointer(reference).map_err(|error| error.to_string())?;
     Ok(local(
         "system.commands.schema",
@@ -1251,6 +1293,11 @@ fn render_doctor(value: &Value) -> String {
             permission_label(name)
         ));
     }
+    if !all_permissions {
+        lines.push(permission_residual_grant_note(
+            &value["daemon"]["installation"],
+        ));
+    }
     let sessions = value["sessions"].as_array().cloned().unwrap_or_default();
     lines.push(format!("Active sessions: {}", sessions.len()));
     for session in sessions {
@@ -1348,6 +1395,7 @@ fn render_setup(value: &Value) -> String {
         "macOS consent is manual; Manuvra cannot grant itself access or add itself silently."
             .to_owned(),
     );
+    lines.push(permission_residual_grant_note(&value["installation"]));
     lines.push("Complete these steps:".to_owned());
     let mut step = 1;
     if residual.contains(&"accessibility") || residual.contains(&"post_event") {
@@ -1409,7 +1457,7 @@ fn doctor_permissions(value: &Value) -> Vec<(&'static str, Option<bool>)> {
 }
 
 fn render_installation(installation: &Value) -> Vec<String> {
-    if installation["installed"] == true {
+    let mut lines = if installation["installed"] == true {
         vec![
             "Installation: installed bundle".to_owned(),
             format!(
@@ -1425,7 +1473,51 @@ fn render_installation(installation: &Value) -> Vec<String> {
             "Bundle: unavailable (development layouts have no canonical Manuvra.app path)"
                 .to_owned(),
         ]
+    };
+    lines.extend(render_signature_identity(installation));
+    lines
+}
+
+fn render_signature_identity(installation: &Value) -> Vec<String> {
+    if installation["installed"] != true {
+        return Vec::new();
     }
+    let cdhash = json_string_field(installation, "cdhash");
+    let authority = json_string_field(installation, "authority");
+    let designated = json_string_field(installation, "designated_requirement");
+    if cdhash.is_none() && authority.is_none() && designated.is_none() {
+        return Vec::new();
+    }
+    let cdhash_value = cdhash.and_then(|value| value);
+    let authority_value = authority.and_then(|value| value);
+    let designated_value = designated.and_then(|value| value);
+    let mut lines = Vec::new();
+    if cdhash.is_some() {
+        lines.push(format!("CDHash: {}", cdhash_value.unwrap_or("unavailable")));
+    }
+    if authority.is_some() {
+        let rendered = authority_value.unwrap_or_else(|| {
+            if cdhash_value.is_some()
+                || designated_value.is_some_and(|value| value.starts_with("cdhash "))
+            {
+                "ad-hoc"
+            } else {
+                "unavailable"
+            }
+        });
+        lines.push(format!("Authority: {rendered}"));
+    }
+    if designated.is_some() {
+        lines.push(format!(
+            "Designated requirement: {}",
+            designated_value.unwrap_or("unavailable")
+        ));
+    }
+    lines
+}
+
+fn json_string_field<'a>(value: &'a Value, key: &str) -> Option<Option<&'a str>> {
+    value.get(key).map(Value::as_str)
 }
 
 fn permission_label(permission: &str) -> &'static str {
@@ -1437,13 +1529,28 @@ fn permission_label(permission: &str) -> &'static str {
     }
 }
 
+fn permission_residual_grant_note(installation: &Value) -> String {
+    let shared = "Other Manuvra.app copies share one TCC row for com.taecontrol.manuvra and stay missing. Do not grant a /tmp prefix; extra copies steal that same row.";
+    match (
+        installation["installed"].as_bool(),
+        installation["bundle"].as_str(),
+    ) {
+        (Some(true), Some(bundle)) => {
+            format!("Enable the exact bundle path `{bundle}`. {shared}")
+        }
+        _ => format!(
+            "Enable the exact bundle path printed by `manuvra doctor` once an installed bundle exists. {shared}"
+        ),
+    }
+}
+
 fn bundle_instruction(step: usize, installation: &Value) -> String {
     match (
         installation["installed"].as_bool(),
         installation["bundle"].as_str(),
     ) {
         (Some(true), Some(bundle)) => format!(
-            "  {step}. If Manuvra is absent, click Add, select `{bundle}`, then enable Manuvra."
+            "  {step}. If Manuvra is absent, click Add, select `{bundle}`, then enable that exact path."
         ),
         (Some(true), None) => format!(
             "  {step}. The installed bundle path is unavailable; reinstall Manuvra, rerun `manuvra setup`, and use the exact path it reports before clicking Add."
@@ -1520,7 +1627,7 @@ mod tests {
     use std::collections::HashSet;
     use std::process::Command as ProcessCommand;
 
-    fn build(args: &[&str]) -> Result<BuiltCommand, String> {
+    fn build(args: &[&str]) -> Result<BuiltCommand, BuildError> {
         let cli = Cli::try_parse_from(std::iter::once("manuvra").chain(args.iter().copied()))
             .expect("valid CLI fixture");
         build_command(cli.command)
@@ -1742,10 +1849,27 @@ mod tests {
 
     #[test]
     fn local_builder_rejects_invalid_inputs() {
-        assert!(build(&["commands", "list", "--cursor", "bad"]).is_err());
-        assert!(build(&["commands", "get", "missing"]).is_err());
-        assert!(build(&["commands", "errors", "missing"]).is_err());
-        assert!(
+        assert!(matches!(
+            build(&["commands", "list", "--cursor", "bad"]),
+            Err(BuildError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            build(&["commands", "get", "missing"]),
+            Err(BuildError::UnknownCommand)
+        ));
+        assert!(matches!(
+            build(&["commands", "get", "common.press"]),
+            Err(BuildError::UnknownCommand)
+        ));
+        assert!(matches!(
+            build(&["commands", "schema", "common.press", "--side", "input"]),
+            Err(BuildError::UnknownCommand)
+        ));
+        assert!(matches!(
+            build(&["commands", "errors", "missing"]),
+            Err(BuildError::InvalidRequest(_))
+        ));
+        assert!(matches!(
             build(&[
                 "raw",
                 "cdp",
@@ -1757,10 +1881,10 @@ mod tests {
                 "x",
                 "--params",
                 "not-json"
-            ])
-            .is_err()
-        );
-        assert!(
+            ]),
+            Err(BuildError::InvalidRequest(_))
+        ));
+        assert!(matches!(
             build(&[
                 "raw",
                 "ax",
@@ -1773,9 +1897,9 @@ mod tests {
                 "AXValue",
                 "--value",
                 "not-json"
-            ])
-            .is_err()
-        );
+            ]),
+            Err(BuildError::InvalidRequest(_))
+        ));
     }
 
     #[test]
@@ -1902,6 +2026,8 @@ mod tests {
         assert!(healthy.contains("Manuvra doctor: ready"));
         assert!(healthy.contains("[granted] Accessibility"));
         assert!(healthy.contains("Next steps:\n  none"));
+        assert!(!healthy.contains("Enable the exact bundle path"));
+        assert!(!healthy.contains("TCC row"));
 
         let mut missing = doctor_fixture(false);
         missing["warnings"] = json!([
@@ -1913,6 +2039,13 @@ mod tests {
         assert!(missing.contains("Run `manuvra setup`"));
         assert!(missing.contains("legacy_state_detected"));
         assert!(missing.contains("Run `manuvra migrate --from computer-use`."));
+        assert!(missing.contains(
+            "Enable the exact bundle path `/opt/homebrew/opt/manuvra/libexec/Manuvra.app`."
+        ));
+        assert!(missing.contains(
+            "Other Manuvra.app copies share one TCC row for com.taecontrol.manuvra and stay missing."
+        ));
+        assert!(missing.contains("Do not grant a /tmp prefix"));
 
         let (error, _) = local_error("timed_out", "daemon did not answer");
         let rendered = render_doctor(&error);
@@ -1920,6 +2053,40 @@ mod tests {
         assert!(rendered.contains("daemon did not answer"));
         assert!(rendered.contains("Recovery: `"));
         assert!(rendered.contains("Help: `manuvra commands errors timed_out`"));
+    }
+
+    #[test]
+    fn doctor_renderer_shows_authority_and_designated_requirement_beside_cdhash() {
+        let mut doctor = doctor_fixture(true);
+        doctor["daemon"]["installation"]["cdhash"] = json!("abc123");
+        doctor["daemon"]["installation"]["authority"] = json!("Manuvra Local");
+        doctor["daemon"]["installation"]["designated_requirement"] =
+            json!("identifier \"com.taecontrol.manuvra\" and certificate leaf = H\"ABCD\"");
+        let rendered = render_doctor(&doctor);
+        assert!(rendered.contains("CDHash: abc123"));
+        assert!(rendered.contains("Authority: Manuvra Local"));
+        assert!(rendered.contains(
+            "Designated requirement: identifier \"com.taecontrol.manuvra\" and certificate leaf = H\"ABCD\""
+        ));
+
+        let mut adhoc = doctor_fixture(true);
+        adhoc["daemon"]["installation"]["cdhash"] = json!("def456");
+        adhoc["daemon"]["installation"]["authority"] = Value::Null;
+        adhoc["daemon"]["installation"]["designated_requirement"] = json!("cdhash H\"DEF456\"");
+        let rendered = render_doctor(&adhoc);
+        assert!(rendered.contains("CDHash: def456"));
+        assert!(rendered.contains("Authority: ad-hoc"));
+        assert!(rendered.contains("Designated requirement: cdhash H\"DEF456\""));
+
+        let mut missing_signature = doctor_fixture(true);
+        missing_signature["daemon"]["installation"]["cdhash"] = Value::Null;
+        missing_signature["daemon"]["installation"]["authority"] = Value::Null;
+        missing_signature["daemon"]["installation"]["designated_requirement"] = Value::Null;
+        let rendered = render_doctor(&missing_signature);
+        assert!(rendered.contains("CDHash: unavailable"));
+        assert!(rendered.contains("Authority: unavailable"));
+        assert!(rendered.contains("Designated requirement: unavailable"));
+        assert!(!rendered.contains("Authority: ad-hoc"));
     }
 
     #[test]
@@ -1969,6 +2136,17 @@ mod tests {
         assert!(rendered.contains("macOS consent is manual"));
         assert!(rendered.contains("/opt/homebrew/opt/manuvra/libexec/Manuvra.app"));
         assert!(rendered.contains("Run `manuvra doctor` again"));
+        assert!(rendered.contains(
+            "Enable the exact bundle path `/opt/homebrew/opt/manuvra/libexec/Manuvra.app`."
+        ));
+        assert!(rendered.contains(
+            "Other Manuvra.app copies share one TCC row for com.taecontrol.manuvra and stay missing."
+        ));
+        assert!(rendered.contains("Do not grant a /tmp prefix"));
+        assert!(rendered.contains("enable that exact path"));
+        assert!(rendered.contains("Accessibility"));
+        assert!(rendered.contains("Post Event (Accessibility pane)"));
+        assert!(!rendered.contains("Privacy & Security > Post Event"));
     }
 
     #[test]
@@ -1979,6 +2157,8 @@ mod tests {
         assert!(rendered.contains("permissions ready"));
         assert!(rendered.contains("No permission prompt or System Settings pane was needed"));
         assert!(!rendered.contains("Complete these steps"));
+        assert!(!rendered.contains("Enable the exact bundle path"));
+        assert!(!rendered.contains("TCC row"));
 
         let residual = setup_fixture(
             setup_fact(false, true, false),
@@ -1988,6 +2168,13 @@ mod tests {
         let rendered = render_setup(&residual);
         assert!(rendered.contains("development layouts have no canonical Manuvra.app path"));
         assert!(rendered.contains("this development layout has no bundle path to add"));
+        assert!(rendered.contains(
+            "Enable the exact bundle path printed by `manuvra doctor` once an installed bundle exists."
+        ));
+        assert!(rendered.contains(
+            "Other Manuvra.app copies share one TCC row for com.taecontrol.manuvra and stay missing."
+        ));
+        assert!(rendered.contains("Do not grant a /tmp prefix"));
         assert!(!rendered.contains("/Applications/Manuvra.app"));
 
         let mut installed_without_bundle = residual;
@@ -1996,5 +2183,37 @@ mod tests {
         assert!(rendered.contains("installed bundle path is unavailable"));
         assert!(rendered.contains("reinstall Manuvra"));
         assert!(!rendered.contains("this development layout has no bundle path to add"));
+    }
+
+    #[test]
+    fn permission_residual_lines_name_exact_bundle_and_shared_tcc_row() {
+        let mut doctor = doctor_fixture(false);
+        doctor["daemon"]["adapters"][0]["permissions"]["accessibility"] = json!(true);
+        doctor["daemon"]["adapters"][0]["permissions"]["post_event"] = json!(false);
+        let rendered = render_doctor(&doctor);
+        assert!(rendered.contains("[missing] Post Event (Accessibility pane)"));
+        assert!(rendered.contains(
+            "Enable the exact bundle path `/opt/homebrew/opt/manuvra/libexec/Manuvra.app`."
+        ));
+        assert!(rendered.contains("share one TCC row for com.taecontrol.manuvra"));
+        assert!(rendered.contains("Do not grant a /tmp prefix; extra copies steal that same row."));
+
+        let mut setup = setup_fixture(
+            setup_fact(true, false, true),
+            setup_fact(false, true, false),
+            setup_fact(true, false, true),
+        );
+        setup["installation"] = json!({
+            "installed": true,
+            "bundle": "/Users/me/Applications/Manuvra.app"
+        });
+        let rendered = render_setup(&setup);
+        assert!(
+            rendered.contains("Enable the exact bundle path `/Users/me/Applications/Manuvra.app`.")
+        );
+        assert!(rendered.contains("share one TCC row for com.taecontrol.manuvra"));
+        assert!(rendered.contains("Do not grant a /tmp prefix"));
+        assert!(rendered.contains("Screen & System Audio Recording"));
+        assert!(!rendered.contains("Privacy & Security > Accessibility"));
     }
 }

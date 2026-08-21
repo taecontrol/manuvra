@@ -258,6 +258,8 @@ mod tests {
                 target_id: session.target_id.clone(),
                 generation: session.target_generation,
                 kind: "macos".to_owned(),
+                owner: "Fixture".to_owned(),
+                title: Some("Window".to_owned()),
                 capabilities: Vec::new(),
             },
             snapshot: WindowSnapshot {

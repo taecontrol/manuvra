@@ -1137,15 +1137,26 @@ fn real_macos_public_background_and_foreground_vertical_slice() {
     let before_move = harness.screenshot_eventually(session);
     let before_move_state = fixture.snapshot();
     let native_before_move = harness.native_oracles().len();
-    fixture.command("move");
-    let refreshed = harness.success(&["targets", "--kind", "macos", "--limit", "10"]);
-    assert!(
-        refreshed["targets"]
+    let generation_before =
+        harness.success(&["targets", "--kind", "macos", "--limit", "10"])["targets"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|candidate| candidate["target_id"] == target),
-        "moved fixture target disappeared: {refreshed}"
+            .find(|candidate| candidate["target_id"] == target)
+            .and_then(|candidate| candidate["generation"].as_u64())
+            .expect("fixture target listed before move");
+    fixture.command("move");
+    let refreshed = harness.success(&["targets", "--kind", "macos", "--limit", "10"]);
+    let after_move_target = refreshed["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|candidate| candidate["target_id"] == target)
+        .unwrap_or_else(|| panic!("moved fixture target disappeared: {refreshed}"));
+    assert_eq!(
+        after_move_target["generation"].as_u64(),
+        Some(generation_before),
+        "move must not replace generation: {refreshed}"
     );
     let stale_frame = harness.error(&[
         "click",

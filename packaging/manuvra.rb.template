@@ -11,6 +11,7 @@ class Manuvra < Formula
 
   def install
     odie "Manuvra supports Apple Silicon only" unless Hardware::CPU.arm?
+    ENV.delete("MANUVRA_CODESIGN_IDENTITY")
     system "./scripts/package-manuvra.sh", "--prefix", prefix
   end
 

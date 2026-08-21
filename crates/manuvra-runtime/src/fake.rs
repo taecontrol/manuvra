@@ -175,6 +175,8 @@ fn fake_chrome() -> TargetDescriptor {
         target_id: "chrome_fake_1".to_owned(),
         generation: 1,
         kind: "chrome".to_owned(),
+        owner: "Chrome".to_owned(),
+        title: Some("Fake Chrome".to_owned()),
         capabilities: vec![
             "common.click",
             "common.type",
@@ -198,6 +200,8 @@ fn fake_macos() -> TargetDescriptor {
         target_id: "macos_fake_1".to_owned(),
         generation: 1,
         kind: "macos".to_owned(),
+        owner: "Fake".to_owned(),
+        title: Some("Fake Target".to_owned()),
         capabilities: vec![
             "common.click",
             "common.type",

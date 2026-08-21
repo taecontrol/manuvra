@@ -44,7 +44,7 @@
     "target_page": {
       "type": "object", "additionalProperties": false, "required": ["targets", "next_cursor"],
       "properties": {
-        "targets": { "type": "array", "maxItems": 10, "items": { "type": "object", "required": ["target_id", "generation", "kind", "capabilities", "actor_lease"], "properties": { "target_id": { "type": "string" }, "generation": { "type": "integer", "minimum": 1 }, "kind": { "enum": ["chrome", "macos"] }, "capabilities": { "type": "array", "items": { "type": "string" } }, "actor_lease": { "enum": ["available", "held"] } } } },
+        "targets": { "type": "array", "maxItems": 10, "items": { "type": "object", "additionalProperties": false, "required": ["target_id", "generation", "kind", "owner", "title", "capabilities", "actor_lease"], "properties": { "target_id": { "type": "string" }, "generation": { "type": "integer", "minimum": 1 }, "kind": { "enum": ["chrome", "macos"] }, "owner": { "type": "string", "minLength": 1, "maxLength": 256 }, "title": { "type": ["string", "null"], "minLength": 1, "maxLength": 256 }, "capabilities": { "type": "array", "items": { "type": "string" } }, "actor_lease": { "enum": ["available", "held"] } } } },
         "next_cursor": { "type": ["string", "null"], "maxLength": 256 }
       }
     },
