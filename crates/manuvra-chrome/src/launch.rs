@@ -11,6 +11,7 @@ pub const GOOGLE_CHROME_MACOS: &str =
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(200);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+const NEW_BLANK_PAGE_PATH: &str = "/json/new?about%3Ablank";
 
 #[derive(Debug, Clone)]
 pub struct LaunchRequest {
@@ -52,9 +53,10 @@ pub fn launch_dedicated_chrome(request: LaunchRequest) -> Result<Value, LaunchEr
     let deadline = Instant::now() + request.timeout;
     match probe(&request.endpoint, remaining(deadline)?) {
         Probe::Chrome { pages } if pages >= 1 => Ok(launch_result("reused", &request)),
-        Probe::Chrome { .. } => wait_for_page(&request, deadline, "reused"),
+        empty @ Probe::Chrome { .. } => wait_for_page(&request, deadline, "reused", empty),
         Probe::Occupied(message) => Err(LaunchError::EndpointBusy(message)),
         Probe::Refused => spawn_and_wait(&request, deadline),
+        transient @ Probe::Transient => wait_for_page(&request, deadline, "reused", transient),
     }
 }
 
@@ -67,7 +69,7 @@ fn spawn_and_wait(request: &LaunchRequest, deadline: Instant) -> Result<Value, L
     }
     ensure_private_directory(&request.profile)?;
     spawn_detached_chrome(request)?;
-    wait_for_page(request, deadline, "launched")
+    wait_for_page(request, deadline, "launched", Probe::Refused)
 }
 
 fn ensure_private_directory(path: &Path) -> Result<(), LaunchError> {
@@ -127,15 +129,26 @@ fn wait_for_page(
     request: &LaunchRequest,
     deadline: Instant,
     state: &str,
+    mut current: Probe,
 ) -> Result<Value, LaunchError> {
+    let mut creation_attempted = false;
     loop {
-        let timeout = remaining(deadline)?;
-        match probe(&request.endpoint, timeout.min(PROBE_TIMEOUT)) {
+        match current {
             Probe::Chrome { pages } if pages >= 1 => return Ok(launch_result(state, request)),
-            Probe::Chrome { .. } | Probe::Refused | Probe::Occupied(_) => {
+            Probe::Occupied(message) => return Err(LaunchError::EndpointBusy(message)),
+            Probe::Chrome { .. } if !creation_attempted => {
+                // Mark before dispatch because every response failure is ambiguous:
+                // Chrome may have created the page. Never replay this mutation.
+                creation_attempted = true;
+                let timeout = remaining(deadline)?.min(PROBE_TIMEOUT);
+                let _ = request.endpoint.put_json(NEW_BLANK_PAGE_PATH, timeout);
+            }
+            Probe::Chrome { .. } | Probe::Refused | Probe::Transient => {
                 thread::sleep(POLL_INTERVAL.min(remaining(deadline)?));
             }
         }
+        let timeout = remaining(deadline)?.min(PROBE_TIMEOUT);
+        current = probe(&request.endpoint, timeout);
     }
 }
 
@@ -149,12 +162,13 @@ fn launch_result(state: &str, request: &LaunchRequest) -> Value {
 
 enum Probe {
     Refused,
+    Transient,
     Chrome { pages: usize },
     Occupied(String),
 }
 
 fn probe(endpoint: &Endpoint, timeout: Duration) -> Probe {
-    match endpoint.get_json("/json/list", timeout) {
+    match endpoint.get_json_for_probe("/json/list", timeout) {
         Ok(value) => match discoverable_page_count(&value) {
             Some(pages) => Probe::Chrome { pages },
             None => Probe::Occupied(
@@ -162,6 +176,7 @@ fn probe(endpoint: &Endpoint, timeout: Duration) -> Probe {
             ),
         },
         Err(error) if error.is_connection_refused() => Probe::Refused,
+        Err(error) if error.is_transient() => Probe::Transient,
         Err(error) => Probe::Occupied(error.to_string()),
     }
 }
@@ -199,7 +214,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct ListServer {
         address: std::net::SocketAddr,
@@ -210,10 +225,6 @@ mod tests {
     impl ListServer {
         fn start(body: Vec<u8>, status: &'static str) -> Self {
             Self::bind(TcpListener::bind("127.0.0.1:0").unwrap(), body, status)
-        }
-
-        fn start_at(address: std::net::SocketAddr, body: Vec<u8>, status: &'static str) -> Self {
-            Self::bind(TcpListener::bind(address).unwrap(), body, status)
         }
 
         fn bind(listener: TcpListener, body: Vec<u8>, status: &'static str) -> Self {
@@ -260,35 +271,166 @@ mod tests {
         }
     }
 
-    fn request_for(endpoint: Endpoint, root: &Path) -> LaunchRequest {
-        LaunchRequest {
-            endpoint,
-            profile: root.join("chrome-dedicated"),
-            binary: root.join("missing-chrome"),
-            timeout: Duration::from_millis(400),
+    #[derive(Clone, Copy)]
+    enum RecoveryMode {
+        ExistingPage,
+        CreateSucceeds,
+        CreateResponseIsAmbiguous,
+        TransientListReadAfterCreate,
+        MalformedAfterCreate,
+    }
+
+    struct RecoveryServer {
+        address: std::net::SocketAddr,
+        create_requests: Arc<AtomicUsize>,
+        list_requests: Arc<AtomicUsize>,
+        stop: Arc<AtomicBool>,
+        worker: Option<thread::JoinHandle<()>>,
+    }
+
+    impl RecoveryServer {
+        fn start(mode: RecoveryMode) -> Self {
+            Self::bind(TcpListener::bind("127.0.0.1:0").unwrap(), mode)
+        }
+
+        fn start_at(address: std::net::SocketAddr, mode: RecoveryMode) -> Self {
+            Self::bind(TcpListener::bind(address).unwrap(), mode)
+        }
+
+        fn bind(listener: TcpListener, mode: RecoveryMode) -> Self {
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let create_requests = Arc::new(AtomicUsize::new(0));
+            let worker_create_requests = create_requests.clone();
+            let list_requests = Arc::new(AtomicUsize::new(0));
+            let worker_list_requests = list_requests.clone();
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_stop = stop.clone();
+            let created = Arc::new(AtomicBool::new(false));
+            let worker_created = created.clone();
+            let worker = thread::spawn(move || {
+                while !worker_stop.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let _ = stream.set_nonblocking(false);
+                            let mut request = [0_u8; 1024];
+                            let count = stream.read(&mut request).unwrap_or_default();
+                            let request = String::from_utf8_lossy(&request[..count]);
+                            let request_line = request.lines().next().unwrap_or_default();
+                            if request_line == "PUT /json/new?about%3Ablank HTTP/1.1" {
+                                worker_create_requests.fetch_add(1, Ordering::SeqCst);
+                                worker_created.store(true, Ordering::SeqCst);
+                                if matches!(mode, RecoveryMode::CreateResponseIsAmbiguous) {
+                                    continue;
+                                }
+                                write_json_response(&mut stream, &page_body());
+                            } else if request_line == "GET /json/list HTTP/1.1" {
+                                let list_request =
+                                    worker_list_requests.fetch_add(1, Ordering::SeqCst) + 1;
+                                if matches!(mode, RecoveryMode::TransientListReadAfterCreate)
+                                    && worker_created.load(Ordering::SeqCst)
+                                    && list_request == 2
+                                {
+                                    thread::sleep(PROBE_TIMEOUT.saturating_mul(2));
+                                    continue;
+                                }
+                                let body = match mode {
+                                    RecoveryMode::ExistingPage => page_body(),
+                                    RecoveryMode::MalformedAfterCreate
+                                        if worker_created.load(Ordering::SeqCst) =>
+                                    {
+                                        b"not-chrome".to_vec()
+                                    }
+                                    _ if worker_created.load(Ordering::SeqCst) => page_body(),
+                                    _ => b"[]".to_vec(),
+                                };
+                                write_json_response(&mut stream, &body);
+                            } else {
+                                let _ = write!(
+                                    stream,
+                                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                                );
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                address,
+                create_requests,
+                list_requests,
+                stop,
+                worker: Some(worker),
+            }
+        }
+
+        fn create_request_count(&self) -> usize {
+            self.create_requests.load(Ordering::SeqCst)
+        }
+
+        fn list_request_count(&self) -> usize {
+            self.list_requests.load(Ordering::SeqCst)
         }
     }
 
-    #[test]
-    fn launch_reuses_an_answering_chrome_list_without_spawning() {
-        let body = serde_json::to_vec(&json!([{
+    impl Drop for RecoveryServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    fn page_body() -> Vec<u8> {
+        serde_json::to_vec(&json!([{
             "id": "page-1",
             "type": "page",
             "title": "Fixture",
             "webSocketDebuggerUrl": "ws://127.0.0.1:0/devtools/page/abc"
         }]))
-        .unwrap();
-        let server = ListServer::start(body, "200 OK");
+        .unwrap()
+    }
+
+    fn write_json_response(stream: &mut impl Write, body: &[u8]) {
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(body);
+    }
+
+    fn request_for(endpoint: Endpoint, root: &Path) -> LaunchRequest {
+        LaunchRequest {
+            endpoint,
+            profile: root.join("chrome-dedicated"),
+            binary: root.join("missing-chrome"),
+            timeout: Duration::from_secs(2),
+        }
+    }
+
+    #[test]
+    fn launch_reuses_an_answering_chrome_list_without_spawning() {
+        let server = RecoveryServer::start(RecoveryMode::ExistingPage);
         let endpoint = Endpoint::parse(&server.address.to_string()).unwrap();
         let temp = tempfile::tempdir().unwrap();
         let result = launch_dedicated_chrome(request_for(endpoint.clone(), temp.path())).unwrap();
-        assert_eq!(result["state"], "reused");
-        assert_eq!(result["endpoint"], endpoint.label());
         assert_eq!(
-            result["profile"].as_str().unwrap(),
-            temp.path().join("chrome-dedicated").to_str().unwrap()
+            result,
+            json!({
+                "state": "reused",
+                "endpoint": endpoint.label(),
+                "profile": temp.path().join("chrome-dedicated"),
+            })
         );
         assert!(!temp.path().join("missing-chrome").exists());
+        assert_eq!(server.create_request_count(), 0);
+        assert_eq!(server.list_request_count(), 1);
     }
 
     #[test]
@@ -301,14 +443,49 @@ mod tests {
     }
 
     #[test]
-    fn empty_chrome_list_times_out_without_spawning() {
-        let server = ListServer::start(b"[]".to_vec(), "200 OK");
+    fn empty_chrome_list_creates_one_blank_page_and_reuses_endpoint() {
+        let server = RecoveryServer::start(RecoveryMode::CreateSucceeds);
+        let endpoint = Endpoint::parse(&server.address.to_string()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let result = launch_dedicated_chrome(request_for(endpoint, temp.path())).unwrap();
+        assert_eq!(result["state"], "reused");
+        assert_eq!(server.create_request_count(), 1);
+        assert_eq!(server.list_request_count(), 2);
+        assert!(!temp.path().join("chrome-dedicated").exists());
+        assert!(!temp.path().join("missing-chrome").exists());
+    }
+
+    #[test]
+    fn ambiguous_create_response_is_not_retried() {
+        let server = RecoveryServer::start(RecoveryMode::CreateResponseIsAmbiguous);
+        let endpoint = Endpoint::parse(&server.address.to_string()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let result = launch_dedicated_chrome(request_for(endpoint, temp.path())).unwrap();
+        assert_eq!(result["state"], "reused");
+        assert_eq!(server.create_request_count(), 1);
+        assert_eq!(server.list_request_count(), 2);
+    }
+
+    #[test]
+    fn transient_list_read_after_creation_retries_discovery_without_recreating() {
+        let server = RecoveryServer::start(RecoveryMode::TransientListReadAfterCreate);
+        let endpoint = Endpoint::parse(&server.address.to_string()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let result = launch_dedicated_chrome(request_for(endpoint, temp.path())).unwrap();
+        assert_eq!(result["state"], "reused");
+        assert_eq!(server.create_request_count(), 1);
+        assert_eq!(server.list_request_count(), 3);
+    }
+
+    #[test]
+    fn malformed_endpoint_after_creation_fails_promptly_without_retry() {
+        let server = RecoveryServer::start(RecoveryMode::MalformedAfterCreate);
         let endpoint = Endpoint::parse(&server.address.to_string()).unwrap();
         let temp = tempfile::tempdir().unwrap();
         let error = launch_dedicated_chrome(request_for(endpoint, temp.path())).unwrap_err();
-        assert_eq!(error.catalog_code(), "timed_out");
-        assert!(!temp.path().join("chrome-dedicated").exists());
-        assert!(!temp.path().join("missing-chrome").exists());
+        assert_eq!(error.catalog_code(), "chrome_endpoint_busy");
+        assert_eq!(server.create_request_count(), 1);
+        assert_eq!(server.list_request_count(), 2);
     }
 
     #[test]
@@ -348,23 +525,19 @@ mod tests {
     }
 
     #[test]
-    fn launch_spawns_when_the_endpoint_is_refused_and_returns_launched() {
+    fn launch_recovers_an_empty_endpoint_after_spawning_and_returns_launched() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
         let endpoint = Endpoint::parse(&address.to_string()).unwrap();
-        let body = serde_json::to_vec(&json!([{
-            "id": "page-1",
-            "type": "page",
-            "webSocketDebuggerUrl": "ws://127.0.0.1/devtools/page/abc"
-        }]))
-        .unwrap();
         let server = Arc::new(std::sync::Mutex::new(None));
         let delayed = server.clone();
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(80));
-            *delayed.lock().expect("delayed list server") =
-                Some(ListServer::start_at(address, body, "200 OK"));
+            *delayed.lock().expect("delayed list server") = Some(RecoveryServer::start_at(
+                address,
+                RecoveryMode::CreateSucceeds,
+            ));
         });
         let temp = tempfile::tempdir().unwrap();
         let profile = temp.path().join("chrome-dedicated");
@@ -375,13 +548,18 @@ mod tests {
             timeout: Duration::from_secs(2),
         })
         .unwrap();
-        drop(server);
-        assert_eq!(result["state"], "launched");
-        assert_eq!(result["endpoint"], endpoint.label());
         assert_eq!(
-            result["profile"].as_str().unwrap(),
-            profile.to_str().unwrap()
+            result,
+            json!({
+                "state": "launched",
+                "endpoint": endpoint.label(),
+                "profile": profile,
+            })
         );
+        let server = server.lock().expect("recovery server");
+        let server = server.as_ref().expect("recovery server started");
+        assert_eq!(server.create_request_count(), 1);
+        assert_eq!(server.list_request_count(), 2);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

@@ -58,20 +58,87 @@ impl Endpoint {
     }
 
     pub fn get_json(&self, path: &str, timeout: Duration) -> Result<Value, EndpointError> {
-        let mut stream = TcpStream::connect_timeout(&self.address, timeout)
-            .map_err(|error| EndpointError::Io(error.to_string()))?;
+        self.request_json("GET", path, timeout)
+            .map_err(RequestFailure::into_endpoint)
+    }
+
+    pub(crate) fn get_json_for_probe(
+        &self,
+        path: &str,
+        timeout: Duration,
+    ) -> Result<Value, RequestFailure> {
+        self.request_json("GET", path, timeout)
+    }
+
+    pub(crate) fn put_json(&self, path: &str, timeout: Duration) -> Result<Value, EndpointError> {
+        self.request_json("PUT", path, timeout)
+            .map_err(RequestFailure::into_endpoint)
+    }
+
+    fn request_json(
+        &self,
+        method: &str,
+        path: &str,
+        timeout: Duration,
+    ) -> Result<Value, RequestFailure> {
+        let mut stream =
+            TcpStream::connect_timeout(&self.address, timeout).map_err(RequestFailure::io)?;
         stream
             .set_read_timeout(Some(timeout))
             .and_then(|()| stream.set_write_timeout(Some(timeout)))
-            .map_err(|error| EndpointError::Io(error.to_string()))?;
+            .map_err(RequestFailure::io)?;
         let host = self.label();
         write!(
             stream,
-            "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nAccept: application/json\r\n\r\n"
+            "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nAccept: application/json\r\n\r\n"
         )
-        .map_err(|error| EndpointError::Io(error.to_string()))?;
+        .map_err(RequestFailure::io)?;
         let response = read_response(&mut stream)?;
-        parse_http_json(&response)
+        parse_http_json(&response).map_err(RequestFailure::definitive)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RequestFailure {
+    error: EndpointError,
+    transient: bool,
+}
+
+impl RequestFailure {
+    fn io(error: std::io::Error) -> Self {
+        let transient = matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        );
+        Self {
+            error: EndpointError::Io(error.to_string()),
+            transient,
+        }
+    }
+
+    fn definitive(error: EndpointError) -> Self {
+        Self {
+            error,
+            transient: false,
+        }
+    }
+
+    fn into_endpoint(self) -> EndpointError {
+        self.error
+    }
+
+    pub(crate) fn is_connection_refused(&self) -> bool {
+        self.error.is_connection_refused()
+    }
+
+    pub(crate) fn is_transient(&self) -> bool {
+        self.transient
+    }
+}
+
+impl std::fmt::Display for RequestFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, formatter)
     }
 }
 
@@ -89,7 +156,7 @@ fn push_configured_endpoint(
     Ok(())
 }
 
-fn read_response(stream: &mut TcpStream) -> Result<Vec<u8>, EndpointError> {
+fn read_response(stream: &mut TcpStream) -> Result<Vec<u8>, RequestFailure> {
     let mut response = Vec::new();
     let mut chunk = [0_u8; 8192];
     while read_discovery_chunk(stream, &mut response, &mut chunk)? {}
@@ -100,19 +167,19 @@ fn read_discovery_chunk(
     stream: &mut TcpStream,
     response: &mut Vec<u8>,
     chunk: &mut [u8],
-) -> Result<bool, EndpointError> {
+) -> Result<bool, RequestFailure> {
     match stream.read(chunk) {
         Ok(0) => Ok(false),
         Ok(count) => Ok(!append_discovery_bytes(response, &chunk[..count])?),
         Err(error) if discovery_read_is_complete(response, &error) => Ok(false),
-        Err(error) => Err(EndpointError::Io(error.to_string())),
+        Err(error) => Err(RequestFailure::io(error)),
     }
 }
 
-fn append_discovery_bytes(response: &mut Vec<u8>, chunk: &[u8]) -> Result<bool, EndpointError> {
+fn append_discovery_bytes(response: &mut Vec<u8>, chunk: &[u8]) -> Result<bool, RequestFailure> {
     response.extend_from_slice(chunk);
     if response.len() > MAX_DISCOVERY_BYTES {
-        return Err(EndpointError::TooLarge);
+        return Err(RequestFailure::definitive(EndpointError::TooLarge));
     }
     Ok(response_complete(response))
 }
