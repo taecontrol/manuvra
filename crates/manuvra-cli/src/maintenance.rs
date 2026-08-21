@@ -141,6 +141,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn empty_owned_destination_is_accepted_and_populated_destination_is_rejected() {
+        let temporary = tempfile::tempdir().unwrap();
+        let empty = temporary.path().join("empty");
+        fs::create_dir(&empty).unwrap();
+        validate_empty_destination(&empty).unwrap();
+
+        fs::write(empty.join("keep.json"), b"{}").unwrap();
+        let error = validate_empty_destination(&empty).unwrap_err();
+        assert!(error.contains("destination already contains data"));
+        assert!(empty.join("keep.json").is_file());
+
+        let file = temporary.path().join("file");
+        fs::write(&file, b"not a directory").unwrap();
+        assert!(validate_empty_destination(&file).is_err());
+    }
+
+    #[test]
     fn copy_rejects_symlinks_and_preserves_source() {
         use std::os::unix::fs::symlink;
         let temporary = tempfile::tempdir().unwrap();

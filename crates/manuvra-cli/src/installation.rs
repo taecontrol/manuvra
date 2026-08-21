@@ -18,16 +18,27 @@ pub struct Installation {
 impl Installation {
     pub fn current() -> Result<Self, InstallationError> {
         let executable = fs::canonicalize(std::env::current_exe()?)?;
-        if let Some(installed) = Self::from_installed_executable(executable.clone())? {
-            installed.verify()?;
-            return Ok(installed);
+        Self::from_canonical_executable(executable)
+    }
+
+    fn from_canonical_executable(executable: PathBuf) -> Result<Self, InstallationError> {
+        match Self::from_installed_executable(executable.clone())? {
+            Some(installed) => {
+                installed.verify()?;
+                Ok(installed)
+            }
+            None => Self::development_layout(executable),
         }
+    }
+
+    fn development_layout(executable: PathBuf) -> Result<Self, InstallationError> {
         if cfg!(debug_assertions) {
-            return Self::development(executable);
+            Self::development(executable)
+        } else {
+            Err(InstallationError::InvalidLayout(
+                "release executable must be inside Manuvra.app/Contents/MacOS".to_owned(),
+            ))
         }
-        Err(InstallationError::InvalidLayout(
-            "release executable must be inside Manuvra.app/Contents/MacOS".to_owned(),
-        ))
     }
 
     fn from_installed_executable(executable: PathBuf) -> Result<Option<Self>, InstallationError> {
@@ -378,10 +389,9 @@ mod tests {
         )
         .unwrap();
 
-        let installation = Installation::from_installed_executable(executable.clone())
-            .unwrap()
-            .unwrap();
+        let installation = Installation::from_canonical_executable(executable.clone()).unwrap();
         installation.verify().unwrap();
+        assert!(installation.installed);
         assert!(
             Installation::from_installed_executable(macos.join("other"))
                 .unwrap()
@@ -401,6 +411,18 @@ mod tests {
 
         fs::write(bundle.join("Contents/Info.plist"), "incomplete").unwrap();
         assert!(installation.verify().is_err());
+    }
+
+    #[test]
+    fn current_development_layout_resolves_the_running_executable() {
+        let installation = Installation::current().unwrap();
+        assert!(!installation.installed);
+        assert!(installation.bundle.is_none());
+        assert_eq!(
+            installation.executable,
+            fs::canonicalize(std::env::current_exe().unwrap()).unwrap()
+        );
+        assert!(installation.resources.is_dir());
     }
 
     #[test]

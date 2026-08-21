@@ -1,7 +1,10 @@
-use serde_json::Value;
+use manuvra_protocol::{
+    CONTROL_PROTOCOL, ControlAction, ControlRequest, ControlResponse, read_frame, write_frame,
+};
+use serde_json::{Value, json};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
@@ -576,4 +579,159 @@ fn public_deadline_returns_the_typed_terminal_result_before_transport_closes() {
     let terminal: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(terminal["error"]["code"], "timed_out");
     assert_eq!(terminal["outcome"], "uncertain");
+}
+
+#[test]
+fn remote_command_without_daemon_reports_disabled_autostart() {
+    let root = tempfile::tempdir().unwrap();
+    let output = Command::new(CLI)
+        .args(["targets"])
+        .env("MANUVRA_TMPDIR", root.path().join("tmp"))
+        .env("MANUVRA_CONFIG_HOME", root.path().join("config"))
+        .env("MANUVRA_NO_AUTOSTART", "1")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(70));
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["error"]["code"], "internal_error");
+    assert!(
+        result["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("autostart is disabled")
+    );
+}
+
+#[test]
+fn remote_command_autostarts_the_daemon_when_the_socket_is_absent() {
+    let root = tempfile::tempdir().unwrap();
+    let temporary = root.path().join("tmp");
+    let config = root.path().join("config");
+    fs::create_dir_all(&temporary).unwrap();
+    let output = Command::new(CLI)
+        .args(["targets"])
+        .env("MANUVRA_TMPDIR", &temporary)
+        .env("MANUVRA_CONFIG_HOME", &config)
+        .env("MANUVRA_TEST_FAKE_ADAPTER", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr={} stdout={}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let targets: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(!targets["targets"].as_array().unwrap().is_empty());
+
+    let stopped = Command::new(CLI)
+        .args(["daemon", "stop"])
+        .env("MANUVRA_TMPDIR", &temporary)
+        .env("MANUVRA_CONFIG_HOME", &config)
+        .env("MANUVRA_NO_AUTOSTART", "1")
+        .output()
+        .unwrap();
+    assert!(
+        stopped.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+}
+
+#[test]
+fn invoke_replaces_a_daemon_that_reports_a_different_build_id() {
+    let root = tempfile::tempdir().unwrap();
+    let temporary = root.path().join("tmp");
+    let config = root.path().join("config");
+    let runtime = temporary.join("manuvra/runtime-v1");
+    fs::create_dir_all(&runtime).unwrap();
+    let socket_path = runtime.join("daemon.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    let worker_socket = socket_path.clone();
+    let worker = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request: ControlRequest = read_frame(&mut stream).unwrap();
+        assert_eq!(request.action, ControlAction::Status);
+        write_frame(
+            &mut stream,
+            &ControlResponse {
+                control_protocol: CONTROL_PROTOCOL,
+                request_id: request.request_id,
+                ok: true,
+                daemon: json!({"running": true, "build_id": "not-this-build"}),
+                error: None,
+            },
+        )
+        .unwrap();
+        drop(stream);
+
+        let (mut stream, _) = listener.accept().unwrap();
+        let request: ControlRequest = read_frame(&mut stream).unwrap();
+        assert_eq!(request.action, ControlAction::Stop);
+        write_frame(
+            &mut stream,
+            &ControlResponse {
+                control_protocol: CONTROL_PROTOCOL,
+                request_id: request.request_id,
+                ok: true,
+                daemon: json!({"running": true, "stopped": true}),
+                error: None,
+            },
+        )
+        .unwrap();
+        drop(stream);
+        drop(listener);
+        fs::remove_file(&worker_socket).unwrap();
+    });
+
+    let output = Command::new(CLI)
+        .args(["targets"])
+        .env("MANUVRA_TMPDIR", &temporary)
+        .env("MANUVRA_CONFIG_HOME", &config)
+        .env("MANUVRA_TEST_FAKE_ADAPTER", "1")
+        .output()
+        .unwrap();
+    worker.join().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr={} stdout={}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let targets: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(!targets["targets"].as_array().unwrap().is_empty());
+
+    let _ = Command::new(CLI)
+        .args(["daemon", "stop"])
+        .env("MANUVRA_TMPDIR", &temporary)
+        .env("MANUVRA_CONFIG_HOME", &config)
+        .env("MANUVRA_NO_AUTOSTART", "1")
+        .output()
+        .unwrap();
+}
+
+#[test]
+fn daemon_exits_after_the_test_idle_timeout() {
+    let root = tempfile::tempdir().unwrap();
+    let temporary = root.path().join("tmp");
+    fs::create_dir_all(&temporary).unwrap();
+    let mut daemon = Command::new(DAEMON)
+        .env("MANUVRA_TMPDIR", &temporary)
+        .env("MANUVRA_CONFIG_HOME", root.path().join("config"))
+        .env("MANUVRA_TEST_FAKE_ADAPTER", "1")
+        .env("MANUVRA_TEST_IDLE_MS", "50")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for_socket(&temporary.join("manuvra/runtime-v1/daemon.sock"));
+    let status = daemon.wait().unwrap();
+    assert!(status.success());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let socket = temporary.join("manuvra/runtime-v1/daemon.sock");
+    while socket.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!socket.exists());
 }

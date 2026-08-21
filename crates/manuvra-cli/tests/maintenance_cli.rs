@@ -35,6 +35,13 @@ fn explicit_migration_preserves_source_and_purge_requires_confirmation() {
     fs::create_dir_all(export.parent().unwrap()).unwrap();
     fs::write(&export, b"evidence").unwrap();
 
+    let missing_all = run(root.path(), &["purge", "--yes"]);
+    assert_eq!(missing_all.status.code(), Some(2));
+    let missing_all: Value = serde_json::from_slice(&missing_all.stdout).unwrap();
+    assert_eq!(missing_all["error"]["code"], "invalid_request");
+    assert_eq!(missing_all["error"]["message"], "purge requires --all");
+    assert!(root.path().join("config").exists());
+
     let unconfirmed = run(root.path(), &["purge", "--all"]);
     assert_eq!(unconfirmed.status.code(), Some(2));
     assert!(root.path().join("config").exists());
