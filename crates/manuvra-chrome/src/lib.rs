@@ -1,8 +1,10 @@
 mod endpoint;
+pub mod launch;
 mod page;
 mod transport;
 
 pub use endpoint::{Endpoint, EndpointError};
+pub use launch::{GOOGLE_CHROME_MACOS, LaunchError, LaunchRequest, launch_dedicated_chrome};
 
 use endpoint::Endpoint as ChromeEndpoint;
 use manuvra_runtime::{
@@ -104,7 +106,12 @@ impl ChromeAdapter {
                     discovered.extend(targets);
                 }
                 Err(error) => {
-                    diagnostics.insert(endpoint.label(), bounded(&error));
+                    let status = if endpoint::connection_refused_text(&error) {
+                        "refused".to_owned()
+                    } else {
+                        bounded(&error)
+                    };
+                    diagnostics.insert(endpoint.label(), status);
                 }
             }
         }
@@ -674,7 +681,7 @@ fn bounded(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use manuvra_runtime::ExecutionMode;
+    use manuvra_runtime::{ExecutionMode, TargetAdapter};
     use std::time::Instant;
 
     #[test]
@@ -865,6 +872,45 @@ mod tests {
                 .unwrap_err()
                 .code,
             "element_stale"
+        );
+    }
+
+    #[test]
+    fn chrome_diagnostics_classify_a_refused_loopback_endpoint() {
+        let adapter = ChromeAdapter::new(vec![Endpoint::parse("127.0.0.1:1").unwrap()]);
+        let diagnostics = adapter.diagnostics();
+        assert_eq!(diagnostics["kind"], "chrome");
+        assert_eq!(diagnostics["endpoints"]["127.0.0.1:1"], "refused");
+    }
+
+    #[test]
+    fn doctor_warns_when_the_chrome_endpoint_is_refused() {
+        use manuvra_protocol::Invocation;
+        use manuvra_runtime::{InteractionModule, Runtime, RuntimeConfig};
+
+        let adapter = ChromeAdapter::new(vec![Endpoint::parse("127.0.0.1:1").unwrap()]);
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(
+            RuntimeConfig {
+                temporary_root: temp.path().join("tmp"),
+                config_root: temp.path().join("config"),
+            },
+            vec![std::sync::Arc::new(adapter)],
+        )
+        .unwrap();
+        let reply = runtime.invoke(Invocation::new(
+            "system.doctor",
+            json!({}),
+            "chrome-refused".to_owned(),
+            2_000,
+        ));
+        let warnings = reply.value["warnings"].as_array().expect("doctor warnings");
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning == "chrome_endpoint_refused"),
+            "{}",
+            reply.value
         );
     }
 }

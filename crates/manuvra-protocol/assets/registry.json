@@ -369,6 +369,21 @@
       "since": "1.0.0"
     },
     {
+      "id": "system.chrome.launch",
+      "cli": ["chrome", "launch"],
+      "summary": "Launch a dedicated visible Chrome with loopback CDP, or reuse one already answering there.",
+      "effect": "lifecycle",
+      "authority": "none",
+      "modes": [],
+      "default_timeout_ms": 15000,
+      "maximum_timeout_ms": 120000,
+      "capabilities": [],
+      "input_schema": "./schemas/command-inputs.schema.json#/$defs/empty",
+      "result_schema": "./schemas/command-results.schema.json#/$defs/chrome_launch",
+      "examples": [{ "cli": "manuvra chrome launch", "input": {} }],
+      "since": "1.0.0"
+    },
+    {
       "id": "daemon.status",
       "cli": ["daemon", "status"],
       "summary": "Report same-user daemon identity, compatibility, admission, sessions, and in-flight work without touching a target.",

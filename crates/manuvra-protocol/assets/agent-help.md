@@ -68,6 +68,13 @@ Homebrew bottles stay ad-hoc (`codesign --sign -`); the formula deletes `MANUVRA
 
 Inspect adapter permission facts only on a successful `manuvra doctor` JSON object that contains `daemon.adapters`. If that array is missing, wait and rerun `doctor`. `manuvra daemon status` is not a doctor document.
 
+Chrome discovery uses a loopback CDP endpoint (`127.0.0.1:9222` by default). If that endpoint is refused, run `manuvra chrome launch` to start a dedicated visible Chrome. `targets`, `doctor`, and `open` do not launch Chrome.
+
+```bash
+manuvra chrome launch
+manuvra targets --kind chrome
+```
+
 Inspect or stop the daemon without target work:
 
 ```bash
@@ -182,11 +189,14 @@ Query normalized accessibility semantics:
 manuvra observe query --session <session-id> --role button --name Save
 ```
 
-Matching is exact. Zero matches return `element_not_found`; multiple matches return `ambiguous_target`. The tool never chooses a fuzzy or ordinal winner. Observe and use the returned exact reference instead:
+Matching is exact. Zero matches return `element_not_found`; multiple matches return `ambiguous_target`. The tool never chooses a fuzzy or ordinal winner. If a semantic query or click is ambiguous, narrow with `--within-role` / `--within-name`, or click a returned exact reference. Do not retry the same unconstrained semantic click.
 
 ```bash
+manuvra click --session <session-id> --within-role region --within-name Primary --role button --name Save
 manuvra click --session <session-id> --ref <element-ref>
 ```
+
+`observe query` matches include `description` when the backend exposes one.
 
 Write the complete accessibility tree:
 
@@ -217,6 +227,8 @@ manuvra navigate --session <session-id> --url https://example.test/account
 ```
 
 Every mutation uses the session's default mode unless `--mode background|foreground` overrides that invocation. The override never changes the session default.
+
+If a click was meant to navigate, observe (query and/or screenshot) before the next mutation. `observed` means the backend confirmed the click and post-state was captured, not that navigation succeeded.
 
 `type` always requires an explicit locator. It never writes to whichever control happens to own global focus.
 
@@ -325,7 +337,10 @@ The only durable tool-managed state lives under `~/.config/manuvra/`:
 ```text
 config.json
 usage.json
+chrome-dedicated/
 ```
+
+`chrome-dedicated/` is the dedicated Chrome user-data-dir created by `manuvra chrome launch`. The daily Chrome default profile is not used, overwritten, or quit.
 
 `config.json` stores the opt-in flag, which defaults false. `usage.json` stores only schema version and aggregate counters keyed by backend, operation name, declared intent, grouped outcome, and count. It must never store raw parameters, values, scripts, URLs, entered text, selectors, references, target/application identity, native messages, invocation records, or precise timestamps.
 

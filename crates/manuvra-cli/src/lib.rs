@@ -1,6 +1,8 @@
+mod chrome;
 mod installation;
 mod maintenance;
 
+pub use chrome::chrome_launch;
 pub use installation::{Installation, InstallationError};
 pub use maintenance::{legacy_config_root, migrate_legacy, purge_owned_roots};
 

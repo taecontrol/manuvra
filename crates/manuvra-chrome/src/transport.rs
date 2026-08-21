@@ -423,14 +423,18 @@ pub fn is_relevant_event(event: &JournalEvent) -> bool {
                 "Page.frameNavigated"
                     | "Page.frameAttached"
                     | "Page.frameDetached"
-                    | "Page.lifecycleEvent"
                     | "Page.domContentEventFired"
                     | "Page.loadEventFired"
-                    | "Network.requestWillBeSent"
-                    | "Network.loadingFinished"
-                    | "Network.loadingFailed"
             )
+            || (method == "Page.lifecycleEvent" && !is_network_lifecycle(event))
     })
+}
+
+fn is_network_lifecycle(event: &JournalEvent) -> bool {
+    matches!(
+        event_params(event).get("name").and_then(Value::as_str),
+        Some("networkIdle" | "networkAlmostIdle")
+    )
 }
 
 #[cfg(test)]
@@ -496,5 +500,49 @@ mod tests {
         let snapshot = journal.snapshot_since(0);
         assert!(snapshot.overflowed);
         assert_eq!(snapshot.events.len(), MAX_EVENTS);
+    }
+
+    #[test]
+    fn relevant_events_are_page_dom_and_ax_not_network() {
+        let relevant = [
+            "DOM.childNodeInserted",
+            "Accessibility.loadComplete",
+            "Page.frameNavigated",
+            "Page.lifecycleEvent",
+            "Page.loadEventFired",
+        ];
+        for method in relevant {
+            assert!(
+                is_relevant_event(&journal_event(method, json!({}))),
+                "{method} should reset the quiet window"
+            );
+        }
+        assert!(is_relevant_event(&journal_event(
+            "Page.lifecycleEvent",
+            json!({"name": "DOMContentLoaded"})
+        )));
+        for event in [
+            journal_event("Network.requestWillBeSent", json!({})),
+            journal_event("Network.loadingFinished", json!({})),
+            journal_event("Network.loadingFailed", json!({})),
+            journal_event("Runtime.consoleAPICalled", json!({})),
+            journal_event("Page.lifecycleEvent", json!({"name": "networkIdle"})),
+            journal_event("Page.lifecycleEvent", json!({"name": "networkAlmostIdle"})),
+        ] {
+            assert!(
+                !is_relevant_event(&event),
+                "{} must not reset the quiet window",
+                event_method(&event).unwrap_or("event")
+            );
+        }
+    }
+
+    fn journal_event(method: &str, params: Value) -> JournalEvent {
+        JournalEvent {
+            cursor: 1,
+            action_sequence: 0,
+            received_ms: 0,
+            message: json!({"method": method, "params": params}),
+        }
     }
 }

@@ -1,12 +1,12 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use manuvra_cli::{
-    ClientError, Installation, daemon_status, daemon_stop, invoke_daemon, legacy_config_root,
-    migrate_legacy, purge_owned_roots,
+    ClientError, Installation, chrome_launch, daemon_status, daemon_stop, invoke_daemon,
+    legacy_config_root, migrate_legacy, purge_owned_roots,
 };
 use manuvra_protocol::{
     AGENT_HELP, Invocation, RpcResponse, command_default_timeout_ms, command_descriptor,
     command_help, encode_operational_line, error_meta, operational_error, registry_page,
-    schema_pointer, validate_command_input,
+    schema_pointer, validate_command_input, validate_command_result,
 };
 use rand::Rng;
 use rand::distr::Alphanumeric;
@@ -156,6 +156,10 @@ enum Command {
         #[command(subcommand)]
         command: DaemonCommand,
     },
+    Chrome {
+        #[command(subcommand)]
+        command: ChromeCommand,
+    },
     Migrate {
         #[arg(long = "from", value_enum)]
         source: LegacySource,
@@ -172,6 +176,11 @@ enum Command {
 enum DaemonCommand {
     Status,
     Stop,
+}
+
+#[derive(Subcommand)]
+enum ChromeCommand {
+    Launch,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -330,6 +339,10 @@ struct TypeLocatorArgs {
     locator_text: Option<String>,
     #[arg(long)]
     identifier: Option<String>,
+    #[arg(long = "within-role")]
+    within_role: Option<String>,
+    #[arg(long = "within-name")]
+    within_name: Option<String>,
     #[arg(long = "ref")]
     reference: Option<String>,
     #[arg(long, value_parser = parse_point)]
@@ -346,6 +359,8 @@ impl From<TypeLocatorArgs> for LocatorArgs {
                 name: value.name,
                 text: value.locator_text,
                 identifier: value.identifier,
+                within_role: value.within_role,
+                within_name: value.within_name,
             },
             reference: value.reference,
             point: value.point,
@@ -364,6 +379,10 @@ struct SemanticArgs {
     text: Option<String>,
     #[arg(long)]
     identifier: Option<String>,
+    #[arg(long = "within-role")]
+    within_role: Option<String>,
+    #[arg(long = "within-name")]
+    within_name: Option<String>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -454,6 +473,11 @@ fn execute_special(
         Command::Daemon {
             command: DaemonCommand::Stop,
         } => Some(control_result(daemon_stop())),
+        Command::Chrome {
+            command: ChromeCommand::Launch,
+        } => Some(run_chrome_launch(timeout_ms.unwrap_or_else(|| {
+            command_default_timeout("system.chrome.launch")
+        }))),
         Command::Setup { .. } => Some(run_setup(
             request_id,
             timeout_ms.unwrap_or_else(|| command_default_timeout("system.setup")),
@@ -494,6 +518,16 @@ fn control_result(result: Result<Value, ClientError>) -> (Value, i32) {
 
 fn run_setup(request_id: String, timeout_ms: u64) -> (Value, i32) {
     invoke("system.setup", json!({}), request_id, timeout_ms)
+}
+
+fn run_chrome_launch(timeout_ms: u64) -> (Value, i32) {
+    match chrome_launch(std::time::Duration::from_millis(timeout_ms)) {
+        Ok(value) => match validate_command_result("system.chrome.launch", &value) {
+            Ok(()) => (value, 0),
+            Err(message) => local_error("internal_error", &message),
+        },
+        Err(error) => local_error(error.catalog_code(), error.message()),
+    }
 }
 
 fn run_purge(all: bool, yes: bool) -> (Value, i32) {
@@ -661,6 +695,7 @@ fn build_direct(command: Command) -> Result<BuiltCommand, String> {
             ]),
         )),
         command @ (Command::Daemon { .. }
+        | Command::Chrome { .. }
         | Command::Setup { .. }
         | Command::Migrate { .. }
         | Command::Purge { .. }) => Ok(build_local_direct(command)),
@@ -671,6 +706,9 @@ fn build_direct(command: Command) -> Result<BuiltCommand, String> {
 fn build_local_direct(command: Command) -> BuiltCommand {
     match command {
         Command::Daemon { command } => local(daemon_command_id(command), json!({}), Value::Null),
+        Command::Chrome {
+            command: ChromeCommand::Launch,
+        } => local("system.chrome.launch", json!({}), Value::Null),
         Command::Setup { .. } => local("system.setup", json!({}), Value::Null),
         Command::Migrate { source } => local(
             "system.migrate",
@@ -982,7 +1020,7 @@ fn action_with_locator(
 }
 
 fn locator_value(args: &LocatorArgs) -> Result<Option<Value>, String> {
-    let semantic = has_semantic(&args.semantic);
+    let semantic = has_semantic(&args.semantic) || has_within(&args.semantic);
     let kinds = usize::from(semantic)
         + usize::from(args.reference.is_some())
         + usize::from(args.point.is_some());
@@ -1020,11 +1058,17 @@ fn semantic_locator(args: &SemanticArgs) -> Result<Value, String> {
         ("name", args.name.clone().map(Value::String)),
         ("text", args.text.clone().map(Value::String)),
         ("identifier", args.identifier.clone().map(Value::String)),
+        ("within_role", args.within_role.clone().map(Value::String)),
+        ("within_name", args.within_name.clone().map(Value::String)),
     ]))
 }
 
 fn has_semantic(args: &SemanticArgs) -> bool {
     args.role.is_some() || args.name.is_some() || args.text.is_some() || args.identifier.is_some()
+}
+
+fn has_within(args: &SemanticArgs) -> bool {
+    args.within_role.is_some() || args.within_name.is_some()
 }
 
 fn evidence(session: String, kind: &str) -> BuiltCommand {
@@ -1209,6 +1253,11 @@ fn classify_doctor_warning(value: &Value) -> DoctorWarning {
                 "Preserve `manuvra doctor --json` output and report warning `unverified_orphans_preserved`; Manuvra will not delete unverified state automatically."
                     .to_owned(),
             ),
+        },
+        "chrome_endpoint_refused" => DoctorWarning {
+            display: "[action required] The Chrome adapter loopback CDP endpoint is refused."
+                .to_owned(),
+            recovery: Some("Run `manuvra chrome launch`.".to_owned()),
         },
         warning if warning.starts_with("legacy_state_detected;") => DoctorWarning {
             display: format!("[action required] {warning}"),
@@ -1672,6 +1721,77 @@ mod tests {
     }
 
     #[test]
+    fn semantic_locator_includes_optional_ancestor_scope() {
+        let built = build(&[
+            "click",
+            "--session",
+            "s_1",
+            "--role",
+            "button",
+            "--name",
+            "Checkout",
+            "--within-role",
+            "region",
+            "--within-name",
+            "Primary",
+        ])
+        .unwrap();
+        match built {
+            BuiltCommand::Remote { input, .. } => {
+                assert_eq!(input["locator"]["kind"], "semantic");
+                assert_eq!(input["locator"]["within_role"], "region");
+                assert_eq!(input["locator"]["within_name"], "Primary");
+            }
+            BuiltCommand::Local { .. } => panic!("click is a remote command"),
+        }
+        let query = build(&[
+            "observe",
+            "query",
+            "--session",
+            "s_1",
+            "--role",
+            "button",
+            "--within-role",
+            "region",
+        ])
+        .unwrap();
+        match query {
+            BuiltCommand::Remote { input, .. } => {
+                assert_eq!(input["semantic"]["within_role"], "region");
+                assert!(input["semantic"].get("within_name").is_none());
+            }
+            BuiltCommand::Local { .. } => panic!("observe query is a remote command"),
+        }
+    }
+
+    #[test]
+    fn within_scope_is_not_a_standalone_locator() {
+        assert!(matches!(
+            build(&[
+                "click",
+                "--session",
+                "s_1",
+                "--within-role",
+                "region",
+                "--within-name",
+                "Primary"
+            ]),
+            Err(BuildError::InvalidRequest(_))
+        ));
+        assert!(
+            locator_value(&LocatorArgs {
+                semantic: SemanticArgs {
+                    within_role: Some("region".to_owned()),
+                    ..Default::default()
+                },
+                reference: Some("e_1".to_owned()),
+                ..Default::default()
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
     fn every_public_route_builds_an_invocation() {
         let routes: &[&[&str]] = &[
             &["commands", "list"],
@@ -1806,6 +1926,7 @@ mod tests {
             &["doctor", "--session", "s_1", "--target", "chrome:fake"],
             &["daemon", "status"],
             &["daemon", "stop"],
+            &["chrome", "launch"],
             &["setup"],
             &["migrate", "--from", "computer-use"],
             &["purge", "--all", "--yes"],
@@ -1823,7 +1944,7 @@ mod tests {
         }
         assert_eq!(
             covered.len(),
-            30,
+            31,
             "every registry command needs a CLI fixture"
         );
     }
@@ -2108,6 +2229,16 @@ mod tests {
     }
 
     #[test]
+    fn doctor_renderer_names_chrome_launch_when_the_endpoint_is_refused() {
+        let mut doctor = doctor_fixture(true);
+        doctor["warnings"] = json!(["chrome_endpoint_refused"]);
+        let rendered = render_doctor(&doctor);
+        assert!(rendered.contains("Manuvra doctor: action required"));
+        assert!(rendered.contains("Chrome adapter loopback CDP endpoint is refused"));
+        assert!(rendered.contains("Run `manuvra chrome launch`."));
+    }
+
+    #[test]
     fn setup_renderer_preserves_daemon_reported_pane_and_permission_states() {
         let mut setup = setup_fixture(
             setup_fact(false, true, false),
@@ -2205,11 +2336,11 @@ mod tests {
         );
         setup["installation"] = json!({
             "installed": true,
-            "bundle": "/Users/me/Applications/Manuvra.app"
+            "bundle": "/opt/manuvra-local/Manuvra.app"
         });
         let rendered = render_setup(&setup);
         assert!(
-            rendered.contains("Enable the exact bundle path `/Users/me/Applications/Manuvra.app`.")
+            rendered.contains("Enable the exact bundle path `/opt/manuvra-local/Manuvra.app`.")
         );
         assert!(rendered.contains("share one TCC row for com.taecontrol.manuvra"));
         assert!(rendered.contains("Do not grant a /tmp prefix"));

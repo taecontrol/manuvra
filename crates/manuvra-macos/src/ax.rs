@@ -859,6 +859,48 @@ fn semantic_matches(element: &Element, semantic: &Map<String, Value>) -> bool {
             .or_else(|| element.string("AXDescription"))
     }) && requested_field_matches(semantic, "text", || element.string("AXValue"))
         && requested_field_matches(semantic, "identifier", || element.string("AXIdentifier"))
+        && ancestor_scope_matches(element, semantic)
+}
+
+fn ancestor_scope_matches(element: &Element, semantic: &Map<String, Value>) -> bool {
+    let within_role = semantic.get("within_role").and_then(Value::as_str);
+    let within_name = semantic.get("within_name").and_then(Value::as_str);
+    if within_role.is_none() && within_name.is_none() {
+        return true;
+    }
+    ancestor_fields_match(&collect_ancestor_fields(element), within_role, within_name)
+}
+
+fn collect_ancestor_fields(element: &Element) -> Vec<(Option<String>, Option<String>)> {
+    let mut ancestors = Vec::new();
+    let mut current = element.element("AXParent");
+    while let Some(ancestor) = current {
+        if ancestors.len() >= MAX_TREE_NODES {
+            break;
+        }
+        ancestors.push((
+            ancestor.string("AXRole").map(|role| public_role(&role)),
+            ancestor
+                .string("AXTitle")
+                .or_else(|| ancestor.string("AXDescription")),
+        ));
+        current = ancestor.element("AXParent");
+    }
+    ancestors
+}
+
+fn ancestor_fields_match(
+    ancestors: &[(Option<String>, Option<String>)],
+    within_role: Option<&str>,
+    within_name: Option<&str>,
+) -> bool {
+    if within_role.is_none() && within_name.is_none() {
+        return true;
+    }
+    ancestors.iter().any(|(role, name)| {
+        within_role.is_none_or(|expected| role.as_deref() == Some(expected))
+            && within_name.is_none_or(|expected| name.as_deref() == Some(expected))
+    })
 }
 
 fn requested_field_matches(
@@ -880,6 +922,7 @@ fn match_entry(path: &str, element: &Element) -> Value {
         "name": public.get("name"),
         "text": public.get("text"),
         "identifier": public.get("identifier"),
+        "description": public.get("description"),
     })
 }
 
@@ -911,6 +954,13 @@ fn public_element(element: &Element) -> Map<String, Value> {
         "identifier".to_owned(),
         element
             .string("AXIdentifier")
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    value.insert(
+        "description".to_owned(),
+        element
+            .string("AXDescription")
             .map(Value::String)
             .unwrap_or(Value::Null),
     );
@@ -1518,6 +1568,14 @@ impl Element {
             .map(|value| value.to_string())
     }
 
+    fn element(&self, name: &str) -> Option<Element> {
+        let value = self.attribute(name).ok()?;
+        (unsafe { CFGetTypeID(Some(&*value)) } == unsafe { AXUIElementGetTypeID() }).then(|| {
+            let raw = CFRetained::into_raw(value).cast();
+            Element(raw)
+        })
+    }
+
     pub(crate) fn bounds(&self) -> Result<WindowBounds, AdapterError> {
         let position = self.attribute("AXPosition")?;
         let size = self.attribute("AXSize")?;
@@ -1738,6 +1796,27 @@ mod tests {
         };
         assert!(close_enough(pinned, pinned));
         assert!(!close_enough(pinned, WindowBounds { x: 13.0, ..pinned }));
+    }
+
+    #[test]
+    fn ancestor_scope_is_exact_and_requires_a_proper_ancestor() {
+        let ancestors = vec![
+            (Some("group".to_owned()), Some("Primary".to_owned())),
+            (Some("window".to_owned()), Some("Fixture".to_owned())),
+        ];
+        assert!(ancestor_fields_match(
+            &ancestors,
+            Some("group"),
+            Some("Primary")
+        ));
+        assert!(ancestor_fields_match(&ancestors, Some("window"), None));
+        assert!(!ancestor_fields_match(
+            &ancestors,
+            Some("group"),
+            Some("Secondary")
+        ));
+        assert!(!ancestor_fields_match(&[], Some("group"), Some("Primary")));
+        assert!(ancestor_fields_match(&ancestors, None, None));
     }
 
     #[test]

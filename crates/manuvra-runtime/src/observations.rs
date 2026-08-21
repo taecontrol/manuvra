@@ -156,6 +156,7 @@ impl Runtime {
                     "name": entry.get("name").cloned().unwrap_or(Value::Null),
                     "text": entry.get("text").cloned().unwrap_or(Value::Null),
                     "identifier": entry.get("identifier").cloned().unwrap_or(Value::Null),
+                    "description": entry.get("description").cloned().unwrap_or(Value::Null),
                 })
             })
             .collect::<Vec<_>>();

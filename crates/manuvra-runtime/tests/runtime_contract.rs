@@ -1381,7 +1381,7 @@ fn timed_out_system_setup_is_terminal_and_retry_does_not_replay_side_effects() {
 }
 
 #[test]
-fn all_thirty_registry_commands_reach_the_shared_interface() {
+fn all_registry_commands_reach_the_shared_interface() {
     let harness = Harness::new();
     let chrome = harness.open("chrome_fake_1", "actor");
     let macos = harness.open("macos_fake_1", "actor");
@@ -1410,6 +1410,7 @@ fn all_thirty_registry_commands_reach_the_shared_interface() {
         harness.invoke("matrix-doctor", "system.doctor", json!({})),
         harness.invoke("matrix-daemon-status", "daemon.status", json!({})),
         harness.invoke("matrix-daemon-stop", "daemon.stop", json!({})),
+        harness.invoke("matrix-chrome-launch", "system.chrome.launch", json!({})),
         harness.invoke("matrix-setup", "system.setup", json!({})),
         harness.invoke("matrix-migrate", "system.migrate", json!({"from": "computer-use"})),
         harness.invoke("matrix-purge", "system.purge", json!({"all": true, "yes": true})),
@@ -1478,7 +1479,7 @@ fn all_thirty_registry_commands_reach_the_shared_interface() {
             .as_array()
             .unwrap()
             .len(),
-        30
+        31
     );
     for reply in replies {
         assert!(

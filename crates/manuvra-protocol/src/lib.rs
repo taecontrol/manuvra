@@ -903,6 +903,9 @@ fn relevant_error_codes(command: &Value) -> Vec<&'static str> {
     if command["effect"] == "mutate" || command["effect"] == "declared" {
         codes.extend(["timed_out", "cancelled", "artifact_io_failed"]);
     }
+    if command["id"] == "system.chrome.launch" {
+        codes.extend(["chrome_unavailable", "chrome_endpoint_busy", "timed_out"]);
+    }
     codes
 }
 
@@ -1116,8 +1119,8 @@ mod tests {
 
     #[test]
     fn registry_and_error_catalog_have_accepted_cardinality() {
-        assert_eq!(registry()["commands"].as_array().unwrap().len(), 30);
-        assert_eq!(all_errors().len(), 44);
+        assert_eq!(registry()["commands"].as_array().unwrap().len(), 31);
+        assert_eq!(all_errors().len(), 46);
         assert_eq!(all_warnings().len(), 1);
         for command in registry()["commands"].as_array().unwrap() {
             let id = command["id"].as_str().unwrap();
@@ -1333,6 +1336,37 @@ mod tests {
                 "accepted invalid input for {command}: {input}"
             );
         }
+    }
+
+    #[test]
+    fn semantic_locator_accepts_optional_ancestor_scope() {
+        validate_command_input(
+            "action.click",
+            &json!({
+                "session_id": "s_1",
+                "locator": {
+                    "kind": "semantic",
+                    "role": "button",
+                    "name": "Save",
+                    "within_role": "region",
+                    "within_name": "Primary"
+                }
+            }),
+        )
+        .unwrap();
+        validate_command_input(
+            "observe.query",
+            &json!({
+                "session_id": "s_1",
+                "semantic": {
+                    "kind": "semantic",
+                    "role": "button",
+                    "within_role": "region"
+                },
+                "limit": 5
+            }),
+        )
+        .unwrap();
     }
 
     #[test]

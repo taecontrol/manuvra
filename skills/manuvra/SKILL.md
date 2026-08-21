@@ -36,6 +36,13 @@ After a first grant, the human closes System Settings. Then run `manuvra daemon 
 
 Ready when `doctor` reports the installed bundle, a usable daemon, and the permissions the next command needs. If `doctor` reports legacy development state, run the migrate command printed by `manuvra --help`.
 
+If `doctor` reports `chrome_endpoint_refused`, or Chrome targets are missing because loopback CDP is refused, run `manuvra chrome launch`. Do not expect `targets`, `doctor`, or `open` to start Chrome.
+
+```bash
+manuvra chrome launch
+manuvra targets --kind chrome
+```
+
 Read `daemon.adapters` only from a successful `manuvra doctor` JSON object that contains that array. If the array is missing, wait and rerun `doctor`. `manuvra daemon status` reports the daemon without touching a target; it is not a doctor document and does not carry adapters.
 
 ## Run a session
@@ -63,11 +70,11 @@ manuvra close --session <session-id>
 
 Background never activates the target or injects global input. If the result is `foreground_required`, retry that invocation with `--mode foreground` only when visible activation is intended. The override does not change the session default.
 
-`type` always needs an explicit locator. Matching is exact: zero hits are `element_not_found`; several hits are `ambiguous_target`. The tool never picks a fuzzy or ordinal winner.
+`type` always needs an explicit locator. Matching is exact: zero hits are `element_not_found`; several hits are `ambiguous_target`. The tool never picks a fuzzy or ordinal winner. If a semantic query or click is ambiguous, narrow with `--within-role` / `--within-name` or click a returned `ref`. Do not retry the same unconstrained semantic click.
 
 If the actor lease expired, mutation returns `actor_lease_expired`. Observation still works. Recover with the `lease` commands in `manuvra --help`. Expiry never reacquires the lease.
 
-- `observed`: the backend confirmed its primitive and required post-action state was captured. That does not prove the application-level effect you wanted.
+- `observed`: the backend confirmed its primitive and required post-action state was captured. That does not prove the application-level effect you wanted. If a click was meant to navigate, observe (query and/or screenshot) before the next mutation.
 - `not_performed`: nothing dispatched, or the backend rejected it with no effect.
 - `uncertain`: dispatch happened or may have happened; confirmation or evidence is incomplete.
 
