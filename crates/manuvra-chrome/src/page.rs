@@ -8,12 +8,13 @@ use manuvra_runtime::{
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const QUIET_WINDOW: Duration = Duration::from_millis(50);
+const CLICK_FOLLOWING_DOCUMENT_WATCH: Duration = Duration::from_millis(400);
 type PageResult<T> = Result<T, Box<AdapterReply>>;
 
 pub fn prepare(
@@ -168,6 +169,8 @@ fn dispatch_click(
     operation: &AdapterOperation,
     cancellation: Arc<AtomicBool>,
 ) -> PageResult<(Value, Option<String>)> {
+    let fence = client.cursor();
+    let main_document = page_main_frame(client, context, cancellation.clone());
     let target = prepared_target(operation)?;
     let button = operation
         .input
@@ -197,7 +200,9 @@ fn dispatch_click(
         )?;
         effects_possible = true;
     }
-    Ok((json!({"dispatched": "click"}), None))
+    let loader =
+        watch_for_following_document(client, context, fence, main_document, &cancellation)?;
+    Ok((json!({"dispatched": "click"}), loader))
 }
 
 fn dispatch_type(
@@ -651,9 +656,10 @@ fn matching_nodes(
     nodes: Vec<Value>,
     cancellation: Arc<AtomicBool>,
 ) -> Result<Vec<Value>, AdapterError> {
+    let tree = AxTree::index(&nodes);
     let mut matches = Vec::new();
-    for node in nodes {
-        let Some(mut public) = public_node(context, &node) else {
+    for node in &nodes {
+        let Some(mut public) = public_node(context, node) else {
             continue;
         };
         if semantic.get("identifier").is_some() || semantic.get("text").is_some() {
@@ -661,12 +667,12 @@ fn matching_nodes(
                 client,
                 context,
                 semantic,
-                &node,
+                node,
                 &mut public,
                 cancellation.clone(),
             )?;
         }
-        if semantic_matches(semantic, &public) {
+        if semantic_matches(semantic, &public) && ancestor_scope_matches(semantic, node, &tree) {
             matches.push(public);
         }
     }
@@ -690,6 +696,7 @@ fn public_node(context: &AdapterContext, node: &Value) -> Option<Value> {
     let role = ax_value(node.get("role"));
     let name = ax_value(node.get("name"));
     let value = ax_value(node.get("value"));
+    let description = ax_value(node.get("description"));
     Some(json!({
         "backend_id": backend_identity,
         "ref": format!("e_{}_{}_{}_{}", context.reference_namespace, context.reference_epoch, frame_tag(frame_id), backend_id),
@@ -698,6 +705,7 @@ fn public_node(context: &AdapterContext, node: &Value) -> Option<Value> {
         "name": name,
         "text": value.or_else(|| name.clone()),
         "identifier": null,
+        "description": description,
     }))
 }
 
@@ -970,7 +978,6 @@ fn wait_for_quiet(
 ) -> PageResult<()> {
     let mut processed = fence;
     let mut last_relevant = Instant::now();
-    let mut pending = HashSet::new();
     let mut navigation_ready = expected_loader.is_none();
     loop {
         if cancellation.load(Ordering::SeqCst) {
@@ -980,10 +987,12 @@ fn wait_for_quiet(
             )));
         }
         if Instant::now() >= deadline {
-            return Err(Box::new(unknown(
-                "stabilization_timeout",
-                "Chrome did not become logically quiet before the deadline",
-            )));
+            let message = if expected_loader.is_some() {
+                "Chrome document was not ready before the deadline"
+            } else {
+                "Chrome did not become logically quiet before the deadline"
+            };
+            return Err(Box::new(unknown("stabilization_timeout", message)));
         }
         let snapshot = client.snapshot_since(processed);
         if snapshot.overflowed {
@@ -997,12 +1006,11 @@ fn wait_for_quiet(
             if is_relevant_event(event) {
                 last_relevant = Instant::now();
             }
-            update_network(event, &mut pending);
             if navigation_event_matches(event, expected_loader) {
                 navigation_ready = true;
             }
         }
-        if pending.is_empty() && navigation_ready && last_relevant.elapsed() >= QUIET_WINDOW {
+        if navigation_ready && last_relevant.elapsed() >= QUIET_WINDOW {
             return Ok(());
         }
         let quiet_remaining = QUIET_WINDOW.saturating_sub(last_relevant.elapsed());
@@ -1016,24 +1024,153 @@ fn wait_for_quiet(
     }
 }
 
-fn update_network(event: &JournalEvent, pending: &mut HashSet<String>) {
-    let params = event_params(event);
-    match event_method(event) {
-        Some("Network.requestWillBeSent") => {
-            let resource_type = params.get("type").and_then(Value::as_str);
-            if !matches!(resource_type, Some("WebSocket" | "EventSource"))
-                && let Some(id) = params.get("requestId").and_then(Value::as_str)
-            {
-                pending.insert(id.to_owned());
+fn watch_for_following_document(
+    client: &CdpClient,
+    context: &AdapterContext,
+    fence: u64,
+    main_document: Option<MainFrameDocument>,
+    cancellation: &Arc<AtomicBool>,
+) -> PageResult<Option<String>> {
+    let deadline = context.deadline;
+    let mut watch = FollowingDocumentWatch::new(main_document);
+    let mut processed = fence;
+    let watch_started = Instant::now();
+    loop {
+        if cancellation.load(Ordering::SeqCst) {
+            return Err(Box::new(unknown(
+                "cancelled",
+                "cancelled while watching for a following document",
+            )));
+        }
+        if Instant::now() >= deadline {
+            return Err(Box::new(unknown(
+                "stabilization_timeout",
+                "Chrome document was not ready before the deadline",
+            )));
+        }
+        let snapshot = client.snapshot_since(processed);
+        if snapshot.overflowed {
+            return Err(Box::new(unknown(
+                "observation_failed",
+                "Chrome event journal overflowed while watching for a following document",
+            )));
+        }
+        for event in &snapshot.events {
+            processed = event.cursor;
+            if let Some(loader) = watch.apply(event) {
+                return Ok(Some(loader));
             }
         }
-        Some("Network.loadingFinished" | "Network.loadingFailed") => {
-            if let Some(id) = params.get("requestId").and_then(Value::as_str) {
-                pending.remove(id);
-            }
+        let elapsed = watch_started.elapsed();
+        if short_watch_closed(elapsed, watch.awaiting_commit()) {
+            return Ok(None);
         }
-        _ => {}
+        let remaining = if watch.awaiting_commit() {
+            deadline.saturating_duration_since(Instant::now())
+        } else {
+            CLICK_FOLLOWING_DOCUMENT_WATCH.saturating_sub(elapsed)
+        }
+        .min(deadline.saturating_duration_since(Instant::now()))
+        .min(Duration::from_millis(10));
+        client.wait_for_journal_change(processed, remaining);
     }
+}
+
+struct MainFrameDocument {
+    id: String,
+    loader_id: Option<String>,
+}
+
+fn page_main_frame(
+    client: &CdpClient,
+    context: &AdapterContext,
+    cancellation: Arc<AtomicBool>,
+) -> Option<MainFrameDocument> {
+    let frame = command_preflight(
+        client,
+        "Page.getFrameTree",
+        json!({}),
+        context,
+        cancellation,
+    )
+    .ok()?
+    .pointer("/frameTree/frame")
+    .cloned()?;
+    Some(MainFrameDocument {
+        id: frame.get("id").and_then(Value::as_str)?.to_owned(),
+        loader_id: frame
+            .get("loaderId")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+struct FollowingDocumentWatch {
+    main_frame: Option<String>,
+    committed_loader: Option<String>,
+    awaiting_frame: Option<String>,
+}
+
+impl FollowingDocumentWatch {
+    fn new(main_document: Option<MainFrameDocument>) -> Self {
+        Self {
+            main_frame: main_document.as_ref().map(|frame| frame.id.clone()),
+            committed_loader: main_document.and_then(|frame| frame.loader_id),
+            awaiting_frame: None,
+        }
+    }
+
+    fn apply(&mut self, event: &JournalEvent) -> Option<String> {
+        let params = event_params(event);
+        match event_method(event) {
+            Some("Page.frameStartedLoading") => {
+                let frame_id = params.get("frameId").and_then(Value::as_str)?;
+                if self.is_main_frame_id(frame_id) {
+                    self.awaiting_frame = Some(frame_id.to_owned());
+                }
+                None
+            }
+            Some("Page.frameNavigated") => {
+                let frame = params.get("frame")?;
+                if !frame_is_main_document(frame, self.main_frame.as_deref()) {
+                    return None;
+                }
+                self.bind_new_loader(frame.get("loaderId").and_then(Value::as_str))
+            }
+            Some("Page.lifecycleEvent") => {
+                let frame_id = params.get("frameId").and_then(Value::as_str)?;
+                if !self.is_main_frame_id(frame_id) {
+                    return None;
+                }
+                self.bind_new_loader(params.get("loaderId").and_then(Value::as_str))
+            }
+            _ => None,
+        }
+    }
+
+    fn bind_new_loader(&mut self, loader: Option<&str>) -> Option<String> {
+        let loader = loader?;
+        if self.committed_loader.as_deref() == Some(loader) {
+            return None;
+        }
+        if self.committed_loader.is_none() && self.awaiting_frame.is_none() {
+            return None;
+        }
+        self.awaiting_frame = None;
+        Some(loader.to_owned())
+    }
+
+    fn awaiting_commit(&self) -> bool {
+        self.awaiting_frame.is_some()
+    }
+
+    fn is_main_frame_id(&self, frame_id: &str) -> bool {
+        self.main_frame.as_deref() == Some(frame_id)
+    }
+}
+
+fn short_watch_closed(elapsed: Duration, awaiting_commit: bool) -> bool {
+    elapsed >= CLICK_FOLLOWING_DOCUMENT_WATCH && !awaiting_commit
 }
 
 fn navigation_event_matches(event: &JournalEvent, expected_loader: Option<&str>) -> bool {
@@ -1046,6 +1183,90 @@ fn navigation_event_matches(event: &JournalEvent, expected_loader: Option<&str>)
             Some("DOMContentLoaded" | "load")
         )
         && event_params(event).get("loaderId").and_then(Value::as_str) == Some(expected)
+}
+
+fn frame_is_main_document(frame: &Value, main_frame: Option<&str>) -> bool {
+    let parent = frame.get("parentId").and_then(Value::as_str).unwrap_or("");
+    if !parent.is_empty() {
+        return false;
+    }
+    match (main_frame, frame.get("id").and_then(Value::as_str)) {
+        (Some(expected), Some(id)) => expected == id,
+        _ => true,
+    }
+}
+
+struct AxTree<'a> {
+    by_id: HashMap<String, &'a Value>,
+    parent: HashMap<String, String>,
+}
+
+impl<'a> AxTree<'a> {
+    fn index(nodes: &'a [Value]) -> Self {
+        let mut by_id = HashMap::new();
+        let mut parent = HashMap::new();
+        for node in nodes {
+            let Some(id) = ax_node_key(node, node.get("nodeId")) else {
+                continue;
+            };
+            by_id.insert(id.clone(), node);
+            if let Some(parent_id) = ax_node_key(node, node.get("parentId")) {
+                parent.insert(id.clone(), parent_id);
+            }
+            if let Some(children) = node.get("childIds").and_then(Value::as_array) {
+                for child in children {
+                    if let Some(child_id) = ax_node_key(node, Some(child)) {
+                        parent.insert(child_id, id.clone());
+                    }
+                }
+            }
+        }
+        Self { by_id, parent }
+    }
+
+    fn parent_node(&self, node: &Value) -> Option<&'a Value> {
+        let id = ax_node_key(node, node.get("nodeId"))?;
+        self.by_id.get(self.parent.get(&id)?).copied()
+    }
+}
+
+fn ax_node_key(node: &Value, id: Option<&Value>) -> Option<String> {
+    let frame = node
+        .get("computerUseFrameId")
+        .and_then(Value::as_str)
+        .unwrap_or("root");
+    let local = id.and_then(|value| {
+        value
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| value.as_u64().map(|number| number.to_string()))
+            .or_else(|| value.as_i64().map(|number| number.to_string()))
+    })?;
+    Some(format!("{frame}:{local}"))
+}
+
+fn ancestor_scope_matches(semantic: &Value, node: &Value, tree: &AxTree<'_>) -> bool {
+    let within_role = semantic.get("within_role").and_then(Value::as_str);
+    let within_name = semantic.get("within_name").and_then(Value::as_str);
+    if within_role.is_none() && within_name.is_none() {
+        return true;
+    }
+    let mut current = tree.parent_node(node);
+    while let Some(ancestor) = current {
+        let role = ax_value(ancestor.get("role"));
+        let name = ax_value(ancestor.get("name"));
+        if exact_optional_field(within_role, role.as_deref())
+            && exact_optional_field(within_name, name.as_deref())
+        {
+            return true;
+        }
+        current = tree.parent_node(ancestor);
+    }
+    false
+}
+
+fn exact_optional_field(expected: Option<&str>, actual: Option<&str>) -> bool {
+    expected.is_none_or(|wanted| actual.is_some_and(|value| normalize(value) == normalize(wanted)))
 }
 
 fn command_preflight(
@@ -1266,6 +1487,267 @@ mod tests {
             &json!({"role": "link", "name": "Save changes"}),
             &node
         ));
+    }
+
+    #[test]
+    fn ancestor_scope_requires_a_proper_exact_ancestor() {
+        let nodes = vec![
+            json!({
+                "nodeId": "region-a",
+                "computerUseFrameId": "root",
+                "role": {"value": "region"},
+                "name": {"value": "Primary"},
+                "childIds": ["button-a"]
+            }),
+            json!({
+                "nodeId": "button-a",
+                "computerUseFrameId": "root",
+                "parentId": "region-a",
+                "backendDOMNodeId": 11,
+                "role": {"value": "button"},
+                "name": {"value": "Checkout"},
+                "description": {"value": "Primary region checkout"}
+            }),
+            json!({
+                "nodeId": "region-b",
+                "computerUseFrameId": "root",
+                "role": {"value": "region"},
+                "name": {"value": "Secondary"},
+                "childIds": ["button-b"]
+            }),
+            json!({
+                "nodeId": "button-b",
+                "computerUseFrameId": "root",
+                "parentId": "region-b",
+                "backendDOMNodeId": 12,
+                "role": {"value": "button"},
+                "name": {"value": "Checkout"}
+            }),
+        ];
+        let tree = AxTree::index(&nodes);
+        let scoped = json!({"role": "button", "name": "Checkout", "within_role": "region", "within_name": "Primary"});
+        assert!(ancestor_scope_matches(&scoped, &nodes[1], &tree));
+        assert!(!ancestor_scope_matches(&scoped, &nodes[3], &tree));
+        assert!(ancestor_scope_matches(
+            &json!({"within_role": "region"}),
+            &nodes[1],
+            &tree
+        ));
+        assert!(ancestor_scope_matches(
+            &json!({"within_name": "Primary"}),
+            &nodes[1],
+            &tree
+        ));
+        assert!(!ancestor_scope_matches(
+            &json!({"within_name": "Primary"}),
+            &nodes[3],
+            &tree
+        ));
+        assert!(!ancestor_scope_matches(
+            &json!({"within_role": "button", "within_name": "Checkout"}),
+            &nodes[1],
+            &tree
+        ));
+        let context = AdapterContext {
+            session_id: "s_test".to_owned(),
+            target_id: "chrome_test".to_owned(),
+            target_generation: 1,
+            action_sequence: 1,
+            reference_namespace: "n_test".to_owned(),
+            reference_epoch: 1,
+            frame_token: None,
+            mode: manuvra_runtime::ExecutionMode::Background,
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        assert_eq!(
+            public_node(&context, &nodes[1]).unwrap()["description"],
+            "Primary region checkout"
+        );
+        assert_eq!(
+            public_node(&context, &nodes[3]).unwrap()["description"],
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn real_frame_started_loading_has_only_frame_id() {
+        let mut watch = FollowingDocumentWatch::new(Some(MainFrameDocument {
+            id: "main".to_owned(),
+            loader_id: Some("loader-1".to_owned()),
+        }));
+        assert_eq!(
+            watch.apply(&journal_event(
+                "Page.frameStartedLoading",
+                json!({"frameId": "main"})
+            )),
+            None
+        );
+        assert!(
+            watch.awaiting_commit(),
+            "real CDP load-start has no loaderId and must still open a following-document wait"
+        );
+        assert!(
+            !short_watch_closed(Duration::from_millis(400), watch.awaiting_commit()),
+            "commit can arrive after the short watch once a main-frame load has started"
+        );
+        assert_eq!(
+            watch
+                .apply(&journal_event(
+                    "Page.frameNavigated",
+                    json!({"frame": {"id": "main", "loaderId": "loader-2"}})
+                ))
+                .as_deref(),
+            Some("loader-2")
+        );
+        assert!(!watch.awaiting_commit());
+        assert!(short_watch_closed(
+            Duration::from_millis(400),
+            watch.awaiting_commit()
+        ));
+    }
+
+    #[test]
+    fn fictional_loader_id_on_frame_started_loading_is_not_a_commit() {
+        let mut watch = FollowingDocumentWatch::new(Some(MainFrameDocument {
+            id: "main".to_owned(),
+            loader_id: Some("loader-1".to_owned()),
+        }));
+        assert_eq!(
+            watch.apply(&journal_event(
+                "Page.frameStartedLoading",
+                json!({"frameId": "main", "loaderId": "loader-3"})
+            )),
+            None
+        );
+        assert!(watch.awaiting_commit());
+    }
+
+    #[test]
+    fn same_document_frame_navigated_is_not_a_following_document() {
+        let mut watch = FollowingDocumentWatch::new(Some(MainFrameDocument {
+            id: "main".to_owned(),
+            loader_id: Some("loader-1".to_owned()),
+        }));
+        assert_eq!(
+            watch.apply(&journal_event(
+                "Page.frameNavigated",
+                json!({"frame": {"id": "main", "loaderId": "loader-1"}})
+            )),
+            None
+        );
+        assert!(!watch.awaiting_commit());
+        assert!(short_watch_closed(
+            Duration::from_millis(400),
+            watch.awaiting_commit()
+        ));
+        assert_eq!(
+            watch.apply(&journal_event(
+                "Page.lifecycleEvent",
+                json!({"frameId": "main", "name": "load", "loaderId": "loader-1"})
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn new_main_frame_loader_without_seen_load_start_is_still_followed() {
+        let mut watch = FollowingDocumentWatch::new(Some(MainFrameDocument {
+            id: "main".to_owned(),
+            loader_id: Some("loader-1".to_owned()),
+        }));
+        assert_eq!(
+            watch
+                .apply(&journal_event(
+                    "Page.frameNavigated",
+                    json!({"frame": {"id": "main", "loaderId": "loader-2"}})
+                ))
+                .as_deref(),
+            Some("loader-2")
+        );
+    }
+
+    #[test]
+    fn child_frame_and_unknown_main_frame_do_not_follow_a_document() {
+        let mut watch = FollowingDocumentWatch::new(Some(MainFrameDocument {
+            id: "main".to_owned(),
+            loader_id: Some("loader-1".to_owned()),
+        }));
+        assert_eq!(
+            watch.apply(&journal_event(
+                "Page.frameStartedLoading",
+                json!({"frameId": "child"})
+            )),
+            None
+        );
+        assert!(!watch.awaiting_commit());
+        assert_eq!(
+            watch.apply(&journal_event(
+                "Page.frameNavigated",
+                json!({"frame": {"id": "child", "parentId": "main", "loaderId": "loader-iframe"}})
+            )),
+            None
+        );
+
+        let mut unknown = FollowingDocumentWatch::new(None);
+        assert_eq!(
+            unknown.apply(&journal_event(
+                "Page.frameStartedLoading",
+                json!({"frameId": "main"})
+            )),
+            None
+        );
+        assert!(!unknown.awaiting_commit());
+        assert_eq!(
+            unknown.apply(&journal_event(
+                "Page.frameNavigated",
+                json!({"frame": {"id": "main", "loaderId": "loader-2"}})
+            )),
+            None
+        );
+        assert_eq!(
+            unknown.apply(&journal_event(
+                "Page.lifecycleEvent",
+                json!({"name": "load", "loaderId": "loader-old"})
+            )),
+            None
+        );
+        assert_eq!(
+            unknown.apply(&journal_event(
+                "Network.requestWillBeSent",
+                json!({"requestId": "req-1"})
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn new_loader_lifecycle_after_real_load_start_is_a_following_document() {
+        let mut watch = FollowingDocumentWatch::new(Some(MainFrameDocument {
+            id: "main".to_owned(),
+            loader_id: Some("loader-1".to_owned()),
+        }));
+        watch.apply(&journal_event(
+            "Page.frameStartedLoading",
+            json!({"frameId": "main"}),
+        ));
+        assert_eq!(
+            watch
+                .apply(&journal_event(
+                    "Page.lifecycleEvent",
+                    json!({"frameId": "main", "name": "DOMContentLoaded", "loaderId": "loader-2"})
+                ))
+                .as_deref(),
+            Some("loader-2")
+        );
+    }
+
+    fn journal_event(method: &str, params: Value) -> JournalEvent {
+        JournalEvent {
+            cursor: 1,
+            action_sequence: 0,
+            received_ms: 0,
+            message: json!({"method": method, "params": params}),
+        }
     }
 
     #[test]

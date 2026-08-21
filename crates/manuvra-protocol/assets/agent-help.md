@@ -189,11 +189,14 @@ Query normalized accessibility semantics:
 manuvra observe query --session <session-id> --role button --name Save
 ```
 
-Matching is exact. Zero matches return `element_not_found`; multiple matches return `ambiguous_target`. The tool never chooses a fuzzy or ordinal winner. Observe and use the returned exact reference instead:
+Matching is exact. Zero matches return `element_not_found`; multiple matches return `ambiguous_target`. The tool never chooses a fuzzy or ordinal winner. If a semantic query or click is ambiguous, narrow with `--within-role` / `--within-name`, or click a returned exact reference. Do not retry the same unconstrained semantic click.
 
 ```bash
+manuvra click --session <session-id> --within-role region --within-name Primary --role button --name Save
 manuvra click --session <session-id> --ref <element-ref>
 ```
+
+`observe query` matches include `description` when the backend exposes one.
 
 Write the complete accessibility tree:
 
@@ -224,6 +227,8 @@ manuvra navigate --session <session-id> --url https://example.test/account
 ```
 
 Every mutation uses the session's default mode unless `--mode background|foreground` overrides that invocation. The override never changes the session default.
+
+If a click was meant to navigate, observe (query and/or screenshot) before the next mutation. `observed` means the backend confirmed the click and post-state was captured, not that navigation succeeded.
 
 `type` always requires an explicit locator. It never writes to whichever control happens to own global focus.
 

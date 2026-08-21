@@ -1339,6 +1339,37 @@ mod tests {
     }
 
     #[test]
+    fn semantic_locator_accepts_optional_ancestor_scope() {
+        validate_command_input(
+            "action.click",
+            &json!({
+                "session_id": "s_1",
+                "locator": {
+                    "kind": "semantic",
+                    "role": "button",
+                    "name": "Save",
+                    "within_role": "region",
+                    "within_name": "Primary"
+                }
+            }),
+        )
+        .unwrap();
+        validate_command_input(
+            "observe.query",
+            &json!({
+                "session_id": "s_1",
+                "semantic": {
+                    "kind": "semantic",
+                    "role": "button",
+                    "within_role": "region"
+                },
+                "limit": 5
+            }),
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn accepted_input_schema_supports_recursive_tagged_ax_values() {
         let input = json!({
             "session_id": "s_1",

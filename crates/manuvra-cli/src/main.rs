@@ -339,6 +339,10 @@ struct TypeLocatorArgs {
     locator_text: Option<String>,
     #[arg(long)]
     identifier: Option<String>,
+    #[arg(long = "within-role")]
+    within_role: Option<String>,
+    #[arg(long = "within-name")]
+    within_name: Option<String>,
     #[arg(long = "ref")]
     reference: Option<String>,
     #[arg(long, value_parser = parse_point)]
@@ -355,6 +359,8 @@ impl From<TypeLocatorArgs> for LocatorArgs {
                 name: value.name,
                 text: value.locator_text,
                 identifier: value.identifier,
+                within_role: value.within_role,
+                within_name: value.within_name,
             },
             reference: value.reference,
             point: value.point,
@@ -373,6 +379,10 @@ struct SemanticArgs {
     text: Option<String>,
     #[arg(long)]
     identifier: Option<String>,
+    #[arg(long = "within-role")]
+    within_role: Option<String>,
+    #[arg(long = "within-name")]
+    within_name: Option<String>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -1010,7 +1020,7 @@ fn action_with_locator(
 }
 
 fn locator_value(args: &LocatorArgs) -> Result<Option<Value>, String> {
-    let semantic = has_semantic(&args.semantic);
+    let semantic = has_semantic(&args.semantic) || has_within(&args.semantic);
     let kinds = usize::from(semantic)
         + usize::from(args.reference.is_some())
         + usize::from(args.point.is_some());
@@ -1048,11 +1058,17 @@ fn semantic_locator(args: &SemanticArgs) -> Result<Value, String> {
         ("name", args.name.clone().map(Value::String)),
         ("text", args.text.clone().map(Value::String)),
         ("identifier", args.identifier.clone().map(Value::String)),
+        ("within_role", args.within_role.clone().map(Value::String)),
+        ("within_name", args.within_name.clone().map(Value::String)),
     ]))
 }
 
 fn has_semantic(args: &SemanticArgs) -> bool {
     args.role.is_some() || args.name.is_some() || args.text.is_some() || args.identifier.is_some()
+}
+
+fn has_within(args: &SemanticArgs) -> bool {
+    args.within_role.is_some() || args.within_name.is_some()
 }
 
 fn evidence(session: String, kind: &str) -> BuiltCommand {
@@ -1702,6 +1718,77 @@ mod tests {
             ..Default::default()
         };
         assert!(locator_value(&args).is_err());
+    }
+
+    #[test]
+    fn semantic_locator_includes_optional_ancestor_scope() {
+        let built = build(&[
+            "click",
+            "--session",
+            "s_1",
+            "--role",
+            "button",
+            "--name",
+            "Checkout",
+            "--within-role",
+            "region",
+            "--within-name",
+            "Primary",
+        ])
+        .unwrap();
+        match built {
+            BuiltCommand::Remote { input, .. } => {
+                assert_eq!(input["locator"]["kind"], "semantic");
+                assert_eq!(input["locator"]["within_role"], "region");
+                assert_eq!(input["locator"]["within_name"], "Primary");
+            }
+            BuiltCommand::Local { .. } => panic!("click is a remote command"),
+        }
+        let query = build(&[
+            "observe",
+            "query",
+            "--session",
+            "s_1",
+            "--role",
+            "button",
+            "--within-role",
+            "region",
+        ])
+        .unwrap();
+        match query {
+            BuiltCommand::Remote { input, .. } => {
+                assert_eq!(input["semantic"]["within_role"], "region");
+                assert!(input["semantic"].get("within_name").is_none());
+            }
+            BuiltCommand::Local { .. } => panic!("observe query is a remote command"),
+        }
+    }
+
+    #[test]
+    fn within_scope_is_not_a_standalone_locator() {
+        assert!(matches!(
+            build(&[
+                "click",
+                "--session",
+                "s_1",
+                "--within-role",
+                "region",
+                "--within-name",
+                "Primary"
+            ]),
+            Err(BuildError::InvalidRequest(_))
+        ));
+        assert!(
+            locator_value(&LocatorArgs {
+                semantic: SemanticArgs {
+                    within_role: Some("region".to_owned()),
+                    ..Default::default()
+                },
+                reference: Some("e_1".to_owned()),
+                ..Default::default()
+            })
+            .is_err()
+        );
     }
 
     #[test]

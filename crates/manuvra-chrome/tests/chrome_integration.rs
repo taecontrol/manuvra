@@ -40,6 +40,32 @@ document.querySelector('#email').addEventListener('keydown',event=>{
 
 const NEXT: &str = r#"<!doctype html><html lang="en"><meta charset="utf-8"><title>CP-06 Next</title><h1>Navigation complete</h1></html>"#;
 const FRAME: &str = r#"<!doctype html><html lang="en"><meta charset="utf-8"><title>Frame</title><button aria-label="Frame target">Frame target</button></html>"#;
+const BUSY: &str = r#"<!doctype html><html lang="en"><meta charset="utf-8"><title>Busy document fixture</title>
+<h1>Busy document</h1>
+<script>
+window.addEventListener('load',()=>{
+  const poll=()=>{fetch('/poll?'+Date.now()).catch(()=>{});};
+  poll();
+  setInterval(poll,25);
+});
+</script></html>"#;
+const REGIONS: &str = r#"<!doctype html><html lang="en"><meta charset="utf-8"><title>Scoped controls fixture</title>
+<section role="region" aria-label="Primary">
+  <button aria-label="Checkout" aria-describedby="primary-hint">Primary checkout</button>
+  <p id="primary-hint">Primary region checkout</p>
+</section>
+<section role="region" aria-label="Secondary">
+  <button aria-label="Checkout">Secondary checkout</button>
+</section>
+<button id="toggle" aria-label="Toggle">Toggle</button>
+<p id="status">Off</p>
+<a href="/next" aria-label="Continue">Continue</a>
+<script>
+document.getElementById('toggle').onclick=()=>{
+  const status=document.getElementById('status');
+  status.textContent=status.textContent==='Off'?'On':'Off';
+};
+</script></html>"#;
 
 struct FixtureServer {
     address: std::net::SocketAddr,
@@ -101,10 +127,13 @@ fn serve_request(stream: &mut std::net::TcpStream) {
         .and_then(|text| text.lines().next())
         .unwrap_or_default();
     let path = request_path(line.split_whitespace().nth(1).unwrap_or("/"));
+    let path = path.split('?').next().unwrap_or(path);
     let (content_type, body) = match path {
         "/next" => ("text/html; charset=utf-8", NEXT.as_bytes()),
         "/frame" => ("text/html; charset=utf-8", FRAME.as_bytes()),
-        "/api" => ("text/plain; charset=utf-8", b"ok" as &[u8]),
+        "/busy" => ("text/html; charset=utf-8", BUSY.as_bytes()),
+        "/regions" => ("text/html; charset=utf-8", REGIONS.as_bytes()),
+        "/api" | "/poll" => ("text/plain; charset=utf-8", b"ok" as &[u8]),
         _ => ("text/html; charset=utf-8", FIXTURE.as_bytes()),
     };
     let _ = write!(
@@ -575,6 +604,163 @@ fn real_chrome_warm_latency_budget() {
     }
     harness.invoke(
         "bench-close",
+        "session.close",
+        json!({"session_id": session}),
+        5_000,
+    );
+}
+
+#[test]
+fn navigate_settles_on_document_ready_while_network_continues() {
+    if std::env::var_os("MANUVRA_RUN_CHROME_TESTS").is_none() {
+        return;
+    }
+    let fixture = FixtureServer::start();
+    let process_root = tempfile::tempdir().unwrap();
+    let (_chrome, port) = ChromeProcess::start(&fixture.url("/"), process_root.path());
+    let harness = Harness::start(Endpoint::parse(&format!("127.0.0.1:{port}")).unwrap());
+    let opened = harness.invoke(
+        "open",
+        "session.open",
+        json!({"target_id": harness.target_id, "role": "actor", "mode": "background"}),
+        5_000,
+    );
+    let session = opened["session_id"].as_str().unwrap();
+    let started = Instant::now();
+    let navigate = harness.invoke(
+        "busy-navigate",
+        "action.navigate",
+        json!({"session_id": session, "url": fixture.url("/busy")}),
+        3_000,
+    );
+    assert_eq!(navigate["outcome"], "observed", "{navigate}");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "document-ready settle exceeded a modest deadline: {:?}",
+        started.elapsed()
+    );
+    let heading = harness.invoke(
+        "busy-heading",
+        "observe.query",
+        json!({"session_id": session, "semantic": {"kind": "semantic", "role": "heading", "name": "Busy document"}}),
+        5_000,
+    );
+    assert_eq!(heading["matches"].as_array().unwrap().len(), 1);
+    harness.invoke(
+        "busy-close",
+        "session.close",
+        json!({"session_id": session}),
+        5_000,
+    );
+}
+
+#[test]
+fn exact_ancestor_scope_disambiguates_and_query_exposes_description() {
+    if std::env::var_os("MANUVRA_RUN_CHROME_TESTS").is_none() {
+        return;
+    }
+    let fixture = FixtureServer::start();
+    let process_root = tempfile::tempdir().unwrap();
+    let (_chrome, port) = ChromeProcess::start(&fixture.url("/regions"), process_root.path());
+    let harness = Harness::start(Endpoint::parse(&format!("127.0.0.1:{port}")).unwrap());
+    let opened = harness.invoke(
+        "open",
+        "session.open",
+        json!({"target_id": harness.target_id, "role": "actor", "mode": "background"}),
+        5_000,
+    );
+    let session = opened["session_id"].as_str().unwrap();
+    let query = harness.invoke(
+        "checkout-query",
+        "observe.query",
+        json!({"session_id": session, "semantic": {"kind": "semantic", "role": "button", "name": "Checkout"}}),
+        5_000,
+    );
+    assert_eq!(query["matches"].as_array().unwrap().len(), 2);
+    assert!(
+        query["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["description"] == "Primary region checkout")
+    );
+    let unconstrained = harness.reply(
+        "unconstrained-click",
+        "action.click",
+        json!({"session_id": session, "locator": {"kind": "semantic", "role": "button", "name": "Checkout"}}),
+        5_000,
+    );
+    assert_eq!(unconstrained.value["error"]["code"], "ambiguous_target");
+    assert_eq!(unconstrained.value["delivery"], "not_dispatched");
+    let scoped = harness.invoke(
+        "scoped-click",
+        "action.click",
+        json!({"session_id": session, "locator": {
+            "kind": "semantic",
+            "role": "button",
+            "name": "Checkout",
+            "within_role": "region",
+            "within_name": "Primary"
+        }}),
+        5_000,
+    );
+    assert_eq!(scoped["outcome"], "observed", "{scoped}");
+    harness.invoke(
+        "regions-close",
+        "session.close",
+        json!({"session_id": session}),
+        5_000,
+    );
+}
+
+#[test]
+fn click_follows_an_optional_following_document() {
+    if std::env::var_os("MANUVRA_RUN_CHROME_TESTS").is_none() {
+        return;
+    }
+    let fixture = FixtureServer::start();
+    let process_root = tempfile::tempdir().unwrap();
+    let (_chrome, port) = ChromeProcess::start(&fixture.url("/regions"), process_root.path());
+    let harness = Harness::start(Endpoint::parse(&format!("127.0.0.1:{port}")).unwrap());
+    let opened = harness.invoke(
+        "open",
+        "session.open",
+        json!({"target_id": harness.target_id, "role": "actor", "mode": "background"}),
+        5_000,
+    );
+    let session = opened["session_id"].as_str().unwrap();
+    let toggle = harness.invoke(
+        "toggle-click",
+        "action.click",
+        json!({"session_id": session, "locator": {"kind": "semantic", "role": "button", "name": "Toggle"}}),
+        5_000,
+    );
+    assert_eq!(toggle["outcome"], "observed", "{toggle}");
+    assert!(toggle.get("page_url").is_none());
+    let status = harness.invoke(
+        "toggle-status",
+        "observe.query",
+        json!({"session_id": session, "semantic": {"kind": "semantic", "identifier": "status", "text": "On"}}),
+        5_000,
+    );
+    assert_eq!(status["matches"].as_array().unwrap().len(), 1);
+    let navigated = harness.invoke(
+        "continue-click",
+        "action.click",
+        json!({"session_id": session, "locator": {"kind": "semantic", "role": "link", "name": "Continue"}}),
+        8_000,
+    );
+    assert_eq!(navigated["outcome"], "observed", "{navigated}");
+    assert!(navigated.get("page_url").is_none());
+    let heading = harness.invoke(
+        "destination-heading",
+        "observe.query",
+        json!({"session_id": session, "semantic": {"kind": "semantic", "role": "heading", "name": "Navigation complete"}}),
+        5_000,
+    );
+    assert_eq!(heading["matches"].as_array().unwrap().len(), 1);
+    harness.invoke(
+        "follow-close",
         "session.close",
         json!({"session_id": session}),
         5_000,

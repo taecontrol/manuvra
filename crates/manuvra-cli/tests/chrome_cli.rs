@@ -22,6 +22,32 @@ const HTML: &str = r#"<!doctype html><html lang="en"><meta charset="utf-8"><titl
 <input id="email" aria-label="Email" value="old@example.test"><div id="status">Ready</div><div style="margin-top:1000px">Bottom</div>
 <script>const nonce=new URLSearchParams(location.search).get('nonce')||'legacy';window.__manuvraNonce=nonce;document.title='Manuvra Chrome Fixture — '+nonce;const status=document.querySelector('#status');status.textContent='Ready — '+nonce;document.querySelector('#email').value='input-'+nonce+'@example.test';document.querySelector('#save').onclick=()=>{console.log('manuvra-save',nonce);status.textContent='Saving — '+nonce;fetch('/api?nonce='+encodeURIComponent(nonce)).then(()=>setTimeout(()=>status.textContent='Saved — '+nonce,50));};document.querySelector('#email').onkeydown=e=>{if(e.key==='Enter'){console.info('manuvra-enter',nonce);status.textContent='Entered — '+nonce;}};</script></html>"#;
 const NEXT: &str = r#"<!doctype html><html lang="en"><title>Next</title><h1>Navigation complete</h1><script>window.__manuvraNonce=new URLSearchParams(location.search).get('nonce')||'legacy';</script></html>"#;
+const BUSY: &str = r#"<!doctype html><html lang="en"><meta charset="utf-8"><title>Busy document fixture</title>
+<h1>Busy document</h1>
+<script>
+window.addEventListener('load',()=>{
+  const poll=()=>{fetch('/poll?'+Date.now()).catch(()=>{});};
+  poll();
+  setInterval(poll,25);
+});
+</script></html>"#;
+const REGIONS: &str = r#"<!doctype html><html lang="en"><meta charset="utf-8"><title>Scoped controls fixture</title>
+<section role="region" aria-label="Primary">
+  <button aria-label="Checkout" aria-describedby="primary-hint">Primary checkout</button>
+  <p id="primary-hint">Primary region checkout</p>
+</section>
+<section role="region" aria-label="Secondary">
+  <button aria-label="Checkout">Secondary checkout</button>
+</section>
+<button id="toggle" aria-label="Toggle">Toggle</button>
+<p id="status">Off</p>
+<a href="/next" aria-label="Continue">Continue</a>
+<script>
+document.getElementById('toggle').onclick=()=>{
+  const status=document.getElementById('status');
+  status.textContent=status.textContent==='Off'?'On':'Off';
+};
+</script></html>"#;
 
 struct Fixture {
     address: std::net::SocketAddr,
@@ -55,7 +81,9 @@ impl Fixture {
                         let path = request_path(target);
                         let (content_type, body) = match path.split('?').next().unwrap_or(path) {
                             "/next" => ("text/html", NEXT.as_bytes()),
-                            "/api" => ("text/plain", b"ok" as &[u8]),
+                            "/busy" => ("text/html", BUSY.as_bytes()),
+                            "/regions" => ("text/html", REGIONS.as_bytes()),
+                            "/api" | "/poll" => ("text/plain", b"ok" as &[u8]),
                             _ => ("text/html", HTML.as_bytes()),
                         };
                         let _ = write!(
@@ -456,6 +484,123 @@ fn public_cli_completes_real_chrome_trajectory() {
     ]);
     harness.run(&["close", "--session", &session]);
     harness.retain(&export_root);
+}
+
+#[test]
+fn cli_document_ready_scope_and_following_document() {
+    if std::env::var_os("MANUVRA_RUN_CHROME_TESTS").is_none() {
+        return;
+    }
+    let fixture = Fixture::start();
+    let chrome_root = tempfile::tempdir().unwrap();
+    let (_chrome, port, expected_target) =
+        Chrome::start(&fixture.url("/regions"), chrome_root.path());
+    let mut harness = Harness::start(&format!("127.0.0.1:{port}"));
+    let target = harness.exact_chrome_target(&expected_target);
+    let opened = harness.run(&["open", "--target", &target]);
+    let session = opened["session_id"].as_str().unwrap().to_owned();
+
+    let started = Instant::now();
+    let busy = harness.run(&[
+        "navigate",
+        "--session",
+        &session,
+        "--url",
+        &fixture.url("/busy"),
+        "--timeout-ms",
+        "3000",
+    ]);
+    assert_eq!(busy["outcome"], "observed", "{busy}");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "document-ready settle exceeded a modest deadline: {:?}",
+        started.elapsed()
+    );
+
+    harness.run(&[
+        "navigate",
+        "--session",
+        &session,
+        "--url",
+        &fixture.url("/regions"),
+    ]);
+    let query = harness.run(&[
+        "observe",
+        "query",
+        "--session",
+        &session,
+        "--role",
+        "button",
+        "--name",
+        "Checkout",
+    ]);
+    assert_eq!(query["matches"].as_array().unwrap().len(), 2);
+    assert!(
+        query["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["description"] == "Primary region checkout")
+    );
+    let unconstrained = harness.output(&[
+        "click",
+        "--session",
+        &session,
+        "--role",
+        "button",
+        "--name",
+        "Checkout",
+    ]);
+    let unconstrained: Value = serde_json::from_slice(&unconstrained.stdout).unwrap();
+    assert_eq!(unconstrained["error"]["code"], "ambiguous_target");
+    let scoped = harness.run(&[
+        "click",
+        "--session",
+        &session,
+        "--role",
+        "button",
+        "--name",
+        "Checkout",
+        "--within-role",
+        "region",
+        "--within-name",
+        "Primary",
+    ]);
+    assert_eq!(scoped["outcome"], "observed", "{scoped}");
+    assert!(scoped.get("page_url").is_none());
+
+    let toggle = harness.run(&[
+        "click",
+        "--session",
+        &session,
+        "--role",
+        "button",
+        "--name",
+        "Toggle",
+    ]);
+    assert_eq!(toggle["outcome"], "observed", "{toggle}");
+    let continue_click = harness.run(&[
+        "click",
+        "--session",
+        &session,
+        "--role",
+        "link",
+        "--name",
+        "Continue",
+    ]);
+    assert_eq!(continue_click["outcome"], "observed", "{continue_click}");
+    let heading = harness.run(&[
+        "observe",
+        "query",
+        "--session",
+        &session,
+        "--role",
+        "heading",
+        "--name",
+        "Navigation complete",
+    ]);
+    assert_eq!(heading["matches"].as_array().unwrap().len(), 1);
+    harness.run(&["close", "--session", &session]);
 }
 
 #[test]
