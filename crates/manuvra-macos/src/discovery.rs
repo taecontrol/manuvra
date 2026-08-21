@@ -199,6 +199,8 @@ impl DiscoveryState {
             let target_id = snapshot.target_id();
             match self.records.get_mut(&target_id) {
                 Some(record) if previously_present.contains(&target_id) => {
+                    record.descriptor.owner = snapshot.owner.clone();
+                    record.descriptor.title = snapshot.title.clone();
                     record.snapshot = snapshot;
                     record.present = true;
                 }
@@ -212,6 +214,8 @@ impl DiscoveryState {
                                 target_id,
                                 generation,
                                 kind: "macos".to_owned(),
+                                owner: snapshot.owner.clone(),
+                                title: snapshot.title.clone(),
                                 capabilities: CAPABILITIES
                                     .iter()
                                     .map(|capability| (*capability).to_owned())
@@ -357,8 +361,8 @@ fn decode_window(dictionary: &CFDictionary<CFString, CFType>) -> Option<WindowSn
         window_id: number(dictionary, unsafe { kCGWindowNumber })?
             .try_into()
             .ok()?,
-        owner: string(dictionary, unsafe { kCGWindowOwnerName })?,
-        title: string(dictionary, unsafe { kCGWindowName }).filter(|title| !title.is_empty()),
+        owner: present_label(string(dictionary, unsafe { kCGWindowOwnerName }))?,
+        title: present_label(string(dictionary, unsafe { kCGWindowName })),
         bounds: bounds(dictionary)?,
         is_on_screen: boolean(dictionary, unsafe { kCGWindowIsOnscreen }).unwrap_or(false),
     })
@@ -376,6 +380,10 @@ fn string(dictionary: &CFDictionary<CFString, CFType>, key: &CFString) -> Option
             .ok()?
             .to_string(),
     )
+}
+
+fn present_label(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.is_empty())
 }
 
 fn boolean(dictionary: &CFDictionary<CFString, CFType>, key: &CFString) -> Option<bool> {
@@ -412,7 +420,7 @@ mod tests {
             pid,
             window_id,
             owner: "Fixture".to_owned(),
-            title: Some(title.to_owned()),
+            title: present_label(Some(title.to_owned())),
             bounds: WindowBounds {
                 x,
                 y,
@@ -516,6 +524,47 @@ mod tests {
             .record(&first[0].target_id, first[0].generation)
             .expect("unique AX match must keep the window");
         assert!(!record.snapshot.is_on_screen);
+    }
+
+    #[test]
+    fn listed_descriptor_uses_snapshot_owner_and_title() {
+        let mut state = DiscoveryState::new();
+        let untitled = window(10, 21, "");
+        let targets = state.apply(vec![window(10, 20, "Notes"), untitled]);
+        let titled = targets
+            .iter()
+            .find(|target| target.title.as_deref() == Some("Notes"))
+            .expect("titled window");
+        assert_eq!(titled.owner, "Fixture");
+        let blank = targets
+            .iter()
+            .find(|target| target.title.is_none())
+            .expect("untitled window");
+        assert_eq!(blank.owner, "Fixture");
+        assert_eq!(blank.title, None);
+    }
+
+    #[test]
+    fn presentation_labels_refresh_without_changing_generation() {
+        let mut state = DiscoveryState::new();
+        let first = state.apply(vec![window(10, 20, "before")]);
+        let generation = first[0].generation;
+        let target_id = first[0].target_id.clone();
+        let updated = state.apply(vec![window(10, 20, "after")]);
+        assert_eq!(updated[0].target_id, target_id);
+        assert_eq!(updated[0].generation, generation);
+        assert_eq!(updated[0].owner, "Fixture");
+        assert_eq!(updated[0].title.as_deref(), Some("after"));
+    }
+
+    #[test]
+    fn empty_window_owner_or_title_is_absent() {
+        assert_eq!(present_label(None), None);
+        assert_eq!(present_label(Some(String::new())), None);
+        assert_eq!(
+            present_label(Some("Notes".to_owned())).as_deref(),
+            Some("Notes")
+        );
     }
 
     #[test]

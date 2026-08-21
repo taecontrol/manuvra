@@ -48,14 +48,14 @@ manuvra export --session <session-id> --all --destination /absolute/output/path
 manuvra close --session <session-id>
 ```
 
-1. `targets` lists currently discoverable targets and their capabilities. Use a returned `target_id` as opaque; do not parse or reconstruct it.
+1. `targets` lists currently discoverable targets with presentation `owner` and `title`, plus capabilities. Choose by those labels when they uniquely identify the window or tab. Use the returned `target_id` as opaque; do not parse or reconstruct it.
 2. `open` returns a session ID. Default role is actor; default mode is `background`.
 3. Observe before the first mutation. Keep the session ID, element references, and `frame_token`.
 4. Perform one explicit action. For a locator, mode, or verb not shown here, resolve the command ID from `manuvra commands list`, then run `manuvra <verb> --help` or `manuvra commands get <command-id>`. Do not pass a capability ID such as `common.press` to `commands get`.
 5. Read `outcome`, `delivery`, `observation`, and `error` together. Do not infer success from exit status or `delivery` alone.
 6. `export` anything that must survive, then `close`. `close` deletes all session artifacts.
 
-When a native window just appeared, identify its target by before/after difference, not by parsing IDs: record macos `target_id` values from `manuvra targets --kind macos`; open or wait for the window; list macos targets again and keep only IDs that were not already recorded; `open` one remaining candidate and confirm with `observe query` and/or `observe screenshot`; if it is the wrong window, `close` and try the next new ID. Done when query or screenshot shows the intended window.
+`owner` and `title` are presentation labels only. They are not identity. `title` may be JSON `null`. If title is JSON `null` or several targets share the same labels, fall back to the before/after probe: record macos `target_id` values from `manuvra targets --kind macos`; open or wait for the window; list macos targets again and keep only IDs that were not already recorded; `open` one remaining candidate and confirm with `observe query` and/or `observe screenshot`; if it is the wrong window, `close` and try the next new ID. Done when query or screenshot shows the intended window.
 
 Background never activates the target or injects global input. If the result is `foreground_required`, retry that invocation with `--mode foreground` only when visible activation is intended. The override does not change the session default.
 

@@ -39,6 +39,8 @@ pub struct TargetDescriptor {
     pub target_id: String,
     pub generation: u64,
     pub kind: String,
+    pub owner: String,
+    pub title: Option<String>,
     pub capabilities: Vec<String>,
 }
 

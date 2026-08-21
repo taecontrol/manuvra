@@ -753,6 +753,8 @@ mod tests {
                 target_id: target_id.to_owned(),
                 generation: 1,
                 kind: "macos".to_owned(),
+                owner: "test".to_owned(),
+                title: None,
                 capabilities: vec![],
             },
             snapshot: WindowSnapshot {

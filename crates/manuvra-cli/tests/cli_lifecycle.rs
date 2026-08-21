@@ -312,7 +312,20 @@ fn representative_cli_lifecycle_has_bounded_results_and_durable_export() {
     assert_eq!(root_mode, 0o700);
 
     let targets = harness.success(&["targets"]);
-    assert_eq!(targets["targets"].as_array().unwrap().len(), 2);
+    let listed = targets["targets"].as_array().unwrap();
+    assert_eq!(listed.len(), 2);
+    let chrome = listed
+        .iter()
+        .find(|target| target["kind"] == "chrome")
+        .expect("chrome target");
+    let macos = listed
+        .iter()
+        .find(|target| target["kind"] == "macos")
+        .expect("macos target");
+    assert_eq!(chrome["owner"], "Chrome");
+    assert_eq!(chrome["title"], "Fake Chrome");
+    assert_eq!(macos["owner"], "Fake");
+    assert_eq!(macos["title"], "Fake Target");
     let actor = harness.open("chrome_fake_1", None);
     let observer = harness.open("chrome_fake_1", Some("observer"));
 

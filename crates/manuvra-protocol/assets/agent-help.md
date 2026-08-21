@@ -17,7 +17,7 @@ Never infer success from an exit code or from input delivery alone. Read `outcom
 ## Quickstart
 
 ```bash
-# 1. Discover exact targets and capabilities.
+# 1. Discover exact targets. Choose by presentation owner/title when unique.
 manuvra targets
 
 # 2. Open the chosen target as the single actor. Background is the default.
@@ -39,7 +39,9 @@ manuvra export --session <session-id> --all --destination /absolute/output/path
 manuvra close --session <session-id>
 ```
 
-When a native window just appeared, identify its target without parsing IDs: list `manuvra targets --kind macos` before and after, exclude already-seen `target_id` values, `open` a remaining candidate, and confirm with `observe query` and/or `observe screenshot`. If it is the wrong window, `close` and try the next new ID.
+`manuvra targets` includes presentation `owner` (application or browser name) and `title` (window or tab title; JSON `null` if empty). Those labels are not identity. Choose a target by them when they uniquely identify the window or tab. Target IDs stay opaque; do not parse or reconstruct them.
+
+When title is JSON `null` or labels collide, or a native window just appeared, identify its target without parsing IDs: list `manuvra targets --kind macos` before and after, exclude already-seen `target_id` values, `open` a remaining candidate, and confirm with `observe query` and/or `observe screenshot`. If it is the wrong window, `close` and try the next new ID.
 
 If any step fails, run the exact `help_command` in the returned error. If the result says effects are possible, observe before deciding whether to retry.
 
@@ -88,7 +90,7 @@ Configuration and exported evidence remain. To remove only enumerated Manuvra-ow
 
 ## Terms
 
-- **Target:** one currently discoverable Chrome or macOS automation destination. Target IDs are opaque; do not parse or reconstruct them.
+- **Target:** one currently discoverable Chrome or macOS automation destination. Target IDs are opaque; do not parse or reconstruct them. `owner` and `title` on `targets` are presentation labels only.
 - **Target generation:** identity of the current underlying process, tab, or window instance. Replacement makes an older target stale.
 - **Session:** daemon-owned state bound to one exact target generation. Every session command requires `--session`; there is no global current session.
 - **Actor:** a session allowed to mutate its target while it owns the target's actor lease. `open` defaults to actor.
