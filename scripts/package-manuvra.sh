@@ -2,19 +2,38 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 --prefix DIR [--source-root DIR]" >&2
+  echo "usage: $0 --prefix DIR [--source-root DIR] [--identity NAME]" >&2
+  echo "       $0 --print-codesign-identity [--identity NAME]" >&2
   exit 2
 }
 
 prefix=""
 source_root=""
+identity=""
+print_codesign_identity=false
 while (($#)); do
   case "$1" in
     --prefix) prefix=${2:-}; shift 2 ;;
     --source-root) source_root=${2:-}; shift 2 ;;
+    --identity)
+      identity=${2:-}
+      [[ -n "$identity" ]] || usage
+      shift 2
+      ;;
+    --print-codesign-identity) print_codesign_identity=true; shift ;;
     *) usage ;;
   esac
 done
+if [[ -z "$identity" && -n "${MANUVRA_CODESIGN_IDENTITY:-}" ]]; then
+  identity=$MANUVRA_CODESIGN_IDENTITY
+fi
+if [[ -z "$identity" ]]; then
+  identity=-
+fi
+if [[ "$print_codesign_identity" == true ]]; then
+  printf '%s\n' "$identity"
+  exit 0
+fi
 [[ -n "$prefix" ]] || usage
 if [[ -z "$source_root" ]]; then
   source_root=$(cd "$(dirname "$0")/.." && pwd -P)
@@ -55,10 +74,10 @@ cp "$source_root"/crates/manuvra-protocol/assets/schemas/*.json "$resources/sche
 jq -S '[.commands[] | {key:.id, value:.examples}] | from_entries' "$resources/registry.json" > "$resources/examples/commands.json"
 cp "$manifest" "$resources/release-manifest.json"
 chmod 755 "$macos/manuvra" "$macos/manuvra-daemon"
-codesign --force --sign - --options runtime "$macos/manuvra"
-codesign --force --sign - --options runtime "$macos/manuvra-daemon"
-codesign --force --sign - --options runtime "$bundle"
+codesign --force --sign "$identity" --options runtime "$macos/manuvra"
+codesign --force --sign "$identity" --options runtime "$macos/manuvra-daemon"
+codesign --force --sign "$identity" --options runtime "$bundle"
 codesign --verify --deep --strict --verbose=2 "$bundle"
-ln -s ../libexec/Manuvra.app/Contents/MacOS/manuvra "$prefix/bin/manuvra"
+ln -sfn ../libexec/Manuvra.app/Contents/MacOS/manuvra "$prefix/bin/manuvra"
 "$prefix/bin/manuvra" commands list --limit 1 >/dev/null
 "$prefix/bin/manuvra" commands schema action.click --side input >/dev/null

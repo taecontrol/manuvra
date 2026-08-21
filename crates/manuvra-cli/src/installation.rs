@@ -110,6 +110,7 @@ impl Installation {
     }
 
     pub fn identity(&self) -> Value {
+        let signature = self.signature_identity();
         json!({
             "installed": self.installed,
             "executable": self.executable,
@@ -118,21 +119,17 @@ impl Installation {
             "bundle_id": BUNDLE_IDENTIFIER,
             "build_id": build_digest(),
             "resource_manifest_sha256": sha256_hex(manuvra_protocol::RELEASE_MANIFEST_JSON.as_bytes()),
-            "cdhash": self.cdhash(),
+            "cdhash": signature.cdhash,
+            "authority": signature.authority,
+            "designated_requirement": signature.designated_requirement,
         })
     }
 
-    fn cdhash(&self) -> Option<String> {
-        let bundle = self.bundle.as_ref()?;
-        let output = Command::new("/usr/bin/codesign")
-            .args(["-dv", "--verbose=4"])
-            .arg(bundle)
-            .output()
-            .ok()?;
-        let text = String::from_utf8_lossy(&output.stderr);
-        text.lines()
-            .find_map(|line| line.strip_prefix("CDHash="))
-            .map(str::to_owned)
+    fn signature_identity(&self) -> SignatureIdentity {
+        self.bundle
+            .as_deref()
+            .map(inspect_signature)
+            .unwrap_or_default()
     }
 
     pub fn examples(&self) -> Value {
@@ -149,6 +146,73 @@ impl Installation {
             .collect::<Map<_, _>>();
         Value::Object(commands)
     }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct SignatureIdentity {
+    cdhash: Option<String>,
+    authority: Option<String>,
+    designated_requirement: Option<String>,
+}
+
+fn inspect_signature(path: &Path) -> SignatureIdentity {
+    parse_signature_identity(
+        &codesign_stderr(&["-dv", "--verbose=4"], path).unwrap_or_default(),
+        &codesign_designated_text(path).unwrap_or_default(),
+    )
+}
+
+fn codesign_output(args: &[&str], path: &Path) -> Option<std::process::Output> {
+    let output = Command::new("/usr/bin/codesign")
+        .args(args)
+        .arg(path)
+        .output()
+        .ok()?;
+    output.status.success().then_some(output)
+}
+
+fn codesign_stderr(args: &[&str], path: &Path) -> Option<String> {
+    codesign_output(args, path).map(|output| String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
+fn codesign_designated_text(path: &Path) -> Option<String> {
+    let output = codesign_output(&["-d", "-r-"], path)?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.contains("designated =>") {
+        Some(stdout.into_owned())
+    } else {
+        Some(format!(
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
+fn parse_signature_identity(display: &str, designated: &str) -> SignatureIdentity {
+    SignatureIdentity {
+        cdhash: first_prefixed_value(display, "CDHash="),
+        authority: first_prefixed_value(display, "Authority="),
+        designated_requirement: designated_requirement(designated),
+    }
+}
+
+fn first_prefixed_value(text: &str, prefix: &str) -> Option<String> {
+    text.lines()
+        .find_map(|line| line.strip_prefix(prefix))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn designated_requirement(text: &str) -> Option<String> {
+    const MARKER: &str = "designated => ";
+    text.lines()
+        .find_map(|line| {
+            line.find(MARKER)
+                .map(|index| line[index + MARKER.len()..].trim())
+        })
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 fn bundle_ancestors(executable: &Path) -> Option<(&Path, &Path, &Path)> {
@@ -337,5 +401,112 @@ mod tests {
 
         fs::write(bundle.join("Contents/Info.plist"), "incomplete").unwrap();
         assert!(installation.verify().is_err());
+    }
+
+    #[test]
+    fn identity_json_always_includes_grant_stable_codesign_fields() {
+        let installation = Installation {
+            executable: PathBuf::from("/tmp/manuvra"),
+            daemon: PathBuf::from("/tmp/manuvra-daemon"),
+            bundle: None,
+            resources: PathBuf::from("/tmp/Resources"),
+            installed: false,
+        };
+        let identity = installation.identity();
+        let object = identity.as_object().expect("identity object");
+        for key in ["cdhash", "authority", "designated_requirement"] {
+            assert!(
+                object.contains_key(key),
+                "identity must report {key} so a new CDHash is not mistaken for a new grant identity"
+            );
+            assert!(
+                object[key].is_null(),
+                "development layouts have no bundle signature to inspect"
+            );
+        }
+    }
+
+    #[test]
+    fn signature_parser_distinguishes_adhoc_cdhash_from_named_authority() {
+        let adhoc = parse_signature_identity(
+            "Executable=/tmp/Manuvra.app\nIdentifier=com.taecontrol.manuvra\nFormat=app bundle with Mach-O thin (arm64)\nSignature=adhoc\nCDHash=0123456789abcdef0123456789abcdef01234567\n",
+            "Executable=/tmp/Manuvra.app\ndesignated => cdhash H\"0123456789ABCDEF0123456789ABCDEF01234567\"\n",
+        );
+        assert_eq!(
+            adhoc.cdhash.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(adhoc.authority, None);
+        assert_eq!(
+            adhoc.designated_requirement.as_deref(),
+            Some("cdhash H\"0123456789ABCDEF0123456789ABCDEF01234567\"")
+        );
+
+        let named = parse_signature_identity(
+            "Executable=/tmp/Manuvra.app\nIdentifier=com.taecontrol.manuvra\nAuthority=Manuvra Local\nAuthority=Manuvra Local CA\nCDHash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+            "designated => identifier \"com.taecontrol.manuvra\" and certificate leaf = H\"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\"\n",
+        );
+        assert_eq!(
+            named.cdhash.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(named.authority.as_deref(), Some("Manuvra Local"));
+        assert_eq!(
+            named.designated_requirement.as_deref(),
+            Some(
+                "identifier \"com.taecontrol.manuvra\" and certificate leaf = H\"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\""
+            )
+        );
+    }
+
+    #[test]
+    fn failed_codesign_inspect_does_not_invent_a_signature_identity() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("not-mach-o");
+        fs::write(&path, b"not a signed Mach-O").unwrap();
+        assert_eq!(inspect_signature(&path), SignatureIdentity::default());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn live_adhoc_signature_is_cdhash_requirement_without_authority() {
+        let temporary = tempfile::tempdir().unwrap();
+        let binary = temporary.path().join("tool");
+        fs::copy("/usr/bin/true", &binary).unwrap();
+        assert!(
+            Command::new("/usr/bin/codesign")
+                .args(["--force", "--sign", "-"])
+                .arg(&binary)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let parsed = inspect_signature(&binary);
+        assert!(parsed.cdhash.is_some());
+        assert_eq!(parsed.authority, None);
+        assert!(
+            parsed
+                .designated_requirement
+                .as_deref()
+                .is_some_and(|value| value.starts_with("cdhash ")),
+            "ad-hoc designated requirement was {:?}",
+            parsed.designated_requirement
+        );
+
+        let identity = Installation {
+            executable: PathBuf::from("/tmp/manuvra"),
+            daemon: PathBuf::from("/tmp/manuvra-daemon"),
+            bundle: Some(binary),
+            resources: PathBuf::from("/tmp/Resources"),
+            installed: true,
+        }
+        .identity();
+        assert!(identity["cdhash"].as_str().is_some());
+        assert!(identity["authority"].is_null());
+        assert!(
+            identity["designated_requirement"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("cdhash "))
+        );
     }
 }

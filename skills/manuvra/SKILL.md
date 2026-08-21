@@ -24,9 +24,13 @@ manuvra doctor
 
 Piped `doctor` and `setup` print JSON. In a terminal they print plain language unless you pass `--json`.
 
-`doctor` reports bundle, daemon, and permission state. It does not prompt or open System Settings. Only `setup` asks macOS for missing permissions, and only from the `manuvra-daemon` identity.
+`doctor` reports bundle, daemon, permission state, and codesign identity (`cdhash`, `authority`, `designated_requirement` on `daemon.installation`). It does not prompt or open System Settings. Only `setup` asks macOS for missing permissions, and only from the `manuvra-daemon` identity. A new CDHash is not a new grant identity when `authority` and `designated_requirement` stay the same.
 
-The human grants permission. Do not edit the TCC database, claim a silent grant, or skip the numbered instructions `setup` prints. If Manuvra is missing from a privacy pane, the human clicks **Add**, selects the exact `Manuvra.app` path `setup` reported, and enables it.
+The human grants permission. Do not edit the TCC database, create or trust a certificate, run `add-trusted-cert`, claim a silent grant, or skip the numbered instructions `setup` prints.
+
+If a permission is missing, enable the exact bundle path `doctor` printed. Other `Manuvra.app` copies share one TCC row for `com.taecontrol.manuvra` and stay missing; toggling Manuvra rebinds that row. Do not grant a `/tmp` prefix. Post Event is the Accessibility pane, not a third list. If Manuvra is absent from a pane, the human clicks **Add**, selects that exact path, and enables it.
+
+`brew install` needs no local certificate; grant that Homebrew app once. Homebrew stays ad-hoc, so `brew upgrade` may require a new grant. A local certificate is only if that machine will rebuild a local prefix and wants the grant to survive. The packager writes `prefix/libexec/Manuvra.app`; the project README names `~/Applications/Manuvra.app` as the recommended grant copy and the Keychain steps.
 
 After a first grant, the human closes System Settings. Then run `manuvra daemon stop` and repeat the `doctor` / `setup` / `doctor` path above. A grant that is still invisible is usually a live daemon that has not restarted.
 
