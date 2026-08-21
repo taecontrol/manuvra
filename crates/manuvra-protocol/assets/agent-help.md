@@ -68,6 +68,13 @@ Homebrew bottles stay ad-hoc (`codesign --sign -`); the formula deletes `MANUVRA
 
 Inspect adapter permission facts only on a successful `manuvra doctor` JSON object that contains `daemon.adapters`. If that array is missing, wait and rerun `doctor`. `manuvra daemon status` is not a doctor document.
 
+Chrome discovery uses a loopback CDP endpoint (`127.0.0.1:9222` by default). If that endpoint is refused, run `manuvra chrome launch` to start a dedicated visible Chrome. `targets`, `doctor`, and `open` do not launch Chrome.
+
+```bash
+manuvra chrome launch
+manuvra targets --kind chrome
+```
+
 Inspect or stop the daemon without target work:
 
 ```bash
@@ -325,7 +332,10 @@ The only durable tool-managed state lives under `~/.config/manuvra/`:
 ```text
 config.json
 usage.json
+chrome-dedicated/
 ```
+
+`chrome-dedicated/` is the dedicated Chrome user-data-dir created by `manuvra chrome launch`. The daily Chrome default profile is not used, overwritten, or quit.
 
 `config.json` stores the opt-in flag, which defaults false. `usage.json` stores only schema version and aggregate counters keyed by backend, operation name, declared intent, grouped outcome, and count. It must never store raw parameters, values, scripts, URLs, entered text, selectors, references, target/application identity, native messages, invocation records, or precise timestamps.
 

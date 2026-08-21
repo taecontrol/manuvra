@@ -337,7 +337,8 @@ impl Runtime {
             CommandId::DaemonStatus
             | CommandId::DaemonStop
             | CommandId::SystemMigrate
-            | CommandId::SystemPurge => InvocationReply::error("command_unsupported", None),
+            | CommandId::SystemPurge
+            | CommandId::SystemChromeLaunch => InvocationReply::error("command_unsupported", None),
             CommandId::ActionClick
             | CommandId::ActionType
             | CommandId::ActionPress

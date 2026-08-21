@@ -36,6 +36,13 @@ After a first grant, the human closes System Settings. Then run `manuvra daemon 
 
 Ready when `doctor` reports the installed bundle, a usable daemon, and the permissions the next command needs. If `doctor` reports legacy development state, run the migrate command printed by `manuvra --help`.
 
+If `doctor` reports `chrome_endpoint_refused`, or Chrome targets are missing because loopback CDP is refused, run `manuvra chrome launch`. Do not expect `targets`, `doctor`, or `open` to start Chrome.
+
+```bash
+manuvra chrome launch
+manuvra targets --kind chrome
+```
+
 Read `daemon.adapters` only from a successful `manuvra doctor` JSON object that contains that array. If the array is missing, wait and rerun `doctor`. `manuvra daemon status` reports the daemon without touching a target; it is not a doctor document and does not carry adapters.
 
 ## Run a session

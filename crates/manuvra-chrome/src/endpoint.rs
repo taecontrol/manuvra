@@ -45,6 +45,14 @@ impl Endpoint {
         self.address.to_string()
     }
 
+    pub fn port(&self) -> u16 {
+        self.address.port()
+    }
+
+    pub fn ip(&self) -> IpAddr {
+        self.address.ip()
+    }
+
     pub fn websocket_url(&self, path: &str) -> Result<String, EndpointError> {
         if !path.starts_with('/') || path.contains('#') || path.contains(char::is_whitespace) {
             return Err(EndpointError::InvalidWebSocketPath(path.to_owned()));
@@ -160,6 +168,16 @@ pub enum EndpointError {
     Json(String),
 }
 
+impl EndpointError {
+    pub fn is_connection_refused(&self) -> bool {
+        matches!(self, Self::Io(message) if connection_refused_text(message))
+    }
+}
+
+pub fn connection_refused_text(message: &str) -> bool {
+    message.contains("Connection refused") || message.contains("connection refused")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,6 +190,15 @@ mod tests {
         assert!(Endpoint::configured(Some("192.0.2.1:9222")).is_err());
         assert!(Endpoint::configured(Some("http://127.0.0.1:9222")).is_err());
         assert!(Endpoint::configured(Some("127.0.0.1:9222, 127.0.0.1:9333")).is_err());
+        assert_eq!(
+            Endpoint::parse("127.0.0.1:9222").unwrap().ip(),
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        );
+        assert!(
+            EndpointError::Io("Connection refused (os error 61)".to_owned())
+                .is_connection_refused()
+        );
+        assert!(!EndpointError::HttpStatus(404).is_connection_refused());
     }
 
     #[test]

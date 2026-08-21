@@ -600,6 +600,11 @@ impl Runtime {
         if let Err(message) = Input::new(&invocation.input, &["session_id", "target_id"]) {
             return InvocationReply::error("invalid_request", Some(&message));
         }
+        let adapter_diagnostics = self
+            .adapters
+            .iter()
+            .map(|adapter| adapter.diagnostics())
+            .collect::<Vec<_>>();
         let state = self.state.lock().expect("runtime state");
         enforce_deadline(
             invocation,
@@ -609,7 +614,7 @@ impl Runtime {
                 "daemon": {
                     "instance": self.daemon_instance,
                     "build_digest": manuvra_protocol::build_digest(),
-                    "adapters": self.adapters.iter().map(|adapter| adapter.diagnostics()).collect::<Vec<_>>(),
+                    "adapters": adapter_diagnostics,
                 },
                 "permissions": {"same_user_socket": true, "native_permissions": "not_required_for_chrome_cdp"},
                 "sessions": state.sessions.values().map(|session| json!({
@@ -622,6 +627,7 @@ impl Runtime {
                     &self.startup_removed,
                     &self.startup_preserved,
                     &self.doctor_warnings,
+                    &adapter_diagnostics,
                 ),
             })),
         )
@@ -681,7 +687,12 @@ fn enforce_deadline(
     }
 }
 
-fn doctor_warnings(removed: &[PathBuf], preserved: &[PathBuf], injected: &[String]) -> Vec<String> {
+fn doctor_warnings(
+    removed: &[PathBuf],
+    preserved: &[PathBuf],
+    injected: &[String],
+    adapters: &[Value],
+) -> Vec<String> {
     let mut warnings = Vec::new();
     if !removed.is_empty() {
         warnings.push("verified_orphans_removed".to_owned());
@@ -689,8 +700,25 @@ fn doctor_warnings(removed: &[PathBuf], preserved: &[PathBuf], injected: &[Strin
     if !preserved.is_empty() {
         warnings.push("unverified_orphans_preserved".to_owned());
     }
+    if chrome_endpoint_refused(adapters) {
+        warnings.push("chrome_endpoint_refused".to_owned());
+    }
     warnings.extend_from_slice(injected);
     warnings
+}
+
+fn chrome_endpoint_refused(adapters: &[Value]) -> bool {
+    adapters.iter().any(|adapter| {
+        adapter.get("kind").and_then(Value::as_str) == Some("chrome")
+            && adapter
+                .get("endpoints")
+                .and_then(Value::as_object)
+                .is_some_and(|endpoints| {
+                    endpoints
+                        .values()
+                        .any(|status| status.as_str() == Some("refused"))
+                })
+    })
 }
 
 fn parse_open_request(invocation: &Invocation) -> Result<OpenRequest, InvocationReply> {
@@ -1024,8 +1052,38 @@ fn artifact_error_reply(error: ArtifactError) -> InvocationReply {
 
 #[cfg(test)]
 mod tests {
+    use super::{chrome_endpoint_refused, doctor_warnings};
+    use serde_json::json;
+
     #[test]
     fn accepted_error_catalog_has_all_entries() {
-        assert_eq!(manuvra_protocol::all_errors().len(), 44);
+        assert_eq!(manuvra_protocol::all_errors().len(), 46);
+    }
+
+    #[test]
+    fn doctor_warns_only_when_a_chrome_endpoint_is_classified_refused() {
+        let refused = [json!({
+            "kind": "chrome",
+            "endpoints": {"127.0.0.1:9222": "refused"}
+        })];
+        let reachable = [json!({
+            "kind": "chrome",
+            "endpoints": {"127.0.0.1:9222": "reachable"}
+        })];
+        let occupied = [json!({
+            "kind": "chrome",
+            "endpoints": {
+                "127.0.0.1:9222": "listener answered but Chrome /json/list was not an array"
+            }
+        })];
+        assert!(chrome_endpoint_refused(&refused));
+        assert!(!chrome_endpoint_refused(&reachable));
+        assert!(!chrome_endpoint_refused(&occupied));
+        assert_eq!(
+            doctor_warnings(&[], &[], &[], &refused),
+            vec!["chrome_endpoint_refused".to_owned()]
+        );
+        assert!(doctor_warnings(&[], &[], &[], &occupied).is_empty());
+        assert!(doctor_warnings(&[], &[], &[], &[]).is_empty());
     }
 }
