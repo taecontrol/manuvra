@@ -802,7 +802,7 @@ pub(crate) mod test_support {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread::{self, JoinHandle};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tungstenite::accept;
 
     pub struct ScriptedChrome {
@@ -979,19 +979,41 @@ pub(crate) mod test_support {
         let _ = stream.set_nonblocking(false);
         let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
         let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-        let mut peek = [0_u8; 512];
-        let count = stream.peek(&mut peek).unwrap_or(0);
-        let head = String::from_utf8_lossy(&peek[..count]);
+        let head = peek_request_head(&stream);
         if head.contains("/devtools/") || head.to_ascii_lowercase().contains("upgrade: websocket") {
             handle_websocket(stream, script);
-        } else {
+        } else if !head.is_empty() {
             handle_http(stream, script);
         }
     }
 
+    fn peek_request_head(stream: &TcpStream) -> String {
+        let mut peek = [0_u8; 512];
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match stream.peek(&mut peek) {
+                Ok(0) => return String::new(),
+                Ok(count) => return String::from_utf8_lossy(&peek[..count]).into_owned(),
+                Err(error) if peek_should_retry(&error) && Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(_) => return String::new(),
+            }
+        }
+    }
+
+    fn peek_should_retry(error: &std::io::Error) -> bool {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        )
+    }
+
     fn handle_http(mut stream: TcpStream, script: Arc<Mutex<Script>>) {
         let mut request = [0_u8; 2048];
-        let _ = stream.read(&mut request);
+        if stream.read(&mut request).unwrap_or(0) == 0 {
+            return;
+        }
         if let Some(raw) = script.lock().expect("scripted Chrome").raw_http.clone() {
             let _ = stream.write_all(&raw);
             return;

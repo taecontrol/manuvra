@@ -58,20 +58,87 @@ impl Endpoint {
     }
 
     pub fn get_json(&self, path: &str, timeout: Duration) -> Result<Value, EndpointError> {
-        let mut stream = TcpStream::connect_timeout(&self.address, timeout)
-            .map_err(|error| EndpointError::Io(error.to_string()))?;
+        self.request_json("GET", path, timeout)
+            .map_err(RequestFailure::into_endpoint)
+    }
+
+    pub(crate) fn get_json_for_probe(
+        &self,
+        path: &str,
+        timeout: Duration,
+    ) -> Result<Value, RequestFailure> {
+        self.request_json("GET", path, timeout)
+    }
+
+    pub(crate) fn put_json(&self, path: &str, timeout: Duration) -> Result<Value, EndpointError> {
+        self.request_json("PUT", path, timeout)
+            .map_err(RequestFailure::into_endpoint)
+    }
+
+    fn request_json(
+        &self,
+        method: &str,
+        path: &str,
+        timeout: Duration,
+    ) -> Result<Value, RequestFailure> {
+        let mut stream =
+            TcpStream::connect_timeout(&self.address, timeout).map_err(RequestFailure::io)?;
         stream
             .set_read_timeout(Some(timeout))
             .and_then(|()| stream.set_write_timeout(Some(timeout)))
-            .map_err(|error| EndpointError::Io(error.to_string()))?;
+            .map_err(RequestFailure::io)?;
         let host = self.label();
         write!(
             stream,
-            "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nAccept: application/json\r\n\r\n"
+            "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nAccept: application/json\r\n\r\n"
         )
-        .map_err(|error| EndpointError::Io(error.to_string()))?;
+        .map_err(RequestFailure::io)?;
         let response = read_response(&mut stream)?;
-        parse_http_json(&response)
+        parse_http_json(&response).map_err(RequestFailure::definitive)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RequestFailure {
+    error: EndpointError,
+    transient: bool,
+}
+
+impl RequestFailure {
+    fn io(error: std::io::Error) -> Self {
+        let transient = matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        );
+        Self {
+            error: EndpointError::Io(error.to_string()),
+            transient,
+        }
+    }
+
+    fn definitive(error: EndpointError) -> Self {
+        Self {
+            error,
+            transient: false,
+        }
+    }
+
+    fn into_endpoint(self) -> EndpointError {
+        self.error
+    }
+
+    pub(crate) fn is_connection_refused(&self) -> bool {
+        self.error.is_connection_refused()
+    }
+
+    pub(crate) fn is_transient(&self) -> bool {
+        self.transient
+    }
+}
+
+impl std::fmt::Display for RequestFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, formatter)
     }
 }
 
@@ -89,7 +156,7 @@ fn push_configured_endpoint(
     Ok(())
 }
 
-fn read_response(stream: &mut TcpStream) -> Result<Vec<u8>, EndpointError> {
+fn read_response(stream: &mut TcpStream) -> Result<Vec<u8>, RequestFailure> {
     let mut response = Vec::new();
     let mut chunk = [0_u8; 8192];
     while read_discovery_chunk(stream, &mut response, &mut chunk)? {}
@@ -100,43 +167,58 @@ fn read_discovery_chunk(
     stream: &mut TcpStream,
     response: &mut Vec<u8>,
     chunk: &mut [u8],
-) -> Result<bool, EndpointError> {
+) -> Result<bool, RequestFailure> {
     match stream.read(chunk) {
         Ok(0) => Ok(false),
         Ok(count) => Ok(!append_discovery_bytes(response, &chunk[..count])?),
         Err(error) if discovery_read_is_complete(response, &error) => Ok(false),
-        Err(error) => Err(EndpointError::Io(error.to_string())),
+        Err(error) => Err(RequestFailure::io(error)),
     }
 }
 
-fn append_discovery_bytes(response: &mut Vec<u8>, chunk: &[u8]) -> Result<bool, EndpointError> {
+fn append_discovery_bytes(response: &mut Vec<u8>, chunk: &[u8]) -> Result<bool, RequestFailure> {
     response.extend_from_slice(chunk);
     if response.len() > MAX_DISCOVERY_BYTES {
-        return Err(EndpointError::TooLarge);
+        return Err(RequestFailure::definitive(EndpointError::TooLarge));
     }
     Ok(response_complete(response))
 }
 
 fn discovery_read_is_complete(response: &[u8], error: &std::io::Error) -> bool {
-    !response.is_empty()
-        && matches!(
-            error.kind(),
-            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-        )
+    discovery_timeout_kind(error)
+        && !response.is_empty()
+        && !declared_content_length_unsatisfied(response)
+}
+
+fn discovery_timeout_kind(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
+fn declared_content_length_unsatisfied(response: &[u8]) -> bool {
+    declared_content_length_end(response).is_some_and(|end| response.len() < end)
 }
 
 fn response_complete(response: &[u8]) -> bool {
-    let Some(boundary) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
-        return false;
-    };
-    let Ok(head) = std::str::from_utf8(&response[..boundary]) else {
-        return false;
-    };
+    declared_content_length_end(response).is_some_and(|end| response.len() >= end)
+}
+
+fn declared_content_length_end(response: &[u8]) -> Option<usize> {
+    let boundary = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")?;
+    let head = std::str::from_utf8(&response[..boundary]).ok()?;
+    let length = content_length_value(head)?;
+    Some(boundary + 4 + length)
+}
+
+fn content_length_value(head: &str) -> Option<usize> {
     head.lines()
         .filter_map(|line| line.split_once(':'))
         .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
-        .is_some_and(|length| response.len() >= boundary + 4 + length)
+        .and_then(|(_, value)| value.trim().parse().ok())
 }
 
 fn parse_http_json(response: &[u8]) -> Result<Value, EndpointError> {
@@ -194,6 +276,7 @@ pub fn connection_refused_text(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn endpoint_configuration_is_loopback_bounded_and_deduplicated() {
@@ -256,13 +339,34 @@ mod tests {
         );
     }
 
+    fn get_json_when_listening(endpoint: &Endpoint) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match endpoint.get_json("/json/list", Duration::from_millis(200)) {
+                Ok(value) => return value,
+                Err(error) if Instant::now() < deadline && racy_discovery_io(&error) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                other => return other.expect("scripted Chrome /json/list"),
+            }
+        }
+    }
+
+    fn racy_discovery_io(error: &EndpointError) -> bool {
+        matches!(
+            error,
+            EndpointError::Io(message)
+                if message.contains("reset")
+                    || message.contains("Broken pipe")
+                    || message.contains("Connection refused")
+        )
+    }
+
     #[test]
     fn discovery_http_parses_json_and_rejects_status_or_oversize() {
         let chrome = crate::transport::test_support::ScriptedChrome::start();
         let endpoint = chrome.endpoint();
-        let listed = endpoint
-            .get_json("/json/list", Duration::from_secs(1))
-            .unwrap();
+        let listed = get_json_when_listening(&endpoint);
         assert_eq!(listed[0]["id"], "page-1");
 
         chrome.http_status(404);
@@ -286,13 +390,12 @@ mod tests {
 
         let mut oversize = vec![b'x'; 16];
         assert!(append_discovery_bytes(&mut oversize, &[b'y'; MAX_DISCOVERY_BYTES]).is_err());
-        assert!(discovery_read_is_complete(
-            b"partial",
-            &std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout")
-        ));
+        let timeout = std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout");
+        assert!(discovery_read_is_complete(b"partial", &timeout));
+        assert!(!discovery_read_is_complete(b"", &timeout));
         assert!(!discovery_read_is_complete(
-            b"",
-            &std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout")
+            b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\nshort",
+            &timeout
         ));
     }
 

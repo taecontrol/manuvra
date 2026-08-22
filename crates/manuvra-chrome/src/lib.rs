@@ -1444,7 +1444,7 @@ mod tests {
         );
         assert_eq!(first.delivery, manuvra_runtime::AdapterDelivery::Confirmed);
         chrome.disconnect();
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + Duration::from_secs(3);
         let second = loop {
             let reply = adapter.invoke(
                 &context,
@@ -1476,7 +1476,7 @@ mod tests {
         );
         assert_eq!(first.delivery, manuvra_runtime::AdapterDelivery::Confirmed);
         chrome.disconnect();
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + Duration::from_secs(3);
         let reply = loop {
             let reply = adapter.invoke(
                 &context,
