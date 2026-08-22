@@ -990,6 +990,7 @@ fn focused_window_snapshot_result() -> Result<Value, AdapterError> {
     )
 }
 
+#[cfg(debug_assertions)]
 fn system_wide_element() -> Result<Element, AdapterError> {
     let raw = unsafe { AXUIElementCreateSystemWide() };
     NonNull::new(raw.cast_mut())
@@ -997,10 +998,12 @@ fn system_wide_element() -> Result<Element, AdapterError> {
         .ok_or_else(|| adapter_error("observation_failed", "AX system-wide element was null"))
 }
 
+#[cfg(debug_assertions)]
 fn system_focused_application() -> Result<Element, AdapterError> {
     element_attribute(&system_wide_element()?, "AXFocusedApplication")
 }
 
+#[cfg(debug_assertions)]
 fn focused_application_pid(application: &Element) -> Result<i32, AdapterError> {
     let mut pid = 0;
     require_ax_success(
@@ -1011,6 +1014,7 @@ fn focused_application_pid(application: &Element) -> Result<i32, AdapterError> {
     .map(|()| pid)
 }
 
+#[cfg(debug_assertions)]
 fn focused_window_snapshot_from(application: &Element, pid: i32) -> Result<Value, AdapterError> {
     let focused_window = element_attribute(application, "AXFocusedWindow")?;
     Ok(json!({
