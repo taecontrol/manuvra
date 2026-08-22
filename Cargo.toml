@@ -10,7 +10,7 @@ exclude = ["tools/crap-gate"]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
