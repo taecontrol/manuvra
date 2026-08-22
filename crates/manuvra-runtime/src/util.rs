@@ -17,23 +17,28 @@ pub fn opaque_id(prefix: &str) -> String {
 
 pub fn ensure_private_directory(path: &Path) -> io::Result<()> {
     if path.exists() {
-        let metadata = fs::symlink_metadata(path)?;
-        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "private root is not a real directory",
-            ));
-        }
-        if metadata.uid() != unsafe { libc::geteuid() } {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "private root belongs to a different user",
-            ));
-        }
+        validate_existing_private_directory(path)?;
     } else {
         fs::create_dir_all(path)?;
     }
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+fn validate_existing_private_directory(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "private root is not a real directory",
+        ));
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "private root belongs to a different user",
+        ));
+    }
     Ok(())
 }
 
@@ -116,4 +121,28 @@ pub fn rfc3339(time: SystemTime) -> String {
         .map(|byte| *byte as u8)
         .collect::<Vec<_>>();
     String::from_utf8(bytes).unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_private_directory;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn ensure_private_directory_creates_and_reuses_a_0700_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("private");
+        ensure_private_directory(&path).unwrap();
+        assert!(path.is_dir());
+        assert_eq!(
+            fs::symlink_metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        ensure_private_directory(&path).unwrap();
+
+        let file = root.path().join("not-a-dir");
+        fs::write(&file, b"nope").unwrap();
+        assert!(ensure_private_directory(&file).is_err());
+    }
 }

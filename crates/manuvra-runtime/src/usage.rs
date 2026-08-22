@@ -99,20 +99,31 @@ impl UsageStore {
             .lock
             .lock()
             .map_err(|_| UsageError::Unavailable("usage lock poisoned".to_owned()))?;
+        self.apply_usage_action(action, destination)
+    }
+
+    fn apply_usage_action(
+        &self,
+        action: &str,
+        destination: Option<&Path>,
+    ) -> Result<UsageActionResult, UsageError> {
         match action {
             "enable" => self.set_enabled(true, action),
             "disable" => self.set_enabled(false, action),
             "show" => self.show(),
             "reset" => self.reset(),
-            "export" => {
-                self.export(destination.ok_or_else(|| {
-                    UsageError::Invalid("export destination is required".to_owned())
-                })?)
-            }
+            "export" => self.export_action(destination),
             _ => Err(UsageError::Invalid(format!(
                 "unknown usage action {action}"
             ))),
         }
+    }
+
+    fn export_action(&self, destination: Option<&Path>) -> Result<UsageActionResult, UsageError> {
+        self.export(
+            destination
+                .ok_or_else(|| UsageError::Invalid("export destination is required".to_owned()))?,
+        )
     }
 
     pub fn record(&self, key: UsageKey<'_>) -> Result<bool, UsageError> {
@@ -166,13 +177,16 @@ impl UsageStore {
             ));
         }
         let config = self.load_config()?;
-        let bytes = if self.usage_path().exists() {
-            fs::read(self.usage_path())?
-        } else {
-            serde_json::to_vec(&UsageAggregate::default())?
-        };
-        copy_exact_without_overwrite(destination, &bytes)?;
+        copy_exact_without_overwrite(destination, &self.export_bytes()?)?;
         Ok(self.result("export", config.raw_usage_enabled, Some(destination), None))
+    }
+
+    fn export_bytes(&self) -> Result<Vec<u8>, UsageError> {
+        if self.usage_path().exists() {
+            Ok(fs::read(self.usage_path())?)
+        } else {
+            Ok(serde_json::to_vec(&UsageAggregate::default())?)
+        }
     }
 
     fn result(
@@ -354,6 +368,10 @@ fn copy_exact_without_overwrite(destination: &Path, bytes: &[u8]) -> Result<(), 
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
+    write_or_reuse_export(destination, bytes)
+}
+
+fn write_or_reuse_export(destination: &Path, bytes: &[u8]) -> Result<(), UsageError> {
     if destination.exists() {
         return reuse_usage_export(destination, bytes);
     }

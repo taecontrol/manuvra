@@ -1,10 +1,12 @@
 use crate::artifacts::ArtifactError;
-use crate::model::AdapterSession;
-use crate::model::{ActorLease, ExecutionMode, Session, SessionRole, SessionState};
+use crate::model::{
+    ActorLease, AdapterSession, ExecutionMode, Session, SessionRole, SessionState, TargetAdapter,
+    TargetDescriptor,
+};
 use crate::usage::UsageError;
 use crate::util::{opaque_id, rfc3339_after};
 use crate::validation::Input;
-use crate::{InvocationReply, Runtime, RuntimeState};
+use crate::{InvocationReply, LocatedTarget, Runtime, RuntimeState};
 use manuvra_protocol::{
     Invocation, command_descriptor, command_help, error_meta, registry_page, schema_pointer,
 };
@@ -26,6 +28,25 @@ struct ExportRequest {
     session_id: String,
     destination: PathBuf,
     selected: Option<Vec<String>>,
+}
+
+struct TargetListFilter<'a> {
+    kind: Option<&'a str>,
+    cursor: usize,
+    limit: usize,
+}
+
+struct LeaseRequest<'a> {
+    session_id: &'a str,
+    action: &'a str,
+    requested_ttl: u64,
+}
+
+struct OpenedAttach {
+    request: OpenRequest,
+    adapter: Arc<dyn TargetAdapter>,
+    adapter_session: AdapterSession,
+    deadline: Instant,
 }
 
 impl Runtime {
@@ -51,17 +72,9 @@ impl Runtime {
         if deadline_expired(invocation, started) {
             return InvocationReply::error("timed_out", None);
         }
-        let input = match Input::new(&invocation.input, &["action", "destination"]) {
-            Ok(input) => input,
-            Err(message) => return InvocationReply::error("invalid_request", Some(&message)),
-        };
-        let action = match input.string("action") {
-            Ok(action) => action,
-            Err(message) => return InvocationReply::error("invalid_request", Some(&message)),
-        };
-        let destination = match input.optional_string("destination") {
-            Ok(destination) => destination.map(Path::new),
-            Err(message) => return InvocationReply::error("invalid_request", Some(&message)),
+        let (action, destination) = match parse_usage_request(invocation) {
+            Ok(request) => request,
+            Err(reply) => return reply,
         };
         let reply = match self.usage.manage(action, destination) {
             Ok(result) => {
@@ -80,29 +93,9 @@ impl Runtime {
         if deadline_expired(invocation, started) {
             return InvocationReply::error("timed_out", None);
         }
-        let input = match Input::new(&invocation.input, &["kind", "cursor", "limit"]) {
-            Ok(input) => input,
-            Err(message) => return InvocationReply::error("invalid_request", Some(&message)),
-        };
-        let kind = match input.optional_string("kind") {
-            Ok(kind) => kind,
-            Err(message) => return InvocationReply::error("invalid_request", Some(&message)),
-        };
-        if kind.is_some_and(|value| !matches!(value, "chrome" | "macos")) {
-            return InvocationReply::error("invalid_request", Some("kind must be chrome or macos"));
-        }
-        let cursor = match parse_cursor(&input) {
-            Ok(cursor) => cursor,
+        let filter = match parse_target_list_request(invocation) {
+            Ok(filter) => filter,
             Err(reply) => return reply,
-        };
-        let limit = match input.unsigned("limit", Some(10)) {
-            Ok(limit @ 1..=10) => limit as usize,
-            _ => {
-                return InvocationReply::error(
-                    "invalid_request",
-                    Some("limit must be between 1 and 10"),
-                );
-            }
         };
         let all = match self.targets_until(started + Duration::from_millis(invocation.deadline_ms))
         {
@@ -110,27 +103,13 @@ impl Runtime {
             Err(error) => return InvocationReply::error(&error.code, error.message.as_deref()),
         }
         .into_iter()
-        .filter(|target| kind.is_none_or(|expected| target.kind == expected))
+        .filter(|target| filter.kind.is_none_or(|expected| target.kind == expected))
         .collect::<Vec<_>>();
-        let end = (cursor + limit).min(all.len());
+        let end = (filter.cursor + filter.limit).min(all.len());
         let state = self.state.lock().expect("runtime state");
-        let targets = all[cursor.min(all.len())..end]
+        let targets = all[filter.cursor.min(all.len())..end]
             .iter()
-            .map(|target| {
-                let held = state.leases.get(&target.target_id).is_some_and(|lease| {
-                    lease.target_generation == target.generation
-                        && (lease.expires_at > Instant::now() || lease.pinned > 0)
-                });
-                json!({
-                    "target_id": target.target_id,
-                    "generation": target.generation,
-                    "kind": target.kind,
-                    "owner": bounded_label(&target.owner),
-                    "title": target.title.as_deref().and_then(bounded_title),
-                    "capabilities": target.capabilities,
-                    "actor_lease": if held { "held" } else { "available" },
-                })
-            })
+            .map(|target| target_list_entry(&state, target))
             .collect::<Vec<_>>();
         enforce_deadline(
             invocation,
@@ -154,14 +133,41 @@ impl Runtime {
             Ok(request) => request,
             Err(reply) => return reply,
         };
-        let (target, adapter) = match self.target_with_adapter_until(
-            &request.target_id,
+        let (target, adapter) =
+            match self.locate_open_target(&request.target_id, invocation, started) {
+                Ok(located) => located,
+                Err(reply) => return reply,
+            };
+        self.complete_open_session(invocation, started, request, target, adapter)
+    }
+
+    fn locate_open_target(
+        &self,
+        target_id: &str,
+        invocation: &Invocation,
+        started: Instant,
+    ) -> Result<LocatedTarget, InvocationReply> {
+        match self.target_with_adapter_until(
+            target_id,
             started + Duration::from_millis(invocation.deadline_ms),
         ) {
-            Ok(Some(target)) => target,
-            Err(error) => return InvocationReply::error(&error.code, error.message.as_deref()),
-            Ok(None) => return InvocationReply::error("target_not_found", None),
-        };
+            Ok(Some(target)) => Ok(target),
+            Err(error) => Err(InvocationReply::error(
+                &error.code,
+                error.message.as_deref(),
+            )),
+            Ok(None) => Err(InvocationReply::error("target_not_found", None)),
+        }
+    }
+
+    fn complete_open_session(
+        &self,
+        invocation: &Invocation,
+        started: Instant,
+        request: OpenRequest,
+        target: TargetDescriptor,
+        adapter: Arc<dyn TargetAdapter>,
+    ) -> InvocationReply {
         let deadline = started + Duration::from_millis(invocation.deadline_ms);
         let session_id = opaque_id("s_");
         let directory =
@@ -178,22 +184,8 @@ impl Runtime {
             let _ = self.artifacts.close_session(&directory);
             return InvocationReply::error("timed_out", None);
         }
-        let session = Session {
-            id: session_id.clone(),
-            target_id: request.target_id.clone(),
-            target_generation: target.generation,
-            role: request.role.clone(),
-            mode: request.mode.clone(),
-            directory: directory.clone(),
-            lease_ttl_ms: request.lease_ttl_ms,
-            reference_namespace: opaque_id("n_"),
-            reference_epoch: 0,
-            frame_token: None,
-            in_flight: 0,
-            state: SessionState::Active,
-        };
-        let publish = self.publish_session(session);
-        if let Err(reply) = publish {
+        let session = new_open_session(&session_id, &request, &target, directory.clone());
+        if let Err(reply) = self.publish_session(session) {
             let _ = self.artifacts.close_session(&directory);
             return reply;
         }
@@ -202,22 +194,56 @@ impl Runtime {
             target_id: request.target_id.clone(),
             target_generation: target.generation,
         };
-        if let Err(error) = adapter.session_opened(&adapter_session, deadline) {
-            self.rollback_open_session(&session_id, &adapter, &adapter_session);
+        self.attach_opened_session(
+            invocation,
+            started,
+            OpenedAttach {
+                request,
+                adapter,
+                adapter_session,
+                deadline,
+            },
+        )
+    }
+
+    fn attach_opened_session(
+        &self,
+        invocation: &Invocation,
+        started: Instant,
+        opened: OpenedAttach,
+    ) -> InvocationReply {
+        if let Err(error) = opened
+            .adapter
+            .session_opened(&opened.adapter_session, opened.deadline)
+        {
+            self.rollback_open_session(
+                &opened.adapter_session.session_id,
+                &opened.adapter,
+                &opened.adapter_session,
+            );
             return InvocationReply::error(&error.code, error.message.as_deref());
         }
         if deadline_expired(invocation, started) {
-            self.rollback_open_session(&session_id, &adapter, &adapter_session);
+            self.rollback_open_session(
+                &opened.adapter_session.session_id,
+                &opened.adapter,
+                &opened.adapter_session,
+            );
             return InvocationReply::error("timed_out", None);
         }
-        let lease = (request.role == SessionRole::Actor)
-            .then(|| lease_json(&session_id, request.lease_ttl_ms, "held"));
+        let lease = (opened.request.role == SessionRole::Actor).then(|| {
+            lease_json(
+                &opened.adapter_session.session_id,
+                opened.request.lease_ttl_ms,
+                "held",
+            )
+        });
         InvocationReply::success(json!({
-            "session_id": session_id,
-            "target_id": request.target_id,
-            "target_generation": target.generation,
-            "role": request.role,
-            "mode": request.mode,
+            "session_id": opened.adapter_session.session_id,
+            "target_id": opened.request.target_id,
+            "target_generation": opened.adapter_session.target_generation,
+            "role": opened.request.role,
+            "mode": opened.request.mode,
             "state": "active",
             "lease": lease,
         }))
@@ -287,17 +313,9 @@ impl Runtime {
         invocation: &Invocation,
         started: Instant,
     ) -> InvocationReply {
-        let input = match Input::new(&invocation.input, &["session_id", "cancel_running"]) {
-            Ok(input) => input,
-            Err(message) => return InvocationReply::error("invalid_request", Some(&message)),
-        };
-        let session_id = match input.string("session_id") {
-            Ok(session_id) => session_id,
-            Err(message) => return InvocationReply::error("invalid_request", Some(&message)),
-        };
-        let cancel_running = match input.boolean("cancel_running", false) {
-            Ok(value) => value,
-            Err(message) => return InvocationReply::error("invalid_request", Some(&message)),
+        let (session_id, cancel_running) = match parse_close_request(invocation) {
+            Ok(request) => request,
+            Err(reply) => return reply,
         };
         if let Err(reply) = self.begin_close(session_id, cancel_running) {
             return reply;
@@ -310,19 +328,12 @@ impl Runtime {
                 Some("session work did not become terminal before close deadline"),
             );
         }
-        self.finish_close(
-            session_id,
-            started + Duration::from_millis(invocation.deadline_ms),
-        )
+        self.finish_close(session_id, deadline)
     }
 
     fn begin_close(&self, session_id: &str, cancel_running: bool) -> Result<(), InvocationReply> {
         let mut state = self.state.lock().expect("runtime state");
-        let in_flight = match state.sessions.get(session_id) {
-            Some(session) if session.state == SessionState::Active => session.in_flight,
-            Some(_) => return Err(InvocationReply::error("session_busy", None)),
-            None => return Err(InvocationReply::error("session_not_found", None)),
-        };
+        let in_flight = closing_in_flight(&state, session_id)?;
         if in_flight > 0 && !cancel_running {
             return Err(InvocationReply::error("session_busy", None));
         }
@@ -332,13 +343,7 @@ impl Runtime {
             .expect("checked session")
             .state = SessionState::Closing;
         if cancel_running {
-            for (request_id, owner) in &state.cancellation_sessions {
-                if owner == session_id
-                    && let Some(token) = state.cancellations.get(request_id)
-                {
-                    token.store(true, Ordering::SeqCst);
-                }
-            }
+            cancel_session_requests(&state, session_id);
         }
         Ok(())
     }
@@ -373,24 +378,48 @@ impl Runtime {
     }
 
     fn finish_close(&self, session_id: &str, deadline: Instant) -> InvocationReply {
-        let session = {
-            let state = self.state.lock().expect("runtime state");
-            match state.sessions.get(session_id) {
-                Some(session) if session.in_flight == 0 => session.clone(),
-                Some(_) => return InvocationReply::error("session_busy", None),
-                None => return InvocationReply::error("session_not_found", None),
-            }
-        };
+        let session =
+            match idle_closing_session(&self.state.lock().expect("runtime state"), session_id) {
+                Ok(session) => session,
+                Err(reply) => return reply,
+            };
+        if let Err(reply) = self.release_closing_resources(&session, session_id, deadline) {
+            return reply;
+        }
+        forget_closed_session(
+            &mut self.state.lock().expect("runtime state"),
+            session_id,
+            &session.target_id,
+        );
+        InvocationReply::success(json!({
+            "session_id": session_id,
+            "closed": true,
+            "artifacts_removed": true,
+        }))
+    }
+
+    fn release_closing_resources(
+        &self,
+        session: &Session,
+        session_id: &str,
+        deadline: Instant,
+    ) -> Result<(), InvocationReply> {
         let adapter = match self.adapter_for_until(&session.target_id, deadline) {
             Ok(adapter) => adapter,
             Err(error) => {
                 self.clear_closing(session_id);
-                return InvocationReply::error(&error.code, error.message.as_deref());
+                return Err(InvocationReply::error(
+                    &error.code,
+                    error.message.as_deref(),
+                ));
             }
         };
         if let Err(error) = self.artifacts.close_session(&session.directory) {
             self.clear_closing(session_id);
-            return InvocationReply::error("artifact_io_failed", Some(&error.to_string()));
+            return Err(InvocationReply::error(
+                "artifact_io_failed",
+                Some(&error.to_string()),
+            ));
         }
         if let Some(adapter) = adapter {
             adapter.session_closed(&AdapterSession {
@@ -399,20 +428,7 @@ impl Runtime {
                 target_generation: session.target_generation,
             });
         }
-        let mut state = self.state.lock().expect("runtime state");
-        state.sessions.remove(session_id);
-        if state
-            .leases
-            .get(&session.target_id)
-            .is_some_and(|lease| lease.session_id == session_id)
-        {
-            state.leases.remove(&session.target_id);
-        }
-        InvocationReply::success(json!({
-            "session_id": session_id,
-            "closed": true,
-            "artifacts_removed": true,
-        }))
+        Ok(())
     }
 
     pub(crate) fn manage_lease(
@@ -423,34 +439,17 @@ impl Runtime {
         if deadline_expired(invocation, started) {
             return InvocationReply::error("timed_out", None);
         }
-        let input = match Input::new(&invocation.input, &["session_id", "action", "ttl_ms"]) {
-            Ok(input) => input,
-            Err(message) => return InvocationReply::error("invalid_request", Some(&message)),
-        };
-        let session_id = match input.string("session_id") {
-            Ok(value) => value,
-            Err(message) => return InvocationReply::error("invalid_request", Some(&message)),
-        };
-        let action = match input.string("action") {
-            Ok(value @ ("acquire" | "renew" | "release")) => value,
-            _ => {
-                return InvocationReply::error(
-                    "invalid_request",
-                    Some("lease action must be acquire, renew, or release"),
-                );
-            }
-        };
-        let requested_ttl = match input.unsigned("ttl_ms", Some(0)) {
-            Ok(value) => value,
-            Err(message) => return InvocationReply::error("invalid_request", Some(&message)),
+        let request = match parse_lease_request(invocation) {
+            Ok(request) => request,
+            Err(reply) => return reply,
         };
         enforce_deadline(
             invocation,
             started,
             self.apply_lease_action(
-                session_id,
-                action,
-                requested_ttl,
+                request.session_id,
+                request.action,
+                request.requested_ttl,
                 started + Duration::from_millis(invocation.deadline_ms),
             ),
         )
@@ -480,12 +479,13 @@ impl Runtime {
         self.validate_session_generation(&session, deadline)?;
         expire_target_lease(&mut state.leases, &session.target_id, now);
         let ttl = validated_lease_ttl(requested_ttl, session.lease_ttl_ms)?;
-        Ok(match action {
-            "acquire" => acquire_lease(&mut state.leases, &session, ttl, now),
-            "renew" => renew_lease(&mut state.leases, &session, ttl, now),
-            "release" => release_lease(&mut state.leases, &session),
-            _ => unreachable!(),
-        })
+        Ok(apply_validated_lease_action(
+            &mut state.leases,
+            &session,
+            action,
+            ttl,
+            now,
+        ))
     }
 
     fn validate_session_generation(
@@ -507,23 +507,30 @@ impl Runtime {
         if deadline_expired(invocation, started) {
             return InvocationReply::error("timed_out", None);
         }
-        let input = match Input::new(&invocation.input, &["session_id", "request_id"]) {
-            Ok(input) => input,
-            Err(message) => return InvocationReply::error("invalid_request", Some(&message)),
+        let (session_id, request_id) = match parse_cancel_request(invocation) {
+            Ok(request) => request,
+            Err(reply) => return reply,
         };
-        let session_id = match input.string("session_id") {
-            Ok(value) => value,
-            Err(message) => return InvocationReply::error("invalid_request", Some(&message)),
+        let reply = match self.cancel_disposition(session_id, request_id) {
+            Ok(disposition) => InvocationReply::success(json!({
+                "request_id": request_id,
+                "disposition": disposition,
+            })),
+            Err(reply) => reply,
         };
-        let request_id = match input.string("request_id") {
-            Ok(value) => value,
-            Err(message) => return InvocationReply::error("invalid_request", Some(&message)),
-        };
+        enforce_deadline(invocation, started, reply)
+    }
+
+    fn cancel_disposition(
+        &self,
+        session_id: &str,
+        request_id: &str,
+    ) -> Result<&'static str, InvocationReply> {
         let state = self.state.lock().expect("runtime state");
         if !state.sessions.contains_key(session_id) {
-            return InvocationReply::error("session_not_found", None);
+            return Err(InvocationReply::error("session_not_found", None));
         }
-        let disposition = match state.cancellation_sessions.get(request_id) {
+        Ok(match state.cancellation_sessions.get(request_id) {
             Some(owner) if owner == session_id => {
                 state
                     .cancellations
@@ -536,12 +543,7 @@ impl Runtime {
                 "already_terminal"
             }
             _ => "unknown_request",
-        };
-        enforce_deadline(
-            invocation,
-            started,
-            InvocationReply::success(json!({"request_id": request_id, "disposition": disposition})),
-        )
+        })
     }
 
     pub(crate) fn export(&self, invocation: &Invocation, started: Instant) -> InvocationReply {
@@ -552,45 +554,22 @@ impl Runtime {
             Ok(request) => request,
             Err(reply) => return reply,
         };
+        enforce_deadline(invocation, started, self.export_request(&request))
+    }
+
+    fn export_request(&self, request: &ExportRequest) -> InvocationReply {
         let directory = match self.session_directory(&request.session_id) {
             Ok(directory) => directory,
             Err(reply) => return reply,
         };
-        let reply = match self.artifacts.export(
+        match self.artifacts.export(
             &directory,
             &request.destination,
             request.selected.as_deref(),
         ) {
-            Ok(files) => {
-                let public_files = if request.selected.is_none() {
-                    vec![json!({
-                        "kind": "manifest",
-                        "path": request.destination.join("manifest.json"),
-                        "artifact_count": files.len(),
-                    })]
-                } else {
-                    files
-                        .iter()
-                        .map(|file| {
-                            json!({
-                                "artifact_id": file.artifact_id,
-                                "kind": file.kind,
-                                "path": file.path,
-                                "sha256": file.sha256,
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                };
-                InvocationReply::success(json!({
-                    "session_id": request.session_id,
-                    "destination": request.destination,
-                    "files": public_files,
-                    "verified": true,
-                }))
-            }
+            Ok(files) => export_success(request, files),
             Err(error) => InvocationReply::error("export_failed", Some(&error.to_string())),
-        };
-        enforce_deadline(invocation, started, reply)
+        }
     }
 
     pub(crate) fn doctor(&self, invocation: &Invocation, started: Instant) -> InvocationReply {
@@ -721,6 +700,216 @@ fn chrome_endpoint_refused(adapters: &[Value]) -> bool {
     })
 }
 
+fn parse_usage_request(invocation: &Invocation) -> Result<(&str, Option<&Path>), InvocationReply> {
+    let input = Input::new(&invocation.input, &["action", "destination"])
+        .map_err(|message| InvocationReply::error("invalid_request", Some(&message)))?;
+    let action = input
+        .string("action")
+        .map_err(|message| InvocationReply::error("invalid_request", Some(&message)))?;
+    let destination = input
+        .optional_string("destination")
+        .map_err(|message| InvocationReply::error("invalid_request", Some(&message)))?
+        .map(Path::new);
+    Ok((action, destination))
+}
+
+fn parse_target_list_request(
+    invocation: &Invocation,
+) -> Result<TargetListFilter<'_>, InvocationReply> {
+    let input = Input::new(&invocation.input, &["kind", "cursor", "limit"])
+        .map_err(|message| InvocationReply::error("invalid_request", Some(&message)))?;
+    Ok(TargetListFilter {
+        kind: parse_target_kind(&input)?,
+        cursor: parse_cursor(&input)?,
+        limit: parse_target_limit(&input)?,
+    })
+}
+
+fn parse_target_kind<'a>(input: &Input<'a>) -> Result<Option<&'a str>, InvocationReply> {
+    let kind = input
+        .optional_string("kind")
+        .map_err(|message| InvocationReply::error("invalid_request", Some(&message)))?;
+    if kind.is_some_and(|value| !matches!(value, "chrome" | "macos")) {
+        Err(InvocationReply::error(
+            "invalid_request",
+            Some("kind must be chrome or macos"),
+        ))
+    } else {
+        Ok(kind)
+    }
+}
+
+fn parse_target_limit(input: &Input<'_>) -> Result<usize, InvocationReply> {
+    match input.unsigned("limit", Some(10)) {
+        Ok(limit @ 1..=10) => Ok(limit as usize),
+        _ => Err(InvocationReply::error(
+            "invalid_request",
+            Some("limit must be between 1 and 10"),
+        )),
+    }
+}
+
+fn target_list_entry(state: &RuntimeState, target: &TargetDescriptor) -> Value {
+    json!({
+        "target_id": target.target_id,
+        "generation": target.generation,
+        "kind": target.kind,
+        "owner": bounded_label(&target.owner),
+        "title": target.title.as_deref().and_then(bounded_title),
+        "capabilities": target.capabilities,
+        "actor_lease": if actor_lease_held(state, target) { "held" } else { "available" },
+    })
+}
+
+fn actor_lease_held(state: &RuntimeState, target: &TargetDescriptor) -> bool {
+    state.leases.get(&target.target_id).is_some_and(|lease| {
+        lease.target_generation == target.generation
+            && (lease.expires_at > Instant::now() || lease.pinned > 0)
+    })
+}
+
+fn new_open_session(
+    session_id: &str,
+    request: &OpenRequest,
+    target: &TargetDescriptor,
+    directory: PathBuf,
+) -> Session {
+    Session {
+        id: session_id.to_owned(),
+        target_id: request.target_id.clone(),
+        target_generation: target.generation,
+        role: request.role.clone(),
+        mode: request.mode.clone(),
+        directory,
+        lease_ttl_ms: request.lease_ttl_ms,
+        reference_namespace: opaque_id("n_"),
+        reference_epoch: 0,
+        frame_token: None,
+        in_flight: 0,
+        state: SessionState::Active,
+    }
+}
+
+fn parse_close_request(invocation: &Invocation) -> Result<(&str, bool), InvocationReply> {
+    let input = Input::new(&invocation.input, &["session_id", "cancel_running"])
+        .map_err(|message| InvocationReply::error("invalid_request", Some(&message)))?;
+    let session_id = input
+        .string("session_id")
+        .map_err(|message| InvocationReply::error("invalid_request", Some(&message)))?;
+    let cancel_running = input
+        .boolean("cancel_running", false)
+        .map_err(|message| InvocationReply::error("invalid_request", Some(&message)))?;
+    Ok((session_id, cancel_running))
+}
+
+fn closing_in_flight(state: &RuntimeState, session_id: &str) -> Result<usize, InvocationReply> {
+    match state.sessions.get(session_id) {
+        Some(session) if session.state == SessionState::Active => Ok(session.in_flight),
+        Some(_) => Err(InvocationReply::error("session_busy", None)),
+        None => Err(InvocationReply::error("session_not_found", None)),
+    }
+}
+
+fn cancel_session_requests(state: &RuntimeState, session_id: &str) {
+    for (request_id, owner) in &state.cancellation_sessions {
+        if owner == session_id
+            && let Some(token) = state.cancellations.get(request_id)
+        {
+            token.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+fn idle_closing_session(
+    state: &RuntimeState,
+    session_id: &str,
+) -> Result<Session, InvocationReply> {
+    match state.sessions.get(session_id) {
+        Some(session) if session.in_flight == 0 => Ok(session.clone()),
+        Some(_) => Err(InvocationReply::error("session_busy", None)),
+        None => Err(InvocationReply::error("session_not_found", None)),
+    }
+}
+
+fn forget_closed_session(state: &mut RuntimeState, session_id: &str, target_id: &str) {
+    state.sessions.remove(session_id);
+    if state
+        .leases
+        .get(target_id)
+        .is_some_and(|lease| lease.session_id == session_id)
+    {
+        state.leases.remove(target_id);
+    }
+}
+
+fn parse_lease_request(invocation: &Invocation) -> Result<LeaseRequest<'_>, InvocationReply> {
+    let input = Input::new(&invocation.input, &["session_id", "action", "ttl_ms"])
+        .map_err(|message| InvocationReply::error("invalid_request", Some(&message)))?;
+    let session_id = input
+        .string("session_id")
+        .map_err(|message| InvocationReply::error("invalid_request", Some(&message)))?;
+    let action = match input.string("action") {
+        Ok(value @ ("acquire" | "renew" | "release")) => value,
+        _ => {
+            return Err(InvocationReply::error(
+                "invalid_request",
+                Some("lease action must be acquire, renew, or release"),
+            ));
+        }
+    };
+    let requested_ttl = input
+        .unsigned("ttl_ms", Some(0))
+        .map_err(|message| InvocationReply::error("invalid_request", Some(&message)))?;
+    Ok(LeaseRequest {
+        session_id,
+        action,
+        requested_ttl,
+    })
+}
+
+fn parse_cancel_request(invocation: &Invocation) -> Result<(&str, &str), InvocationReply> {
+    let input = Input::new(&invocation.input, &["session_id", "request_id"])
+        .map_err(|message| InvocationReply::error("invalid_request", Some(&message)))?;
+    let session_id = input
+        .string("session_id")
+        .map_err(|message| InvocationReply::error("invalid_request", Some(&message)))?;
+    let request_id = input
+        .string("request_id")
+        .map_err(|message| InvocationReply::error("invalid_request", Some(&message)))?;
+    Ok((session_id, request_id))
+}
+
+fn export_success(
+    request: &ExportRequest,
+    files: Vec<crate::artifacts::PublishedArtifact>,
+) -> InvocationReply {
+    let public_files = if request.selected.is_none() {
+        vec![json!({
+            "kind": "manifest",
+            "path": request.destination.join("manifest.json"),
+            "artifact_count": files.len(),
+        })]
+    } else {
+        files
+            .iter()
+            .map(|file| {
+                json!({
+                    "artifact_id": file.artifact_id,
+                    "kind": file.kind,
+                    "path": file.path,
+                    "sha256": file.sha256,
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    InvocationReply::success(json!({
+        "session_id": request.session_id,
+        "destination": request.destination,
+        "files": public_files,
+        "verified": true,
+    }))
+}
+
 fn parse_open_request(invocation: &Invocation) -> Result<OpenRequest, InvocationReply> {
     let input = Input::new(
         &invocation.input,
@@ -761,27 +950,8 @@ fn parse_export_request(invocation: &Invocation) -> Result<ExportRequest, Invoca
         .string("session_id")
         .map(str::to_owned)
         .map_err(|message| InvocationReply::error("invalid_request", Some(&message)))?;
-    let destination = input
-        .string("destination")
-        .map(PathBuf::from)
-        .map_err(|message| InvocationReply::error("invalid_request", Some(&message)))?;
-    if !destination.is_absolute() {
-        return Err(InvocationReply::error(
-            "invalid_request",
-            Some("destination must be absolute"),
-        ));
-    }
-    let all = input
-        .boolean("all", false)
-        .map_err(|message| InvocationReply::error("invalid_request", Some(&message)))?;
-    let selected = parse_artifact_ids(input.optional_value("artifact_ids"))
-        .map_err(|message| InvocationReply::error("invalid_request", Some(&message)))?;
-    if all == selected.is_some() {
-        return Err(InvocationReply::error(
-            "invalid_request",
-            Some("choose exactly one of all or artifact_ids"),
-        ));
-    }
+    let destination = absolute_export_destination(&input)?;
+    let selected = exclusive_export_selection(&input)?;
     Ok(ExportRequest {
         session_id,
         destination,
@@ -789,20 +959,58 @@ fn parse_export_request(invocation: &Invocation) -> Result<ExportRequest, Invoca
     })
 }
 
+fn absolute_export_destination(input: &Input<'_>) -> Result<PathBuf, InvocationReply> {
+    let destination = input
+        .string("destination")
+        .map(PathBuf::from)
+        .map_err(|message| InvocationReply::error("invalid_request", Some(&message)))?;
+    if destination.is_absolute() {
+        Ok(destination)
+    } else {
+        Err(InvocationReply::error(
+            "invalid_request",
+            Some("destination must be absolute"),
+        ))
+    }
+}
+
+fn exclusive_export_selection(input: &Input<'_>) -> Result<Option<Vec<String>>, InvocationReply> {
+    let all = input
+        .boolean("all", false)
+        .map_err(|message| InvocationReply::error("invalid_request", Some(&message)))?;
+    let selected = parse_artifact_ids(input.optional_value("artifact_ids"))
+        .map_err(|message| InvocationReply::error("invalid_request", Some(&message)))?;
+    if all == selected.is_some() {
+        Err(InvocationReply::error(
+            "invalid_request",
+            Some("choose exactly one of all or artifact_ids"),
+        ))
+    } else {
+        Ok(selected)
+    }
+}
+
 fn discovery_list(value: &Value) -> InvocationReply {
-    let input = match Input::new(value, &["cursor", "limit"]) {
-        Ok(input) => input,
-        Err(message) => return InvocationReply::error("invalid_request", Some(&message)),
-    };
-    let cursor = match parse_cursor(&input) {
-        Ok(cursor) => cursor,
-        Err(reply) => return reply,
-    };
+    match parse_registry_page(value) {
+        Ok((cursor, limit)) => InvocationReply::success(registry_page(cursor, limit)),
+        Err(reply) => reply,
+    }
+}
+
+fn parse_registry_page(value: &Value) -> Result<(usize, usize), InvocationReply> {
+    let input = Input::new(value, &["cursor", "limit"])
+        .map_err(|message| InvocationReply::error("invalid_request", Some(&message)))?;
+    let cursor = parse_cursor(&input)?;
     let limit = match input.unsigned("limit", Some(10)) {
         Ok(limit @ 1..=10) => limit as usize,
-        _ => return InvocationReply::error("invalid_request", Some("invalid registry limit")),
+        _ => {
+            return Err(InvocationReply::error(
+                "invalid_request",
+                Some("invalid registry limit"),
+            ));
+        }
     };
-    InvocationReply::success(registry_page(cursor, limit))
+    Ok((cursor, limit))
 }
 
 fn discovery_get(value: &Value) -> InvocationReply {
@@ -817,16 +1025,8 @@ fn discovery_get(value: &Value) -> InvocationReply {
 }
 
 fn discovery_schema(value: &Value) -> InvocationReply {
-    let input = match Input::new(value, &["command", "side"]) {
-        Ok(input) => input,
-        Err(message) => return InvocationReply::error("invalid_request", Some(&message)),
-    };
-    let command = match input.string("command").ok().and_then(command_descriptor) {
-        Some(command) => command,
-        None => return InvocationReply::error("unknown_command", None),
-    };
-    let key = match schema_side(&input) {
-        Ok(key) => key,
+    let (command, key) = match parse_schema_request(value) {
+        Ok(request) => request,
         Err(reply) => return reply,
     };
     match resolve_schema_pointer(command, key) {
@@ -836,6 +1036,17 @@ fn discovery_schema(value: &Value) -> InvocationReply {
             Some("installed schema pointer is invalid"),
         ),
     }
+}
+
+fn parse_schema_request(value: &Value) -> Result<(&Value, &'static str), InvocationReply> {
+    let input = Input::new(value, &["command", "side"])
+        .map_err(|message| InvocationReply::error("invalid_request", Some(&message)))?;
+    let command = input
+        .string("command")
+        .ok()
+        .and_then(command_descriptor)
+        .ok_or_else(|| InvocationReply::error("unknown_command", None))?;
+    Ok((command, schema_side(&input)?))
 }
 
 fn schema_side(input: &Input<'_>) -> Result<&'static str, InvocationReply> {
@@ -953,6 +1164,21 @@ fn validated_lease_ttl(requested: u64, default: u64) -> Result<u64, InvocationRe
     }
 }
 
+fn apply_validated_lease_action(
+    leases: &mut std::collections::HashMap<String, ActorLease>,
+    session: &Session,
+    action: &str,
+    ttl: u64,
+    now: Instant,
+) -> InvocationReply {
+    match action {
+        "acquire" => acquire_lease(leases, session, ttl, now),
+        "renew" => renew_lease(leases, session, ttl, now),
+        "release" => release_lease(leases, session),
+        _ => unreachable!(),
+    }
+}
+
 fn acquire_lease(
     leases: &mut std::collections::HashMap<String, ActorLease>,
     session: &Session,
@@ -1029,6 +1255,10 @@ fn parse_artifact_ids(value: Option<&Value>) -> Result<Option<Vec<String>>, Stri
     if values.is_empty() {
         return Err("artifact_ids must not be empty".to_owned());
     }
+    Ok(Some(string_artifact_ids(values)?))
+}
+
+fn string_artifact_ids(values: &[Value]) -> Result<Vec<String>, String> {
     values
         .iter()
         .map(|value| {
@@ -1037,8 +1267,7 @@ fn parse_artifact_ids(value: Option<&Value>) -> Result<Option<Vec<String>>, Stri
                 .map(str::to_owned)
                 .ok_or_else(|| "artifact ID must be a string".to_owned())
         })
-        .collect::<Result<Vec<_>, _>>()
-        .map(Some)
+        .collect()
 }
 
 fn usage_error_reply(error: UsageError) -> InvocationReply {
@@ -1052,7 +1281,12 @@ fn artifact_error_reply(error: ArtifactError) -> InvocationReply {
 
 #[cfg(test)]
 mod tests {
-    use super::{chrome_endpoint_refused, doctor_warnings};
+    use super::{
+        chrome_endpoint_refused, doctor_warnings, parse_artifact_ids, parse_export_request,
+        parse_role, parse_schema_request,
+    };
+    use crate::validation::Input;
+    use manuvra_protocol::Invocation;
     use serde_json::json;
 
     #[test]
@@ -1085,5 +1319,77 @@ mod tests {
         );
         assert!(doctor_warnings(&[], &[], &[], &occupied).is_empty());
         assert!(doctor_warnings(&[], &[], &[], &[]).is_empty());
+    }
+
+    #[test]
+    fn parse_role_and_export_selection_keep_admission_results() {
+        let actor_input = json!({});
+        let actor = Input::new(&actor_input, &["role"]).unwrap();
+        assert!(matches!(
+            parse_role(&actor),
+            Ok(crate::model::SessionRole::Actor)
+        ));
+        let observer_input = json!({"role": "observer"});
+        let observer = Input::new(&observer_input, &["role"]).unwrap();
+        assert!(matches!(
+            parse_role(&observer),
+            Ok(crate::model::SessionRole::Observer)
+        ));
+        let invalid_input = json!({"role": "admin"});
+        let invalid = Input::new(&invalid_input, &["role"]).unwrap();
+        assert_eq!(
+            parse_role(&invalid).unwrap_err().value["error"]["code"],
+            "invalid_request"
+        );
+
+        assert!(parse_artifact_ids(None).unwrap().is_none());
+        assert_eq!(
+            parse_artifact_ids(Some(&json!(["a_one"]))).unwrap(),
+            Some(vec!["a_one".to_owned()])
+        );
+        assert!(parse_artifact_ids(Some(&json!([]))).is_err());
+        assert!(parse_artifact_ids(Some(&json!("a_one"))).is_err());
+        assert!(parse_artifact_ids(Some(&json!([1]))).is_err());
+
+        let destination = std::env::temp_dir().join("manuvra-export-parse");
+        let parsed = parse_export_request(&Invocation::new(
+            "artifact.export",
+            json!({
+                "session_id": "s_test",
+                "all": true,
+                "destination": destination
+            }),
+            "export-parse".to_owned(),
+            1_000,
+        ))
+        .unwrap();
+        assert!(parsed.selected.is_none());
+        assert!(
+            parse_export_request(&Invocation::new(
+                "artifact.export",
+                json!({
+                    "session_id": "s_test",
+                    "destination": "relative"
+                }),
+                "export-relative".to_owned(),
+                1_000,
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn discovery_schema_accepts_input_and_result_sides() {
+        let input = json!({"command": "action.click", "side": "input"});
+        let parsed = parse_schema_request(&input).unwrap();
+        assert_eq!(parsed.1, "input_schema");
+        let result = json!({"command": "action.click", "side": "result"});
+        assert_eq!(parse_schema_request(&result).unwrap().1, "result_schema");
+        assert_eq!(
+            parse_schema_request(&json!({"command": "missing", "side": "input"}))
+                .unwrap_err()
+                .value["error"]["code"],
+            "unknown_command"
+        );
     }
 }

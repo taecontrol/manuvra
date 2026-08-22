@@ -85,6 +85,11 @@ pub struct CleanupReport {
     pub preserved: Vec<PathBuf>,
 }
 
+enum OrphanAction {
+    Preserve,
+    Remove,
+}
+
 impl ArtifactStore {
     pub fn new(temporary_root: &Path, daemon_instance: String) -> Result<Self, ArtifactError> {
         let sessions_root = temporary_root.join("manuvra/sessions-v1");
@@ -198,21 +203,17 @@ impl ArtifactStore {
         selected: Option<&[String]>,
     ) -> Result<Vec<PublishedArtifact>, ArtifactError> {
         let _guard = self.lock()?;
+        self.prepare_export(directory, destination)?;
+        let manifest = self.read_manifest(directory)?;
+        let exported = copy_selected_entries(&manifest, destination, selected)?;
+        maybe_write_exported_manifest(&manifest, destination, &exported, selected)?;
+        Ok(exported)
+    }
+
+    fn prepare_export(&self, directory: &Path, destination: &Path) -> Result<(), ArtifactError> {
         self.verify_owned(directory, true)?;
         reject_export_inside_session(directory, destination)?;
-        ensure_export_directory(destination)?;
-        let manifest = self.read_manifest(directory)?;
-        let entries = selected_entries(&manifest, selected)?;
-        let mut exported = Vec::with_capacity(entries.len());
-        for entry in entries {
-            exported.push(copy_verified(entry, destination)?);
-        }
-        if selected.is_none() {
-            let exported_manifest = exported_manifest(&manifest, destination, &exported)?;
-            let manifest_bytes = serde_json::to_vec_pretty(&exported_manifest)?;
-            copy_without_overwrite(&destination.join(MANIFEST_FILE), &manifest_bytes)?;
-        }
-        Ok(exported)
+        ensure_export_directory(destination)
     }
 
     pub fn close_session(&self, directory: &Path) -> Result<(), ArtifactError> {
@@ -226,28 +227,41 @@ impl ArtifactStore {
         let _guard = self.lock()?;
         let mut report = CleanupReport::default();
         for entry in fs::read_dir(&self.sessions_root)? {
-            let path = entry?.path();
-            if !is_direct_real_child(&self.sessions_root, &path)? {
-                report.preserved.push(path);
-                continue;
-            }
-            let owner = match self.read_owner(&path) {
-                Ok(owner) => owner,
-                Err(_) => {
-                    report.preserved.push(path);
-                    continue;
-                }
-            };
-            if owner.daemon_instance == self.daemon_instance
-                || self.verify_owned(&path, false).is_err()
-            {
-                report.preserved.push(path);
-                continue;
-            }
-            fs::remove_dir_all(&path)?;
-            report.removed.push(path);
+            self.classify_orphan(entry?, &mut report)?;
         }
         Ok(report)
+    }
+
+    fn classify_orphan(
+        &self,
+        entry: fs::DirEntry,
+        report: &mut CleanupReport,
+    ) -> Result<(), ArtifactError> {
+        let path = entry.path();
+        match self.orphan_disposition(&path)? {
+            OrphanAction::Preserve => report.preserved.push(path),
+            OrphanAction::Remove => {
+                fs::remove_dir_all(&path)?;
+                report.removed.push(path);
+            }
+        }
+        Ok(())
+    }
+
+    fn orphan_disposition(&self, path: &Path) -> Result<OrphanAction, ArtifactError> {
+        if !is_direct_real_child(&self.sessions_root, path)? {
+            return Ok(OrphanAction::Preserve);
+        }
+        let owner = match self.read_owner(path) {
+            Ok(owner) => owner,
+            Err(_) => return Ok(OrphanAction::Preserve),
+        };
+        if owner.daemon_instance == self.daemon_instance || self.verify_owned(path, false).is_err()
+        {
+            Ok(OrphanAction::Preserve)
+        } else {
+            Ok(OrphanAction::Remove)
+        }
     }
 
     fn verify_owned(&self, directory: &Path, require_current: bool) -> Result<(), ArtifactError> {
@@ -278,16 +292,9 @@ impl ArtifactStore {
         manifest: &ArtifactManifest,
         require_current: bool,
     ) -> bool {
-        (!require_current || owner.daemon_instance == self.daemon_instance)
-            && owner.schema == "manuvra/session-owner@1"
-            && manifest.schema == "manuvra/artifact-manifest@1"
-            && manifest.lifetime == "until_session_close"
-            && owner.effective_uid == self.effective_uid
-            && owner.canonical_directory == canonical.display().to_string()
-            && owner.session_id == manifest.session_id
-            && owner.target_id == manifest.target_id
-            && owner.target_generation == manifest.generation
-            && manifest.session_directory == owner.canonical_directory
+        current_daemon_agrees(require_current, owner, &self.daemon_instance)
+            && owner_record_is_well_formed(canonical, owner, self.effective_uid)
+            && owner_matches_manifest(owner, manifest)
     }
 
     fn read_owner(&self, directory: &Path) -> Result<OwnershipRecord, ArtifactError> {
@@ -321,6 +328,41 @@ impl ArtifactStore {
     }
 }
 
+fn copy_selected_entries(
+    manifest: &ArtifactManifest,
+    destination: &Path,
+    selected: Option<&[String]>,
+) -> Result<Vec<PublishedArtifact>, ArtifactError> {
+    let entries = selected_entries(manifest, selected)?;
+    let mut exported = Vec::with_capacity(entries.len());
+    for entry in entries {
+        exported.push(copy_verified(entry, destination)?);
+    }
+    Ok(exported)
+}
+
+fn maybe_write_exported_manifest(
+    source: &ArtifactManifest,
+    destination: &Path,
+    exported: &[PublishedArtifact],
+    selected: Option<&[String]>,
+) -> Result<(), ArtifactError> {
+    if selected.is_none() {
+        write_exported_manifest(source, destination, exported)?;
+    }
+    Ok(())
+}
+
+fn write_exported_manifest(
+    source: &ArtifactManifest,
+    destination: &Path,
+    exported: &[PublishedArtifact],
+) -> Result<(), ArtifactError> {
+    let exported_manifest = exported_manifest(source, destination, exported)?;
+    let manifest_bytes = serde_json::to_vec_pretty(&exported_manifest)?;
+    copy_without_overwrite(&destination.join(MANIFEST_FILE), &manifest_bytes)
+}
+
 fn exported_manifest(
     source: &ArtifactManifest,
     destination: &Path,
@@ -329,26 +371,7 @@ fn exported_manifest(
     let destination = fs::canonicalize(destination)?;
     let mut artifacts = Vec::with_capacity(source.artifacts.len());
     for entry in &source.artifacts {
-        let published = exported
-            .iter()
-            .find(|candidate| candidate.artifact_id == entry.artifact_id)
-            .ok_or_else(|| {
-                ArtifactError::Export(format!(
-                    "exported artifact {} was absent from the completed copy set",
-                    entry.artifact_id
-                ))
-            })?;
-        let bytes = fs::read(&published.path)?;
-        if sha256_hex(&bytes) != entry.sha256 {
-            return Err(ArtifactError::Export(format!(
-                "destination hash differs for {}",
-                entry.artifact_id
-            )));
-        }
-        let mut entry = entry.clone();
-        entry.absolute_path = fs::canonicalize(&published.path)?.display().to_string();
-        entry.lifetime = "caller_owned".to_owned();
-        artifacts.push(entry);
+        artifacts.push(rewrite_exported_entry(entry, exported)?);
     }
     let manifest = ArtifactManifest {
         schema: "manuvra/exported-artifact-manifest@1".to_owned(),
@@ -362,6 +385,59 @@ fn exported_manifest(
     let value = serde_json::to_value(&manifest)?;
     manuvra_protocol::validate_exported_artifact_manifest(&value).map_err(ArtifactError::Export)?;
     Ok(manifest)
+}
+
+fn rewrite_exported_entry(
+    entry: &ArtifactEntry,
+    exported: &[PublishedArtifact],
+) -> Result<ArtifactEntry, ArtifactError> {
+    let published = exported
+        .iter()
+        .find(|candidate| candidate.artifact_id == entry.artifact_id)
+        .ok_or_else(|| {
+            ArtifactError::Export(format!(
+                "exported artifact {} was absent from the completed copy set",
+                entry.artifact_id
+            ))
+        })?;
+    let bytes = fs::read(&published.path)?;
+    if sha256_hex(&bytes) != entry.sha256 {
+        return Err(ArtifactError::Export(format!(
+            "destination hash differs for {}",
+            entry.artifact_id
+        )));
+    }
+    let mut entry = entry.clone();
+    entry.absolute_path = fs::canonicalize(&published.path)?.display().to_string();
+    entry.lifetime = "caller_owned".to_owned();
+    Ok(entry)
+}
+
+fn current_daemon_agrees(
+    require_current: bool,
+    owner: &OwnershipRecord,
+    daemon_instance: &str,
+) -> bool {
+    !require_current || owner.daemon_instance == daemon_instance
+}
+
+fn owner_record_is_well_formed(
+    canonical: &Path,
+    owner: &OwnershipRecord,
+    effective_uid: u32,
+) -> bool {
+    owner.schema == "manuvra/session-owner@1"
+        && owner.effective_uid == effective_uid
+        && owner.canonical_directory == canonical.display().to_string()
+}
+
+fn owner_matches_manifest(owner: &OwnershipRecord, manifest: &ArtifactManifest) -> bool {
+    manifest.schema == "manuvra/artifact-manifest@1"
+        && manifest.lifetime == "until_session_close"
+        && owner.session_id == manifest.session_id
+        && owner.target_id == manifest.target_id
+        && owner.target_generation == manifest.generation
+        && manifest.session_directory == owner.canonical_directory
 }
 
 fn validate_session_metadata(
@@ -416,10 +492,19 @@ fn write_and_link(
     partial: &Path,
     destination: &Path,
 ) -> Result<(), ArtifactError> {
-    file.write_all(bytes)?;
-    file.sync_all()?;
+    persist_partial_file(file, bytes)?;
     fs::hard_link(partial, destination)?;
     fs::remove_file(partial)?;
+    sync_parent_directory(destination)
+}
+
+fn persist_partial_file(file: &mut fs::File, bytes: &[u8]) -> Result<(), ArtifactError> {
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn sync_parent_directory(destination: &Path) -> Result<(), ArtifactError> {
     if let Some(parent) = destination.parent() {
         fs::File::open(parent)?.sync_all()?;
     }
@@ -522,6 +607,18 @@ fn validate_manifest_entry(
     effective_uid: u32,
     ids: &mut HashSet<String>,
 ) -> Result<(), ArtifactError> {
+    validate_manifest_metadata(entry, ids)?;
+    let path = Path::new(&entry.absolute_path);
+    let metadata = fs::symlink_metadata(path)?;
+    validate_artifact_file(directory, path, &metadata, effective_uid)?;
+    validate_manifest_file_facts(entry, path, &metadata)?;
+    validate_artifact_file_name(entry, path)
+}
+
+fn validate_manifest_metadata(
+    entry: &ArtifactEntry,
+    ids: &mut HashSet<String>,
+) -> Result<(), ArtifactError> {
     if !entry.complete
         || entry.lifetime != "until_session_close"
         || !entry.artifact_id.starts_with("a_")
@@ -531,24 +628,34 @@ fn validate_manifest_entry(
             "manifest artifact metadata is invalid".to_owned(),
         ));
     }
-    let path = Path::new(&entry.absolute_path);
-    let metadata = fs::symlink_metadata(path)?;
-    validate_artifact_file(directory, path, &metadata, effective_uid)?;
+    Ok(())
+}
+
+fn validate_manifest_file_facts(
+    entry: &ArtifactEntry,
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), ArtifactError> {
     if metadata.len() != entry.bytes || sha256_hex(&fs::read(path)?) != entry.sha256 {
         return Err(ArtifactError::Ownership(
             "manifest artifact facts do not match the file".to_owned(),
         ));
     }
+    Ok(())
+}
+
+fn validate_artifact_file_name(entry: &ArtifactEntry, path: &Path) -> Result<(), ArtifactError> {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default();
-    if !name.starts_with(&format!("{}.", entry.artifact_id)) {
-        return Err(ArtifactError::Ownership(
+    if name.starts_with(&format!("{}.", entry.artifact_id)) {
+        Ok(())
+    } else {
+        Err(ArtifactError::Ownership(
             "manifest artifact name does not match its ID".to_owned(),
-        ));
+        ))
     }
-    Ok(())
 }
 
 fn validate_artifact_file(
@@ -557,18 +664,46 @@ fn validate_artifact_file(
     metadata: &fs::Metadata,
     effective_uid: u32,
 ) -> Result<(), ArtifactError> {
-    if !path.is_absolute()
-        || !metadata.file_type().is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.uid() != effective_uid
-        || unix_mode(path)? != 0o600
-        || fs::canonicalize(path)?.parent() != Some(directory)
-    {
-        return Err(ArtifactError::Ownership(
+    require_absolute_regular_file(path, metadata)?;
+    require_private_uid_mode(path, metadata, effective_uid)?;
+    require_direct_session_child(directory, path)
+}
+
+fn require_absolute_regular_file(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), ArtifactError> {
+    if path.is_absolute() && metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
+        Ok(())
+    } else {
+        Err(ArtifactError::Ownership(
             "manifest artifact is not a private direct child".to_owned(),
-        ));
+        ))
     }
-    Ok(())
+}
+
+fn require_private_uid_mode(
+    path: &Path,
+    metadata: &fs::Metadata,
+    effective_uid: u32,
+) -> Result<(), ArtifactError> {
+    if metadata.uid() == effective_uid && unix_mode(path)? == 0o600 {
+        Ok(())
+    } else {
+        Err(ArtifactError::Ownership(
+            "manifest artifact is not a private direct child".to_owned(),
+        ))
+    }
+}
+
+fn require_direct_session_child(directory: &Path, path: &Path) -> Result<(), ArtifactError> {
+    if fs::canonicalize(path)?.parent() == Some(directory) {
+        Ok(())
+    } else {
+        Err(ArtifactError::Ownership(
+            "manifest artifact is not a private direct child".to_owned(),
+        ))
+    }
 }
 
 fn validate_directory_entries(
@@ -606,19 +741,30 @@ fn reject_export_inside_session(session: &Path, destination: &Path) -> Result<()
 
 fn verify_private_regular_file(path: &Path) -> Result<(), ArtifactError> {
     let metadata = fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        return Err(ArtifactError::Ownership(format!(
+    require_regular_file(path, &metadata)?;
+    require_owner_mode_600(path, &metadata)
+}
+
+fn require_regular_file(path: &Path, metadata: &fs::Metadata) -> Result<(), ArtifactError> {
+    if metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
+        Ok(())
+    } else {
+        Err(ArtifactError::Ownership(format!(
             "{} is not a regular file",
             path.display()
-        )));
+        )))
     }
-    if unix_mode(path)? != 0o600 || metadata.uid() != unsafe { libc::geteuid() } {
-        return Err(ArtifactError::Ownership(format!(
+}
+
+fn require_owner_mode_600(path: &Path, metadata: &fs::Metadata) -> Result<(), ArtifactError> {
+    if unix_mode(path)? == 0o600 && metadata.uid() == unsafe { libc::geteuid() } {
+        Ok(())
+    } else {
+        Err(ArtifactError::Ownership(format!(
             "{} mode is not 0600",
             path.display()
-        )));
+        )))
     }
-    Ok(())
 }
 
 fn is_direct_real_child(root: &Path, path: &Path) -> Result<bool, ArtifactError> {
@@ -654,4 +800,15 @@ pub enum ArtifactError {
     Ownership(String),
     #[error("artifact export: {0}")]
     Export(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sync_parent_directory;
+    use std::path::Path;
+
+    #[test]
+    fn sync_parent_directory_skips_paths_without_a_parent() {
+        assert!(sync_parent_directory(Path::new("/")).is_ok());
+    }
 }

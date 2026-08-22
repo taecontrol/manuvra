@@ -32,7 +32,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use usage::UsageStore;
 use util::opaque_id;
 
-type LocatedTarget = (TargetDescriptor, Arc<dyn TargetAdapter>);
+pub(crate) type LocatedTarget = (TargetDescriptor, Arc<dyn TargetAdapter>);
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -270,35 +270,30 @@ impl Runtime {
         let deadline = started + Duration::from_millis(invocation.deadline_ms);
         let mut state = self.state.lock().expect("runtime state");
         loop {
-            if let Some(cached) = state.terminal_requests.get(&invocation.request_id) {
-                return Ok(RequestClaim::Ready(replay_or_conflict(cached, &digest)));
-            }
-            match state.pending_requests.get(&invocation.request_id) {
-                Some(pending) if pending != &digest => {
-                    return Err(InvocationReply::error("request_id_conflict", None));
-                }
-                Some(_) => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        return Err(InvocationReply::error("timed_out", None));
-                    }
-                    let waited = self
-                        .request_completion
-                        .wait_timeout(state, remaining)
-                        .expect("runtime state");
-                    state = waited.0;
-                    if waited.1.timed_out() {
-                        return Err(InvocationReply::error("timed_out", None));
-                    }
-                }
-                None => {
-                    state
-                        .pending_requests
-                        .insert(invocation.request_id.clone(), digest);
-                    return Ok(RequestClaim::Owner);
-                }
+            match take_request_claim(&mut state, invocation, &digest) {
+                Some(claim) => return claim,
+                None => state = self.await_pending_owner(state, deadline)?,
             }
         }
+    }
+
+    fn await_pending_owner<'a>(
+        &'a self,
+        state: std::sync::MutexGuard<'a, RuntimeState>,
+        deadline: Instant,
+    ) -> Result<std::sync::MutexGuard<'a, RuntimeState>, InvocationReply> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(InvocationReply::error("timed_out", None));
+        }
+        let waited = self
+            .request_completion
+            .wait_timeout(state, remaining)
+            .expect("runtime state");
+        if waited.1.timed_out() {
+            return Err(InvocationReply::error("timed_out", None));
+        }
+        Ok(waited.0)
     }
 
     fn finish_request(&self, invocation: &Invocation, reply: InvocationReply) -> InvocationReply {
@@ -322,23 +317,10 @@ impl Runtime {
             | CommandId::SystemCommandsSchema
             | CommandId::SystemCommandsErrors => self.discovery(invocation, started),
             CommandId::SystemCommandsUsage => self.usage_command(invocation, started),
-            CommandId::TargetList => self.list_targets(invocation, started),
-            CommandId::SessionOpen => self.open_session(invocation, started),
-            CommandId::SessionClose => self.close_session(invocation, started),
-            CommandId::LeaseManage => self.manage_lease(invocation, started),
             CommandId::ObserveQuery
             | CommandId::ObserveScreenshot
             | CommandId::ObserveTree
             | CommandId::ObserveEvidence => self.observe(invocation, started),
-            CommandId::RequestCancel => self.cancel(invocation, started),
-            CommandId::ArtifactExport => self.export(invocation, started),
-            CommandId::SystemDoctor => self.doctor(invocation, started),
-            CommandId::SystemSetup => self.setup(invocation, started),
-            CommandId::DaemonStatus
-            | CommandId::DaemonStop
-            | CommandId::SystemMigrate
-            | CommandId::SystemPurge
-            | CommandId::SystemChromeLaunch => InvocationReply::error("command_unsupported", None),
             CommandId::ActionClick
             | CommandId::ActionType
             | CommandId::ActionPress
@@ -348,6 +330,83 @@ impl Runtime {
             | CommandId::RawAxGet
             | CommandId::RawAxSet
             | CommandId::RawAxPerform => self.execute_adapter_command(invocation, started),
+            other => self.dispatch_control(invocation, started, other),
+        }
+    }
+
+    fn dispatch_control(
+        &self,
+        invocation: &Invocation,
+        started: Instant,
+        command: CommandId,
+    ) -> InvocationReply {
+        match command {
+            CommandId::TargetList
+            | CommandId::SessionOpen
+            | CommandId::SessionClose
+            | CommandId::LeaseManage => self.dispatch_session(invocation, started, command),
+            CommandId::RequestCancel
+            | CommandId::ArtifactExport
+            | CommandId::SystemDoctor
+            | CommandId::SystemSetup => self.dispatch_support(invocation, started, command),
+            CommandId::DaemonStatus
+            | CommandId::DaemonStop
+            | CommandId::SystemMigrate
+            | CommandId::SystemPurge
+            | CommandId::SystemChromeLaunch => InvocationReply::error("command_unsupported", None),
+            _ => unreachable!("command family already dispatched"),
+        }
+    }
+
+    fn dispatch_session(
+        &self,
+        invocation: &Invocation,
+        started: Instant,
+        command: CommandId,
+    ) -> InvocationReply {
+        match command {
+            CommandId::TargetList => self.list_targets(invocation, started),
+            CommandId::SessionOpen => self.open_session(invocation, started),
+            CommandId::SessionClose => self.close_session(invocation, started),
+            CommandId::LeaseManage => self.manage_lease(invocation, started),
+            _ => unreachable!("session family already selected"),
+        }
+    }
+
+    fn dispatch_support(
+        &self,
+        invocation: &Invocation,
+        started: Instant,
+        command: CommandId,
+    ) -> InvocationReply {
+        match command {
+            CommandId::RequestCancel => self.cancel(invocation, started),
+            CommandId::ArtifactExport => self.export(invocation, started),
+            CommandId::SystemDoctor => self.doctor(invocation, started),
+            CommandId::SystemSetup => self.setup(invocation, started),
+            _ => unreachable!("support family already selected"),
+        }
+    }
+}
+
+fn take_request_claim(
+    state: &mut RuntimeState,
+    invocation: &Invocation,
+    digest: &str,
+) -> Option<Result<RequestClaim, InvocationReply>> {
+    if let Some(cached) = state.terminal_requests.get(&invocation.request_id) {
+        return Some(Ok(RequestClaim::Ready(replay_or_conflict(cached, digest))));
+    }
+    match state.pending_requests.get(&invocation.request_id) {
+        Some(pending) if pending != digest => {
+            Some(Err(InvocationReply::error("request_id_conflict", None)))
+        }
+        Some(_) => None,
+        None => {
+            state
+                .pending_requests
+                .insert(invocation.request_id.clone(), digest.to_owned());
+            Some(Ok(RequestClaim::Owner))
         }
     }
 }
@@ -386,24 +445,39 @@ fn validate_protocol_identity(invocation: &Invocation) -> Result<(), InvocationR
 }
 
 fn validate_request_identity(invocation: &Invocation) -> Result<(), InvocationReply> {
-    if !(50..=120_000).contains(&invocation.deadline_ms) {
-        return Err(InvocationReply::error(
+    validate_deadline_ms(invocation)?;
+    validate_request_id(invocation)?;
+    validate_known_command(invocation)
+}
+
+fn validate_deadline_ms(invocation: &Invocation) -> Result<(), InvocationReply> {
+    if (50..=120_000).contains(&invocation.deadline_ms) {
+        Ok(())
+    } else {
+        Err(InvocationReply::error(
             "invalid_request",
             Some("deadline_ms must be between 50 and 120000"),
-        ));
+        ))
     }
+}
+
+fn validate_request_id(invocation: &Invocation) -> Result<(), InvocationReply> {
     if invocation.request_id.is_empty() || invocation.request_id.len() > 128 {
-        return Err(InvocationReply::error(
+        Err(InvocationReply::error(
             "invalid_request",
             Some("request_id must contain 1 through 128 bytes"),
-        ));
+        ))
+    } else {
+        Ok(())
     }
+}
+
+fn validate_known_command(invocation: &Invocation) -> Result<(), InvocationReply> {
     if command_descriptor(&invocation.command).is_none() {
         return Err(InvocationReply::error("unknown_command", None));
     }
     manuvra_protocol::validate_command_input(&invocation.command, &invocation.input)
-        .map_err(|message| InvocationReply::error("invalid_request", Some(&message)))?;
-    Ok(())
+        .map_err(|message| InvocationReply::error("invalid_request", Some(&message)))
 }
 
 impl InteractionModule for Runtime {

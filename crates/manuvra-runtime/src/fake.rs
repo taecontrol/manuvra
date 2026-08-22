@@ -54,56 +54,8 @@ impl TargetAdapter for FakeAdapter {
         if operation.command == "observe.screenshot" {
             thread::sleep(Duration::from_millis(20));
         }
-        if behavior == "block" {
-            return block_until_cancelled(context.deadline, cancellation);
-        }
-        if behavior == "reject" {
-            return AdapterReply {
-                delivery: AdapterDelivery::Rejected,
-                response: json!({"fake": "rejected"}),
-                screenshot: None,
-                screenshot_width: None,
-                screenshot_height: None,
-                frame_signature: None,
-                artifact: None,
-                error: None,
-                timing: Default::default(),
-                already_settled: false,
-                relevant_event_after_ms: None,
-                continuous_events: false,
-                capture_race_once: false,
-                interrupted: false,
-            };
-        }
-        if behavior == "ambiguous" {
-            return AdapterReply {
-                delivery: AdapterDelivery::Unknown,
-                response: json!({"fake": "transport_disconnected"}),
-                screenshot: None,
-                screenshot_width: None,
-                screenshot_height: None,
-                frame_signature: None,
-                artifact: None,
-                error: None,
-                timing: Default::default(),
-                already_settled: false,
-                relevant_event_after_ms: None,
-                continuous_events: false,
-                capture_race_once: false,
-                interrupted: false,
-            };
-        }
-
-        let response = fake_response(context, operation);
-        let mut reply = AdapterReply::confirmed(response, Some(ONE_PIXEL_PNG.to_vec()));
-        reply.screenshot_width = Some(1);
-        reply.screenshot_height = Some(1);
-        reply.frame_signature = Some("fake-1x1".to_owned());
-        reply.continuous_events = behavior == "continuous";
-        reply.capture_race_once = behavior == "race";
-        reply.interrupted = behavior == "interrupt";
-        reply.relevant_event_after_ms = (behavior == "cascade").then_some(10);
-        reply
+        injected_behavior_reply(&behavior, context.deadline, cancellation)
+            .unwrap_or_else(|| confirmed_fake_reply(context, operation, &behavior))
     }
 }
 
@@ -219,6 +171,63 @@ fn fake_macos() -> TargetDescriptor {
         .map(str::to_owned)
         .collect(),
     }
+}
+
+fn injected_behavior_reply(
+    behavior: &str,
+    deadline: Instant,
+    cancellation: Arc<AtomicBool>,
+) -> Option<AdapterReply> {
+    match behavior {
+        "block" => Some(block_until_cancelled(deadline, cancellation)),
+        "reject" => Some(injected_delivery(
+            AdapterDelivery::Rejected,
+            json!({"fake": "rejected"}),
+        )),
+        "ambiguous" => Some(injected_delivery(
+            AdapterDelivery::Unknown,
+            json!({"fake": "transport_disconnected"}),
+        )),
+        _ => None,
+    }
+}
+
+fn injected_delivery(delivery: AdapterDelivery, response: Value) -> AdapterReply {
+    AdapterReply {
+        delivery,
+        response,
+        screenshot: None,
+        screenshot_width: None,
+        screenshot_height: None,
+        frame_signature: None,
+        artifact: None,
+        error: None,
+        timing: Default::default(),
+        already_settled: false,
+        relevant_event_after_ms: None,
+        continuous_events: false,
+        capture_race_once: false,
+        interrupted: false,
+    }
+}
+
+fn confirmed_fake_reply(
+    context: &AdapterContext,
+    operation: &AdapterOperation,
+    behavior: &str,
+) -> AdapterReply {
+    let mut reply = AdapterReply::confirmed(
+        fake_response(context, operation),
+        Some(ONE_PIXEL_PNG.to_vec()),
+    );
+    reply.screenshot_width = Some(1);
+    reply.screenshot_height = Some(1);
+    reply.frame_signature = Some("fake-1x1".to_owned());
+    reply.continuous_events = behavior == "continuous";
+    reply.capture_race_once = behavior == "race";
+    reply.interrupted = behavior == "interrupt";
+    reply.relevant_event_after_ms = (behavior == "cascade").then_some(10);
+    reply
 }
 
 fn fake_behavior(operation: &AdapterOperation) -> String {

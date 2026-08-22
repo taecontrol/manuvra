@@ -1526,3 +1526,363 @@ fn every_registry_actor_command_rejects_an_observer_session() {
     }
     assert_eq!(actor_commands.len(), 8);
 }
+
+#[test]
+fn lease_observe_mutate_and_artifact_results_stay_at_public_runtime_seams() {
+    let harness = Harness::new();
+    let chrome_kind = harness.invoke(
+        "kind-chrome",
+        "target.list",
+        json!({"kind": "chrome", "limit": 10}),
+    );
+    assert_eq!(chrome_kind.value["targets"].as_array().unwrap().len(), 1);
+    assert_eq!(chrome_kind.value["targets"][0]["kind"], "chrome");
+    assert_eq!(
+        error_code(&harness.invoke("kind-invalid", "target.list", json!({"kind": "safari"}))),
+        Some("invalid_request")
+    );
+
+    let actor = harness.open("chrome_fake_1", "actor");
+    let observer = harness.open("chrome_fake_1", "observer");
+    let held = harness.invoke("targets-held", "target.list", json!({"limit": 10}));
+    let chrome = held.value["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|target| target["kind"] == "chrome")
+        .unwrap();
+    assert_eq!(chrome["actor_lease"], "held");
+
+    let released = harness.invoke(
+        "lease-release",
+        "lease.manage",
+        json!({"session_id": actor, "action": "release"}),
+    );
+    assert_eq!(released.value["state"], "released");
+    let after_release = harness.invoke(
+        "click-without-lease",
+        "action.click",
+        json!({"session_id": actor, "locator": {"kind": "semantic", "name": "Save"}}),
+    );
+    assert_eq!(error_code(&after_release), Some("actor_lease_expired"));
+    assert_eq!(after_release.value["outcome"], "not_performed");
+    assert_eq!(after_release.value["delivery"], "not_dispatched");
+
+    let acquired = harness.invoke(
+        "lease-acquire",
+        "lease.manage",
+        json!({"session_id": actor, "action": "acquire"}),
+    );
+    assert_eq!(acquired.value["state"], "held");
+    let renewed = harness.invoke(
+        "lease-renew",
+        "lease.manage",
+        json!({"session_id": actor, "action": "renew", "ttl_ms": 30_000}),
+    );
+    assert_eq!(renewed.value["state"], "held");
+    assert_eq!(renewed.value["ttl_ms"], 30_000);
+    assert_eq!(
+        error_code(&harness.invoke(
+            "lease-acquire-held",
+            "lease.manage",
+            json!({"session_id": actor, "action": "acquire"})
+        )),
+        Some("actor_lease_held")
+    );
+    assert_eq!(
+        error_code(&harness.invoke(
+            "observer-lease",
+            "lease.manage",
+            json!({"session_id": observer, "action": "acquire"})
+        )),
+        Some("actor_lease_required")
+    );
+
+    let query = harness.invoke(
+        "observe-query",
+        "observe.query",
+        json!({"session_id": actor, "semantic": {"kind": "semantic", "name": "Save"}}),
+    );
+    assert_eq!(query.value["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(query.value["observation_status"], "stable");
+    assert_eq!(
+        error_code(&harness.invoke(
+            "observe-missing",
+            "observe.query",
+            json!({"session_id": actor, "semantic": {"kind": "semantic", "name": "Missing"}})
+        )),
+        Some("element_not_found")
+    );
+
+    let shot = harness.invoke(
+        "observe-shot",
+        "observe.screenshot",
+        json!({"session_id": actor}),
+    );
+    let frame_token = shot.value["frame_token"].as_str().unwrap().to_owned();
+    let logs = harness.invoke(
+        "observe-logs",
+        "observe.evidence",
+        json!({"session_id": actor, "kind": "logs"}),
+    );
+    assert_eq!(logs.value["kind"], "logs");
+    let manifest = harness.invoke(
+        "observe-manifest",
+        "observe.evidence",
+        json!({"session_id": actor, "kind": "manifest"}),
+    );
+    assert_eq!(manifest.value["kind"], "manifest");
+    assert!(Path::new(manifest.value["path"].as_str().unwrap()).is_file());
+    assert_eq!(
+        error_code(&harness.invoke(
+            "observe-kind-invalid",
+            "observe.evidence",
+            json!({"session_id": actor, "kind": "heap"})
+        )),
+        Some("invalid_request")
+    );
+
+    let clicked = harness.invoke(
+        "mutate-click",
+        "action.click",
+        json!({
+            "session_id": actor,
+            "locator": {"kind": "point", "x": 1, "y": 1, "frame_token": frame_token}
+        }),
+    );
+    assert_eq!(clicked.value["outcome"], "observed");
+    assert_eq!(clicked.value["delivery"], "backend_confirmed");
+    assert_eq!(clicked.value["effect_verification"], "not_asserted");
+    assert_eq!(
+        error_code(&harness.invoke(
+            "stale-frame",
+            "action.click",
+            json!({
+                "session_id": actor,
+                "locator": {"kind": "point", "x": 1, "y": 1, "frame_token": frame_token}
+            })
+        )),
+        Some("frame_stale")
+    );
+
+    let rejected = harness.invoke(
+        "mutate-reject",
+        "raw.cdp",
+        json!({"session_id": actor, "intent": "action", "method": "Fake.reject", "params": {}}),
+    );
+    assert_eq!(rejected.value["outcome"], "not_performed");
+    assert_eq!(rejected.value["delivery"], "backend_rejected");
+    let uncertain = harness.invoke(
+        "mutate-ambiguous",
+        "raw.cdp",
+        json!({"session_id": actor, "intent": "action", "method": "Fake.ambiguous", "params": {}}),
+    );
+    assert_eq!(uncertain.value["outcome"], "uncertain");
+    assert_eq!(uncertain.value["delivery"], "unknown");
+    let interrupted = harness.invoke(
+        "mutate-interrupt",
+        "raw.cdp",
+        json!({"session_id": actor, "intent": "action", "method": "Fake.interrupt", "params": {}}),
+    );
+    assert_eq!(error_code(&interrupted), Some("interrupted"));
+    assert_eq!(interrupted.value["outcome"], "uncertain");
+
+    let artifact_id = serde_json::from_slice::<Value>(
+        &fs::read(Path::new(shot.value["manifest_path"].as_str().unwrap())).unwrap(),
+    )
+    .unwrap()["artifacts"][0]["artifact_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let selected_dest = harness._root.path().join("selected-export");
+    let selected = harness.invoke(
+        "export-selected",
+        "artifact.export",
+        json!({
+            "session_id": actor,
+            "artifact_ids": [artifact_id],
+            "destination": selected_dest
+        }),
+    );
+    assert_eq!(selected.value["verified"], true);
+    assert_eq!(selected.value["files"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        selected.value["files"][0]["artifact_id"].as_str().unwrap(),
+        artifact_id
+    );
+    assert!(!selected_dest.join("manifest.json").exists());
+    assert_eq!(
+        error_code(&harness.invoke(
+            "export-both",
+            "artifact.export",
+            json!({
+                "session_id": actor,
+                "all": true,
+                "artifact_ids": [artifact_id],
+                "destination": harness._root.path().join("both")
+            })
+        )),
+        Some("invalid_request")
+    );
+    assert_eq!(
+        error_code(&harness.invoke(
+            "export-relative",
+            "artifact.export",
+            json!({"session_id": actor, "all": true, "destination": "relative-export"})
+        )),
+        Some("invalid_request")
+    );
+}
+
+#[test]
+fn cancel_running_close_waits_until_session_work_is_idle() {
+    let harness = Harness::new();
+    let actor = harness.open("chrome_fake_1", "actor");
+    let runtime = harness.runtime.clone();
+    let action_session = actor.clone();
+    let action = thread::spawn(move || {
+        invoke(
+            &runtime,
+            "close-cancel-block",
+            "raw.cdp",
+            json!({
+                "session_id": action_session,
+                "intent": "action",
+                "method": "Fake.block",
+                "params": {}
+            }),
+            1_000,
+        )
+    });
+    thread::sleep(Duration::from_millis(20));
+    let closed = harness.invoke(
+        "close-cancel-running",
+        "session.close",
+        json!({"session_id": actor, "cancel_running": true}),
+    );
+    assert_eq!(closed.exit_code, 0, "{}", closed.value);
+    assert_eq!(closed.value["closed"], true);
+    assert_eq!(error_code(&action.join().unwrap()), Some("cancelled"));
+}
+
+#[test]
+fn request_identity_and_discovery_keep_envelope_and_schema_results() {
+    let harness = Harness::new();
+    let short_deadline = harness.runtime.invoke(Invocation::new(
+        "target.list",
+        json!({}),
+        "short-deadline".to_owned(),
+        1,
+    ));
+    assert_eq!(error_code(&short_deadline), Some("invalid_request"));
+    let empty_id = harness.runtime.invoke(Invocation::new(
+        "target.list",
+        json!({}),
+        String::new(),
+        1_000,
+    ));
+    assert_eq!(error_code(&empty_id), Some("invalid_request"));
+    assert_eq!(
+        error_code(&harness.invoke(
+            "schema-unknown",
+            "system.commands.schema",
+            json!({"command": "not.a.command", "side": "input"})
+        )),
+        Some("unknown_command")
+    );
+    assert_eq!(
+        error_code(&harness.invoke(
+            "schema-side",
+            "system.commands.schema",
+            json!({"command": "action.click", "side": "docs"})
+        )),
+        Some("invalid_request")
+    );
+    let input_schema = harness.invoke(
+        "schema-input",
+        "system.commands.schema",
+        json!({"command": "action.click", "side": "input"}),
+    );
+    assert_eq!(input_schema.exit_code, 0, "{}", input_schema.value);
+    let result_schema = harness.invoke(
+        "schema-result",
+        "system.commands.schema",
+        json!({"command": "action.click", "side": "result"}),
+    );
+    assert_eq!(result_schema.exit_code, 0, "{}", result_schema.value);
+    assert_eq!(
+        error_code(&harness.invoke(
+            "usage-unknown",
+            "system.commands.usage",
+            json!({"action": "wipe"})
+        )),
+        Some("invalid_request")
+    );
+    assert_eq!(
+        error_code(&harness.invoke(
+            "open-role",
+            "session.open",
+            json!({"target_id": "chrome_fake_1", "role": "admin"})
+        )),
+        Some("invalid_request")
+    );
+    let observer = harness.open("chrome_fake_1", "observer");
+    assert!(observer.starts_with("s_"));
+    assert_eq!(
+        error_code(&harness.invoke("list-limit", "target.list", json!({"limit": 0}))),
+        Some("invalid_request")
+    );
+    assert_eq!(
+        error_code(&harness.invoke("list-cursor", "target.list", json!({"cursor": "nope"}))),
+        Some("invalid_request")
+    );
+    let page = harness.invoke("list-page", "target.list", json!({"limit": 1}));
+    assert_eq!(page.value["targets"].as_array().unwrap().len(), 1);
+    assert_eq!(page.value["next_cursor"], "1");
+    assert_eq!(
+        error_code(&harness.invoke("schema-limit", "system.commands.list", json!({"limit": 11}))),
+        Some("invalid_request")
+    );
+    assert_eq!(
+        error_code(&harness.invoke(
+            "click-mode",
+            "action.click",
+            json!({
+                "session_id": observer,
+                "locator": {"kind": "semantic", "name": "Save"},
+                "mode": "sideways"
+            })
+        )),
+        Some("invalid_request")
+    );
+    let foreground = harness.invoke(
+        "click-foreground",
+        "action.click",
+        json!({
+            "session_id": observer,
+            "locator": {"kind": "semantic", "name": "Save"},
+            "mode": "foreground"
+        }),
+    );
+    assert_eq!(error_code(&foreground), Some("actor_lease_required"));
+    assert_eq!(
+        error_code(&harness.invoke(
+            "export-missing",
+            "artifact.export",
+            json!({
+                "session_id": "s_missing",
+                "all": true,
+                "destination": harness._root.path().join("missing-export")
+            })
+        )),
+        Some("session_not_found")
+    );
+    assert_eq!(
+        error_code(&harness.invoke(
+            "click-missing",
+            "action.click",
+            json!({"session_id": "s_missing", "locator": {"kind": "semantic", "name": "Save"}})
+        )),
+        Some("session_not_found")
+    );
+}
