@@ -333,11 +333,9 @@ mod tests {
                 while !worker_stop.load(Ordering::SeqCst) {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
-                            let _ = stream.set_nonblocking(false);
-                            let mut request = [0_u8; 1024];
-                            let count = stream.read(&mut request).unwrap_or_default();
-                            let request = String::from_utf8_lossy(&request[..count]);
-                            let request_line = request.lines().next().unwrap_or_default();
+                            let Some(request_line) = read_http_request_line(&mut stream) else {
+                                continue;
+                            };
                             if request_line == "PUT /json/new?about%3Ablank HTTP/1.1" {
                                 worker_create_requests.fetch_add(1, Ordering::SeqCst);
                                 worker_created.store(true, Ordering::SeqCst);
@@ -396,6 +394,35 @@ mod tests {
                 let _ = worker.join();
             }
         }
+    }
+
+    fn read_http_request_line(stream: &mut std::net::TcpStream) -> Option<String> {
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 256];
+        for _ in 0..50 {
+            match stream.read(&mut chunk) {
+                Ok(0) => thread::sleep(Duration::from_millis(2)),
+                Ok(count) => {
+                    request.extend_from_slice(&chunk[..count]);
+                    let text = String::from_utf8_lossy(&request);
+                    if text.contains('\n') {
+                        return text.lines().next().map(str::to_owned);
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(_) => return None,
+            }
+        }
+        None
     }
 
     fn page_body() -> Vec<u8> {
