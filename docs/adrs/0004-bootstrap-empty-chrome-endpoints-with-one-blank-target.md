@@ -1,4 +1,4 @@
-# ADR-0003: Bootstrap empty Chrome endpoints with one blank target
+# ADR-0004: Bootstrap empty Chrome endpoints with one blank target
 
 Date: 2026-08-21
 Status: Accepted
