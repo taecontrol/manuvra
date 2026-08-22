@@ -67,6 +67,8 @@ make test
 make crap
 ```
 
+`make crap` fails when any production function scores above 8. Hosted CI still treats that inventory as advisory. See [ADR-0003](docs/adrs/0003-pin-production-crap-at-8.md).
+
 Build an installable bundle in a staging prefix with:
 
 ```bash
