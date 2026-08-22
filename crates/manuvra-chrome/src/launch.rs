@@ -133,23 +133,43 @@ fn wait_for_page(
 ) -> Result<Value, LaunchError> {
     let mut creation_attempted = false;
     loop {
-        match current {
-            Probe::Chrome { pages } if pages >= 1 => return Ok(launch_result(state, request)),
-            Probe::Occupied(message) => return Err(LaunchError::EndpointBusy(message)),
-            Probe::Chrome { .. } if !creation_attempted => {
-                // Mark before dispatch because every response failure is ambiguous:
-                // Chrome may have created the page. Never replay this mutation.
-                creation_attempted = true;
-                let timeout = remaining(deadline)?.min(PROBE_TIMEOUT);
-                let _ = request.endpoint.put_json(NEW_BLANK_PAGE_PATH, timeout);
-            }
-            Probe::Chrome { .. } | Probe::Refused | Probe::Transient => {
-                thread::sleep(POLL_INTERVAL.min(remaining(deadline)?));
-            }
+        if let Some(result) =
+            settle_current_probe(request, deadline, state, current, &mut creation_attempted)?
+        {
+            return Ok(result);
         }
-        let timeout = remaining(deadline)?.min(PROBE_TIMEOUT);
-        current = probe(&request.endpoint, timeout);
+        current = probe(&request.endpoint, probe_timeout(deadline)?);
     }
+}
+
+fn settle_current_probe(
+    request: &LaunchRequest,
+    deadline: Instant,
+    state: &str,
+    current: Probe,
+    creation_attempted: &mut bool,
+) -> Result<Option<Value>, LaunchError> {
+    match current {
+        Probe::Chrome { pages } if pages >= 1 => Ok(Some(launch_result(state, request))),
+        Probe::Occupied(message) => Err(LaunchError::EndpointBusy(message)),
+        Probe::Chrome { .. } if !*creation_attempted => {
+            // Mark before dispatch because every response failure is ambiguous:
+            // Chrome may have created the page. Never replay this mutation.
+            *creation_attempted = true;
+            let _ = request
+                .endpoint
+                .put_json(NEW_BLANK_PAGE_PATH, probe_timeout(deadline)?);
+            Ok(None)
+        }
+        Probe::Chrome { .. } | Probe::Refused | Probe::Transient => {
+            thread::sleep(POLL_INTERVAL.min(remaining(deadline)?));
+            Ok(None)
+        }
+    }
+}
+
+fn probe_timeout(deadline: Instant) -> Result<Duration, LaunchError> {
+    Ok(remaining(deadline)?.min(PROBE_TIMEOUT))
 }
 
 fn launch_result(state: &str, request: &LaunchRequest) -> Value {
