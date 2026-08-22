@@ -35,7 +35,7 @@
     },
     "lifecycle": { "const": "pass" },
     "privacy": { "const": "pass" },
-    "crap": { "type": "object", "additionalProperties": false, "required": ["threshold", "maximum", "offenders", "missing_coverage"], "properties": { "threshold": { "const": 15 }, "maximum": { "type": "number", "maximum": 15 }, "offenders": { "const": 0 }, "missing_coverage": { "type": "integer", "minimum": 0 } } },
+    "crap": { "type": "object", "additionalProperties": false, "required": ["threshold", "maximum", "offenders", "missing_coverage"], "properties": { "threshold": { "const": 8 }, "maximum": { "type": "number", "maximum": 8 }, "offenders": { "const": 0 }, "missing_coverage": { "type": "integer", "minimum": 0 } } },
     "local_evidence_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
   },
   "$defs": {

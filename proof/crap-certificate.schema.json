@@ -14,7 +14,7 @@
       "additionalProperties": false,
       "required": ["threshold", "missing_coverage", "waivers"],
       "properties": {
-        "threshold": { "const": 15 },
+        "threshold": { "const": 8 },
         "missing_coverage": { "const": "pessimistic" },
         "waivers": { "const": false }
       }
@@ -44,7 +44,7 @@
       "required": ["schema_version", "threshold", "entries"],
       "properties": {
         "schema_version": { "const": 1 },
-        "threshold": { "const": 15 },
+        "threshold": { "const": 8 },
         "entries": {
           "type": "array",
           "minItems": 1,
@@ -60,7 +60,7 @@
               "complexity": { "type": "number", "minimum": 1 },
               "coverage": { "type": "number", "minimum": 0, "maximum": 100 },
               "coverage_missing": { "type": "boolean" },
-              "crap": { "type": "number", "maximum": 15 }
+              "crap": { "type": "number", "maximum": 8 }
             }
           }
         }

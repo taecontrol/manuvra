@@ -1816,6 +1816,7 @@ fn ax_value_into<T>(pointer: *const c_void, kind: i32, value: &mut T) -> Result<
         .ok_or_else(|| adapter_error("raw_value_unsupported", "AXValue payload was malformed"))
 }
 
+#[inline(never)]
 fn decode_element_bounds(
     position: CFRetained<CFType>,
     size: CFRetained<CFType>,
@@ -2505,6 +2506,39 @@ mod tests {
         };
         assert!(close_enough(pinned, pinned));
         assert!(!close_enough(pinned, WindowBounds { x: 13.0, ..pinned }));
+    }
+
+    #[test]
+    fn decode_element_bounds_reads_position_and_size_and_rejects_mismatched_kinds() {
+        let position = decode_ax_point(&json!({"x": 10.0, "y": 20.0})).unwrap();
+        let size = decode_ax_size(&json!({"width": 300.0, "height": 200.0})).unwrap();
+        assert_eq!(
+            decode_element_bounds(position, size).unwrap(),
+            WindowBounds {
+                x: 10.0,
+                y: 20.0,
+                width: 300.0,
+                height: 200.0,
+            }
+        );
+
+        let swapped_position = decode_ax_size(&json!({"width": 1.0, "height": 2.0})).unwrap();
+        let size = decode_ax_size(&json!({"width": 300.0, "height": 200.0})).unwrap();
+        assert_eq!(
+            decode_element_bounds(swapped_position, size)
+                .unwrap_err()
+                .code,
+            "observation_failed"
+        );
+
+        let position = decode_ax_point(&json!({"x": 10.0, "y": 20.0})).unwrap();
+        let swapped_size = decode_ax_point(&json!({"x": 1.0, "y": 2.0})).unwrap();
+        assert_eq!(
+            decode_element_bounds(position, swapped_size)
+                .unwrap_err()
+                .code,
+            "observation_failed"
+        );
     }
 
     #[test]

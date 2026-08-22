@@ -688,7 +688,7 @@ mod tests {
         };
         write_json_report(Some(&path), &[entry]).unwrap();
         let contents = fs::read_to_string(path).unwrap();
-        assert!(contents.contains("\"threshold\": 15.0"));
+        assert!(contents.contains("\"threshold\": 8.0"));
         assert!(contents.contains("\"function\": \"f\""));
     }
 }
