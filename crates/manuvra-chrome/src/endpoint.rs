@@ -24,16 +24,9 @@ impl Endpoint {
     }
 
     pub fn configured(value: Option<&str>) -> Result<Vec<Self>, EndpointError> {
-        let value = value.unwrap_or(DEFAULT_ENDPOINT);
         let mut endpoints = Vec::new();
-        for item in value.split(',') {
-            if item.trim() != item || item.is_empty() {
-                return Err(EndpointError::Invalid(item.to_owned()));
-            }
-            let endpoint = Self::parse(item)?;
-            if !endpoints.contains(&endpoint) {
-                endpoints.push(endpoint);
-            }
+        for item in value.unwrap_or(DEFAULT_ENDPOINT).split(',') {
+            push_configured_endpoint(&mut endpoints, item)?;
         }
         if endpoints.is_empty() || endpoints.len() > MAX_ENDPOINTS {
             return Err(EndpointError::Count(endpoints.len()));
@@ -82,34 +75,54 @@ impl Endpoint {
     }
 }
 
+fn push_configured_endpoint(
+    endpoints: &mut Vec<Endpoint>,
+    item: &str,
+) -> Result<(), EndpointError> {
+    if item.trim() != item || item.is_empty() {
+        return Err(EndpointError::Invalid(item.to_owned()));
+    }
+    let endpoint = Endpoint::parse(item)?;
+    if !endpoints.contains(&endpoint) {
+        endpoints.push(endpoint);
+    }
+    Ok(())
+}
+
 fn read_response(stream: &mut TcpStream) -> Result<Vec<u8>, EndpointError> {
     let mut response = Vec::new();
     let mut chunk = [0_u8; 8192];
-    loop {
-        match stream.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(count) => {
-                response.extend_from_slice(&chunk[..count]);
-                if response.len() > MAX_DISCOVERY_BYTES {
-                    return Err(EndpointError::TooLarge);
-                }
-                if response_complete(&response) {
-                    break;
-                }
-            }
-            Err(error)
-                if !response.is_empty()
-                    && matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) =>
-            {
-                break;
-            }
-            Err(error) => return Err(EndpointError::Io(error.to_string())),
-        }
-    }
+    while read_discovery_chunk(stream, &mut response, &mut chunk)? {}
     Ok(response)
+}
+
+fn read_discovery_chunk(
+    stream: &mut TcpStream,
+    response: &mut Vec<u8>,
+    chunk: &mut [u8],
+) -> Result<bool, EndpointError> {
+    match stream.read(chunk) {
+        Ok(0) => Ok(false),
+        Ok(count) => Ok(!append_discovery_bytes(response, &chunk[..count])?),
+        Err(error) if discovery_read_is_complete(response, &error) => Ok(false),
+        Err(error) => Err(EndpointError::Io(error.to_string())),
+    }
+}
+
+fn append_discovery_bytes(response: &mut Vec<u8>, chunk: &[u8]) -> Result<bool, EndpointError> {
+    response.extend_from_slice(chunk);
+    if response.len() > MAX_DISCOVERY_BYTES {
+        return Err(EndpointError::TooLarge);
+    }
+    Ok(response_complete(response))
+}
+
+fn discovery_read_is_complete(response: &[u8], error: &std::io::Error) -> bool {
+    !response.is_empty()
+        && matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        )
 }
 
 fn response_complete(response: &[u8]) -> bool {
@@ -199,6 +212,17 @@ mod tests {
                 .is_connection_refused()
         );
         assert!(!EndpointError::HttpStatus(404).is_connection_refused());
+        assert_eq!(
+            Endpoint::configured(None).unwrap()[0].label(),
+            "127.0.0.1:9222"
+        );
+        assert!(Endpoint::configured(Some("")).is_err());
+        assert!(Endpoint::configured(Some("127.0.0.1:0")).is_err());
+        let too_many = (9222..9232)
+            .map(|port| format!("127.0.0.1:{port}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(Endpoint::configured(Some(&too_many)).is_err());
     }
 
     #[test]
@@ -209,6 +233,11 @@ mod tests {
             "ws://127.0.0.1:9222/devtools/page/abc"
         );
         assert!(endpoint.websocket_url("ws://evil.example/page").is_err());
+        let v6 = Endpoint::parse("[::1]:9222").unwrap();
+        assert_eq!(
+            v6.websocket_url("/devtools/page/abc").unwrap(),
+            "ws://[::1]:9222/devtools/page/abc"
+        );
     }
 
     #[test]
@@ -225,5 +254,58 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn discovery_http_parses_json_and_rejects_status_or_oversize() {
+        let chrome = crate::transport::test_support::ScriptedChrome::start();
+        let endpoint = chrome.endpoint();
+        let listed = endpoint
+            .get_json("/json/list", Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(listed[0]["id"], "page-1");
+
+        chrome.http_status(404);
+        assert!(matches!(
+            endpoint.get_json("/json/list", Duration::from_secs(1)),
+            Err(EndpointError::HttpStatus(404))
+        ));
+
+        chrome.http_status(200);
+        chrome.http_body(b"not-json".to_vec());
+        assert!(matches!(
+            endpoint.get_json("/json/list", Duration::from_secs(1)),
+            Err(EndpointError::Json(_))
+        ));
+
+        chrome.raw_http(b"not-http".to_vec());
+        assert!(matches!(
+            endpoint.get_json("/json/list", Duration::from_millis(200)),
+            Err(EndpointError::MalformedHttp)
+        ));
+
+        let mut oversize = vec![b'x'; 16];
+        assert!(append_discovery_bytes(&mut oversize, &[b'y'; MAX_DISCOVERY_BYTES]).is_err());
+        assert!(discovery_read_is_complete(
+            b"partial",
+            &std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout")
+        ));
+        assert!(!discovery_read_is_complete(
+            b"",
+            &std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout")
+        ));
+    }
+
+    #[test]
+    fn partial_discovery_response_without_length_is_accepted_on_timeout() {
+        let chrome = crate::transport::test_support::ScriptedChrome::start();
+        chrome.omit_content_length();
+        chrome.hold_after_headers();
+        chrome.http_body(br#"[{"id":"page-1","type":"page","webSocketDebuggerUrl":"ws://127.0.0.1/devtools/page/page-1"}]"#.to_vec());
+        let listed = chrome
+            .endpoint()
+            .get_json("/json/list", Duration::from_millis(40))
+            .unwrap();
+        assert_eq!(listed[0]["id"], "page-1");
     }
 }

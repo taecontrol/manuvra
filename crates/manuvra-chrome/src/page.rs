@@ -1,6 +1,6 @@
 use crate::transport::{
-    CdpClient, CommandFailure, CommandOutcome, JournalEvent, event_method, event_params,
-    is_relevant_event,
+    CdpClient, CommandFailure, CommandOutcome, JournalEvent, JournalSnapshot, event_method,
+    event_params, is_relevant_event,
 };
 use base64::Engine;
 use manuvra_runtime::{
@@ -27,18 +27,27 @@ pub fn prepare(
     let Some(locator) = operation.input.get("locator") else {
         return Ok(operation.clone());
     };
-    let prepared = match locator.get("kind").and_then(Value::as_str) {
-        Some("semantic") => resolve_semantic(client, context, locator, cancellation)?,
-        Some("ref") => resolve_reference(client, context, locator, cancellation)?,
-        Some("point") => resolve_point(client, context, locator, cancellation)?,
-        _ => return Err(error("invalid_request", "invalid Chrome locator")),
-    };
+    let prepared = resolve_locator(client, context, locator, cancellation)?;
     let mut operation = operation.clone();
     operation.prepared = Some(json!({
         "target": prepared,
         "preflight_ms": millis(started.elapsed()),
     }));
     Ok(operation)
+}
+
+fn resolve_locator(
+    client: &CdpClient,
+    context: &AdapterContext,
+    locator: &Value,
+    cancellation: Arc<AtomicBool>,
+) -> Result<Value, AdapterError> {
+    match locator.get("kind").and_then(Value::as_str) {
+        Some("semantic") => resolve_semantic(client, context, locator, cancellation),
+        Some("ref") => resolve_reference(client, context, locator, cancellation),
+        Some("point") => resolve_point(client, context, locator, cancellation),
+        _ => Err(error("invalid_request", "invalid Chrome locator")),
+    }
 }
 
 pub fn observe(
@@ -140,27 +149,53 @@ fn dispatch(
     cancellation: Arc<AtomicBool>,
 ) -> PageResult<(Value, Option<String>)> {
     match operation.command.as_str() {
-        "action.click" => dispatch_click(observation, context, operation, cancellation),
-        "action.type" => dispatch_type(observation, context, operation, cancellation),
-        "action.press" => dispatch_press(observation, context, operation, cancellation),
-        "action.scroll" => dispatch_scroll(observation, context, operation, cancellation),
-        "action.navigate" => dispatch_navigate(observation, context, operation, cancellation),
-        "raw.cdp" => dispatch_raw(
-            raw.ok_or_else(|| {
-                Box::new(rejected(
-                    "capability_unavailable",
-                    "raw CDP connection unavailable",
-                ))
-            })?,
-            context,
-            operation,
-            cancellation,
-        ),
+        command if command.starts_with("action.") => {
+            dispatch_action(observation, context, operation, cancellation)
+        }
+        "raw.cdp" => dispatch_raw_or_unavailable(raw, context, operation, cancellation),
         _ => Err(Box::new(rejected(
             "command_unsupported",
             "unsupported Chrome action",
         ))),
     }
+}
+
+fn dispatch_action(
+    observation: &CdpClient,
+    context: &AdapterContext,
+    operation: &AdapterOperation,
+    cancellation: Arc<AtomicBool>,
+) -> PageResult<(Value, Option<String>)> {
+    match operation.command.as_str() {
+        "action.click" => dispatch_click(observation, context, operation, cancellation),
+        "action.type" => dispatch_type(observation, context, operation, cancellation),
+        "action.press" => dispatch_press(observation, context, operation, cancellation),
+        "action.scroll" => dispatch_scroll(observation, context, operation, cancellation),
+        "action.navigate" => dispatch_navigate(observation, context, operation, cancellation),
+        _ => Err(Box::new(rejected(
+            "command_unsupported",
+            "unsupported Chrome action",
+        ))),
+    }
+}
+
+fn dispatch_raw_or_unavailable(
+    raw: Option<&CdpClient>,
+    context: &AdapterContext,
+    operation: &AdapterOperation,
+    cancellation: Arc<AtomicBool>,
+) -> PageResult<(Value, Option<String>)> {
+    dispatch_raw(
+        raw.ok_or_else(|| {
+            Box::new(rejected(
+                "capability_unavailable",
+                "raw CDP connection unavailable",
+            ))
+        })?,
+        context,
+        operation,
+        cancellation,
+    )
 }
 
 fn dispatch_click(
@@ -251,18 +286,8 @@ fn dispatch_press(
     operation: &AdapterOperation,
     cancellation: Arc<AtomicBool>,
 ) -> PageResult<(Value, Option<String>)> {
-    let mut effects_possible = false;
-    if operation.input.get("locator").is_some() {
-        let target = prepared_target(operation)?;
-        let backend_id = target.backend_id.ok_or_else(|| {
-            Box::new(rejected(
-                "capability_unavailable",
-                "key target is not an element",
-            ))
-        })?;
-        focus_backend(client, context, backend_id, false, cancellation.clone())?;
-        effects_possible = true;
-    }
+    let mut effects_possible =
+        focus_press_target(client, context, operation, cancellation.clone())?;
     let key = operation
         .input
         .get("key")
@@ -292,6 +317,25 @@ fn dispatch_press(
         effects_possible = true;
     }
     Ok((json!({"dispatched": "press"}), None))
+}
+
+fn focus_press_target(
+    client: &CdpClient,
+    context: &AdapterContext,
+    operation: &AdapterOperation,
+    cancellation: Arc<AtomicBool>,
+) -> PageResult<bool> {
+    if operation.input.get("locator").is_none() {
+        return Ok(false);
+    }
+    let backend_id = prepared_target(operation)?.backend_id.ok_or_else(|| {
+        Box::new(rejected(
+            "capability_unavailable",
+            "key target is not an element",
+        ))
+    })?;
+    focus_backend(client, context, backend_id, false, cancellation)?;
+    Ok(true)
 }
 
 fn dispatch_scroll(
@@ -540,14 +584,28 @@ fn resolve_point(
     cancellation: Arc<AtomicBool>,
 ) -> Result<Value, AdapterError> {
     let layout = layout(client, context, cancellation)?;
-    let signature = layout_signature(&layout);
+    require_current_frame_token(locator, &layout)?;
+    let (x, y) = require_point_in_viewport(locator, &layout)?;
+    Ok(json!({
+        "x": x,
+        "y": y,
+        "backend_id": null,
+    }))
+}
+
+fn require_current_frame_token(locator: &Value, layout: &Value) -> Result<(), AdapterError> {
+    let signature = layout_signature(layout);
     let token = locator
         .get("frame_token")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if !token.ends_with(&signature) {
-        return Err(error("frame_stale", "Chrome viewport geometry changed"));
-    }
+    token
+        .ends_with(&signature)
+        .then_some(())
+        .ok_or_else(|| error("frame_stale", "Chrome viewport geometry changed"))
+}
+
+fn require_point_in_viewport(locator: &Value, layout: &Value) -> Result<(f64, f64), AdapterError> {
     let viewport = layout.get("visualViewport").unwrap_or(&Value::Null);
     let width = viewport
         .get("clientWidth")
@@ -559,17 +617,14 @@ fn resolve_point(
         .unwrap_or(0.0);
     let x = locator.get("x").and_then(Value::as_f64).unwrap_or(-1.0);
     let y = locator.get("y").and_then(Value::as_f64).unwrap_or(-1.0);
-    if x < 0.0 || y < 0.0 || x >= width || y >= height {
-        return Err(error(
-            "element_not_found",
-            "Chrome point is outside the current viewport",
-        ));
-    }
-    Ok(json!({
-        "x": x,
-        "y": y,
-        "backend_id": null,
-    }))
+    (x >= 0.0 && y >= 0.0 && x < width && y < height)
+        .then_some((x, y))
+        .ok_or_else(|| {
+            error(
+                "element_not_found",
+                "Chrome point is outside the current viewport",
+            )
+        })
 }
 
 fn ax_nodes(
@@ -577,12 +632,33 @@ fn ax_nodes(
     context: &AdapterContext,
     cancellation: Arc<AtomicBool>,
 ) -> Result<Vec<Value>, AdapterError> {
+    let frames = page_frame_ids(client, context, cancellation.clone())?;
+    let mut combined = Vec::new();
+    let mut seen_nodes = HashSet::new();
+    for frame_id in frames {
+        append_frame_ax_nodes(
+            client,
+            context,
+            &frame_id,
+            &mut combined,
+            &mut seen_nodes,
+            cancellation.clone(),
+        )?;
+    }
+    Ok(combined)
+}
+
+fn page_frame_ids(
+    client: &CdpClient,
+    context: &AdapterContext,
+    cancellation: Arc<AtomicBool>,
+) -> Result<Vec<String>, AdapterError> {
     let tree = command_preflight(
         client,
         "Page.getFrameTree",
         json!({}),
         context,
-        cancellation.clone(),
+        cancellation,
     )?;
     let mut frames = Vec::new();
     collect_frame_ids(tree.get("frameTree").unwrap_or(&Value::Null), &mut frames);
@@ -592,50 +668,60 @@ fn ax_nodes(
             "Chrome returned no page frame tree",
         ));
     }
-    let mut combined = Vec::new();
-    let mut seen_nodes = HashSet::new();
-    for frame_id in frames {
-        let result = command_preflight(
-            client,
-            "Accessibility.getFullAXTree",
-            json!({"frameId": frame_id}),
-            context,
-            cancellation.clone(),
-        )?;
-        let nodes = result
-            .get("nodes")
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                error(
-                    "observation_failed",
-                    "Chrome returned no complete accessibility tree for an attached frame",
-                )
-            })?;
-        for node in nodes {
-            let owning_frame = node
-                .get("frameId")
-                .and_then(Value::as_str)
-                .unwrap_or(&frame_id)
-                .to_owned();
-            let identity = node
-                .get("backendDOMNodeId")
-                .and_then(Value::as_u64)
-                .map(|backend| format!("{owning_frame}:backend:{backend}"))
-                .or_else(|| {
-                    node.get("nodeId")
-                        .and_then(Value::as_str)
-                        .map(|node_id| format!("{owning_frame}:ax:{node_id}"))
-                })
-                .unwrap_or_else(|| format!("{owning_frame}:index:{}", combined.len()));
-            if !seen_nodes.insert(identity) {
-                continue;
-            }
-            let mut node = node.clone();
-            node["computerUseFrameId"] = Value::String(owning_frame);
-            combined.push(node);
+    Ok(frames)
+}
+
+fn append_frame_ax_nodes(
+    client: &CdpClient,
+    context: &AdapterContext,
+    frame_id: &str,
+    combined: &mut Vec<Value>,
+    seen_nodes: &mut HashSet<String>,
+    cancellation: Arc<AtomicBool>,
+) -> Result<(), AdapterError> {
+    let result = command_preflight(
+        client,
+        "Accessibility.getFullAXTree",
+        json!({"frameId": frame_id}),
+        context,
+        cancellation,
+    )?;
+    let nodes = result
+        .get("nodes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            error(
+                "observation_failed",
+                "Chrome returned no complete accessibility tree for an attached frame",
+            )
+        })?;
+    for node in nodes {
+        let owning_frame = node
+            .get("frameId")
+            .and_then(Value::as_str)
+            .unwrap_or(frame_id)
+            .to_owned();
+        let identity = ax_node_identity(node, &owning_frame, combined.len());
+        if !seen_nodes.insert(identity) {
+            continue;
         }
+        let mut node = node.clone();
+        node["computerUseFrameId"] = Value::String(owning_frame);
+        combined.push(node);
     }
-    Ok(combined)
+    Ok(())
+}
+
+fn ax_node_identity(node: &Value, owning_frame: &str, index: usize) -> String {
+    node.get("backendDOMNodeId")
+        .and_then(Value::as_u64)
+        .map(|backend| format!("{owning_frame}:backend:{backend}"))
+        .or_else(|| {
+            node.get("nodeId")
+                .and_then(Value::as_str)
+                .map(|node_id| format!("{owning_frame}:ax:{node_id}"))
+        })
+        .unwrap_or_else(|| format!("{owning_frame}:index:{index}"))
 }
 
 fn collect_frame_ids(tree: &Value, output: &mut Vec<String>) {
@@ -659,24 +745,34 @@ fn matching_nodes(
     let tree = AxTree::index(&nodes);
     let mut matches = Vec::new();
     for node in &nodes {
-        let Some(mut public) = public_node(context, node) else {
-            continue;
-        };
-        if semantic.get("identifier").is_some() || semantic.get("text").is_some() {
-            attach_dom_fields(
-                client,
-                context,
-                semantic,
-                node,
-                &mut public,
-                cancellation.clone(),
-            )?;
-        }
-        if semantic_matches(semantic, &public) && ancestor_scope_matches(semantic, node, &tree) {
+        if let Some(public) =
+            matching_public_node(client, context, semantic, node, &tree, cancellation.clone())?
+        {
             matches.push(public);
         }
     }
     Ok(matches)
+}
+
+fn matching_public_node(
+    client: &CdpClient,
+    context: &AdapterContext,
+    semantic: &Value,
+    node: &Value,
+    tree: &AxTree<'_>,
+    cancellation: Arc<AtomicBool>,
+) -> Result<Option<Value>, AdapterError> {
+    let Some(mut public) = public_node(context, node) else {
+        return Ok(None);
+    };
+    if semantic.get("identifier").is_some() || semantic.get("text").is_some() {
+        attach_dom_fields(client, context, semantic, node, &mut public, cancellation)?;
+    }
+    if semantic_matches(semantic, &public) && ancestor_scope_matches(semantic, node, tree) {
+        Ok(Some(public))
+    } else {
+        Ok(None)
+    }
 }
 
 fn public_node(context: &AdapterContext, node: &Value) -> Option<Value> {
@@ -721,52 +817,78 @@ fn attach_dom_fields(
         .get("backendDOMNodeId")
         .and_then(Value::as_u64)
         .ok_or_else(|| error("element_stale", "Chrome AX node has no DOM identity"))?;
+    attach_identifier(client, context, backend_id, public, cancellation.clone())?;
+    if semantic.get("text").is_some() {
+        attach_text_content(client, context, backend_id, public, cancellation)?;
+    }
+    Ok(())
+}
+
+fn attach_identifier(
+    client: &CdpClient,
+    context: &AdapterContext,
+    backend_id: u64,
+    public: &mut Value,
+    cancellation: Arc<AtomicBool>,
+) -> Result<(), AdapterError> {
     let described = command_preflight(
         client,
         "DOM.describeNode",
         json!({"backendNodeId": backend_id, "depth": 0}),
         context,
-        cancellation.clone(),
+        cancellation,
     )?;
+    let empty = Vec::new();
     let attributes = described
         .pointer("/node/attributes")
         .and_then(Value::as_array)
+        .unwrap_or(&empty);
+    if let Some(identifier) = attribute_value(attributes, "id") {
+        public["identifier"] = identifier;
+    }
+    Ok(())
+}
+
+fn attribute_value(attributes: &[Value], name: &str) -> Option<Value> {
+    attributes
+        .chunks_exact(2)
+        .find(|pair| pair[0].as_str() == Some(name))
+        .map(|pair| pair[1].clone())
+}
+
+fn attach_text_content(
+    client: &CdpClient,
+    context: &AdapterContext,
+    backend_id: u64,
+    public: &mut Value,
+    cancellation: Arc<AtomicBool>,
+) -> Result<(), AdapterError> {
+    let resolved = command_preflight(
+        client,
+        "DOM.resolveNode",
+        json!({"backendNodeId": backend_id}),
+        context,
+        cancellation.clone(),
+    )?;
+    let object_id = resolved
+        .pointer("/object/objectId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| error("element_stale", "Chrome element no longer resolves"))?;
+    let text = command_preflight(
+        client,
+        "Runtime.callFunctionOn",
+        json!({
+            "objectId": object_id,
+            "functionDeclaration": "function(){return this.textContent}",
+            "returnByValue": true,
+        }),
+        context,
+        cancellation,
+    )?;
+    public["text"] = text
+        .pointer("/result/value")
         .cloned()
-        .unwrap_or_default();
-    for pair in attributes.chunks_exact(2) {
-        if pair[0].as_str() == Some("id") {
-            public["identifier"] = pair[1].clone();
-            break;
-        }
-    }
-    if semantic.get("text").is_some() {
-        let resolved = command_preflight(
-            client,
-            "DOM.resolveNode",
-            json!({"backendNodeId": backend_id}),
-            context,
-            cancellation.clone(),
-        )?;
-        let object_id = resolved
-            .pointer("/object/objectId")
-            .and_then(Value::as_str)
-            .ok_or_else(|| error("element_stale", "Chrome element no longer resolves"))?;
-        let text = command_preflight(
-            client,
-            "Runtime.callFunctionOn",
-            json!({
-                "objectId": object_id,
-                "functionDeclaration": "function(){return this.textContent}",
-                "returnByValue": true,
-            }),
-            context,
-            cancellation,
-        )?;
-        public["text"] = text
-            .pointer("/result/value")
-            .cloned()
-            .unwrap_or(Value::Null);
-    }
+        .unwrap_or(Value::Null);
     Ok(())
 }
 
@@ -976,10 +1098,53 @@ fn wait_for_quiet(
     deadline: Instant,
     cancellation: &Arc<AtomicBool>,
 ) -> PageResult<()> {
-    let mut processed = fence;
-    let mut last_relevant = Instant::now();
-    let mut navigation_ready = expected_loader.is_none();
+    let mut settle = QuietWindow::new(fence, expected_loader);
     loop {
+        settle.abort(cancellation, deadline)?;
+        let snapshot = client.snapshot_since(settle.processed);
+        require_journal_intact(&snapshot, "during stabilization")?;
+        settle.observe(&snapshot.events);
+        if settle.is_ready() {
+            return Ok(());
+        }
+        client.wait_for_journal_change(settle.processed, settle.wait_budget(deadline));
+    }
+}
+
+struct QuietWindow {
+    processed: u64,
+    last_relevant: Instant,
+    navigation_ready: bool,
+    expected_loader: Option<String>,
+}
+
+impl QuietWindow {
+    fn new(fence: u64, expected_loader: Option<&str>) -> Self {
+        Self {
+            processed: fence,
+            last_relevant: Instant::now(),
+            navigation_ready: expected_loader.is_none(),
+            expected_loader: expected_loader.map(str::to_owned),
+        }
+    }
+
+    fn observe(&mut self, events: &[JournalEvent]) {
+        for event in events {
+            self.processed = event.cursor;
+            if is_relevant_event(event) {
+                self.last_relevant = Instant::now();
+            }
+            if navigation_event_matches(event, self.expected_loader.as_deref()) {
+                self.navigation_ready = true;
+            }
+        }
+    }
+
+    fn is_ready(&self) -> bool {
+        self.navigation_ready && self.last_relevant.elapsed() >= QUIET_WINDOW
+    }
+
+    fn abort(&self, cancellation: &Arc<AtomicBool>, deadline: Instant) -> PageResult<()> {
         if cancellation.load(Ordering::SeqCst) {
             return Err(Box::new(unknown(
                 "cancelled",
@@ -987,41 +1152,32 @@ fn wait_for_quiet(
             )));
         }
         if Instant::now() >= deadline {
-            let message = if expected_loader.is_some() {
+            let message = if self.expected_loader.is_some() {
                 "Chrome document was not ready before the deadline"
             } else {
                 "Chrome did not become logically quiet before the deadline"
             };
             return Err(Box::new(unknown("stabilization_timeout", message)));
         }
-        let snapshot = client.snapshot_since(processed);
-        if snapshot.overflowed {
-            return Err(Box::new(unknown(
-                "observation_failed",
-                "Chrome event journal overflowed during stabilization",
-            )));
-        }
-        for event in &snapshot.events {
-            processed = event.cursor;
-            if is_relevant_event(event) {
-                last_relevant = Instant::now();
-            }
-            if navigation_event_matches(event, expected_loader) {
-                navigation_ready = true;
-            }
-        }
-        if navigation_ready && last_relevant.elapsed() >= QUIET_WINDOW {
-            return Ok(());
-        }
-        let quiet_remaining = QUIET_WINDOW.saturating_sub(last_relevant.elapsed());
-        let deadline_remaining = deadline.saturating_duration_since(Instant::now());
-        client.wait_for_journal_change(
-            processed,
-            quiet_remaining
-                .min(deadline_remaining)
-                .min(Duration::from_millis(10)),
-        );
+        Ok(())
     }
+
+    fn wait_budget(&self, deadline: Instant) -> Duration {
+        QUIET_WINDOW
+            .saturating_sub(self.last_relevant.elapsed())
+            .min(deadline.saturating_duration_since(Instant::now()))
+            .min(Duration::from_millis(10))
+    }
+}
+
+fn require_journal_intact(snapshot: &JournalSnapshot, during: &str) -> PageResult<()> {
+    if snapshot.overflowed {
+        return Err(Box::new(unknown(
+            "observation_failed",
+            &format!("Chrome event journal overflowed {during}"),
+        )));
+    }
+    Ok(())
 }
 
 fn watch_for_following_document(
@@ -1036,44 +1192,61 @@ fn watch_for_following_document(
     let mut processed = fence;
     let watch_started = Instant::now();
     loop {
-        if cancellation.load(Ordering::SeqCst) {
-            return Err(Box::new(unknown(
-                "cancelled",
-                "cancelled while watching for a following document",
-            )));
-        }
-        if Instant::now() >= deadline {
-            return Err(Box::new(unknown(
-                "stabilization_timeout",
-                "Chrome document was not ready before the deadline",
-            )));
-        }
+        abort_following_watch(cancellation, deadline)?;
         let snapshot = client.snapshot_since(processed);
-        if snapshot.overflowed {
-            return Err(Box::new(unknown(
-                "observation_failed",
-                "Chrome event journal overflowed while watching for a following document",
-            )));
+        require_journal_intact(&snapshot, "while watching for a following document")?;
+        if let Some(loader) = apply_watch_events(&mut watch, &snapshot.events, &mut processed) {
+            return Ok(Some(loader));
         }
-        for event in &snapshot.events {
-            processed = event.cursor;
-            if let Some(loader) = watch.apply(event) {
-                return Ok(Some(loader));
-            }
-        }
-        let elapsed = watch_started.elapsed();
-        if short_watch_closed(elapsed, watch.awaiting_commit()) {
+        if short_watch_closed(watch_started.elapsed(), watch.awaiting_commit()) {
             return Ok(None);
         }
-        let remaining = if watch.awaiting_commit() {
-            deadline.saturating_duration_since(Instant::now())
-        } else {
-            CLICK_FOLLOWING_DOCUMENT_WATCH.saturating_sub(elapsed)
-        }
-        .min(deadline.saturating_duration_since(Instant::now()))
-        .min(Duration::from_millis(10));
-        client.wait_for_journal_change(processed, remaining);
+        client.wait_for_journal_change(
+            processed,
+            following_watch_budget(deadline, watch_started.elapsed(), watch.awaiting_commit()),
+        );
     }
+}
+
+fn abort_following_watch(cancellation: &Arc<AtomicBool>, deadline: Instant) -> PageResult<()> {
+    if cancellation.load(Ordering::SeqCst) {
+        return Err(Box::new(unknown(
+            "cancelled",
+            "cancelled while watching for a following document",
+        )));
+    }
+    if Instant::now() >= deadline {
+        return Err(Box::new(unknown(
+            "stabilization_timeout",
+            "Chrome document was not ready before the deadline",
+        )));
+    }
+    Ok(())
+}
+
+fn apply_watch_events(
+    watch: &mut FollowingDocumentWatch,
+    events: &[JournalEvent],
+    processed: &mut u64,
+) -> Option<String> {
+    for event in events {
+        *processed = event.cursor;
+        if let Some(loader) = watch.apply(event) {
+            return Some(loader);
+        }
+    }
+    None
+}
+
+fn following_watch_budget(deadline: Instant, elapsed: Duration, awaiting_commit: bool) -> Duration {
+    let remaining = if awaiting_commit {
+        deadline.saturating_duration_since(Instant::now())
+    } else {
+        CLICK_FOLLOWING_DOCUMENT_WATCH.saturating_sub(elapsed)
+    };
+    remaining
+        .min(deadline.saturating_duration_since(Instant::now()))
+        .min(Duration::from_millis(10))
 }
 
 struct MainFrameDocument {
@@ -1123,29 +1296,35 @@ impl FollowingDocumentWatch {
     fn apply(&mut self, event: &JournalEvent) -> Option<String> {
         let params = event_params(event);
         match event_method(event) {
-            Some("Page.frameStartedLoading") => {
-                let frame_id = params.get("frameId").and_then(Value::as_str)?;
-                if self.is_main_frame_id(frame_id) {
-                    self.awaiting_frame = Some(frame_id.to_owned());
-                }
-                None
-            }
-            Some("Page.frameNavigated") => {
-                let frame = params.get("frame")?;
-                if !frame_is_main_document(frame, self.main_frame.as_deref()) {
-                    return None;
-                }
-                self.bind_new_loader(frame.get("loaderId").and_then(Value::as_str))
-            }
-            Some("Page.lifecycleEvent") => {
-                let frame_id = params.get("frameId").and_then(Value::as_str)?;
-                if !self.is_main_frame_id(frame_id) {
-                    return None;
-                }
-                self.bind_new_loader(params.get("loaderId").and_then(Value::as_str))
-            }
+            Some("Page.frameStartedLoading") => self.on_frame_started_loading(params),
+            Some("Page.frameNavigated") => self.on_frame_navigated(params),
+            Some("Page.lifecycleEvent") => self.on_lifecycle_event(params),
             _ => None,
         }
+    }
+
+    fn on_frame_started_loading(&mut self, params: &Value) -> Option<String> {
+        let frame_id = params.get("frameId").and_then(Value::as_str)?;
+        if self.is_main_frame_id(frame_id) {
+            self.awaiting_frame = Some(frame_id.to_owned());
+        }
+        None
+    }
+
+    fn on_frame_navigated(&mut self, params: &Value) -> Option<String> {
+        let frame = params.get("frame")?;
+        if !frame_is_main_document(frame, self.main_frame.as_deref()) {
+            return None;
+        }
+        self.bind_new_loader(frame.get("loaderId").and_then(Value::as_str))
+    }
+
+    fn on_lifecycle_event(&mut self, params: &Value) -> Option<String> {
+        let frame_id = params.get("frameId").and_then(Value::as_str)?;
+        if !self.is_main_frame_id(frame_id) {
+            return None;
+        }
+        self.bind_new_loader(params.get("loaderId").and_then(Value::as_str))
     }
 
     fn bind_new_loader(&mut self, loader: Option<&str>) -> Option<String> {
@@ -1781,6 +1960,365 @@ mod tests {
         assert_eq!(normalized_key("Enter").unwrap().virtual_code, 13);
         assert!(normalized_key("x").is_some());
         assert!(normalized_key("UnsupportedLongKey").is_none());
+    }
+
+    #[test]
+    fn navigation_ready_and_quad_center_keep_document_and_geometry_rules() {
+        assert!(!navigation_event_matches(
+            &journal_event(
+                "Page.lifecycleEvent",
+                json!({"name": "load", "loaderId": "a"})
+            ),
+            None
+        ));
+        assert!(navigation_event_matches(
+            &journal_event(
+                "Page.lifecycleEvent",
+                json!({"name": "DOMContentLoaded", "loaderId": "loader-2"})
+            ),
+            Some("loader-2")
+        ));
+        assert!(navigation_event_matches(
+            &journal_event(
+                "Page.lifecycleEvent",
+                json!({"name": "load", "loaderId": "loader-2"})
+            ),
+            Some("loader-2")
+        ));
+        assert!(!navigation_event_matches(
+            &journal_event(
+                "Page.lifecycleEvent",
+                json!({"name": "networkIdle", "loaderId": "loader-2"})
+            ),
+            Some("loader-2")
+        ));
+        assert_eq!(
+            quad_center(&[
+                json!(0.0),
+                json!(0.0),
+                json!(8.0),
+                json!(0.0),
+                json!(8.0),
+                json!(4.0),
+                json!(0.0),
+                json!(4.0)
+            ]),
+            Some((4.0, 2.0))
+        );
+        assert_eq!(quad_center(&[json!(1.0)]), None);
+        assert_eq!(
+            ax_node_identity(&json!({"backendDOMNodeId": 7}), "main", 0),
+            "main:backend:7"
+        );
+        assert_eq!(
+            ax_node_identity(&json!({"nodeId": "ax-1"}), "main", 0),
+            "main:ax:ax-1"
+        );
+        assert_eq!(ax_node_identity(&json!({}), "main", 3), "main:index:3");
+        assert_eq!(
+            attribute_value(
+                &[json!("id"), json!("save"), json!("class"), json!("x")],
+                "id"
+            ),
+            Some(json!("save"))
+        );
+        let overflow = JournalSnapshot {
+            events: Vec::new(),
+            overflowed: true,
+            last_cursor: 0,
+        };
+        assert_eq!(
+            require_journal_intact(&overflow, "during stabilization")
+                .unwrap_err()
+                .error
+                .unwrap()
+                .code,
+            "observation_failed"
+        );
+        let confirmed = outcome_reply(CommandOutcome::Confirmed(json!({"id": 1})));
+        assert_eq!(
+            confirmed.delivery,
+            manuvra_runtime::AdapterDelivery::Confirmed
+        );
+        let rejected = outcome_reply(CommandOutcome::Rejected(
+            json!({"error": {"message": "no"}}),
+        ));
+        assert_eq!(rejected.error.unwrap().code, "raw_protocol_error");
+        assert_eq!(
+            outcome_reply(CommandOutcome::NotSent("closed".to_owned()))
+                .error
+                .unwrap()
+                .code,
+            "dispatch_failed"
+        );
+        assert_eq!(
+            outcome_reply(CommandOutcome::Unknown("maybe".to_owned()))
+                .error
+                .unwrap()
+                .code,
+            "transport_ambiguous"
+        );
+    }
+
+    #[test]
+    fn quiet_window_requires_document_ready_then_a_short_quiet_period() {
+        let mut settle = QuietWindow::new(0, Some("loader-2"));
+        assert!(!settle.is_ready());
+        settle.observe(&[journal_event(
+            "Page.lifecycleEvent",
+            json!({"name": "load", "loaderId": "loader-2"}),
+        )]);
+        assert!(!settle.is_ready());
+        std::thread::sleep(QUIET_WINDOW + Duration::from_millis(5));
+        assert!(settle.is_ready());
+        let mut same_document = QuietWindow::new(0, None);
+        std::thread::sleep(QUIET_WINDOW + Duration::from_millis(5));
+        assert!(same_document.is_ready());
+        same_document.observe(&[journal_event("DOM.childNodeInserted", json!({}))]);
+        assert!(!same_document.is_ready());
+    }
+
+    #[test]
+    fn wait_for_quiet_and_following_watch_honor_cancel_deadline_and_document_ready() {
+        let chrome = crate::transport::test_support::ScriptedChrome::start();
+        let client = chrome.connect_observation();
+        let cancellation = Arc::new(AtomicBool::new(true));
+        assert_eq!(
+            wait_for_quiet(
+                &client,
+                0,
+                None,
+                Instant::now() + Duration::from_secs(1),
+                &cancellation
+            )
+            .unwrap_err()
+            .error
+            .unwrap()
+            .code,
+            "cancelled"
+        );
+        let live = Arc::new(AtomicBool::new(false));
+        assert_eq!(
+            wait_for_quiet(&client, 0, None, Instant::now(), &live)
+                .unwrap_err()
+                .error
+                .unwrap()
+                .code,
+            "stabilization_timeout"
+        );
+        chrome.push_event(
+            "Page.lifecycleEvent",
+            json!({"name": "DOMContentLoaded", "loaderId": "loader-2"}),
+        );
+        wait_for_quiet(
+            &client,
+            0,
+            Some("loader-2"),
+            Instant::now() + Duration::from_secs(1),
+            &live,
+        )
+        .unwrap();
+
+        let context = AdapterContext {
+            session_id: "s".to_owned(),
+            target_id: "t".to_owned(),
+            target_generation: 1,
+            action_sequence: 1,
+            reference_namespace: "n".to_owned(),
+            reference_epoch: 1,
+            frame_token: None,
+            mode: manuvra_runtime::ExecutionMode::Background,
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        chrome.push_event(
+            "Page.frameNavigated",
+            json!({"frame": {"id": "main", "loaderId": "loader-2"}}),
+        );
+        assert_eq!(
+            watch_for_following_document(
+                &client,
+                &context,
+                0,
+                Some(MainFrameDocument {
+                    id: "main".to_owned(),
+                    loader_id: Some("loader-1".to_owned()),
+                }),
+                &live
+            )
+            .unwrap()
+            .as_deref(),
+            Some("loader-2")
+        );
+        let cancelled = Arc::new(AtomicBool::new(true));
+        assert_eq!(
+            watch_for_following_document(&client, &context, 0, None, &cancelled)
+                .unwrap_err()
+                .error
+                .unwrap()
+                .code,
+            "cancelled"
+        );
+    }
+
+    #[test]
+    fn prepare_observe_and_mutate_use_the_scripted_page_fixture() {
+        let chrome = crate::transport::test_support::ScriptedChrome::start();
+        chrome.reply(
+            "Page.getFrameTree",
+            json!({"frameTree": {"frame": {"id": "main", "loaderId": "loader-1"}}}),
+        );
+        chrome.reply(
+            "Accessibility.getFullAXTree",
+            json!({"nodes": [
+                {
+                    "nodeId": "1",
+                    "backendDOMNodeId": 42,
+                    "role": {"value": "button"},
+                    "name": {"value": "Save changes"},
+                    "ignored": false
+                },
+                {
+                    "nodeId": "2",
+                    "backendDOMNodeId": 43,
+                    "role": {"value": "button"},
+                    "name": {"value": "Save changes"},
+                    "ignored": false
+                },
+                {
+                    "nodeId": "3",
+                    "ignored": true
+                }
+            ]}),
+        );
+        chrome.reply(
+            "DOM.getBoxModel",
+            json!({"model": {"content": [0, 0, 8, 0, 8, 4, 0, 4]}}),
+        );
+        chrome.reply(
+            "Page.getLayoutMetrics",
+            json!({"visualViewport": {"clientWidth": 800, "clientHeight": 600}}),
+        );
+        let mut png = vec![0; 24];
+        png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        png[16..20].copy_from_slice(&2_u32.to_be_bytes());
+        png[20..24].copy_from_slice(&2_u32.to_be_bytes());
+        chrome.reply(
+            "Page.captureScreenshot",
+            json!({"data": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, png)}),
+        );
+        chrome.reply("Page.navigate", json!({"errorText": "net::ERR"}));
+        let client = chrome.connect_observation();
+        let context = AdapterContext {
+            session_id: "s".to_owned(),
+            target_id: "t".to_owned(),
+            target_generation: 1,
+            action_sequence: 1,
+            reference_namespace: "n".to_owned(),
+            reference_epoch: 1,
+            frame_token: None,
+            mode: manuvra_runtime::ExecutionMode::Background,
+            deadline: Instant::now() + Duration::from_secs(2),
+        };
+        let cancellation = Arc::new(AtomicBool::new(false));
+        assert_eq!(
+            prepare(
+                &client,
+                &context,
+                &AdapterOperation::new(
+                    "action.click".to_owned(),
+                    json!({"locator": {"kind": "semantic", "role": "button", "name": "Save changes"}})
+                ),
+                cancellation.clone()
+            )
+            .unwrap_err()
+            .code,
+            "ambiguous_target"
+        );
+        assert_eq!(
+            prepare(
+                &client,
+                &context,
+                &AdapterOperation::new(
+                    "action.click".to_owned(),
+                    json!({"locator": {"kind": "semantic", "role": "link"}})
+                ),
+                cancellation.clone()
+            )
+            .unwrap_err()
+            .code,
+            "element_not_found"
+        );
+        let no_locator = prepare(
+            &client,
+            &context,
+            &AdapterOperation::new("action.press".to_owned(), json!({"key": "Enter"})),
+            cancellation.clone(),
+        )
+        .unwrap();
+        assert!(no_locator.prepared.is_none());
+        let screenshot = screenshot_reply(&client, &context, cancellation.clone());
+        assert_eq!(screenshot.screenshot_width, Some(2));
+        assert_eq!(
+            observe(
+                &client,
+                &context,
+                &AdapterOperation::new("observe.unknown".to_owned(), json!({})),
+                cancellation.clone()
+            )
+            .error
+            .unwrap()
+            .code,
+            "command_unsupported"
+        );
+        let mut click = AdapterOperation::new("action.click".to_owned(), json!({}));
+        click.prepared = Some(json!({"target": {"x": 4.0, "y": 2.0, "backend_id": 42}}));
+        let clicked = mutate(&client, None, &context, &click, cancellation.clone());
+        assert_eq!(
+            clicked.error.as_ref().map(|error| error.code.as_str()),
+            None
+        );
+        let mut typed = AdapterOperation::new("action.type".to_owned(), json!({"text": "x"}));
+        typed.prepared = Some(json!({"target": {"x": 1.0, "y": 1.0, "backend_id": null}}));
+        assert_eq!(
+            mutate(&client, None, &context, &typed, cancellation.clone())
+                .error
+                .unwrap()
+                .code,
+            "capability_unavailable"
+        );
+        let mut raw =
+            AdapterOperation::new("raw.cdp".to_owned(), json!({"method": "Runtime.evaluate"}));
+        assert_eq!(
+            mutate(&client, None, &context, &raw, cancellation.clone())
+                .error
+                .unwrap()
+                .code,
+            "capability_unavailable"
+        );
+        raw.command = "action.unknown".to_owned();
+        assert_eq!(
+            mutate(&client, None, &context, &raw, cancellation.clone())
+                .error
+                .unwrap()
+                .code,
+            "command_unsupported"
+        );
+        let navigate = mutate(
+            &client,
+            None,
+            &context,
+            &AdapterOperation::new(
+                "action.navigate".to_owned(),
+                json!({"url": "https://x.test/"}),
+            ),
+            cancellation.clone(),
+        );
+        assert_eq!(navigate.error.unwrap().code, "backend_rejected");
+        chrome.reply("Page.getFrameTree", json!({"frameTree": {}}));
+        assert_eq!(
+            ax_nodes(&client, &context, cancellation).unwrap_err().code,
+            "observation_failed"
+        );
     }
 
     #[test]
