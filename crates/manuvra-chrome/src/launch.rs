@@ -297,6 +297,7 @@ mod tests {
         CreateSucceeds,
         CreateResponseIsAmbiguous,
         TransientListReadAfterCreate,
+        PartialListBodyAfterCreate,
         MalformedAfterCreate,
     }
 
@@ -347,24 +348,15 @@ mod tests {
                             } else if request_line == "GET /json/list HTTP/1.1" {
                                 let list_request =
                                     worker_list_requests.fetch_add(1, Ordering::SeqCst) + 1;
-                                if matches!(mode, RecoveryMode::TransientListReadAfterCreate)
-                                    && worker_created.load(Ordering::SeqCst)
-                                    && list_request == 2
-                                {
-                                    thread::sleep(PROBE_TIMEOUT.saturating_mul(2));
+                                if hold_first_list_after_create(
+                                    mode,
+                                    worker_created.load(Ordering::SeqCst),
+                                    list_request,
+                                    &mut stream,
+                                ) {
                                     continue;
                                 }
-                                let body = match mode {
-                                    RecoveryMode::ExistingPage => page_body(),
-                                    RecoveryMode::MalformedAfterCreate
-                                        if worker_created.load(Ordering::SeqCst) =>
-                                    {
-                                        b"not-chrome".to_vec()
-                                    }
-                                    _ if worker_created.load(Ordering::SeqCst) => page_body(),
-                                    _ => b"[]".to_vec(),
-                                };
-                                write_json_response(&mut stream, &body);
+                                write_json_response(&mut stream, &list_body(mode, &worker_created));
                             } else {
                                 let _ = write!(
                                     stream,
@@ -423,6 +415,51 @@ mod tests {
             body.len()
         );
         let _ = stream.write_all(body);
+    }
+
+    fn hold_first_list_after_create(
+        mode: RecoveryMode,
+        created: bool,
+        list_request: usize,
+        stream: &mut impl Write,
+    ) -> bool {
+        if !created || list_request != 2 {
+            return false;
+        }
+        match mode {
+            RecoveryMode::TransientListReadAfterCreate => {
+                thread::sleep(PROBE_TIMEOUT.saturating_mul(2));
+                true
+            }
+            RecoveryMode::PartialListBodyAfterCreate => {
+                write_held_partial_json(stream, &page_body());
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn write_held_partial_json(stream: &mut impl Write, body: &[u8]) {
+        let prefix = &body[..body.len() / 2];
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(prefix);
+        let _ = stream.flush();
+        thread::sleep(PROBE_TIMEOUT.saturating_mul(2));
+    }
+
+    fn list_body(mode: RecoveryMode, created: &AtomicBool) -> Vec<u8> {
+        match mode {
+            RecoveryMode::ExistingPage => page_body(),
+            RecoveryMode::MalformedAfterCreate if created.load(Ordering::SeqCst) => {
+                b"not-chrome".to_vec()
+            }
+            _ if created.load(Ordering::SeqCst) => page_body(),
+            _ => b"[]".to_vec(),
+        }
     }
 
     fn request_for(endpoint: Endpoint, root: &Path) -> LaunchRequest {
@@ -489,6 +526,17 @@ mod tests {
     #[test]
     fn transient_list_read_after_creation_retries_discovery_without_recreating() {
         let server = RecoveryServer::start(RecoveryMode::TransientListReadAfterCreate);
+        let endpoint = Endpoint::parse(&server.address.to_string()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let result = launch_dedicated_chrome(request_for(endpoint, temp.path())).unwrap();
+        assert_eq!(result["state"], "reused");
+        assert_eq!(server.create_request_count(), 1);
+        assert!(server.list_request_count() >= 3);
+    }
+
+    #[test]
+    fn partial_list_body_timeout_after_creation_retries_discovery_without_recreating() {
+        let server = RecoveryServer::start(RecoveryMode::PartialListBodyAfterCreate);
         let endpoint = Endpoint::parse(&server.address.to_string()).unwrap();
         let temp = tempfile::tempdir().unwrap();
         let result = launch_dedicated_chrome(request_for(endpoint, temp.path())).unwrap();

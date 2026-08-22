@@ -185,25 +185,40 @@ fn append_discovery_bytes(response: &mut Vec<u8>, chunk: &[u8]) -> Result<bool, 
 }
 
 fn discovery_read_is_complete(response: &[u8], error: &std::io::Error) -> bool {
-    !response.is_empty()
-        && matches!(
-            error.kind(),
-            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-        )
+    discovery_timeout_kind(error)
+        && !response.is_empty()
+        && !declared_content_length_unsatisfied(response)
+}
+
+fn discovery_timeout_kind(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
+fn declared_content_length_unsatisfied(response: &[u8]) -> bool {
+    declared_content_length_end(response).is_some_and(|end| response.len() < end)
 }
 
 fn response_complete(response: &[u8]) -> bool {
-    let Some(boundary) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
-        return false;
-    };
-    let Ok(head) = std::str::from_utf8(&response[..boundary]) else {
-        return false;
-    };
+    declared_content_length_end(response).is_some_and(|end| response.len() >= end)
+}
+
+fn declared_content_length_end(response: &[u8]) -> Option<usize> {
+    let boundary = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")?;
+    let head = std::str::from_utf8(&response[..boundary]).ok()?;
+    let length = content_length_value(head)?;
+    Some(boundary + 4 + length)
+}
+
+fn content_length_value(head: &str) -> Option<usize> {
     head.lines()
         .filter_map(|line| line.split_once(':'))
         .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
-        .is_some_and(|length| response.len() >= boundary + 4 + length)
+        .and_then(|(_, value)| value.trim().parse().ok())
 }
 
 fn parse_http_json(response: &[u8]) -> Result<Value, EndpointError> {
@@ -353,13 +368,12 @@ mod tests {
 
         let mut oversize = vec![b'x'; 16];
         assert!(append_discovery_bytes(&mut oversize, &[b'y'; MAX_DISCOVERY_BYTES]).is_err());
-        assert!(discovery_read_is_complete(
-            b"partial",
-            &std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout")
-        ));
+        let timeout = std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout");
+        assert!(discovery_read_is_complete(b"partial", &timeout));
+        assert!(!discovery_read_is_complete(b"", &timeout));
         assert!(!discovery_read_is_complete(
-            b"",
-            &std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout")
+            b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\nshort",
+            &timeout
         ));
     }
 
