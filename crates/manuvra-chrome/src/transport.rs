@@ -802,7 +802,7 @@ pub(crate) mod test_support {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread::{self, JoinHandle};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tungstenite::accept;
 
     pub struct ScriptedChrome {
@@ -989,15 +989,17 @@ pub(crate) mod test_support {
 
     fn peek_request_head(stream: &TcpStream) -> String {
         let mut peek = [0_u8; 512];
-        for _ in 0..50 {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
             match stream.peek(&mut peek) {
-                Ok(0) => thread::sleep(Duration::from_millis(2)),
+                Ok(0) => return String::new(),
                 Ok(count) => return String::from_utf8_lossy(&peek[..count]).into_owned(),
-                Err(error) if peek_should_retry(&error) => thread::sleep(Duration::from_millis(2)),
-                Err(_) => break,
+                Err(error) if peek_should_retry(&error) && Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(_) => return String::new(),
             }
         }
-        String::new()
     }
 
     fn peek_should_retry(error: &std::io::Error) -> bool {

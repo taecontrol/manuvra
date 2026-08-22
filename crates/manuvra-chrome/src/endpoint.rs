@@ -276,6 +276,7 @@ pub fn connection_refused_text(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn endpoint_configuration_is_loopback_bounded_and_deduplicated() {
@@ -338,13 +339,34 @@ mod tests {
         );
     }
 
+    fn get_json_when_listening(endpoint: &Endpoint) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match endpoint.get_json("/json/list", Duration::from_millis(200)) {
+                Ok(value) => return value,
+                Err(error) if Instant::now() < deadline && racy_discovery_io(&error) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                other => return other.expect("scripted Chrome /json/list"),
+            }
+        }
+    }
+
+    fn racy_discovery_io(error: &EndpointError) -> bool {
+        matches!(
+            error,
+            EndpointError::Io(message)
+                if message.contains("reset")
+                    || message.contains("Broken pipe")
+                    || message.contains("Connection refused")
+        )
+    }
+
     #[test]
     fn discovery_http_parses_json_and_rejects_status_or_oversize() {
         let chrome = crate::transport::test_support::ScriptedChrome::start();
         let endpoint = chrome.endpoint();
-        let listed = endpoint
-            .get_json("/json/list", Duration::from_secs(1))
-            .unwrap();
+        let listed = get_json_when_listening(&endpoint);
         assert_eq!(listed[0]["id"], "page-1");
 
         chrome.http_status(404);
