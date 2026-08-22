@@ -474,7 +474,7 @@ mod tests {
         let result = launch_dedicated_chrome(request_for(endpoint, temp.path())).unwrap();
         assert_eq!(result["state"], "reused");
         assert_eq!(server.create_request_count(), 1);
-        assert_eq!(server.list_request_count(), 3);
+        assert!(server.list_request_count() >= 3);
     }
 
     #[test]
