@@ -166,22 +166,12 @@ impl DiscoveryState {
 
     pub fn validated_record(&mut self, target_id: &str, generation: u64) -> Option<WindowRecord> {
         let cached = self.record(target_id, generation)?;
-        match validate_cached_window(&cached.snapshot) {
-            Ok(Some(snapshot)) => {
-                self.last_error = None;
-                let record = self.records.get_mut(target_id)?;
-                record.snapshot = snapshot;
-                Some(record.clone())
-            }
-            Ok(None) => {
-                self.refresh_native();
-                self.record(target_id, generation)
-            }
-            Err(error) => {
-                self.last_error = Some(error);
-                None
-            }
-        }
+        apply_validated_snapshot(
+            self,
+            target_id,
+            generation,
+            validate_cached_window(&cached.snapshot),
+        )
     }
 
     fn apply(&mut self, windows: Vec<WindowSnapshot>) -> Vec<TargetDescriptor> {
@@ -251,6 +241,54 @@ impl WindowSnapshot {
     }
 }
 
+fn apply_validated_snapshot(
+    state: &mut DiscoveryState,
+    target_id: &str,
+    generation: u64,
+    validated: Result<Option<WindowSnapshot>, String>,
+) -> Option<WindowRecord> {
+    validated
+        .map(|snapshot| apply_ok_snapshot(state, target_id, generation, snapshot))
+        .unwrap_or_else(|error| fail_validated_snapshot(state, error))
+}
+
+fn fail_validated_snapshot(state: &mut DiscoveryState, error: String) -> Option<WindowRecord> {
+    state.last_error = Some(error);
+    None
+}
+
+fn apply_ok_snapshot(
+    state: &mut DiscoveryState,
+    target_id: &str,
+    generation: u64,
+    snapshot: Option<WindowSnapshot>,
+) -> Option<WindowRecord> {
+    if let Some(snapshot) = snapshot {
+        return refresh_cached_snapshot(state, target_id, snapshot);
+    }
+    refresh_missing_snapshot(state, target_id, generation)
+}
+
+fn refresh_missing_snapshot(
+    state: &mut DiscoveryState,
+    target_id: &str,
+    generation: u64,
+) -> Option<WindowRecord> {
+    state.refresh_native();
+    state.record(target_id, generation)
+}
+
+fn refresh_cached_snapshot(
+    state: &mut DiscoveryState,
+    target_id: &str,
+    snapshot: WindowSnapshot,
+) -> Option<WindowRecord> {
+    state.last_error = None;
+    let record = state.records.get_mut(target_id)?;
+    record.snapshot = snapshot;
+    Some(record.clone())
+}
+
 fn ax_agreed_windows(
     windows: &[WindowSnapshot],
     ax_bounds: &HashMap<i32, Vec<WindowBounds>>,
@@ -290,72 +328,109 @@ fn listed_window_claims_bounds(windows: &[WindowSnapshot], snapshot: &WindowSnap
 }
 
 fn validate_cached_window(cached: &WindowSnapshot) -> Result<Option<WindowSnapshot>, String> {
-    if let Some(snapshot) = window_server_window(cached.window_id)? {
-        if snapshot.pid != cached.pid {
-            return Ok(None);
-        }
-        return Ok(Some(snapshot));
-    }
-    let ax_bounds = crate::ax::application_window_bounds(cached.pid).unwrap_or_default();
-    let matches = ax_bounds
+    Ok(validated_snapshot(
+        cached,
+        window_server_window(cached.window_id)?,
+    ))
+}
+
+fn validated_snapshot(
+    cached: &WindowSnapshot,
+    window_server: Option<WindowSnapshot>,
+) -> Option<WindowSnapshot> {
+    window_server.map_or_else(
+        || ax_only_cached_window(cached),
+        |snapshot| same_pid_snapshot(snapshot, cached.pid),
+    )
+}
+
+fn same_pid_snapshot(snapshot: WindowSnapshot, pid: i32) -> Option<WindowSnapshot> {
+    (snapshot.pid == pid).then_some(snapshot)
+}
+
+fn ax_only_cached_window(cached: &WindowSnapshot) -> Option<WindowSnapshot> {
+    let matches = crate::ax::application_window_bounds(cached.pid)
+        .unwrap_or_default()
         .iter()
         .filter(|bounds| crate::ax::same_bounds(**bounds, cached.bounds))
         .count();
-    Ok((matches == 1).then(|| {
+    (matches == 1).then(|| {
         let mut snapshot = cached.clone();
         snapshot.is_on_screen = false;
         snapshot
-    }))
+    })
 }
 
 fn window_server_window(window_id: u32) -> Result<Option<WindowSnapshot>, String> {
-    let array = CGWindowListCopyWindowInfo(
+    let array = copy_window_list(
         CGWindowListOption::OptionIncludingWindow | CGWindowListOption::ExcludeDesktopElements,
         window_id,
-    )
-    .ok_or_else(|| "CGWindowListCopyWindowInfo returned no exact window list".to_owned())?;
-    // SAFETY: CoreGraphics documents the returned array as containing
-    // CFDictionary window records with CFString keys and CF property-list values.
-    let array: CFRetained<CFArray<CFDictionary<CFString, CFType>>> =
-        unsafe { CFRetained::cast_unchecked(array) };
+    )?;
     Ok(array.iter().find_map(|dictionary| {
         decode_window(&dictionary).filter(|snapshot| snapshot.window_id == window_id)
     }))
 }
 
 fn window_server_windows() -> Result<Vec<WindowSnapshot>, String> {
-    let array = CGWindowListCopyWindowInfo(
-        CGWindowListOption::OptionAll | CGWindowListOption::ExcludeDesktopElements,
-        kCGNullWindowID,
-    )
-    .ok_or_else(|| "CGWindowListCopyWindowInfo returned no window list".to_owned())?;
+    Ok(decode_window_list(
+        copy_window_list(
+            CGWindowListOption::OptionAll | CGWindowListOption::ExcludeDesktopElements,
+            kCGNullWindowID,
+        )?
+        .as_ref(),
+        std::process::id() as i32,
+    ))
+}
 
+fn copy_window_list(
+    option: CGWindowListOption,
+    window_id: u32,
+) -> Result<CFRetained<CFArray<CFDictionary<CFString, CFType>>>, String> {
+    let array = CGWindowListCopyWindowInfo(option, window_id)
+        .ok_or_else(|| "CGWindowListCopyWindowInfo returned no window list".to_owned())?;
     // SAFETY: CoreGraphics documents the returned array as containing
     // CFDictionary window records with CFString keys and CF property-list values.
-    let array: CFRetained<CFArray<CFDictionary<CFString, CFType>>> =
-        unsafe { CFRetained::cast_unchecked(array) };
-    let own_pid = std::process::id() as i32;
-    let mut windows = Vec::new();
-    for dictionary in array.iter() {
-        if let Some(snapshot) = decode_window(&dictionary)
-            && snapshot.pid != own_pid
-            && snapshot.bounds.width >= 2.0
-            && snapshot.bounds.height >= 2.0
-            && snapshot.owner != "Window Server"
-            && snapshot.owner != "Dock"
-        {
-            windows.push(snapshot);
-        }
-    }
-    Ok(windows)
+    Ok(unsafe { CFRetained::cast_unchecked(array) })
+}
+
+fn decode_window_list(
+    array: &CFArray<CFDictionary<CFString, CFType>>,
+    own_pid: i32,
+) -> Vec<WindowSnapshot> {
+    array
+        .iter()
+        .filter_map(|dictionary| {
+            decode_window(&dictionary)
+                .filter(|snapshot| include_discovered_window(snapshot, own_pid))
+        })
+        .collect()
+}
+
+fn include_discovered_window(snapshot: &WindowSnapshot, own_pid: i32) -> bool {
+    snapshot.pid != own_pid && large_enough(snapshot) && not_system_owner(snapshot)
+}
+
+fn large_enough(snapshot: &WindowSnapshot) -> bool {
+    snapshot.bounds.width >= 2.0 && snapshot.bounds.height >= 2.0
+}
+
+fn not_system_owner(snapshot: &WindowSnapshot) -> bool {
+    snapshot.owner != "Window Server" && snapshot.owner != "Dock"
 }
 
 fn decode_window(dictionary: &CFDictionary<CFString, CFType>) -> Option<WindowSnapshot> {
-    let layer = number(dictionary, unsafe { kCGWindowLayer })?;
-    let sharing = number(dictionary, unsafe { kCGWindowSharingState })?;
-    if layer != 0 || sharing == 0 {
+    if !is_standard_window(dictionary) {
         return None;
     }
+    decode_standard_window(dictionary)
+}
+
+fn is_standard_window(dictionary: &CFDictionary<CFString, CFType>) -> bool {
+    number(dictionary, unsafe { kCGWindowLayer }) == Some(0)
+        && number(dictionary, unsafe { kCGWindowSharingState }).is_some_and(|sharing| sharing != 0)
+}
+
+fn decode_standard_window(dictionary: &CFDictionary<CFString, CFType>) -> Option<WindowSnapshot> {
     Some(WindowSnapshot {
         pid: number(dictionary, unsafe { kCGWindowOwnerPID })?,
         window_id: number(dictionary, unsafe { kCGWindowNumber })?
@@ -555,6 +630,38 @@ mod tests {
         assert_eq!(updated[0].generation, generation);
         assert_eq!(updated[0].owner, "Fixture");
         assert_eq!(updated[0].title.as_deref(), Some("after"));
+    }
+
+    #[test]
+    fn discovery_filters_and_window_decode_keep_native_results() {
+        let owned = window(std::process::id() as i32, 20, "self");
+        assert!(!include_discovered_window(&owned, owned.pid));
+        let tiny = window_at(10, 20, "tiny", 0.0, 0.0);
+        let mut tiny = tiny;
+        tiny.bounds.width = 1.0;
+        assert!(!include_discovered_window(&tiny, 1));
+        let mut dock = window(10, 20, "Dock");
+        dock.owner = "Dock".to_owned();
+        assert!(!include_discovered_window(&dock, 1));
+        let mut server = window(10, 20, "ws");
+        server.owner = "Window Server".to_owned();
+        assert!(!include_discovered_window(&server, 1));
+        assert!(include_discovered_window(&window(10, 20, "Notes"), 1));
+
+        let live = window_server_windows().expect("window list is readable without TCC mutation");
+        assert!(
+            live.iter()
+                .all(|snapshot| snapshot.pid != std::process::id() as i32)
+        );
+        assert!(live.iter().all(large_enough));
+        assert!(live.iter().all(not_system_owner));
+        for snapshot in &live {
+            assert_eq!(
+                same_pid_snapshot(snapshot.clone(), snapshot.pid).as_ref(),
+                Some(snapshot)
+            );
+            assert!(same_pid_snapshot(snapshot.clone(), snapshot.pid.wrapping_add(1)).is_none());
+        }
     }
 
     #[test]

@@ -111,52 +111,91 @@ impl EvidenceState {
         context: &AdapterContext,
         operation: &AdapterOperation,
     ) -> AdapterReply {
-        let kind = operation
-            .input
-            .get("kind")
-            .and_then(Value::as_str)
-            .unwrap_or("diagnostics");
-        let session = self.sessions.get(&context.session_id);
-        let value = match kind {
-            "events" => json!({
-                "kind": "events",
-                "complete": session.is_none_or(|session| session.dropped == 0),
-                "target_id": context.target_id,
-                "start_cursor": session.and_then(|session| session.events.front()).and_then(|event| event.get("cursor")).cloned(),
-                "end_cursor": session.and_then(|session| session.events.back()).and_then(|event| event.get("cursor")).cloned(),
-                "dropped": session.map(|session| session.dropped).unwrap_or(0),
-                "events": session.map(|session| session.events.iter().cloned().collect::<Vec<_>>()).unwrap_or_default(),
-            }),
-            "logs" => json!({
-                "kind": "logs",
-                "complete": session.is_none_or(|session| session.log_dropped == 0),
-                "target_id": context.target_id,
-                "dropped": session.map(|session| session.log_dropped).unwrap_or(0),
-                "events": session.map(|session| session.logs.iter().cloned().collect::<Vec<_>>()).unwrap_or_default(),
-            }),
-            "timings" => json!({
-                "kind": "timings",
-                "complete": session.is_none_or(|session| session.timing_dropped == 0),
-                "dropped": session.map(|session| session.timing_dropped).unwrap_or(0),
-                "target_id": context.target_id,
-                "entries": session.map(|session| session.timings.iter().cloned().collect::<Vec<_>>()).unwrap_or_default(),
-            }),
-            _ => json!({
-                "kind": "diagnostics",
-                "complete": true,
-                "target_id": context.target_id,
-                "target_generation": context.target_generation,
-                "session_target_matches": session.is_some_and(|session| session.target_id == context.target_id),
-                "window": {
-                    "application": record.snapshot.owner,
-                    "title": record.snapshot.title,
-                    "is_on_screen": record.snapshot.is_on_screen,
-                },
-                "permissions": PermissionSnapshot::current().diagnostics(),
-            }),
-        };
-        artifact_reply(kind, value)
+        let kind = evidence_kind(operation);
+        artifact_reply(
+            kind,
+            evidence_value(
+                self.sessions.get(&context.session_id),
+                record,
+                context,
+                kind,
+            ),
+        )
     }
+}
+
+fn evidence_kind(operation: &AdapterOperation) -> &str {
+    operation
+        .input
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("diagnostics")
+}
+
+fn evidence_value(
+    session: Option<&SessionEvidence>,
+    record: &WindowRecord,
+    context: &AdapterContext,
+    kind: &str,
+) -> Value {
+    match kind {
+        "events" => events_value(session, context),
+        "logs" => logs_value(session, context),
+        "timings" => timings_value(session, context),
+        _ => diagnostics_value(session, record, context),
+    }
+}
+
+fn events_value(session: Option<&SessionEvidence>, context: &AdapterContext) -> Value {
+    json!({
+        "kind": "events",
+        "complete": session.is_none_or(|session| session.dropped == 0),
+        "target_id": context.target_id,
+        "start_cursor": session.and_then(|session| session.events.front()).and_then(|event| event.get("cursor")).cloned(),
+        "end_cursor": session.and_then(|session| session.events.back()).and_then(|event| event.get("cursor")).cloned(),
+        "dropped": session.map(|session| session.dropped).unwrap_or(0),
+        "events": session.map(|session| session.events.iter().cloned().collect::<Vec<_>>()).unwrap_or_default(),
+    })
+}
+
+fn logs_value(session: Option<&SessionEvidence>, context: &AdapterContext) -> Value {
+    json!({
+        "kind": "logs",
+        "complete": session.is_none_or(|session| session.log_dropped == 0),
+        "target_id": context.target_id,
+        "dropped": session.map(|session| session.log_dropped).unwrap_or(0),
+        "events": session.map(|session| session.logs.iter().cloned().collect::<Vec<_>>()).unwrap_or_default(),
+    })
+}
+
+fn timings_value(session: Option<&SessionEvidence>, context: &AdapterContext) -> Value {
+    json!({
+        "kind": "timings",
+        "complete": session.is_none_or(|session| session.timing_dropped == 0),
+        "dropped": session.map(|session| session.timing_dropped).unwrap_or(0),
+        "target_id": context.target_id,
+        "entries": session.map(|session| session.timings.iter().cloned().collect::<Vec<_>>()).unwrap_or_default(),
+    })
+}
+
+fn diagnostics_value(
+    session: Option<&SessionEvidence>,
+    record: &WindowRecord,
+    context: &AdapterContext,
+) -> Value {
+    json!({
+        "kind": "diagnostics",
+        "complete": true,
+        "target_id": context.target_id,
+        "target_generation": context.target_generation,
+        "session_target_matches": session.is_some_and(|session| session.target_id == context.target_id),
+        "window": {
+            "application": record.snapshot.owner,
+            "title": record.snapshot.title,
+            "is_on_screen": record.snapshot.is_on_screen,
+        },
+        "permissions": PermissionSnapshot::current().diagnostics(),
+    })
 }
 
 fn delivery_name(delivery: &AdapterDelivery) -> &'static str {
@@ -295,5 +334,25 @@ mod tests {
         assert_eq!(artifact["events"][0]["action_sequence"], 1);
         assert_eq!(artifact["events"][0]["command"], "action.click");
         assert_eq!(artifact["events"][0]["delivery"], "confirmed");
+        let events =
+            AdapterOperation::new("observe.evidence".to_owned(), json!({"kind": "events"}));
+        let timings =
+            AdapterOperation::new("observe.evidence".to_owned(), json!({"kind": "timings"}));
+        let diagnostics = AdapterOperation::new("observe.evidence".to_owned(), json!({}));
+        assert_eq!(
+            evidence.reply(&record, &context, &events).response["kind"],
+            "events"
+        );
+        assert_eq!(
+            evidence.reply(&record, &context, &timings).response["kind"],
+            "timings"
+        );
+        assert_eq!(
+            evidence.reply(&record, &context, &diagnostics).response["kind"],
+            "diagnostics"
+        );
+        evidence.closed(&session);
+        let missing = evidence.reply(&record, &context, &logs);
+        assert_eq!(missing.response["kind"], "logs");
     }
 }

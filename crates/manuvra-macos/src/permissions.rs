@@ -113,72 +113,134 @@ fn setup_permissions_with(
     api: &impl PermissionApi,
     deadline: Instant,
 ) -> Result<serde_json::Value, SetupPermissionsError> {
-    if Instant::now() >= deadline {
-        return Err(SetupPermissionsError::Deadline);
-    }
+    require_deadline(deadline)?;
     let before = api.snapshot();
-    for permission in PERMISSIONS {
-        if !permission.granted_in(before) {
-            if Instant::now() >= deadline {
-                return Err(SetupPermissionsError::Deadline);
-            }
-            api.request(permission);
-            if Instant::now() >= deadline {
-                return Err(SetupPermissionsError::Deadline);
-            }
-        }
-    }
+    request_ungranted(api, before, deadline)?;
     let after = api.snapshot();
-    if Instant::now() >= deadline {
-        return Err(SetupPermissionsError::Deadline);
+    require_deadline(deadline)?;
+    open_residual_settings(api, before, after, deadline)
+}
+
+fn require_deadline(deadline: Instant) -> Result<(), SetupPermissionsError> {
+    (Instant::now() < deadline)
+        .then_some(())
+        .ok_or(SetupPermissionsError::Deadline)
+}
+
+fn request_ungranted(
+    api: &impl PermissionApi,
+    before: PermissionSnapshot,
+    deadline: Instant,
+) -> Result<(), SetupPermissionsError> {
+    for permission in PERMISSIONS {
+        request_if_missing(api, permission, before, deadline)?;
     }
-    let mut permissions = PERMISSIONS
+    Ok(())
+}
+
+fn request_if_missing(
+    api: &impl PermissionApi,
+    permission: Permission,
+    before: PermissionSnapshot,
+    deadline: Instant,
+) -> Result<(), SetupPermissionsError> {
+    if permission.granted_in(before) {
+        return Ok(());
+    }
+    require_deadline(deadline)?;
+    api.request(permission);
+    require_deadline(deadline)
+}
+
+fn permission_facts(
+    before: PermissionSnapshot,
+    after: PermissionSnapshot,
+) -> serde_json::Map<String, serde_json::Value> {
+    PERMISSIONS
         .into_iter()
-        .map(|permission| {
-            let before_granted = permission.granted_in(before);
-            let granted = permission.granted_in(after);
-            (
-                permission.name().to_owned(),
-                serde_json::json!({
-                    "before_granted": before_granted,
-                    "prompt_requested": !before_granted,
-                    "settings_opened": false,
-                    "granted": granted,
-                    "freshly_granted": !before_granted && granted,
-                    "residual": !granted,
-                }),
-            )
-        })
-        .collect::<serde_json::Map<_, _>>();
+        .map(|permission| permission_fact(permission, before, after))
+        .collect()
+}
+
+fn permission_fact(
+    permission: Permission,
+    before: PermissionSnapshot,
+    after: PermissionSnapshot,
+) -> (String, serde_json::Value) {
+    let before_granted = permission.granted_in(before);
+    let granted = permission.granted_in(after);
+    (
+        permission.name().to_owned(),
+        serde_json::json!({
+            "before_granted": before_granted,
+            "prompt_requested": !before_granted,
+            "settings_opened": false,
+            "granted": granted,
+            "freshly_granted": !before_granted && granted,
+            "residual": !granted,
+        }),
+    )
+}
+
+fn open_residual_settings(
+    api: &impl PermissionApi,
+    before: PermissionSnapshot,
+    after: PermissionSnapshot,
+    deadline: Instant,
+) -> Result<serde_json::Value, SetupPermissionsError> {
+    let mut permissions = permission_facts(before, after);
     let mut opened_by_url = HashMap::new();
     for permission in PERMISSIONS {
-        if permission.granted_in(after) {
-            continue;
-        }
-        if Instant::now() >= deadline {
-            return Err(SetupPermissionsError::Deadline);
-        }
-        let opened = match opened_by_url.get(permission.settings_url()) {
-            Some(opened) => *opened,
-            None => {
-                let opened = api
-                    .open_settings(permission.settings_url(), deadline)
-                    .map_err(|error| match error {
-                        SetupPermissionsError::Deadline => SetupPermissionsError::Deadline,
-                        SetupPermissionsError::Settings(_) => {
-                            SetupPermissionsError::Settings(permission.name())
-                        }
-                    })?;
-                opened_by_url.insert(permission.settings_url(), opened);
-                opened
-            }
-        };
-        permissions[permission.name()]["settings_opened"] = serde_json::Value::Bool(opened);
-        if !opened {
-            return Err(SetupPermissionsError::Settings(permission.name()));
-        }
+        open_residual_permission(
+            api,
+            permission,
+            after,
+            deadline,
+            &mut opened_by_url,
+            &mut permissions,
+        )?;
     }
     Ok(serde_json::json!({"permissions": permissions}))
+}
+
+fn open_residual_permission(
+    api: &impl PermissionApi,
+    permission: Permission,
+    after: PermissionSnapshot,
+    deadline: Instant,
+    opened_by_url: &mut HashMap<&'static str, bool>,
+    permissions: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<(), SetupPermissionsError> {
+    if permission.granted_in(after) {
+        return Ok(());
+    }
+    require_deadline(deadline)?;
+    let opened = open_settings_once(api, permission, deadline, opened_by_url)?;
+    permissions[permission.name()]["settings_opened"] = serde_json::Value::Bool(opened);
+    opened
+        .then_some(())
+        .ok_or(SetupPermissionsError::Settings(permission.name()))
+}
+
+fn open_settings_once(
+    api: &impl PermissionApi,
+    permission: Permission,
+    deadline: Instant,
+    opened_by_url: &mut HashMap<&'static str, bool>,
+) -> Result<bool, SetupPermissionsError> {
+    if let Some(opened) = opened_by_url.get(permission.settings_url()) {
+        return Ok(*opened);
+    }
+    let opened = api
+        .open_settings(permission.settings_url(), deadline)
+        .map_err(|error| match error {
+            SetupPermissionsError::Deadline => SetupPermissionsError::Deadline,
+            SetupPermissionsError::Settings(_) => {
+                SetupPermissionsError::Settings(permission.name())
+            }
+        })?;
+    opened_by_url.insert(permission.settings_url(), opened);
+    Ok(opened)
 }
 
 fn settings_open_suppressed() -> bool {
@@ -202,17 +264,17 @@ fn spawn_settings_child(
     url: &'static str,
     deadline: Instant,
 ) -> Result<bool, SetupPermissionsError> {
-    let mut child = match Command::new("/usr/bin/open")
+    wait_for_settings_child(&mut spawn_open(url)?, deadline)
+}
+
+fn spawn_open(url: &'static str) -> Result<std::process::Child, SetupPermissionsError> {
+    Command::new("/usr/bin/open")
         .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-    {
-        Ok(child) => child,
-        Err(_) => return Err(SetupPermissionsError::Settings("System Settings")),
-    };
-    wait_for_settings_child(&mut child, deadline)
+        .map_err(|_| SetupPermissionsError::Settings("System Settings"))
 }
 
 fn wait_for_settings_child(
@@ -309,35 +371,23 @@ pub(crate) enum MissingPermission {
 
 impl PermissionSnapshot {
     pub fn current() -> Self {
-        // SAFETY: these public preflight functions take no pointers, do not prompt, and return the
-        // current TCC disposition for the calling daemon identity.
-        unsafe {
-            Self {
-                accessibility: crate::seam::permission("accessibility", AXIsProcessTrusted() != 0),
-                screen_recording: crate::seam::permission(
-                    "screen_recording",
-                    CGPreflightScreenCaptureAccess(),
-                ),
-                post_event: crate::seam::permission("post_event", CGPreflightPostEventAccess()),
-            }
+        Self {
+            accessibility: crate::seam::permission("accessibility", accessibility_trusted()),
+            screen_recording: crate::seam::permission(
+                "screen_recording",
+                CGPreflightScreenCaptureAccess(),
+            ),
+            post_event: crate::seam::permission("post_event", CGPreflightPostEventAccess()),
         }
     }
 
     pub fn diagnostics(self) -> serde_json::Value {
-        let executable = std::env::current_exe()
-            .ok()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "manuvra-daemon".to_owned());
         serde_json::json!({
             "accessibility": self.accessibility,
             "screen_recording": self.screen_recording,
             "post_event": self.post_event,
-            "responsible_identity": executable,
-            "recovery": {
-                "accessibility": "System Settings > Privacy & Security > Accessibility",
-                "screen_recording": "System Settings > Privacy & Security > Screen & System Audio Recording",
-                "post_event": "System Settings > Privacy & Security > Accessibility",
-            },
+            "responsible_identity": responsible_identity(),
+            "recovery": permission_recovery(),
             "prompts_triggered": false,
         })
     }
@@ -346,12 +396,41 @@ impl PermissionSnapshot {
         if command == "observe.screenshot" {
             return (!self.screen_recording).then_some(MissingPermission::ScreenRecording);
         }
-        if !self.accessibility {
-            return Some(MissingPermission::Accessibility);
-        }
-        (foreground && command.starts_with("action.") && !self.post_event)
-            .then_some(MissingPermission::PostEvent)
+        missing_ax_or_post_event(self, command, foreground)
     }
+}
+
+fn missing_ax_or_post_event(
+    snapshot: PermissionSnapshot,
+    command: &str,
+    foreground: bool,
+) -> Option<MissingPermission> {
+    if !snapshot.accessibility {
+        return Some(MissingPermission::Accessibility);
+    }
+    (foreground && command.starts_with("action.") && !snapshot.post_event)
+        .then_some(MissingPermission::PostEvent)
+}
+
+fn accessibility_trusted() -> bool {
+    // SAFETY: these public preflight functions take no pointers, do not prompt, and return the
+    // current TCC disposition for the calling daemon identity.
+    unsafe { AXIsProcessTrusted() != 0 }
+}
+
+fn responsible_identity() -> String {
+    std::env::current_exe()
+        .ok()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "manuvra-daemon".to_owned())
+}
+
+fn permission_recovery() -> serde_json::Value {
+    serde_json::json!({
+        "accessibility": "System Settings > Privacy & Security > Accessibility",
+        "screen_recording": "System Settings > Privacy & Security > Screen & System Audio Recording",
+        "post_event": "System Settings > Privacy & Security > Accessibility",
+    })
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -620,5 +699,54 @@ mod tests {
             setup_permissions_with(&api, Instant::now() + Duration::from_secs(1)),
             Err(SetupPermissionsError::Settings("screen_recording"))
         );
+    }
+
+    #[test]
+    fn permission_preflight_facts_and_settings_guard_keep_results() {
+        let granted = PermissionSnapshot {
+            accessibility: true,
+            screen_recording: true,
+            post_event: true,
+        };
+        let diagnostics = granted.diagnostics();
+        assert_eq!(diagnostics["prompts_triggered"], false);
+        assert_eq!(
+            diagnostics["recovery"]["accessibility"],
+            "System Settings > Privacy & Security > Accessibility"
+        );
+        assert_eq!(
+            settings_open_suppressed(),
+            std::env::var_os("MANUVRA_TEST_NO_OPEN").is_some()
+        );
+        assert_eq!(
+            open_settings_until(ACCESSIBILITY_SETTINGS_URL, Instant::now()),
+            Err(SetupPermissionsError::Deadline)
+        );
+        assert!(completed_settings_result(true, Instant::now() + Duration::from_secs(1)).unwrap());
+        assert_eq!(
+            completed_settings_result(true, Instant::now()),
+            Err(SetupPermissionsError::Deadline)
+        );
+        let snapshot = PermissionSnapshot::current();
+        assert_eq!(
+            snapshot.missing_for("observe.screenshot", false).is_some(),
+            !snapshot.screen_recording
+        );
+        let mut child = dummy_child();
+        let _ = settings_child_result(&mut child, Instant::now() + Duration::from_secs(1));
+        assert_eq!(
+            wait_for_settings_child(&mut dummy_child(), Instant::now()),
+            Err(SetupPermissionsError::Deadline)
+        );
+        let _ = child.wait();
+    }
+
+    fn dummy_child() -> std::process::Child {
+        Command::new("/usr/bin/true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn true")
     }
 }
