@@ -42,15 +42,25 @@ impl Runtime {
             Ok(admission) => admission,
             Err(reply) => return reply,
         };
-        let reply = match invocation.command.as_str() {
-            "observe.query" => self.observe_query(invocation, &input, &admission, started),
-            "observe.screenshot" => self.observe_screenshot(invocation, &admission, started),
-            "observe.tree" => self.observe_tree(invocation, &admission, started),
-            "observe.evidence" => self.observe_evidence(invocation, &input, &admission, started),
-            _ => InvocationReply::error("unknown_command", None),
-        };
+        let reply = self.dispatch_observation(invocation, &input, &admission, started);
         self.finish_observation(invocation, &admission);
         reply
+    }
+
+    fn dispatch_observation(
+        &self,
+        invocation: &Invocation,
+        input: &Input<'_>,
+        admission: &ObservationAdmission,
+        started: Instant,
+    ) -> InvocationReply {
+        match invocation.command.as_str() {
+            "observe.query" => self.observe_query(invocation, input, admission, started),
+            "observe.screenshot" => self.observe_screenshot(invocation, admission, started),
+            "observe.tree" => self.observe_tree(invocation, admission, started),
+            "observe.evidence" => self.observe_evidence(invocation, input, admission, started),
+            _ => InvocationReply::error("unknown_command", None),
+        }
     }
 
     fn admit_observation(
@@ -120,84 +130,68 @@ impl Runtime {
         admission: &ObservationAdmission,
         started: Instant,
     ) -> InvocationReply {
-        match input.value("semantic") {
-            Ok(value) if value.is_object() => {}
-            _ => {
-                return InvocationReply::error(
-                    "invalid_request",
-                    Some("semantic locator is required"),
-                );
-            }
+        if let Err(reply) = require_semantic_locator(input) {
+            return reply;
         }
         let epoch = self.next_reference_epoch(&admission.session_id);
         let reply = match self.invoke_observation(invocation, admission, epoch, started) {
             Ok(reply) => reply,
             Err(reply) => return reply,
         };
-        let matches = reply
-            .response
-            .get("matches")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+        let matches = query_matches(&reply.response);
         if matches.is_empty() {
             return InvocationReply::error("element_not_found", None);
         }
-        let public_matches = matches
-            .iter()
-            .map(|entry| {
-                let backend = entry
-                    .get("backend_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown");
-                json!({
-                    "ref": element_ref(admission, epoch, backend),
-                    "role": entry.get("role").cloned().unwrap_or(Value::Null),
-                    "name": entry.get("name").cloned().unwrap_or(Value::Null),
-                    "text": entry.get("text").cloned().unwrap_or(Value::Null),
-                    "identifier": entry.get("identifier").cloned().unwrap_or(Value::Null),
-                    "description": entry.get("description").cloned().unwrap_or(Value::Null),
-                })
-            })
-            .collect::<Vec<_>>();
-        let overflow = reply
-            .response
-            .get("overflow")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let overflow_path = if overflow.is_empty() {
-            None
-        } else {
-            let bytes = serde_json::to_vec(&overflow).expect("query overflow");
-            match self.artifacts.publish(
-                &admission.directory,
-                ArtifactWrite {
-                    kind: "query_overflow",
-                    extension: "json",
-                    media_type: "application/json",
-                    bytes: &bytes,
-                    request_id: &invocation.request_id,
-                    action_sequence: admission.sequence_before,
-                },
-            ) {
-                Ok(published) => Some(published.path),
-                Err(error) => {
-                    return InvocationReply::error("observation_failed", Some(&error.to_string()));
-                }
-            }
-        };
+        let overflow_path =
+            match self.publish_query_overflow(invocation, admission, &reply.response) {
+                Ok(path) => path,
+                Err(reply) => return reply,
+            };
         let sequence_after = self.action_sequence(&admission.target_id);
         InvocationReply::success(json!({
             "session_id": admission.session_id,
             "target_id": admission.target_id,
             "ref_epoch": format!("r_{epoch}"),
-            "matches": public_matches,
+            "matches": public_query_matches(admission, epoch, &matches),
             "overflow_path": overflow_path,
             "action_sequence_before": admission.sequence_before,
             "action_sequence_after": sequence_after,
             "observation_status": observation_status(admission.sequence_before, sequence_after),
         }))
+    }
+
+    fn publish_query_overflow(
+        &self,
+        invocation: &Invocation,
+        admission: &ObservationAdmission,
+        response: &Value,
+    ) -> Result<Option<PathBuf>, InvocationReply> {
+        let overflow = response
+            .get("overflow")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if overflow.is_empty() {
+            return Ok(None);
+        }
+        let bytes = serde_json::to_vec(&overflow).expect("query overflow");
+        match self.artifacts.publish(
+            &admission.directory,
+            ArtifactWrite {
+                kind: "query_overflow",
+                extension: "json",
+                media_type: "application/json",
+                bytes: &bytes,
+                request_id: &invocation.request_id,
+                action_sequence: admission.sequence_before,
+            },
+        ) {
+            Ok(published) => Ok(Some(published.path)),
+            Err(error) => Err(InvocationReply::error(
+                "observation_failed",
+                Some(&error.to_string()),
+            )),
+        }
     }
 
     fn observe_screenshot(
@@ -328,9 +322,9 @@ impl Runtime {
         admission: &ObservationAdmission,
         started: Instant,
     ) -> InvocationReply {
-        let kind = match input.string("kind") {
-            Ok(kind @ ("logs" | "events" | "diagnostics" | "timings" | "manifest")) => kind,
-            _ => return InvocationReply::error("invalid_request", Some("invalid evidence kind")),
+        let kind = match evidence_kind(input) {
+            Ok(kind) => kind,
+            Err(reply) => return reply,
         };
         if kind == "manifest" {
             return manifest_pointer(self, admission);
@@ -344,6 +338,16 @@ impl Runtime {
             Ok(reply) => reply,
             Err(reply) => return reply,
         };
+        self.publish_evidence(invocation, admission, kind, reply)
+    }
+
+    fn publish_evidence(
+        &self,
+        invocation: &Invocation,
+        admission: &ObservationAdmission,
+        kind: &str,
+        reply: AdapterReply,
+    ) -> InvocationReply {
         let sequence_after = self.action_sequence(&admission.target_id);
         if reply.response.get("complete").and_then(Value::as_bool) == Some(false) {
             return InvocationReply::error(
@@ -351,14 +355,7 @@ impl Runtime {
                 Some("adapter evidence journal overflowed; no partial artifact was published"),
             );
         }
-        let (extension, media_type, bytes) = match reply.artifact {
-            Some(artifact) => (artifact.extension, artifact.media_type, artifact.bytes),
-            None => (
-                "json".to_owned(),
-                "application/json".to_owned(),
-                serde_json::to_vec(&reply.response).expect("adapter evidence"),
-            ),
-        };
+        let (extension, media_type, bytes) = evidence_bytes(reply);
         match self.artifacts.publish(
             &admission.directory,
             ArtifactWrite {
@@ -464,6 +461,69 @@ impl Runtime {
             .action_sequences
             .get(target_id)
             .unwrap_or(&0)
+    }
+}
+
+fn require_semantic_locator(input: &Input<'_>) -> Result<(), InvocationReply> {
+    match input.value("semantic") {
+        Ok(value) if value.is_object() => Ok(()),
+        _ => Err(InvocationReply::error(
+            "invalid_request",
+            Some("semantic locator is required"),
+        )),
+    }
+}
+
+fn query_matches(response: &Value) -> Vec<Value> {
+    response
+        .get("matches")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn public_query_matches(
+    admission: &ObservationAdmission,
+    epoch: u64,
+    matches: &[Value],
+) -> Vec<Value> {
+    matches
+        .iter()
+        .map(|entry| {
+            let backend = entry
+                .get("backend_id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            json!({
+                "ref": element_ref(admission, epoch, backend),
+                "role": entry.get("role").cloned().unwrap_or(Value::Null),
+                "name": entry.get("name").cloned().unwrap_or(Value::Null),
+                "text": entry.get("text").cloned().unwrap_or(Value::Null),
+                "identifier": entry.get("identifier").cloned().unwrap_or(Value::Null),
+                "description": entry.get("description").cloned().unwrap_or(Value::Null),
+            })
+        })
+        .collect()
+}
+
+fn evidence_kind<'a>(input: &Input<'a>) -> Result<&'a str, InvocationReply> {
+    match input.string("kind") {
+        Ok(kind @ ("logs" | "events" | "diagnostics" | "timings" | "manifest")) => Ok(kind),
+        _ => Err(InvocationReply::error(
+            "invalid_request",
+            Some("invalid evidence kind"),
+        )),
+    }
+}
+
+fn evidence_bytes(reply: AdapterReply) -> (String, String, Vec<u8>) {
+    match reply.artifact {
+        Some(artifact) => (artifact.extension, artifact.media_type, artifact.bytes),
+        None => (
+            "json".to_owned(),
+            "application/json".to_owned(),
+            serde_json::to_vec(&reply.response).expect("adapter evidence"),
+        ),
     }
 }
 

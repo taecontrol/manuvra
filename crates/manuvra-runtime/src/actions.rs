@@ -63,19 +63,23 @@ impl Runtime {
             Ok(queued) => queued,
             Err(reply) => return reply,
         };
+        self.run_queued_mutation(invocation, &plan, started, queued)
+    }
+
+    fn run_queued_mutation(
+        &self,
+        invocation: &Invocation,
+        plan: &CommandPlan,
+        started: Instant,
+        queued: QueuedMutation,
+    ) -> InvocationReply {
         let target_lock = self.target_lock(&queued.target_id);
         let _target_guard = target_lock.blocking_lock();
-        if queued.cancellation.load(Ordering::SeqCst) {
-            self.finish_queued_mutation(invocation, &plan.session_id);
-            return predispatch_action_error(invocation, &plan.session_id, "cancelled", started);
-        }
-        if request_deadline(started, invocation).is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            self.finish_queued_mutation(invocation, &plan.session_id);
-            return predispatch_action_error(invocation, &plan.session_id, "timed_out", started);
+        if let Some(reply) = self.abort_queued_mutation(invocation, plan, started, &queued) {
+            return reply;
         }
         let operation =
-            match self.prepare_mutation(invocation, &plan, started, queued.cancellation.clone()) {
+            match self.prepare_mutation(invocation, plan, started, queued.cancellation.clone()) {
                 Ok(operation) => operation,
                 Err(reply) => {
                     self.finish_queued_mutation(invocation, &plan.session_id);
@@ -83,7 +87,7 @@ impl Runtime {
                 }
             };
         let admission =
-            match self.admit_mutation(invocation, &plan, started, queued.cancellation.clone()) {
+            match self.admit_mutation(invocation, plan, started, queued.cancellation.clone()) {
                 Ok(admission) => admission,
                 Err(reply) => {
                     self.finish_queued_mutation(invocation, &plan.session_id);
@@ -91,6 +95,32 @@ impl Runtime {
                 }
             };
         self.dispatch_admitted_mutation(invocation, started, admission, operation)
+    }
+
+    fn abort_queued_mutation(
+        &self,
+        invocation: &Invocation,
+        plan: &CommandPlan,
+        started: Instant,
+        queued: &QueuedMutation,
+    ) -> Option<InvocationReply> {
+        let code = if queued.cancellation.load(Ordering::SeqCst) {
+            Some("cancelled")
+        } else if request_deadline(started, invocation)
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            Some("timed_out")
+        } else {
+            None
+        };
+        let code = code?;
+        self.finish_queued_mutation(invocation, &plan.session_id);
+        Some(predispatch_action_error(
+            invocation,
+            &plan.session_id,
+            code,
+            started,
+        ))
     }
 
     fn dispatch_admitted_mutation(
@@ -133,69 +163,7 @@ impl Runtime {
         started: Instant,
         cancellation: Arc<AtomicBool>,
     ) -> Result<AdapterOperation, InvocationReply> {
-        let (context, adapter) = {
-            let state = self.state.lock().expect("runtime state");
-            let session = state
-                .sessions
-                .get(&plan.session_id)
-                .cloned()
-                .ok_or_else(|| {
-                    action_error(
-                        invocation,
-                        &plan.session_id,
-                        "session_not_found",
-                        None,
-                        started,
-                        None,
-                    )
-                })?;
-            let mode = self.validate_mutation_context(invocation, plan, &session, started)?;
-            let adapter = self
-                .adapter_for_until(
-                    &session.target_id,
-                    started + Duration::from_millis(invocation.deadline_ms),
-                )
-                .map_err(|error| {
-                    action_error(
-                        invocation,
-                        &session.id,
-                        &error.code,
-                        Some(&mode),
-                        started,
-                        None,
-                    )
-                })?
-                .ok_or_else(|| {
-                    action_error(
-                        invocation,
-                        &session.id,
-                        "target_not_found",
-                        Some(&mode),
-                        started,
-                        None,
-                    )
-                })?;
-            let action_sequence = state
-                .action_sequences
-                .get(&session.target_id)
-                .copied()
-                .unwrap_or(0)
-                .saturating_add(1);
-            (
-                AdapterContext {
-                    session_id: session.id,
-                    target_id: session.target_id,
-                    target_generation: session.target_generation,
-                    action_sequence,
-                    reference_namespace: session.reference_namespace,
-                    reference_epoch: session.reference_epoch,
-                    frame_token: session.frame_token,
-                    mode,
-                    deadline: started + Duration::from_millis(invocation.deadline_ms),
-                },
-                adapter,
-            )
-        };
+        let (context, adapter) = self.mutation_prepare_context(invocation, plan, started)?;
         let operation = AdapterOperation::new(invocation.command.clone(), invocation.input.clone());
         let mode = context.mode.clone();
         match catch_unwind(AssertUnwindSafe(|| {
@@ -219,6 +187,84 @@ impl Runtime {
         }
     }
 
+    fn mutation_prepare_context(
+        &self,
+        invocation: &Invocation,
+        plan: &CommandPlan,
+        started: Instant,
+    ) -> Result<(AdapterContext, Arc<dyn crate::model::TargetAdapter>), InvocationReply> {
+        let state = self.state.lock().expect("runtime state");
+        let session = state
+            .sessions
+            .get(&plan.session_id)
+            .cloned()
+            .ok_or_else(|| {
+                action_error(
+                    invocation,
+                    &plan.session_id,
+                    "session_not_found",
+                    None,
+                    started,
+                    None,
+                )
+            })?;
+        let mode = self.validate_mutation_context(invocation, plan, &session, started)?;
+        let adapter = self.mutation_adapter(invocation, &session, &mode, started)?;
+        let action_sequence = state
+            .action_sequences
+            .get(&session.target_id)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        Ok((
+            AdapterContext {
+                session_id: session.id,
+                target_id: session.target_id,
+                target_generation: session.target_generation,
+                action_sequence,
+                reference_namespace: session.reference_namespace,
+                reference_epoch: session.reference_epoch,
+                frame_token: session.frame_token,
+                mode,
+                deadline: started + Duration::from_millis(invocation.deadline_ms),
+            },
+            adapter,
+        ))
+    }
+
+    fn mutation_adapter(
+        &self,
+        invocation: &Invocation,
+        session: &Session,
+        mode: &ExecutionMode,
+        started: Instant,
+    ) -> Result<Arc<dyn crate::model::TargetAdapter>, InvocationReply> {
+        self.adapter_for_until(
+            &session.target_id,
+            started + Duration::from_millis(invocation.deadline_ms),
+        )
+        .map_err(|error| {
+            action_error(
+                invocation,
+                &session.id,
+                &error.code,
+                Some(mode),
+                started,
+                None,
+            )
+        })?
+        .ok_or_else(|| {
+            action_error(
+                invocation,
+                &session.id,
+                "target_not_found",
+                Some(mode),
+                started,
+                None,
+            )
+        })
+    }
+
     fn execute_raw_read(
         &self,
         invocation: &Invocation,
@@ -229,41 +275,52 @@ impl Runtime {
             Ok(admission) => admission,
             Err(reply) => return reply,
         };
-        let adapter = match self
-            .adapter_for_until(&admission.context.target_id, admission.context.deadline)
-        {
-            Ok(Some(adapter)) => adapter,
-            Ok(None) => {
-                self.finish_admitted(&admission);
-                return InvocationReply::error("target_not_found", None);
-            }
-            Err(error) => {
-                self.finish_admitted(&admission);
-                return InvocationReply::error(&error.code, error.message.as_deref());
-            }
+        let reply = self.invoke_raw_read(invocation, started, &admission);
+        self.finish_admitted(&admission);
+        reply
+    }
+
+    fn invoke_raw_read(
+        &self,
+        invocation: &Invocation,
+        started: Instant,
+        admission: &Admission,
+    ) -> InvocationReply {
+        let adapter = match self.raw_read_adapter(admission) {
+            Ok(adapter) => adapter,
+            Err(reply) => return reply,
         };
         let operation = AdapterOperation::new(invocation.command.clone(), invocation.input.clone());
-        let adapter_reply = match catch_unwind(AssertUnwindSafe(|| {
+        match catch_unwind(AssertUnwindSafe(|| {
             adapter.invoke(
                 &admission.context,
                 &operation,
                 admission.cancellation.clone(),
             )
         })) {
-            Ok(reply) => reply,
-            Err(_) => {
-                let reply = self.finish_raw_usage(
-                    &admission,
-                    "uncertain",
-                    InvocationReply::error("internal_error", None),
-                );
-                self.finish_admitted(&admission);
-                return reply;
+            Ok(adapter_reply) => {
+                self.complete_raw_read(invocation, started, admission, adapter_reply)
             }
-        };
-        let reply = self.complete_raw_read(invocation, started, &admission, adapter_reply);
-        self.finish_admitted(&admission);
-        reply
+            Err(_) => self.finish_raw_usage(
+                admission,
+                "uncertain",
+                InvocationReply::error("internal_error", None),
+            ),
+        }
+    }
+
+    fn raw_read_adapter(
+        &self,
+        admission: &Admission,
+    ) -> Result<Arc<dyn crate::model::TargetAdapter>, InvocationReply> {
+        match self.adapter_for_until(&admission.context.target_id, admission.context.deadline) {
+            Ok(Some(adapter)) => Ok(adapter),
+            Ok(None) => Err(InvocationReply::error("target_not_found", None)),
+            Err(error) => Err(InvocationReply::error(
+                &error.code,
+                error.message.as_deref(),
+            )),
+        }
     }
 
     fn admit_mutation(
@@ -381,57 +438,47 @@ impl Runtime {
         started: Instant,
     ) -> Result<ExecutionMode, InvocationReply> {
         validate_session_ready(invocation, session, started)?;
-        let target = self
-            .target_until(
-                &session.target_id,
-                started + Duration::from_millis(invocation.deadline_ms),
-            )
-            .map_err(|error| {
-                action_error(
-                    invocation,
-                    &plan.session_id,
-                    &error.code,
-                    None,
-                    started,
-                    None,
-                )
-            })?
-            .ok_or_else(|| {
-                action_error(
-                    invocation,
-                    &plan.session_id,
-                    "target_not_found",
-                    None,
-                    started,
-                    None,
-                )
-            })?;
+        let target = self.mutation_target(invocation, plan, session, started)?;
         validate_target(invocation, session, &target, started)?;
         let mode = plan
             .mode_override
             .clone()
             .unwrap_or_else(|| session.mode.clone());
-        validate_background(invocation, &target, &mode).map_err(|code| {
-            action_error(
-                invocation,
-                &plan.session_id,
-                code,
-                Some(&mode),
-                started,
-                None,
-            )
-        })?;
-        validate_locator(invocation, session).map_err(|code| {
-            action_error(
-                invocation,
-                &plan.session_id,
-                code,
-                Some(&mode),
-                started,
-                None,
-            )
-        })?;
+        validate_mutation_mode(invocation, plan, session, &target, &mode, started)?;
         Ok(mode)
+    }
+
+    fn mutation_target(
+        &self,
+        invocation: &Invocation,
+        plan: &CommandPlan,
+        session: &Session,
+        started: Instant,
+    ) -> Result<TargetDescriptor, InvocationReply> {
+        self.target_until(
+            &session.target_id,
+            started + Duration::from_millis(invocation.deadline_ms),
+        )
+        .map_err(|error| {
+            action_error(
+                invocation,
+                &plan.session_id,
+                &error.code,
+                None,
+                started,
+                None,
+            )
+        })?
+        .ok_or_else(|| {
+            action_error(
+                invocation,
+                &plan.session_id,
+                "target_not_found",
+                None,
+                started,
+                None,
+            )
+        })
     }
 
     fn admit_read(
@@ -441,54 +488,15 @@ impl Runtime {
         started: Instant,
     ) -> Result<Admission, InvocationReply> {
         let mut state = self.state.lock().expect("runtime state");
-        let session = state
-            .sessions
-            .get(&plan.session_id)
-            .cloned()
-            .ok_or_else(|| InvocationReply::error("session_not_found", None))?;
-        if session.state == SessionState::Closing {
-            return Err(InvocationReply::error("session_busy", None));
-        }
-        let target = self
-            .target_until(
-                &session.target_id,
-                started + Duration::from_millis(invocation.deadline_ms),
-            )
-            .map_err(|error| InvocationReply::error(&error.code, error.message.as_deref()))?
-            .ok_or_else(|| InvocationReply::error("target_not_found", None))?;
-        if target.generation != session.target_generation {
-            return Err(InvocationReply::error("target_stale", None));
-        }
-        validate_capability(invocation, &target)
-            .map_err(|code| InvocationReply::error(code, None))?;
-        validate_read_authority(invocation, &session, &state)?;
-        validate_locator(invocation, &session)
-            .map_err(|code| InvocationReply::error(code, None))?;
+        let session = active_read_session(&state, &plan.session_id)?;
+        let target = self.read_target(invocation, &session, started)?;
+        validate_read_admission(invocation, &session, &target, &state)?;
         let mode = plan
             .mode_override
             .clone()
             .unwrap_or_else(|| session.mode.clone());
-        let lease_pinned = invocation.command == "raw.cdp";
-        if lease_pinned {
-            let lease = state
-                .leases
-                .get_mut(&session.target_id)
-                .expect("validated actor lease");
-            lease.expires_at = Instant::now() + Duration::from_millis(lease.ttl_ms);
-            lease.pinned += 1;
-        }
-        state
-            .sessions
-            .get_mut(&session.id)
-            .expect("session exists")
-            .in_flight += 1;
-        let cancellation = Arc::new(AtomicBool::new(false));
-        state
-            .cancellations
-            .insert(invocation.request_id.clone(), cancellation.clone());
-        state
-            .cancellation_sessions
-            .insert(invocation.request_id.clone(), session.id.clone());
+        let lease_pinned = pin_read_lease(&mut state, invocation, &session);
+        let cancellation = register_read_inflight(&mut state, invocation, &session.id);
         Ok(Admission {
             context: AdapterContext {
                 session_id: session.id,
@@ -509,6 +517,25 @@ impl Runtime {
         })
     }
 
+    fn read_target(
+        &self,
+        invocation: &Invocation,
+        session: &Session,
+        started: Instant,
+    ) -> Result<TargetDescriptor, InvocationReply> {
+        let target = self
+            .target_until(
+                &session.target_id,
+                started + Duration::from_millis(invocation.deadline_ms),
+            )
+            .map_err(|error| InvocationReply::error(&error.code, error.message.as_deref()))?
+            .ok_or_else(|| InvocationReply::error("target_not_found", None))?;
+        if target.generation != session.target_generation {
+            return Err(InvocationReply::error("target_stale", None));
+        }
+        Ok(target)
+    }
+
     fn complete_mutation(
         &self,
         invocation: &Invocation,
@@ -516,22 +543,51 @@ impl Runtime {
         admission: &Admission,
         adapter_reply: crate::model::AdapterReply,
     ) -> InvocationReply {
-        if adapter_reply.delivery == AdapterDelivery::Rejected {
-            return self.complete_rejected_mutation(invocation, started, admission, &adapter_reply);
+        match adapter_reply.delivery {
+            AdapterDelivery::Rejected => {
+                self.complete_rejected_mutation(invocation, started, admission, &adapter_reply)
+            }
+            AdapterDelivery::Unknown => {
+                self.complete_unknown_mutation(invocation, started, admission, &adapter_reply)
+            }
+            AdapterDelivery::Confirmed => {
+                self.complete_confirmed_mutation(invocation, started, admission, adapter_reply)
+            }
         }
-        if adapter_reply.delivery == AdapterDelivery::Unknown {
-            return self.complete_unknown_mutation(invocation, started, admission, &adapter_reply);
+    }
+
+    fn complete_confirmed_mutation(
+        &self,
+        invocation: &Invocation,
+        started: Instant,
+        admission: &Admission,
+        adapter_reply: crate::model::AdapterReply,
+    ) -> InvocationReply {
+        if let Err(reply) =
+            self.settle_confirmed_mutation(invocation, started, admission, &adapter_reply)
+        {
+            return reply;
         }
+        self.publish_confirmed_mutation(invocation, started, admission, &adapter_reply)
+    }
+
+    fn settle_confirmed_mutation(
+        &self,
+        invocation: &Invocation,
+        started: Instant,
+        admission: &Admission,
+        adapter_reply: &crate::model::AdapterReply,
+    ) -> Result<(), InvocationReply> {
         if let Some(raw) = &admission.raw {
             if self
                 .publish_raw_response(admission, &adapter_reply.response)
                 .is_err()
             {
-                return self.finish_raw_usage(
+                return Err(self.finish_raw_usage(
                     admission,
                     "uncertain",
                     admitted_action_error(invocation, admission, "artifact_io_failed", started),
-                );
+                ));
             }
             debug_assert!(!raw.operation.is_empty());
         }
@@ -541,21 +597,31 @@ impl Runtime {
                 .as_ref()
                 .map(|error| error.code.as_str())
                 .unwrap_or("interrupted");
-            return self.finish_raw_usage(
+            return Err(self.finish_raw_usage(
                 admission,
                 "uncertain",
                 admitted_action_error(invocation, admission, code, started),
-            );
+            ));
         }
         if !adapter_reply.already_settled
-            && let Err(code) = settle(admission, &adapter_reply)
+            && let Err(code) = settle(admission, adapter_reply)
         {
-            return self.finish_raw_usage(
+            return Err(self.finish_raw_usage(
                 admission,
                 "uncertain",
                 admitted_action_error(invocation, admission, code, started),
-            );
+            ));
         }
+        Ok(())
+    }
+
+    fn publish_confirmed_mutation(
+        &self,
+        invocation: &Invocation,
+        started: Instant,
+        admission: &Admission,
+        adapter_reply: &crate::model::AdapterReply,
+    ) -> InvocationReply {
         let Some(screenshot) = adapter_reply.screenshot.as_deref() else {
             return self.finish_raw_usage(
                 admission,
@@ -590,46 +656,17 @@ impl Runtime {
                 );
             }
         };
-        let artifact_ms = millis(artifact_started.elapsed());
-        let elapsed = millis(started.elapsed());
-        let signature = adapter_reply
-            .frame_signature
-            .as_deref()
-            .unwrap_or("unbound");
-        let frame_token = format!(
-            "f_{}_{}_{}_{}",
-            admission.context.session_id,
-            admission.context.target_generation,
-            admission.context.action_sequence,
-            signature
-        );
+        let frame_token = mutation_frame_token(admission, adapter_reply);
         self.set_action_frame_token(&admission.context.session_id, frame_token.clone());
-        let result = InvocationReply::success(json!({
-            "schema": "manuvra/action-result@1",
-            "protocol_version": "1.0",
-            "registry_version": "1.0.0",
-            "request_id": invocation.request_id,
-            "command": invocation.command,
-            "session_id": admission.context.session_id,
-            "target_id": admission.context.target_id,
-            "action_sequence": admission.context.action_sequence,
-            "outcome": "observed",
-            "delivery": "backend_confirmed",
-            "requested_mode": admission.context.mode.as_str(),
-            "effective_mode": admission.context.mode.as_str(),
-            "effect_verification": "not_asserted",
-            "observation": {
-                "status": "captured",
-                "screenshot_path": published.path,
-                "frame_token": frame_token,
-                "action_sequence_before": admission.context.action_sequence,
-                "action_sequence_after": admission.context.action_sequence,
-            },
-            "timing_ms": adapter_timing(elapsed, artifact_ms, &adapter_reply.timing),
-            "warnings": [],
-            "error": null,
-            "manifest_path": published.manifest_path,
-        }));
+        let result = confirmed_mutation_result(
+            invocation,
+            admission,
+            adapter_reply,
+            &published,
+            &frame_token,
+            millis(artifact_started.elapsed()),
+            millis(started.elapsed()),
+        );
         self.finish_raw_usage(admission, "completed", result)
     }
 
@@ -751,56 +788,43 @@ impl Runtime {
         admission: &Admission,
         adapter_reply: crate::model::AdapterReply,
     ) -> InvocationReply {
-        let outcome = match adapter_reply.delivery {
-            AdapterDelivery::Confirmed => "completed",
-            AdapterDelivery::Rejected => "not_performed",
-            AdapterDelivery::Unknown => "uncertain",
-        };
-        let response_value = adapter_reply.error.as_ref().map_or_else(
-            || adapter_reply.response.clone(),
-            |error| {
-                json!({
-                    "error": {
-                        "code": error.code,
-                        "message": error.message,
-                        "details": error.details,
-                    },
-                    "value": adapter_reply.response,
-                })
-            },
-        );
-        let response = serde_json::to_vec(&response_value).expect("adapter response");
-        let published = match self.artifacts.publish(
-            &admission.session_directory,
-            ArtifactWrite {
-                kind: "raw_response",
-                extension: "json",
-                media_type: "application/json",
-                bytes: &response,
-                request_id: &admission.request_id,
-                action_sequence: admission.context.action_sequence,
-            },
-        ) {
+        let outcome = raw_read_outcome(adapter_reply.delivery.clone());
+        let published = match self.publish_raw_read_response(admission, &adapter_reply) {
             Ok(published) => published,
-            Err(error) => {
-                return InvocationReply::error("artifact_io_failed", Some(&error.to_string()));
-            }
-        };
-        let delivery = match adapter_reply.delivery {
-            AdapterDelivery::Confirmed => "backend_confirmed",
-            AdapterDelivery::Rejected => "backend_rejected",
-            AdapterDelivery::Unknown => "unknown",
+            Err(reply) => return reply,
         };
         let result = InvocationReply::success(json!({
             "session_id": admission.context.session_id,
             "command": invocation.command,
             "intent": admission.raw.as_ref().and_then(|raw| raw.intent.clone()),
-            "delivery": delivery,
+            "delivery": raw_read_delivery(adapter_reply.delivery),
             "response_path": published.path,
             "timing_ms": {"total": millis(started.elapsed())},
             "warning": null,
         }));
         self.finish_raw_usage(admission, outcome, result)
+    }
+
+    fn publish_raw_read_response(
+        &self,
+        admission: &Admission,
+        adapter_reply: &crate::model::AdapterReply,
+    ) -> Result<crate::artifacts::PublishedArtifact, InvocationReply> {
+        let response =
+            serde_json::to_vec(&raw_read_response_value(adapter_reply)).expect("adapter response");
+        self.artifacts
+            .publish(
+                &admission.session_directory,
+                ArtifactWrite {
+                    kind: "raw_response",
+                    extension: "json",
+                    media_type: "application/json",
+                    bytes: &response,
+                    request_id: &admission.request_id,
+                    action_sequence: admission.context.action_sequence,
+                },
+            )
+            .map_err(|error| InvocationReply::error("artifact_io_failed", Some(&error.to_string())))
     }
 
     fn finish_raw_usage(
@@ -838,6 +862,178 @@ impl Runtime {
             lease.pinned = lease.pinned.saturating_sub(1);
         }
     }
+}
+
+fn active_read_session(state: &RuntimeState, session_id: &str) -> Result<Session, InvocationReply> {
+    let session = state
+        .sessions
+        .get(session_id)
+        .cloned()
+        .ok_or_else(|| InvocationReply::error("session_not_found", None))?;
+    if session.state == SessionState::Closing {
+        return Err(InvocationReply::error("session_busy", None));
+    }
+    Ok(session)
+}
+
+fn validate_read_admission(
+    invocation: &Invocation,
+    session: &Session,
+    target: &TargetDescriptor,
+    state: &RuntimeState,
+) -> Result<(), InvocationReply> {
+    validate_capability(invocation, target).map_err(|code| InvocationReply::error(code, None))?;
+    validate_read_authority(invocation, session, state)?;
+    validate_locator(invocation, session).map_err(|code| InvocationReply::error(code, None))
+}
+
+fn pin_read_lease(state: &mut RuntimeState, invocation: &Invocation, session: &Session) -> bool {
+    let lease_pinned = invocation.command == "raw.cdp";
+    if lease_pinned {
+        let lease = state
+            .leases
+            .get_mut(&session.target_id)
+            .expect("validated actor lease");
+        lease.expires_at = Instant::now() + Duration::from_millis(lease.ttl_ms);
+        lease.pinned += 1;
+    }
+    lease_pinned
+}
+
+fn register_read_inflight(
+    state: &mut RuntimeState,
+    invocation: &Invocation,
+    session_id: &str,
+) -> Arc<AtomicBool> {
+    state
+        .sessions
+        .get_mut(session_id)
+        .expect("session exists")
+        .in_flight += 1;
+    let cancellation = Arc::new(AtomicBool::new(false));
+    state
+        .cancellations
+        .insert(invocation.request_id.clone(), cancellation.clone());
+    state
+        .cancellation_sessions
+        .insert(invocation.request_id.clone(), session_id.to_owned());
+    cancellation
+}
+
+fn mutation_frame_token(
+    admission: &Admission,
+    adapter_reply: &crate::model::AdapterReply,
+) -> String {
+    let signature = adapter_reply
+        .frame_signature
+        .as_deref()
+        .unwrap_or("unbound");
+    format!(
+        "f_{}_{}_{}_{}",
+        admission.context.session_id,
+        admission.context.target_generation,
+        admission.context.action_sequence,
+        signature
+    )
+}
+
+fn confirmed_mutation_result(
+    invocation: &Invocation,
+    admission: &Admission,
+    adapter_reply: &crate::model::AdapterReply,
+    published: &crate::artifacts::PublishedArtifact,
+    frame_token: &str,
+    artifact_ms: u64,
+    elapsed: u64,
+) -> InvocationReply {
+    InvocationReply::success(json!({
+        "schema": "manuvra/action-result@1",
+        "protocol_version": "1.0",
+        "registry_version": "1.0.0",
+        "request_id": invocation.request_id,
+        "command": invocation.command,
+        "session_id": admission.context.session_id,
+        "target_id": admission.context.target_id,
+        "action_sequence": admission.context.action_sequence,
+        "outcome": "observed",
+        "delivery": "backend_confirmed",
+        "requested_mode": admission.context.mode.as_str(),
+        "effective_mode": admission.context.mode.as_str(),
+        "effect_verification": "not_asserted",
+        "observation": {
+            "status": "captured",
+            "screenshot_path": published.path,
+            "frame_token": frame_token,
+            "action_sequence_before": admission.context.action_sequence,
+            "action_sequence_after": admission.context.action_sequence,
+        },
+        "timing_ms": adapter_timing(elapsed, artifact_ms, &adapter_reply.timing),
+        "warnings": [],
+        "error": null,
+        "manifest_path": published.manifest_path,
+    }))
+}
+
+fn raw_read_outcome(delivery: AdapterDelivery) -> &'static str {
+    match delivery {
+        AdapterDelivery::Confirmed => "completed",
+        AdapterDelivery::Rejected => "not_performed",
+        AdapterDelivery::Unknown => "uncertain",
+    }
+}
+
+fn raw_read_delivery(delivery: AdapterDelivery) -> &'static str {
+    match delivery {
+        AdapterDelivery::Confirmed => "backend_confirmed",
+        AdapterDelivery::Rejected => "backend_rejected",
+        AdapterDelivery::Unknown => "unknown",
+    }
+}
+
+fn raw_read_response_value(adapter_reply: &crate::model::AdapterReply) -> Value {
+    adapter_reply.error.as_ref().map_or_else(
+        || adapter_reply.response.clone(),
+        |error| {
+            json!({
+                "error": {
+                    "code": error.code,
+                    "message": error.message,
+                    "details": error.details,
+                },
+                "value": adapter_reply.response,
+            })
+        },
+    )
+}
+
+fn validate_mutation_mode(
+    invocation: &Invocation,
+    plan: &CommandPlan,
+    session: &Session,
+    target: &TargetDescriptor,
+    mode: &ExecutionMode,
+    started: Instant,
+) -> Result<(), InvocationReply> {
+    validate_background(invocation, target, mode).map_err(|code| {
+        action_error(
+            invocation,
+            &plan.session_id,
+            code,
+            Some(mode),
+            started,
+            None,
+        )
+    })?;
+    validate_locator(invocation, session).map_err(|code| {
+        action_error(
+            invocation,
+            &plan.session_id,
+            code,
+            Some(mode),
+            started,
+            None,
+        )
+    })
 }
 
 fn validate_session_ready(
@@ -940,6 +1136,29 @@ fn pin_actor_lease(
     started: Instant,
     now: Instant,
 ) -> Result<u64, InvocationReply> {
+    require_live_actor_lease(state, invocation, session, mode, started, now)?;
+    let lease = state
+        .leases
+        .get_mut(&session.target_id)
+        .expect("validated lease");
+    lease.expires_at = now + Duration::from_millis(lease.ttl_ms);
+    lease.pinned += 1;
+    let sequence = state
+        .action_sequences
+        .entry(session.target_id.clone())
+        .or_insert(0);
+    *sequence += 1;
+    Ok(*sequence)
+}
+
+fn require_live_actor_lease(
+    state: &mut RuntimeState,
+    invocation: &Invocation,
+    session: &Session,
+    mode: &ExecutionMode,
+    started: Instant,
+    now: Instant,
+) -> Result<(), InvocationReply> {
     let lease = state.leases.get(&session.target_id).ok_or_else(|| {
         action_error(
             invocation,
@@ -981,18 +1200,7 @@ fn pin_actor_lease(
             None,
         ));
     }
-    let lease = state
-        .leases
-        .get_mut(&session.target_id)
-        .expect("validated lease");
-    lease.expires_at = now + Duration::from_millis(lease.ttl_ms);
-    lease.pinned += 1;
-    let sequence = state
-        .action_sequences
-        .entry(session.target_id.clone())
-        .or_insert(0);
-    *sequence += 1;
-    Ok(*sequence)
+    Ok(())
 }
 
 fn plan_command(invocation: &Invocation) -> Result<CommandPlan, InvocationReply> {
@@ -1005,30 +1213,7 @@ fn plan_command(invocation: &Invocation) -> Result<CommandPlan, InvocationReply>
         .map_err(|message| InvocationReply::error("invalid_request", Some(&message)))?
         .to_owned();
     validate_command_specific(invocation, &input)?;
-    let mode_override = if allowed.contains(&"mode") {
-        match input.optional_string("mode") {
-            Ok(None) => None,
-            Ok(Some(mode @ ("background" | "foreground")))
-                if command_modes(&invocation.command)
-                    .is_some_and(|modes| modes.contains(&mode)) =>
-            {
-                Some(if mode == "background" {
-                    ExecutionMode::Background
-                } else {
-                    ExecutionMode::Foreground
-                })
-            }
-            Ok(Some(_)) => {
-                return Err(InvocationReply::error(
-                    "invalid_request",
-                    Some("invalid mode"),
-                ));
-            }
-            Err(message) => return Err(InvocationReply::error("invalid_request", Some(&message))),
-        }
-    } else {
-        None
-    };
+    let mode_override = plan_mode_override(invocation, &input, &allowed)?;
     let (raw, mutating) = raw_and_effect(invocation, &input)?;
     Ok(CommandPlan {
         session_id,
@@ -1036,6 +1221,47 @@ fn plan_command(invocation: &Invocation) -> Result<CommandPlan, InvocationReply>
         raw,
         mutating,
     })
+}
+
+fn plan_mode_override(
+    invocation: &Invocation,
+    input: &Input<'_>,
+    allowed: &[&str],
+) -> Result<Option<ExecutionMode>, InvocationReply> {
+    if !allowed.contains(&"mode") {
+        return Ok(None);
+    }
+    parse_requested_mode(invocation, input)
+}
+
+fn parse_requested_mode(
+    invocation: &Invocation,
+    input: &Input<'_>,
+) -> Result<Option<ExecutionMode>, InvocationReply> {
+    match input.optional_string("mode") {
+        Ok(None) => Ok(None),
+        Ok(Some(mode)) => requested_execution_mode(invocation, mode),
+        Err(message) => Err(InvocationReply::error("invalid_request", Some(&message))),
+    }
+}
+
+fn requested_execution_mode(
+    invocation: &Invocation,
+    mode: &str,
+) -> Result<Option<ExecutionMode>, InvocationReply> {
+    if !matches!(mode, "background" | "foreground")
+        || !command_modes(&invocation.command).is_some_and(|modes| modes.contains(&mode))
+    {
+        return Err(InvocationReply::error(
+            "invalid_request",
+            Some("invalid mode"),
+        ));
+    }
+    Ok(Some(if mode == "background" {
+        ExecutionMode::Background
+    } else {
+        ExecutionMode::Foreground
+    }))
 }
 
 fn validate_command_specific(
@@ -1084,25 +1310,52 @@ fn raw_and_effect(
     input: &Input<'_>,
 ) -> Result<(Option<RawUsage>, bool), InvocationReply> {
     match invocation.command.as_str() {
-        "raw.cdp" => {
-            let intent = input.string("intent").expect("validated intent");
-            let method = input
-                .string("method")
-                .map_err(|message| InvocationReply::error("invalid_request", Some(&message)))?;
-            Ok((
-                Some(RawUsage {
-                    backend: "cdp".to_owned(),
-                    operation: method.to_owned(),
-                    intent: Some(intent.to_owned()),
-                }),
-                intent == "action",
-            ))
-        }
-        "raw.ax.get" => Ok((Some(ax_usage(input, "attribute")?), false)),
-        "raw.ax.set" => Ok((Some(ax_usage(input, "attribute")?), true)),
-        "raw.ax.perform" => Ok((Some(ax_usage(input, "action")?), true)),
+        "raw.cdp" => cdp_raw_and_effect(input),
+        command if command.starts_with("raw.ax.") => ax_raw_and_effect(command, input),
         _ => Ok((None, true)),
     }
+}
+
+fn ax_raw_and_effect(
+    command: &str,
+    input: &Input<'_>,
+) -> Result<(Option<RawUsage>, bool), InvocationReply> {
+    if command == "raw.ax.get" {
+        ax_query_usage(input)
+    } else {
+        ax_mutating_usage(command, input)
+    }
+}
+
+fn ax_query_usage(input: &Input<'_>) -> Result<(Option<RawUsage>, bool), InvocationReply> {
+    Ok((Some(ax_usage(input, "attribute")?), false))
+}
+
+fn ax_mutating_usage(
+    command: &str,
+    input: &Input<'_>,
+) -> Result<(Option<RawUsage>, bool), InvocationReply> {
+    let key = if command == "raw.ax.set" {
+        "attribute"
+    } else {
+        "action"
+    };
+    Ok((Some(ax_usage(input, key)?), true))
+}
+
+fn cdp_raw_and_effect(input: &Input<'_>) -> Result<(Option<RawUsage>, bool), InvocationReply> {
+    let intent = input.string("intent").expect("validated intent");
+    let method = input
+        .string("method")
+        .map_err(|message| InvocationReply::error("invalid_request", Some(&message)))?;
+    Ok((
+        Some(RawUsage {
+            backend: "cdp".to_owned(),
+            operation: method.to_owned(),
+            intent: Some(intent.to_owned()),
+        }),
+        intent == "action",
+    ))
 }
 
 fn ax_usage(input: &Input<'_>, key: &str) -> Result<RawUsage, InvocationReply> {
@@ -1240,14 +1493,25 @@ fn validate_read_authority(
 
 fn settle(admission: &Admission, reply: &crate::model::AdapterReply) -> Result<(), &'static str> {
     if reply.continuous_events {
-        while Instant::now() < admission.context.deadline {
-            if admission.cancellation.load(Ordering::SeqCst) {
-                return Err("cancelled");
-            }
-            thread::sleep(Duration::from_millis(2));
-        }
-        return Err("stabilization_timeout");
+        return settle_continuous(admission);
     }
+    settle_quiet_window(admission, reply)
+}
+
+fn settle_continuous(admission: &Admission) -> Result<(), &'static str> {
+    while Instant::now() < admission.context.deadline {
+        if admission.cancellation.load(Ordering::SeqCst) {
+            return Err("cancelled");
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    Err("stabilization_timeout")
+}
+
+fn settle_quiet_window(
+    admission: &Admission,
+    reply: &crate::model::AdapterReply,
+) -> Result<(), &'static str> {
     if let Some(delay) = reply.relevant_event_after_ms {
         wait_cancellable(admission, Duration::from_millis(delay))?;
     }
@@ -1453,5 +1717,124 @@ fn add_usage_warning(value: &mut Value) {
         }
     } else if let Some(warning) = value.get_mut("warning") {
         *warning = Value::String("usage_not_recorded".to_owned());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RuntimeState, pin_actor_lease};
+    use crate::model::{ActorLease, ExecutionMode, Session, SessionRole, SessionState};
+    use manuvra_protocol::Invocation;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    fn sample_session() -> Session {
+        Session {
+            id: "s_actor".to_owned(),
+            target_id: "chrome_fake_1".to_owned(),
+            target_generation: 1,
+            role: SessionRole::Actor,
+            mode: ExecutionMode::Background,
+            directory: PathBuf::from("/tmp"),
+            lease_ttl_ms: 10_000,
+            reference_namespace: "n_test".to_owned(),
+            reference_epoch: 0,
+            frame_token: None,
+            in_flight: 0,
+            state: SessionState::Active,
+        }
+    }
+
+    fn empty_state() -> RuntimeState {
+        RuntimeState {
+            sessions: HashMap::new(),
+            leases: HashMap::new(),
+            action_sequences: HashMap::new(),
+            terminal_requests: HashMap::new(),
+            cancellations: HashMap::new(),
+            cancellation_sessions: HashMap::new(),
+            pending_requests: HashMap::new(),
+        }
+    }
+
+    fn click(session_id: &str) -> Invocation {
+        Invocation::new(
+            "action.click",
+            json!({"session_id": session_id, "locator": {"kind": "semantic", "name": "Save"}}),
+            "lease-pin".to_owned(),
+            1_000,
+        )
+    }
+
+    #[test]
+    fn pin_actor_lease_expires_without_silently_reattaching() {
+        let now = Instant::now();
+        let session = sample_session();
+        let invocation = click(&session.id);
+        let mode = ExecutionMode::Background;
+        let mut state = empty_state();
+
+        let missing = pin_actor_lease(&mut state, &invocation, &session, &mode, now, now)
+            .expect_err("missing lease");
+        assert_eq!(missing.value["error"]["code"], "actor_lease_expired");
+
+        state.leases.insert(
+            session.target_id.clone(),
+            ActorLease {
+                session_id: "s_other".to_owned(),
+                target_generation: 1,
+                ttl_ms: 10_000,
+                expires_at: now + Duration::from_secs(10),
+                pinned: 0,
+            },
+        );
+        let foreign = pin_actor_lease(&mut state, &invocation, &session, &mode, now, now)
+            .expect_err("foreign lease");
+        assert_eq!(foreign.value["error"]["code"], "actor_lease_required");
+
+        state.leases.insert(
+            session.target_id.clone(),
+            ActorLease {
+                session_id: session.id.clone(),
+                target_generation: 9,
+                ttl_ms: 10_000,
+                expires_at: now + Duration::from_secs(10),
+                pinned: 0,
+            },
+        );
+        let stale = pin_actor_lease(&mut state, &invocation, &session, &mode, now, now)
+            .expect_err("stale generation");
+        assert_eq!(stale.value["error"]["code"], "target_stale");
+
+        state.leases.insert(
+            session.target_id.clone(),
+            ActorLease {
+                session_id: session.id.clone(),
+                target_generation: 1,
+                ttl_ms: 10_000,
+                expires_at: now - Duration::from_secs(1),
+                pinned: 0,
+            },
+        );
+        let expired = pin_actor_lease(&mut state, &invocation, &session, &mode, now, now)
+            .expect_err("expired lease");
+        assert_eq!(expired.value["error"]["code"], "actor_lease_expired");
+        assert!(!state.leases.contains_key(&session.target_id));
+
+        state.leases.insert(
+            session.target_id.clone(),
+            ActorLease {
+                session_id: session.id.clone(),
+                target_generation: 1,
+                ttl_ms: 10_000,
+                expires_at: now + Duration::from_secs(10),
+                pinned: 0,
+            },
+        );
+        let sequence = pin_actor_lease(&mut state, &invocation, &session, &mode, now, now).unwrap();
+        assert_eq!(sequence, 1);
+        assert_eq!(state.leases.get(&session.target_id).unwrap().pinned, 1);
     }
 }

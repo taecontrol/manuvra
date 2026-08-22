@@ -55,19 +55,25 @@ impl ReferenceStore {
 
     fn issue(&mut self, context: &AdapterContext, element: &Element) -> (String, String) {
         self.begin_epoch(context);
-        if let Some((reference, _)) = self.issued.iter().find(|(_, issued)| {
-            issued.session_id == context.session_id
-                && issued.namespace == context.reference_namespace
-                && issued.epoch == context.reference_epoch
-                && unsafe { CFEqual(issued.element.as_ptr(), element.as_ptr()) }
-        }) {
-            let backend_id = reference
-                .rsplit_once('_')
-                .map(|(_, backend)| backend)
-                .unwrap_or_default()
-                .to_owned();
-            return (backend_id, reference.clone());
+        if let Some(existing) = self.existing_reference(context, element) {
+            return existing;
         }
+        self.issue_new(context, element)
+    }
+
+    fn existing_reference(
+        &self,
+        context: &AdapterContext,
+        element: &Element,
+    ) -> Option<(String, String)> {
+        let (reference, _) = self
+            .issued
+            .iter()
+            .find(|(_, issued)| issued.matches_element(context, element))?;
+        Some((backend_id_from_reference(reference), reference.clone()))
+    }
+
+    fn issue_new(&mut self, context: &AdapterContext, element: &Element) -> (String, String) {
         self.next_id = self.next_id.saturating_add(1);
         let backend_id = format!("m{:x}", self.next_id);
         let reference = element_ref(context, &backend_id);
@@ -81,12 +87,16 @@ impl ReferenceStore {
             },
         );
         self.order.push_back(reference.clone());
+        self.evict_overflow();
+        (backend_id, reference)
+    }
+
+    fn evict_overflow(&mut self) {
         while self.issued.len() > MAX_REFERENCE_ENTRIES {
             if let Some(oldest) = self.order.pop_front() {
                 self.issued.remove(&oldest);
             }
         }
-        (backend_id, reference)
     }
 
     fn resolve(
@@ -94,23 +104,11 @@ impl ReferenceStore {
         context: &AdapterContext,
         value: Option<&Value>,
     ) -> Result<Element, AdapterError> {
-        let reference = value
-            .and_then(Value::as_str)
-            .ok_or_else(|| adapter_error("invalid_request", "element ref is required"))?;
-        let prefix = format!(
-            "e_{}_{}_",
-            context.reference_namespace, context.reference_epoch
-        );
-        if !reference.starts_with(&prefix) {
-            return Err(adapter_error("element_stale", "element ref epoch is stale"));
-        }
+        let reference = required_element_ref(value)?;
+        require_current_ref_prefix(context, reference)?;
         self.issued
             .get(reference)
-            .filter(|issued| {
-                issued.session_id == context.session_id
-                    && issued.namespace == context.reference_namespace
-                    && issued.epoch == context.reference_epoch
-            })
+            .filter(|issued| issued.matches_session(context))
             .map(|issued| issued.element.clone())
             .ok_or_else(|| {
                 adapter_error(
@@ -121,6 +119,47 @@ impl ReferenceStore {
     }
 }
 
+impl IssuedReference {
+    fn matches_session(&self, context: &AdapterContext) -> bool {
+        self.session_id == context.session_id
+            && self.namespace == context.reference_namespace
+            && self.epoch == context.reference_epoch
+    }
+
+    fn matches_element(&self, context: &AdapterContext, element: &Element) -> bool {
+        self.matches_session(context) && unsafe { CFEqual(self.element.as_ptr(), element.as_ptr()) }
+    }
+}
+
+fn required_element_ref(value: Option<&Value>) -> Result<&str, AdapterError> {
+    value
+        .and_then(Value::as_str)
+        .ok_or_else(|| adapter_error("invalid_request", "element ref is required"))
+}
+
+fn require_current_ref_prefix(
+    context: &AdapterContext,
+    reference: &str,
+) -> Result<(), AdapterError> {
+    let prefix = format!(
+        "e_{}_{}_",
+        context.reference_namespace, context.reference_epoch
+    );
+    if reference.starts_with(&prefix) {
+        Ok(())
+    } else {
+        Err(adapter_error("element_stale", "element ref epoch is stale"))
+    }
+}
+
+fn backend_id_from_reference(reference: &str) -> String {
+    reference
+        .rsplit_once('_')
+        .map(|(_, backend)| backend)
+        .unwrap_or_default()
+        .to_owned()
+}
+
 pub(crate) fn invoke(
     record: &WindowRecord,
     context: &AdapterContext,
@@ -128,22 +167,86 @@ pub(crate) fn invoke(
     cancellation: Arc<AtomicBool>,
     references: &mut ReferenceStore,
 ) -> AdapterReply {
-    if cancellation.load(Ordering::SeqCst) {
-        return rejected("cancelled", "operation was cancelled before AX dispatch");
+    if let Some(reply) =
+        cancelled_reply(&cancellation, "operation was cancelled before AX dispatch")
+    {
+        return reply;
     }
-    let window = match exact_window(record) {
-        Ok(window) => window,
-        Err(error) => return rejected_error(error),
-    };
-    let result = match operation.command.as_str() {
-        "observe.query" => query(&window, context, operation, cancellation, references),
-        "observe.tree" => tree(&window, context, cancellation, references),
-        "raw.ax.get" => raw_get(&window, context, operation, references),
-        _ => Err(adapter_error(
+    ax_value_reply(dispatch_ax_read(
+        record,
+        context,
+        operation,
+        cancellation,
+        references,
+    ))
+}
+
+fn cancelled_reply(cancellation: &AtomicBool, message: &str) -> Option<AdapterReply> {
+    cancellation
+        .load(Ordering::SeqCst)
+        .then(|| rejected("cancelled", message))
+}
+
+fn dispatch_ax_read(
+    record: &WindowRecord,
+    context: &AdapterContext,
+    operation: &AdapterOperation,
+    cancellation: Arc<AtomicBool>,
+    references: &mut ReferenceStore,
+) -> Result<Value, AdapterError> {
+    ax_read_command(
+        exact_window(record)?,
+        context,
+        operation,
+        cancellation,
+        references,
+    )
+}
+
+fn ax_read_command(
+    window: Element,
+    context: &AdapterContext,
+    operation: &AdapterOperation,
+    cancellation: Arc<AtomicBool>,
+    references: &mut ReferenceStore,
+) -> Result<Value, AdapterError> {
+    if operation.command.starts_with("observe.") {
+        return ax_observe(&window, context, operation, cancellation, references);
+    }
+    raw_get_or_unsupported(&window, context, operation, references)
+}
+
+fn raw_get_or_unsupported(
+    window: &Element,
+    context: &AdapterContext,
+    operation: &AdapterOperation,
+    references: &mut ReferenceStore,
+) -> Result<Value, AdapterError> {
+    if operation.command == "raw.ax.get" {
+        raw_get(window, context, operation, references)
+    } else {
+        Err(adapter_error(
             "capability_unavailable",
             "operation is not implemented by the AX path",
-        )),
-    };
+        ))
+    }
+}
+
+fn ax_observe(
+    window: &Element,
+    context: &AdapterContext,
+    operation: &AdapterOperation,
+    cancellation: Arc<AtomicBool>,
+    references: &mut ReferenceStore,
+) -> Result<Value, AdapterError> {
+    if operation.command == "observe.query" {
+        query(window, context, operation, cancellation, references)
+    } else {
+        tree(window, context, cancellation, references)
+    }
+}
+
+fn ax_value_reply(result: Result<Value, AdapterError>) -> AdapterReply {
     match result {
         Ok(response) => AdapterReply::confirmed(response, None),
         Err(error) => rejected_error(error),
@@ -162,21 +265,70 @@ pub(crate) fn prepare_mutation(
 ) -> Result<PreparedAx, AdapterError> {
     let window = exact_window(record)?;
     let element = mutation_element(&window, context, operation, references)?;
-    if let Some(element) = &element {
-        validate_descendant(&window, element)?;
-    }
-    if context.mode.as_str() == "background" || operation.command.starts_with("raw.ax.") {
-        validate_background_mutation(operation, element.as_ref())?;
-    }
-    if operation.command == "raw.ax.set" {
-        let value = operation
-            .input
-            .get("value")
-            .ok_or_else(|| adapter_error("invalid_request", "AX value is required"))?;
-        let mut items = 0usize;
-        let _ = decode_ax_value(context, references, value, 0, &mut items)?;
-    }
+    constrain_prepared_element(&window, context, operation, references, element.as_ref())?;
     Ok(PreparedAx { element })
+}
+
+fn constrain_prepared_element(
+    window: &Element,
+    context: &AdapterContext,
+    operation: &AdapterOperation,
+    references: &ReferenceStore,
+    element: Option<&Element>,
+) -> Result<(), AdapterError> {
+    validate_prepared_descendant(window, element)?;
+    remaining_prepared_constraints(context, operation, references, element)
+}
+
+fn remaining_prepared_constraints(
+    context: &AdapterContext,
+    operation: &AdapterOperation,
+    references: &ReferenceStore,
+    element: Option<&Element>,
+) -> Result<(), AdapterError> {
+    constrain_background_or_raw(context, operation, element)?;
+    decode_prepared_raw_set(context, operation, references)
+}
+
+fn validate_prepared_descendant(
+    window: &Element,
+    element: Option<&Element>,
+) -> Result<(), AdapterError> {
+    let Some(element) = element else {
+        return Ok(());
+    };
+    validate_descendant(window, element)
+}
+
+fn constrain_background_or_raw(
+    context: &AdapterContext,
+    operation: &AdapterOperation,
+    element: Option<&Element>,
+) -> Result<(), AdapterError> {
+    if !background_or_raw(context, operation) {
+        return Ok(());
+    }
+    validate_background_mutation(operation, element)
+}
+
+fn background_or_raw(context: &AdapterContext, operation: &AdapterOperation) -> bool {
+    context.mode.as_str() == "background" || operation.command.starts_with("raw.ax.")
+}
+
+fn decode_prepared_raw_set(
+    context: &AdapterContext,
+    operation: &AdapterOperation,
+    references: &ReferenceStore,
+) -> Result<(), AdapterError> {
+    if operation.command != "raw.ax.set" {
+        return Ok(());
+    }
+    let value = operation
+        .input
+        .get("value")
+        .ok_or_else(|| adapter_error("invalid_request", "AX value is required"))?;
+    let mut items = 0usize;
+    decode_ax_value(context, references, value, 0, &mut items).map(|_| ())
 }
 
 fn mutation_element(
@@ -185,36 +337,64 @@ fn mutation_element(
     operation: &AdapterOperation,
     references: &ReferenceStore,
 ) -> Result<Option<Element>, AdapterError> {
-    let element = match operation.command.as_str() {
-        "action.click" | "action.type"
-            if operation
-                .input
-                .get("locator")
-                .and_then(|locator| locator.get("kind"))
-                .and_then(Value::as_str)
-                != Some("point") =>
-        {
-            Some(resolve_locator(window, context, operation, references)?)
+    if let Some(element) = action_mutation_element(window, context, operation, references)? {
+        return Ok(Some(element));
+    }
+    raw_mutation_element(context, operation, references)
+}
+
+fn action_mutation_element(
+    window: &Element,
+    context: &AdapterContext,
+    operation: &AdapterOperation,
+    references: &ReferenceStore,
+) -> Result<Option<Element>, AdapterError> {
+    match operation.command.as_str() {
+        "action.click" | "action.type" => {
+            click_or_type_element(window, context, operation, references)
         }
-        "action.press" | "action.scroll" if operation.input.get("locator").is_some() => {
-            if operation
-                .input
-                .get("locator")
-                .and_then(|locator| locator.get("kind"))
-                .and_then(Value::as_str)
-                == Some("point")
-            {
-                None
-            } else {
-                Some(resolve_locator(window, context, operation, references)?)
-            }
+        "action.press" | "action.scroll" => {
+            press_or_scroll_element(window, context, operation, references)
         }
-        "raw.ax.set" | "raw.ax.perform" => {
-            Some(references.resolve(context, operation.input.get("ref"))?)
-        }
-        _ => None,
-    };
-    Ok(element)
+        _ => Ok(None),
+    }
+}
+
+fn click_or_type_element(
+    window: &Element,
+    context: &AdapterContext,
+    operation: &AdapterOperation,
+    references: &ReferenceStore,
+) -> Result<Option<Element>, AdapterError> {
+    if locator_kind(operation) == Some("point") {
+        return Ok(None);
+    }
+    resolve_locator(window, context, operation, references).map(Some)
+}
+
+fn press_or_scroll_element(
+    window: &Element,
+    context: &AdapterContext,
+    operation: &AdapterOperation,
+    references: &ReferenceStore,
+) -> Result<Option<Element>, AdapterError> {
+    if operation.input.get("locator").is_none() {
+        return Ok(None);
+    }
+    click_or_type_element(window, context, operation, references)
+}
+
+fn raw_mutation_element(
+    context: &AdapterContext,
+    operation: &AdapterOperation,
+    references: &ReferenceStore,
+) -> Result<Option<Element>, AdapterError> {
+    match operation.command.as_str() {
+        "raw.ax.set" | "raw.ax.perform" => references
+            .resolve(context, operation.input.get("ref"))
+            .map(Some),
+        _ => Ok(None),
+    }
 }
 
 fn validate_background_mutation(
@@ -224,9 +404,20 @@ fn validate_background_mutation(
     match operation.command.as_str() {
         "action.click" => validate_background_click(operation, element),
         "action.type" => validate_background_type(operation, element),
-        "raw.ax.set" => validate_background_set(operation, required_element(element)?),
-        "raw.ax.perform" => validate_background_perform(operation, required_element(element)?),
+        "raw.ax.set" | "raw.ax.perform" => validate_background_raw(operation, element),
         _ => Ok(()),
+    }
+}
+
+fn validate_background_raw(
+    operation: &AdapterOperation,
+    element: Option<&Element>,
+) -> Result<(), AdapterError> {
+    let element = required_element(element)?;
+    if operation.command == "raw.ax.set" {
+        validate_background_set(operation, element)
+    } else {
+        validate_background_perform(operation, element)
     }
 }
 
@@ -238,37 +429,54 @@ fn validate_background_click(
     operation: &AdapterOperation,
     element: Option<&Element>,
 ) -> Result<(), AdapterError> {
+    background_click_policy(operation)?;
+    require_advertised_action(required_element(element)?, "AXPress")
+}
+
+fn background_click_policy(operation: &AdapterOperation) -> Result<(), AdapterError> {
     if locator_kind(operation) == Some("point") {
         return Err(adapter_error(
             "foreground_required",
             "point clicks require explicit foreground mode",
         ));
     }
-    if operation.input.get("button").and_then(Value::as_str) != Some("left")
-        || operation.input.get("count").and_then(Value::as_u64) != Some(1)
+    require_single_left_click(operation)
+}
+
+fn require_single_left_click(operation: &AdapterOperation) -> Result<(), AdapterError> {
+    if operation.input.get("button").and_then(Value::as_str) == Some("left")
+        && operation.input.get("count").and_then(Value::as_u64) == Some(1)
     {
-        return Err(adapter_error(
+        Ok(())
+    } else {
+        Err(adapter_error(
             "foreground_required",
             "background click supports only one left AXPress",
-        ));
+        ))
     }
-    require_native_capability(
-        required_element(element)?.supports_action("AXPress")?,
-        "AXPress",
-    )
 }
 
 fn validate_background_type(
     operation: &AdapterOperation,
     element: Option<&Element>,
 ) -> Result<(), AdapterError> {
+    reject_point_background(operation, "point typing requires explicit foreground mode")?;
+    require_settable_value(required_element(element)?)
+}
+
+fn reject_point_background(
+    operation: &AdapterOperation,
+    message: &str,
+) -> Result<(), AdapterError> {
     if locator_kind(operation) == Some("point") {
-        return Err(adapter_error(
-            "foreground_required",
-            "point typing requires explicit foreground mode",
-        ));
+        Err(adapter_error("foreground_required", message))
+    } else {
+        Ok(())
     }
-    if required_element(element)?.attribute_settable("AXValue")? {
+}
+
+fn require_settable_value(element: &Element) -> Result<(), AdapterError> {
+    if element.attribute_settable("AXValue")? {
         Ok(())
     } else {
         Err(adapter_error(
@@ -276,6 +484,10 @@ fn validate_background_type(
             "the exact AX element does not expose settable AXValue",
         ))
     }
+}
+
+fn require_advertised_action(element: &Element, action: &str) -> Result<(), AdapterError> {
+    require_native_capability(element.supports_action(action)?, action)
 }
 
 fn validate_background_set(
@@ -335,10 +547,12 @@ pub(crate) fn invoke_prepared(
     cancellation: Arc<AtomicBool>,
     references: &ReferenceStore,
 ) -> AdapterReply {
-    if cancellation.load(Ordering::SeqCst) {
-        return rejected("cancelled", "operation was cancelled before AX dispatch");
+    if let Some(reply) =
+        cancelled_reply(&cancellation, "operation was cancelled before AX dispatch")
+    {
+        return reply;
     }
-    if context.mode.as_str() == "foreground" && operation.command.starts_with("action.") {
+    if is_foreground_action(context, operation) {
         return crate::foreground::invoke_prepared(
             record,
             context,
@@ -347,37 +561,79 @@ pub(crate) fn invoke_prepared(
             cancellation,
         );
     }
-    let result = match operation.command.as_str() {
-        "action.click" => prepared
-            .element
-            .as_ref()
-            .ok_or_else(|| adapter_error("element_not_found", "prepared click element is absent"))
-            .and_then(|element| element.perform("AXPress"))
-            .map(|()| json!({"performed": "AXPress", "effective_mode": "background"})),
-        "action.type" => prepared
-            .element
-            .as_ref()
-            .ok_or_else(|| adapter_error("element_not_found", "prepared type element is absent"))
-            .and_then(|element| type_prepared(element, operation, false)),
-        "raw.ax.set" => prepared
-            .element
-            .as_ref()
-            .ok_or_else(|| adapter_error("element_not_found", "prepared raw element is absent"))
-            .and_then(|element| raw_set_prepared(element, context, operation, references)),
-        "raw.ax.perform" => prepared
-            .element
-            .as_ref()
-            .ok_or_else(|| adapter_error("element_not_found", "prepared raw element is absent"))
-            .and_then(|element| raw_perform_prepared(element, operation)),
+    ax_value_reply(invoke_ax_mutation(context, operation, prepared, references))
+}
+
+fn is_foreground_action(context: &AdapterContext, operation: &AdapterOperation) -> bool {
+    context.mode.as_str() == "foreground" && operation.command.starts_with("action.")
+}
+
+fn invoke_ax_mutation(
+    context: &AdapterContext,
+    operation: &AdapterOperation,
+    prepared: &PreparedAx,
+    references: &ReferenceStore,
+) -> Result<Value, AdapterError> {
+    match operation.command.as_str() {
+        "action.click" => prepared_click(prepared),
+        "action.type" => prepared_type(prepared, operation),
+        "raw.ax.set" => prepared_raw_set(prepared, context, operation, references),
+        "raw.ax.perform" => prepared_raw_perform(prepared, operation),
         _ => Err(adapter_error(
             "capability_unavailable",
             "prepared mutation command is unsupported",
         )),
-    };
-    match result {
-        Ok(response) => AdapterReply::confirmed(response, None),
-        Err(error) => rejected_error(error),
     }
+}
+
+fn prepared_element<'a>(
+    prepared: &'a PreparedAx,
+    missing: &str,
+) -> Result<&'a Element, AdapterError> {
+    prepared
+        .element
+        .as_ref()
+        .ok_or_else(|| adapter_error("element_not_found", missing))
+}
+
+fn prepared_click(prepared: &PreparedAx) -> Result<Value, AdapterError> {
+    prepared_element(prepared, "prepared click element is absent")?.perform("AXPress")?;
+    Ok(json!({"performed": "AXPress", "effective_mode": "background"}))
+}
+
+fn prepared_type(
+    prepared: &PreparedAx,
+    operation: &AdapterOperation,
+) -> Result<Value, AdapterError> {
+    type_prepared(
+        prepared_element(prepared, "prepared type element is absent")?,
+        operation,
+        false,
+    )
+}
+
+fn prepared_raw_set(
+    prepared: &PreparedAx,
+    context: &AdapterContext,
+    operation: &AdapterOperation,
+    references: &ReferenceStore,
+) -> Result<Value, AdapterError> {
+    raw_set_prepared(
+        prepared_element(prepared, "prepared raw element is absent")?,
+        context,
+        operation,
+        references,
+    )
+}
+
+fn prepared_raw_perform(
+    prepared: &PreparedAx,
+    operation: &AdapterOperation,
+) -> Result<Value, AdapterError> {
+    raw_perform_prepared(
+        prepared_element(prepared, "prepared raw element is absent")?,
+        operation,
+    )
 }
 
 fn type_prepared(
@@ -385,37 +641,89 @@ fn type_prepared(
     operation: &AdapterOperation,
     collapse_selection: bool,
 ) -> Result<Value, AdapterError> {
-    let requested = required_string(&operation.input, "text")?;
-    let replace = operation
-        .input
-        .get("replace")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let text = if replace {
-        requested.to_owned()
-    } else {
-        let current = element
-            .attribute("AXValue")
-            .ok()
-            .and_then(|value| value.downcast::<CFString>().ok())
-            .map(|value| value.to_string())
-            .unwrap_or_default();
-        format!("{current}{requested}")
-    };
+    write_typed_value(
+        element,
+        required_string(&operation.input, "text")?,
+        operation
+            .input
+            .get("replace")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        collapse_selection,
+    )
+}
+
+fn write_typed_value(
+    element: &Element,
+    requested: &str,
+    replace: bool,
+    collapse_selection: bool,
+) -> Result<Value, AdapterError> {
+    let text = typed_ax_value(element, requested, replace);
     crate::oracle::record(
         "ax_value_set",
         json!({"replace": replace, "characters": requested.chars().count()}),
     );
+    apply_typed_value(element, text, requested, collapse_selection)
+}
+
+fn apply_typed_value(
+    element: &Element,
+    text: String,
+    requested: &str,
+    collapse_selection: bool,
+) -> Result<Value, AdapterError> {
     element.set_string("AXValue", &text)?;
-    if collapse_selection
-        && let Some((text_end, attempts)) = collapse_selection_at_text_end(element, &text)?
-    {
-        crate::oracle::record(
-            "ax_selection_collapsed",
-            json!({"utf16_location": text_end.location, "attempts": attempts}),
-        );
-    }
+    finish_typed_value(element, text, requested, collapse_selection)
+}
+
+fn finish_typed_value(
+    element: &Element,
+    text: String,
+    requested: &str,
+    collapse_selection: bool,
+) -> Result<Value, AdapterError> {
+    maybe_collapse_typed_selection(element, &text, collapse_selection)?;
     Ok(json!({"characters": requested.chars().count(), "effective_mode": "background"}))
+}
+
+fn typed_ax_value(element: &Element, requested: &str, replace: bool) -> String {
+    if replace {
+        requested.to_owned()
+    } else {
+        format!("{}{requested}", current_ax_string(element))
+    }
+}
+
+fn current_ax_string(element: &Element) -> String {
+    element
+        .attribute("AXValue")
+        .ok()
+        .and_then(|value| value.downcast::<CFString>().ok())
+        .map(|value| value.to_string())
+        .unwrap_or_default()
+}
+
+fn maybe_collapse_typed_selection(
+    element: &Element,
+    text: &str,
+    collapse_selection: bool,
+) -> Result<(), AdapterError> {
+    if !collapse_selection {
+        return Ok(());
+    }
+    record_collapsed_selection(collapse_selection_at_text_end(element, text)?)
+}
+
+fn record_collapsed_selection(result: Option<(CFRange, usize)>) -> Result<(), AdapterError> {
+    let Some((text_end, attempts)) = result else {
+        return Ok(());
+    };
+    crate::oracle::record(
+        "ax_selection_collapsed",
+        json!({"utf16_location": text_end.location, "attempts": attempts}),
+    );
+    Ok(())
 }
 
 fn text_end_range(text: &str) -> CFRange {
@@ -432,24 +740,64 @@ fn collapse_selection_at_text_end(
     if !element.attribute_settable("AXSelectedTextRange")? {
         return Ok(None);
     }
+    try_collapse_selection(element, text)
+}
+
+fn try_collapse_selection(
+    element: &Element,
+    text: &str,
+) -> Result<Option<(CFRange, usize)>, AdapterError> {
     let expected = text_end_range(text);
-    let range = ax_struct(4, &expected)?;
-    for attempt in 1..=5 {
-        thread::park_timeout(Duration::from_millis(10));
-        element.set_cf(
-            "AXSelectedTextRange",
-            CFRetained::as_ptr(&range).as_ptr().cast(),
-        )?;
-        thread::park_timeout(Duration::from_millis(10));
-        let observed = selected_text_range(element)?;
-        if observed.location == expected.location && observed.length == expected.length {
-            return Ok(Some((expected, attempt)));
-        }
-    }
-    Err(adapter_error(
-        "dispatch_failed",
-        "AXSelectedTextRange did not retain the requested insertion point",
-    ))
+    retry_collapse(element, expected, ax_struct(4, &expected)?)
+}
+
+fn retry_collapse(
+    element: &Element,
+    expected: CFRange,
+    range: CFRetained<CFType>,
+) -> Result<Option<(CFRange, usize)>, AdapterError> {
+    (1..=5)
+        .find_map(|attempt| collapse_attempt(element, &range, expected, attempt))
+        .unwrap_or_else(|| {
+            Err(adapter_error(
+                "dispatch_failed",
+                "AXSelectedTextRange did not retain the requested insertion point",
+            ))
+        })
+}
+
+fn collapse_attempt(
+    element: &Element,
+    range: &CFRetained<CFType>,
+    expected: CFRange,
+    attempt: usize,
+) -> Option<Result<Option<(CFRange, usize)>, AdapterError>> {
+    selection_matches(element, range, expected).map_or_else(
+        |error| Some(Err(error)),
+        |matched| matched.then_some(Ok(Some((expected, attempt)))),
+    )
+}
+
+fn selection_matches(
+    element: &Element,
+    range: &CFRetained<CFType>,
+    expected: CFRange,
+) -> Result<bool, AdapterError> {
+    thread::park_timeout(Duration::from_millis(10));
+    element.set_cf(
+        "AXSelectedTextRange",
+        CFRetained::as_ptr(range).as_ptr().cast(),
+    )?;
+    observed_range_matches(element, expected)
+}
+
+fn observed_range_matches(element: &Element, expected: CFRange) -> Result<bool, AdapterError> {
+    thread::park_timeout(Duration::from_millis(10));
+    Ok(range_equals(selected_text_range(element)?, expected))
+}
+
+fn range_equals(observed: CFRange, expected: CFRange) -> bool {
+    observed.location == expected.location && observed.length == expected.length
 }
 
 fn selected_text_range(element: &Element) -> Result<CFRange, AdapterError> {
@@ -479,13 +827,47 @@ fn raw_set_prepared(
     operation: &AdapterOperation,
     references: &ReferenceStore,
 ) -> Result<Value, AdapterError> {
-    let attribute = required_string(&operation.input, "attribute")?;
+    set_raw_attribute(
+        element,
+        required_string(&operation.input, "attribute")?,
+        context,
+        operation,
+        references,
+    )
+}
+
+fn set_raw_attribute(
+    element: &Element,
+    attribute: &str,
+    context: &AdapterContext,
+    operation: &AdapterOperation,
+    references: &ReferenceStore,
+) -> Result<Value, AdapterError> {
+    set_decoded_attribute(
+        element,
+        attribute,
+        decode_raw_set_value(context, operation, references)?,
+    )
+}
+
+fn decode_raw_set_value(
+    context: &AdapterContext,
+    operation: &AdapterOperation,
+    references: &ReferenceStore,
+) -> Result<CFRetained<CFType>, AdapterError> {
     let value = operation
         .input
         .get("value")
         .ok_or_else(|| adapter_error("invalid_request", "AX value is required"))?;
     let mut items = 0usize;
-    let value = decode_ax_value(context, references, value, 0, &mut items)?;
+    decode_ax_value(context, references, value, 0, &mut items)
+}
+
+fn set_decoded_attribute(
+    element: &Element,
+    attribute: &str,
+    value: CFRetained<CFType>,
+) -> Result<Value, AdapterError> {
     element.set_cf(attribute, CFRetained::as_ptr(&value).as_ptr().cast())?;
     Ok(json!({"attribute": attribute, "set": true}))
 }
@@ -494,38 +876,63 @@ fn raw_perform_prepared(
     element: &Element,
     operation: &AdapterOperation,
 ) -> Result<Value, AdapterError> {
-    let action = required_string(&operation.input, "action")?;
+    perform_raw_action(element, required_string(&operation.input, "action")?)
+}
+
+fn perform_raw_action(element: &Element, action: &str) -> Result<Value, AdapterError> {
     element.perform(action)?;
     Ok(json!({"action": action, "performed": true}))
 }
 
 pub(crate) fn exact_window(record: &WindowRecord) -> Result<Element, AdapterError> {
     let application = Element::application(record.snapshot.pid)?;
-    let candidates = application_windows(&application)
+    unique_bounds_match(window_candidates(&application), record.snapshot.bounds)
+}
+
+fn window_candidates(application: &Element) -> Vec<(Element, WindowBounds)> {
+    application_windows(application)
         .into_iter()
         .filter_map(|window| {
             let bounds = window.bounds().ok()?;
             Some((window, bounds))
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+fn unique_bounds_match(
+    candidates: Vec<(Element, WindowBounds)>,
+    expected: WindowBounds,
+) -> Result<Element, AdapterError> {
     crate::oracle::record(
         "ax_window_resolution",
         json!({
-            "expected_bounds": record.snapshot.bounds,
+            "expected_bounds": expected,
             "candidate_bounds": candidates.iter().map(|(_, bounds)| bounds).collect::<Vec<_>>(),
         }),
     );
-    let matches = candidates
-        .iter()
-        .filter(|(_, bounds)| close_enough(*bounds, record.snapshot.bounds))
-        .collect::<Vec<_>>();
+    select_unique_window(
+        candidates
+            .iter()
+            .filter(|(_, bounds)| close_enough(*bounds, expected))
+            .map(|(window, _)| window.clone())
+            .collect(),
+        expected,
+        &candidates,
+    )
+}
+
+fn select_unique_window(
+    matches: Vec<Element>,
+    expected: WindowBounds,
+    candidates: &[(Element, WindowBounds)],
+) -> Result<Element, AdapterError> {
     match matches.len() {
-        1 => Ok(matches[0].0.clone()),
+        1 => Ok(matches.into_iter().next().expect("len is 1")),
         0 => Err(adapter_error(
             "target_not_found",
             &format!(
                 "no AX window matches pinned bounds {:?}; AX candidates are {:?}",
-                record.snapshot.bounds,
+                expected,
                 candidates
                     .iter()
                     .map(|(_, bounds)| *bounds)
@@ -540,11 +947,20 @@ pub(crate) fn exact_window(record: &WindowRecord) -> Result<Element, AdapterErro
 }
 
 pub(crate) fn focus_exact_window(record: &WindowRecord) -> Result<(), AdapterError> {
-    let application = Element::application(record.snapshot.pid)?;
-    let window = exact_window(record)?;
+    raise_main_window(
+        Element::application(record.snapshot.pid)?,
+        exact_window(record)?,
+    )
+}
+
+fn raise_main_window(application: Element, window: Element) -> Result<(), AdapterError> {
     window.perform("AXRaise")?;
+    set_main_and_focused(&application, &window)
+}
+
+fn set_main_and_focused(application: &Element, window: &Element) -> Result<(), AdapterError> {
     window.set_bool("AXMain", true)?;
-    application.set_element("AXFocusedWindow", &window)
+    application.set_element("AXFocusedWindow", window)
 }
 
 pub(crate) fn application_window_bounds(pid: i32) -> Result<Vec<WindowBounds>, AdapterError> {
@@ -567,27 +983,45 @@ pub(crate) fn focused_window_snapshot() -> Value {
 
 #[cfg(debug_assertions)]
 fn focused_window_snapshot_result() -> Result<Value, AdapterError> {
+    let focused_application = system_focused_application()?;
+    focused_window_snapshot_from(
+        &focused_application,
+        focused_application_pid(&focused_application)?,
+    )
+}
+
+#[cfg(debug_assertions)]
+fn system_wide_element() -> Result<Element, AdapterError> {
     let raw = unsafe { AXUIElementCreateSystemWide() };
-    let system = NonNull::new(raw.cast_mut())
+    NonNull::new(raw.cast_mut())
         .map(Element)
-        .ok_or_else(|| adapter_error("observation_failed", "AX system-wide element was null"))?;
-    let focused_application = element_attribute(&system, "AXFocusedApplication")?;
+        .ok_or_else(|| adapter_error("observation_failed", "AX system-wide element was null"))
+}
+
+#[cfg(debug_assertions)]
+fn system_focused_application() -> Result<Element, AdapterError> {
+    element_attribute(&system_wide_element()?, "AXFocusedApplication")
+}
+
+#[cfg(debug_assertions)]
+fn focused_application_pid(application: &Element) -> Result<i32, AdapterError> {
     let mut pid = 0;
-    let status = unsafe { AXUIElementGetPid(focused_application.as_ptr(), &mut pid) };
-    if status != AX_SUCCESS {
-        return Err(ax_error(
-            status,
-            "read focused application pid",
-            "AXFocusedApplication".to_owned(),
-        ));
-    }
-    let focused_window = element_attribute(&focused_application, "AXFocusedWindow")?;
-    let bounds = focused_window.bounds().ok();
+    require_ax_success(
+        unsafe { AXUIElementGetPid(application.as_ptr(), &mut pid) },
+        "read focused application pid",
+        "AXFocusedApplication",
+    )
+    .map(|()| pid)
+}
+
+#[cfg(debug_assertions)]
+fn focused_window_snapshot_from(application: &Element, pid: i32) -> Result<Value, AdapterError> {
+    let focused_window = element_attribute(application, "AXFocusedWindow")?;
     Ok(json!({
         "available": true,
         "application_pid": pid,
         "window_title": focused_window.string("AXTitle"),
-        "window_bounds": bounds,
+        "window_bounds": focused_window.bounds().ok(),
     }))
 }
 
@@ -605,18 +1039,32 @@ fn element_attribute(element: &Element, name: &str) -> Result<Element, AdapterEr
 fn application_windows(application: &Element) -> Vec<Element> {
     let mut windows = Vec::new();
     for attribute in ["AXWindows", "AXChildren"] {
-        for candidate in application.elements(attribute).unwrap_or_default() {
-            let role = candidate.string("AXRole");
-            let is_window = matches!(role.as_deref(), Some("AXWindow" | "AXDialog" | "AXSheet"));
-            let duplicate = windows
-                .iter()
-                .any(|window: &Element| unsafe { CFEqual(window.as_ptr(), candidate.as_ptr()) });
-            if is_window && !duplicate {
-                windows.push(candidate);
-            }
-        }
+        push_window_candidates(
+            &mut windows,
+            application.elements(attribute).unwrap_or_default(),
+        );
     }
     windows
+}
+
+fn push_window_candidates(windows: &mut Vec<Element>, candidates: Vec<Element>) {
+    for candidate in candidates {
+        if is_window_role(candidate.string("AXRole").as_deref())
+            && !contains_element(windows, &candidate)
+        {
+            windows.push(candidate);
+        }
+    }
+}
+
+fn is_window_role(role: Option<&str>) -> bool {
+    matches!(role, Some("AXWindow" | "AXDialog" | "AXSheet"))
+}
+
+fn contains_element(windows: &[Element], candidate: &Element) -> bool {
+    windows
+        .iter()
+        .any(|window| unsafe { CFEqual(window.as_ptr(), candidate.as_ptr()) })
 }
 
 pub(crate) fn same_bounds(left: WindowBounds, right: WindowBounds) -> bool {
@@ -624,20 +1072,38 @@ pub(crate) fn same_bounds(left: WindowBounds, right: WindowBounds) -> bool {
 }
 
 pub(crate) fn observer_elements(record: &WindowRecord) -> Result<Vec<Element>, AdapterError> {
-    let root = exact_window(record)?;
-    let mut elements = vec![Element::application(record.snapshot.pid)?];
+    collect_observer_elements(
+        Element::application(record.snapshot.pid)?,
+        exact_window(record)?,
+    )
+}
+
+fn collect_observer_elements(
+    application: Element,
+    root: Element,
+) -> Result<Vec<Element>, AdapterError> {
+    let mut elements = vec![application];
     let mut stack = vec![root];
     while let Some(element) = stack.pop() {
-        if elements.len() >= MAX_TREE_NODES {
-            return Err(adapter_error(
-                "observation_failed",
-                "AX observer element set exceeded the node bound",
-            ));
-        }
-        stack.extend(element.elements("AXChildren").unwrap_or_default());
-        elements.push(element);
+        push_observer_element(&mut elements, &mut stack, element)?;
     }
     Ok(elements)
+}
+
+fn push_observer_element(
+    elements: &mut Vec<Element>,
+    stack: &mut Vec<Element>,
+    element: Element,
+) -> Result<(), AdapterError> {
+    if elements.len() >= MAX_TREE_NODES {
+        return Err(adapter_error(
+            "observation_failed",
+            "AX observer element set exceeded the node bound",
+        ));
+    }
+    stack.extend(element.elements("AXChildren").unwrap_or_default());
+    elements.push(element);
+    Ok(())
 }
 
 pub(crate) fn exact_window_is_main(record: &WindowRecord) -> Result<bool, AdapterError> {
@@ -697,17 +1163,36 @@ fn query(
     cancellation: Arc<AtomicBool>,
     references: &mut ReferenceStore,
 ) -> Result<Value, AdapterError> {
-    let semantic = operation
+    let semantic = required_semantic(operation)?;
+    let limit = query_limit(operation);
+    let matches = collect_semantic_matches(window, context, cancellation, references, semantic)?;
+    Ok(split_query_matches(matches, limit))
+}
+
+fn required_semantic(operation: &AdapterOperation) -> Result<&Map<String, Value>, AdapterError> {
+    operation
         .input
         .get("semantic")
         .and_then(Value::as_object)
-        .ok_or_else(|| adapter_error("invalid_request", "semantic locator is required"))?;
-    let limit = operation
+        .ok_or_else(|| adapter_error("invalid_request", "semantic locator is required"))
+}
+
+fn query_limit(operation: &AdapterOperation) -> usize {
+    operation
         .input
         .get("limit")
         .and_then(Value::as_u64)
         .unwrap_or(5)
-        .clamp(1, 5) as usize;
+        .clamp(1, 5) as usize
+}
+
+fn collect_semantic_matches(
+    window: &Element,
+    context: &AdapterContext,
+    cancellation: Arc<AtomicBool>,
+    references: &mut ReferenceStore,
+    semantic: &Map<String, Value>,
+) -> Result<Vec<Value>, AdapterError> {
     let mut matches = Vec::new();
     walk(window, cancellation, |_, element| {
         if semantic_matches(element, semantic) {
@@ -716,12 +1201,16 @@ fn query(
         }
         true
     })?;
+    Ok(matches)
+}
+
+fn split_query_matches(mut matches: Vec<Value>, limit: usize) -> Value {
     let overflow = if matches.len() > limit {
         matches.split_off(limit)
     } else {
         Vec::new()
     };
-    Ok(json!({"matches": matches, "overflow": overflow}))
+    json!({"matches": matches, "overflow": overflow})
 }
 
 fn tree(
@@ -730,21 +1219,8 @@ fn tree(
     cancellation: Arc<AtomicBool>,
     references: &mut ReferenceStore,
 ) -> Result<Value, AdapterError> {
-    let mut nodes = Vec::new();
-    walk(window, cancellation, |_, element| {
-        let (backend_id, reference) = references.issue(context, element);
-        let mut node = public_element(element);
-        node.insert("ref".to_owned(), json!(reference));
-        node.insert("backend_id".to_owned(), json!(backend_id));
-        nodes.push(Value::Object(node));
-        nodes.len() < MAX_TREE_NODES
-    })?;
-    if nodes.len() >= MAX_TREE_NODES {
-        return Err(adapter_error(
-            "observation_failed",
-            "AX tree exceeded the complete-tree node bound",
-        ));
-    }
+    let nodes = collect_tree_nodes(window, context, cancellation, references)?;
+    require_complete_tree(&nodes)?;
     let node_count = nodes.len();
     Ok(json!({
         "tree": {
@@ -754,6 +1230,43 @@ fn tree(
         },
         "node_count": node_count,
     }))
+}
+
+fn collect_tree_nodes(
+    window: &Element,
+    context: &AdapterContext,
+    cancellation: Arc<AtomicBool>,
+    references: &mut ReferenceStore,
+) -> Result<Vec<Value>, AdapterError> {
+    let mut nodes = Vec::new();
+    walk(window, cancellation, |_, element| {
+        nodes.push(Value::Object(tree_node(context, references, element)));
+        nodes.len() < MAX_TREE_NODES
+    })?;
+    Ok(nodes)
+}
+
+fn tree_node(
+    context: &AdapterContext,
+    references: &mut ReferenceStore,
+    element: &Element,
+) -> Map<String, Value> {
+    let (backend_id, reference) = references.issue(context, element);
+    let mut node = public_element(element);
+    node.insert("ref".to_owned(), json!(reference));
+    node.insert("backend_id".to_owned(), json!(backend_id));
+    node
+}
+
+fn require_complete_tree(nodes: &[Value]) -> Result<(), AdapterError> {
+    if nodes.len() >= MAX_TREE_NODES {
+        Err(adapter_error(
+            "observation_failed",
+            "AX tree exceeded the complete-tree node bound",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn raw_get(
@@ -778,38 +1291,51 @@ fn resolve_locator(
     operation: &AdapterOperation,
     references: &ReferenceStore,
 ) -> Result<Element, AdapterError> {
-    let locator = operation
-        .input
-        .get("locator")
-        .and_then(Value::as_object)
-        .ok_or_else(|| adapter_error("invalid_request", "AX locator is required"))?;
+    let locator = required_locator(operation)?;
     match locator.get("kind").and_then(Value::as_str) {
         Some("ref") => references.resolve(context, locator.get("ref")),
-        Some("semantic") => {
-            let mut found = Vec::new();
-            walk(window, Arc::new(AtomicBool::new(false)), |_, element| {
-                if semantic_matches(element, locator) {
-                    found.push(element.clone());
-                }
-                found.len() < 2
-            })?;
-            match found.len() {
-                1 => Ok(found.remove(0)),
-                0 => Err(adapter_error(
-                    "element_not_found",
-                    "AX locator matched no element",
-                )),
-                _ => Err(adapter_error(
-                    "ambiguous_target",
-                    "AX locator matched more than one element",
-                )),
-            }
-        }
+        Some("semantic") => resolve_semantic_locator(window, locator),
         Some("point") => Err(adapter_error(
             "foreground_required",
             "point locators require the foreground CGEvent path",
         )),
         _ => Err(adapter_error("invalid_request", "unknown AX locator kind")),
+    }
+}
+
+fn required_locator(operation: &AdapterOperation) -> Result<&Map<String, Value>, AdapterError> {
+    operation
+        .input
+        .get("locator")
+        .and_then(Value::as_object)
+        .ok_or_else(|| adapter_error("invalid_request", "AX locator is required"))
+}
+
+fn resolve_semantic_locator(
+    window: &Element,
+    locator: &Map<String, Value>,
+) -> Result<Element, AdapterError> {
+    let mut found = Vec::new();
+    walk(window, Arc::new(AtomicBool::new(false)), |_, element| {
+        if semantic_matches(element, locator) {
+            found.push(element.clone());
+        }
+        found.len() < 2
+    })?;
+    unique_semantic_match(found)
+}
+
+fn unique_semantic_match(mut found: Vec<Element>) -> Result<Element, AdapterError> {
+    match found.len() {
+        1 => Ok(found.remove(0)),
+        0 => Err(adapter_error(
+            "element_not_found",
+            "AX locator matched no element",
+        )),
+        _ => Err(adapter_error(
+            "ambiguous_target",
+            "AX locator matched more than one element",
+        )),
     }
 }
 
@@ -821,19 +1347,44 @@ fn walk(
     let mut stack = vec![("0".to_owned(), root.clone())];
     let mut visited = 0usize;
     while let Some((path, element)) = stack.pop() {
-        if cancellation.load(Ordering::SeqCst) {
-            return Err(adapter_error("cancelled", "AX traversal was cancelled"));
-        }
-        visited += 1;
-        if visited > MAX_TREE_NODES || !visit(&path, &element) {
-            break;
-        }
-        let children = element.elements("AXChildren").unwrap_or_default();
-        for (index, child) in children.into_iter().enumerate().rev() {
-            stack.push((format!("{path}-{index}"), child));
-        }
+        walk_next(
+            &mut stack,
+            &mut visited,
+            &cancellation,
+            &mut visit,
+            path,
+            element,
+        )?;
     }
     Ok(())
+}
+
+fn walk_next(
+    stack: &mut Vec<(String, Element)>,
+    visited: &mut usize,
+    cancellation: &AtomicBool,
+    visit: &mut impl FnMut(&str, &Element) -> bool,
+    path: String,
+    element: Element,
+) -> Result<(), AdapterError> {
+    if cancellation.load(Ordering::SeqCst) {
+        return Err(adapter_error("cancelled", "AX traversal was cancelled"));
+    }
+    *visited += 1;
+    if *visited <= MAX_TREE_NODES && visit(&path, &element) {
+        push_children(
+            stack,
+            &path,
+            element.elements("AXChildren").unwrap_or_default(),
+        );
+    }
+    Ok(())
+}
+
+fn push_children(stack: &mut Vec<(String, Element)>, path: &str, children: Vec<Element>) {
+    for (index, child) in children.into_iter().enumerate().rev() {
+        stack.push((format!("{path}-{index}"), child));
+    }
 }
 
 fn validate_descendant(window: &Element, requested: &Element) -> Result<(), AdapterError> {
@@ -928,41 +1479,19 @@ fn match_entry(path: &str, element: &Element) -> Value {
 
 fn public_element(element: &Element) -> Map<String, Value> {
     let mut value = Map::new();
-    value.insert(
-        "role".to_owned(),
-        element
-            .string("AXRole")
-            .map(|role| json!(public_role(&role)))
-            .unwrap_or(Value::Null),
-    );
-    value.insert(
-        "name".to_owned(),
-        element
-            .string("AXTitle")
-            .or_else(|| element.string("AXDescription"))
-            .map(Value::String)
-            .unwrap_or(Value::Null),
-    );
+    value.insert("role".to_owned(), public_role_value(element));
+    value.insert("name".to_owned(), public_name_value(element));
     value.insert(
         "text".to_owned(),
-        element
-            .string("AXValue")
-            .map(Value::String)
-            .unwrap_or(Value::Null),
+        optional_string_value(element.string("AXValue")),
     );
     value.insert(
         "identifier".to_owned(),
-        element
-            .string("AXIdentifier")
-            .map(Value::String)
-            .unwrap_or(Value::Null),
+        optional_string_value(element.string("AXIdentifier")),
     );
     value.insert(
         "description".to_owned(),
-        element
-            .string("AXDescription")
-            .map(Value::String)
-            .unwrap_or(Value::Null),
+        optional_string_value(element.string("AXDescription")),
     );
     if let Ok(bounds) = element.bounds() {
         value.insert("bounds".to_owned(), json!(bounds));
@@ -970,19 +1499,53 @@ fn public_element(element: &Element) -> Map<String, Value> {
     value
 }
 
+fn public_role_value(element: &Element) -> Value {
+    element
+        .string("AXRole")
+        .map(|role| json!(public_role(&role)))
+        .unwrap_or(Value::Null)
+}
+
+fn public_name_value(element: &Element) -> Value {
+    optional_string_value(
+        element
+            .string("AXTitle")
+            .or_else(|| element.string("AXDescription")),
+    )
+}
+
+fn optional_string_value(value: Option<String>) -> Value {
+    value.map(Value::String).unwrap_or(Value::Null)
+}
+
 fn public_role(role: &str) -> String {
+    named_public_role(role)
+        .unwrap_or_else(|| ax_role_fallback(role))
+        .to_ascii_lowercase()
+}
+
+fn named_public_role(role: &str) -> Option<&'static str> {
     match role {
-        "AXButton" | "AXMenuButton" => "button",
-        "AXTextField" | "AXTextArea" | "AXComboBox" => "textbox",
-        "AXStaticText" => "text",
-        "AXCheckBox" => "checkbox",
-        "AXRadioButton" => "radio",
-        "AXWindow" => "window",
-        "AXMenuItem" => "menuitem",
-        "AXLink" => "link",
-        _ => role.strip_prefix("AX").unwrap_or(role),
+        "AXButton" | "AXMenuButton" => Some("button"),
+        "AXTextField" | "AXTextArea" | "AXComboBox" => Some("textbox"),
+        _ => other_named_role(role),
     }
-    .to_ascii_lowercase()
+}
+
+fn other_named_role(role: &str) -> Option<&'static str> {
+    match role {
+        "AXStaticText" => Some("text"),
+        "AXCheckBox" => Some("checkbox"),
+        "AXRadioButton" => Some("radio"),
+        "AXWindow" => Some("window"),
+        "AXMenuItem" => Some("menuitem"),
+        "AXLink" => Some("link"),
+        _ => None,
+    }
+}
+
+fn ax_role_fallback(role: &str) -> &str {
+    role.strip_prefix("AX").unwrap_or(role)
 }
 
 fn element_ref(context: &AdapterContext, backend_id: &str) -> String {
@@ -1008,9 +1571,31 @@ fn encode_ax_value(
     items: &mut usize,
 ) -> Result<Value, AdapterError> {
     raw_item(depth, items)?;
+    encode_ax_known(window, context, references, value, depth, items)
+}
+
+fn encode_ax_known(
+    window: &Element,
+    context: &AdapterContext,
+    references: &mut ReferenceStore,
+    value: &CFRetained<CFType>,
+    depth: usize,
+    items: &mut usize,
+) -> Result<Value, AdapterError> {
     if let Some(encoded) = encode_ax_scalar(value)? {
         return Ok(encoded);
     }
+    encode_ax_collection_or_native(window, context, references, value, depth, items)
+}
+
+fn encode_ax_collection_or_native(
+    window: &Element,
+    context: &AdapterContext,
+    references: &mut ReferenceStore,
+    value: &CFRetained<CFType>,
+    depth: usize,
+    items: &mut usize,
+) -> Result<Value, AdapterError> {
     if let Some(encoded) = encode_ax_collection(window, context, references, value, depth, items)? {
         return Ok(encoded);
     }
@@ -1018,29 +1603,41 @@ fn encode_ax_value(
 }
 
 fn encode_ax_scalar(value: &CFRetained<CFType>) -> Result<Option<Value>, AdapterError> {
+    if let Some(encoded) = encode_ax_null_string_or_url(value) {
+        return Ok(Some(encoded));
+    }
+    encode_ax_boolean_or_number(value)
+}
+
+fn encode_ax_null_string_or_url(value: &CFRetained<CFType>) -> Option<Value> {
     if value.downcast_ref::<CFNull>().is_some() {
-        return Ok(Some(json!({"type": "null", "value": null})));
+        return Some(json!({"type": "null", "value": null}));
     }
     if let Some(value) = value.downcast_ref::<CFString>() {
-        return Ok(Some(json!({"type": "string", "value": value.to_string()})));
+        return Some(json!({"type": "string", "value": value.to_string()}));
     }
-    if let Some(value) = value.downcast_ref::<CFURL>() {
-        return Ok(Some(
-            json!({"type": "url", "value": value.string().to_string()}),
-        ));
-    }
+    value
+        .downcast_ref::<CFURL>()
+        .map(|value| json!({"type": "url", "value": value.string().to_string()}))
+}
+
+fn encode_ax_boolean_or_number(value: &CFRetained<CFType>) -> Result<Option<Value>, AdapterError> {
     if let Some(value) = value.downcast_ref::<CFBoolean>() {
         return Ok(Some(json!({"type": "boolean", "value": value.as_bool()})));
     }
-    if let Some(value) = value.downcast_ref::<CFNumber>() {
-        let number = value
-            .as_i64()
-            .map(Value::from)
-            .or_else(|| value.as_f64().map(Value::from))
-            .ok_or_else(|| adapter_error("raw_value_unsupported", "CFNumber had no JSON value"))?;
-        return Ok(Some(json!({"type": "number", "value": number})));
-    }
-    Ok(None)
+    encode_ax_number(value)
+}
+
+fn encode_ax_number(value: &CFRetained<CFType>) -> Result<Option<Value>, AdapterError> {
+    let Some(value) = value.downcast_ref::<CFNumber>() else {
+        return Ok(None);
+    };
+    let number = value
+        .as_i64()
+        .map(Value::from)
+        .or_else(|| value.as_f64().map(Value::from))
+        .ok_or_else(|| adapter_error("raw_value_unsupported", "CFNumber had no JSON value"))?;
+    Ok(Some(json!({"type": "number", "value": number})))
 }
 
 fn encode_ax_collection(
@@ -1159,38 +1756,10 @@ fn encode_ax_struct_type(
 fn encode_ax_struct(value: &CFRetained<CFType>, kind: i32) -> Result<Value, AdapterError> {
     let pointer = CFRetained::as_ptr(value).as_ptr().cast();
     match kind {
-        1 => {
-            let mut point = CGPoint::ZERO;
-            ax_value_into(pointer, kind, &mut point)?;
-            Ok(json!({"type": "point", "x": point.x, "y": point.y}))
-        }
-        2 => {
-            let mut size = CGSize::ZERO;
-            ax_value_into(pointer, kind, &mut size)?;
-            Ok(json!({"type": "size", "width": size.width, "height": size.height}))
-        }
-        3 => {
-            let mut rect = CGRect::ZERO;
-            ax_value_into(pointer, kind, &mut rect)?;
-            Ok(json!({
-                "type": "rect", "x": rect.origin.x, "y": rect.origin.y,
-                "width": rect.size.width, "height": rect.size.height,
-            }))
-        }
-        4 => {
-            let mut range = CFRange {
-                location: 0,
-                length: 0,
-            };
-            ax_value_into(pointer, kind, &mut range)?;
-            let location = u64::try_from(range.location).map_err(|_| {
-                adapter_error("raw_value_unsupported", "AX range location was negative")
-            })?;
-            let length = u64::try_from(range.length).map_err(|_| {
-                adapter_error("raw_value_unsupported", "AX range length was negative")
-            })?;
-            Ok(json!({"type": "range", "location": location, "length": length}))
-        }
+        1 => encode_ax_point_value(pointer, kind),
+        2 => encode_ax_size_value(pointer, kind),
+        3 => encode_ax_rect_value(pointer, kind),
+        4 => encode_ax_range_value(pointer, kind),
         _ => Err(adapter_error(
             "raw_value_unsupported",
             &format!("unsupported AXValue type {kind}"),
@@ -1198,10 +1767,101 @@ fn encode_ax_struct(value: &CFRetained<CFType>, kind: i32) -> Result<Value, Adap
     }
 }
 
+fn encode_ax_point_value(pointer: *const c_void, kind: i32) -> Result<Value, AdapterError> {
+    let mut point = CGPoint::ZERO;
+    ax_value_into(pointer, kind, &mut point)?;
+    Ok(json!({"type": "point", "x": point.x, "y": point.y}))
+}
+
+fn encode_ax_size_value(pointer: *const c_void, kind: i32) -> Result<Value, AdapterError> {
+    let mut size = CGSize::ZERO;
+    ax_value_into(pointer, kind, &mut size)?;
+    Ok(json!({"type": "size", "width": size.width, "height": size.height}))
+}
+
+fn encode_ax_rect_value(pointer: *const c_void, kind: i32) -> Result<Value, AdapterError> {
+    let mut rect = CGRect::ZERO;
+    ax_value_into(pointer, kind, &mut rect)?;
+    Ok(json!({
+        "type": "rect", "x": rect.origin.x, "y": rect.origin.y,
+        "width": rect.size.width, "height": rect.size.height,
+    }))
+}
+
+fn encode_ax_range_value(pointer: *const c_void, kind: i32) -> Result<Value, AdapterError> {
+    let mut range = CFRange {
+        location: 0,
+        length: 0,
+    };
+    ax_value_into(pointer, kind, &mut range)?;
+    encode_ax_range_fields(range)
+}
+
+fn encode_ax_range_fields(range: CFRange) -> Result<Value, AdapterError> {
+    Ok(json!({
+        "type": "range",
+        "location": encode_ax_index(range.location, "location")?,
+        "length": encode_ax_index(range.length, "length")?,
+    }))
+}
+
+fn encode_ax_index(value: isize, field: &str) -> Result<u64, AdapterError> {
+    u64::try_from(value).map_err(|_| {
+        adapter_error(
+            "raw_value_unsupported",
+            &format!("AX range {field} was negative"),
+        )
+    })
+}
+
 fn ax_value_into<T>(pointer: *const c_void, kind: i32, value: &mut T) -> Result<(), AdapterError> {
     unsafe { AXValueGetValue(pointer, kind, (value as *mut T).cast()) }
         .then_some(())
         .ok_or_else(|| adapter_error("raw_value_unsupported", "AXValue payload was malformed"))
+}
+
+#[inline(never)]
+fn decode_element_bounds(
+    position: CFRetained<CFType>,
+    size: CFRetained<CFType>,
+) -> Result<WindowBounds, AdapterError> {
+    let mut point = CGPoint::ZERO;
+    let mut dimensions = CGSize::ZERO;
+    require_ax_value(
+        &position,
+        1,
+        &mut point,
+        "AX window position or size was not a valid AXValue",
+    )?;
+    require_ax_value(
+        &size,
+        2,
+        &mut dimensions,
+        "AX window position or size was not a valid AXValue",
+    )?;
+    Ok(WindowBounds {
+        x: point.x,
+        y: point.y,
+        width: dimensions.width,
+        height: dimensions.height,
+    })
+}
+
+fn require_ax_value<T>(
+    value: &CFRetained<CFType>,
+    kind: i32,
+    output: &mut T,
+    message: &str,
+) -> Result<(), AdapterError> {
+    unsafe {
+        AXValueGetValue(
+            CFRetained::as_ptr(value).as_ptr().cast(),
+            kind,
+            (output as *mut T).cast(),
+        )
+    }
+    .then_some(())
+    .ok_or_else(|| adapter_error("observation_failed", message))
 }
 
 fn decode_ax_value(
@@ -1249,15 +1909,33 @@ fn decode_known_ax_value(
 }
 
 fn decode_ax_scalar(kind: &str, value: &Value) -> Result<Option<CFRetained<CFType>>, AdapterError> {
-    let decoded = match kind {
-        "null" => decode_ax_null()?,
-        "boolean" => decode_ax_boolean(value)?,
-        "number" => decode_ax_number(value)?,
-        "string" => decode_ax_string(value)?,
-        "url" => decode_ax_url(value)?,
-        _ => return Ok(None),
-    };
-    Ok(Some(decoded))
+    match decode_ax_primitive(kind, value)? {
+        Some(decoded) => Ok(Some(decoded)),
+        None => decode_ax_textual(kind, value),
+    }
+}
+
+fn decode_ax_primitive(
+    kind: &str,
+    value: &Value,
+) -> Result<Option<CFRetained<CFType>>, AdapterError> {
+    match kind {
+        "null" => decode_ax_null().map(Some),
+        "boolean" => decode_ax_boolean(value).map(Some),
+        "number" => decode_ax_number(value).map(Some),
+        _ => Ok(None),
+    }
+}
+
+fn decode_ax_textual(
+    kind: &str,
+    value: &Value,
+) -> Result<Option<CFRetained<CFType>>, AdapterError> {
+    match kind {
+        "string" => decode_ax_string(value).map(Some),
+        "url" => decode_ax_url(value).map(Some),
+        _ => Ok(None),
+    }
 }
 
 fn decode_ax_null() -> Result<CFRetained<CFType>, AdapterError> {
@@ -1296,54 +1974,77 @@ fn decode_ax_url(value: &Value) -> Result<CFRetained<CFType>, AdapterError> {
 }
 
 fn decode_ax_struct(kind: &str, value: &Value) -> Result<Option<CFRetained<CFType>>, AdapterError> {
-    let decoded = match kind {
-        "point" => decode_ax_point(value)?,
-        "size" => decode_ax_size(value)?,
-        "rect" => decode_ax_rect(value)?,
-        "range" => decode_ax_range(value)?,
-        _ => return Ok(None),
-    };
-    Ok(Some(decoded))
+    match decode_ax_point_or_size(kind, value)? {
+        Some(decoded) => Ok(Some(decoded)),
+        None => decode_ax_rect_or_range(kind, value),
+    }
+}
+
+fn decode_ax_point_or_size(
+    kind: &str,
+    value: &Value,
+) -> Result<Option<CFRetained<CFType>>, AdapterError> {
+    match kind {
+        "point" => decode_ax_point(value).map(Some),
+        "size" => decode_ax_size(value).map(Some),
+        _ => Ok(None),
+    }
+}
+
+fn decode_ax_rect_or_range(
+    kind: &str,
+    value: &Value,
+) -> Result<Option<CFRetained<CFType>>, AdapterError> {
+    match kind {
+        "rect" => decode_ax_rect(value).map(Some),
+        "range" => decode_ax_range(value).map(Some),
+        _ => Ok(None),
+    }
 }
 
 fn decode_ax_point(value: &Value) -> Result<CFRetained<CFType>, AdapterError> {
-    ax_struct(
-        1,
-        &CGPoint::new(required_number(value, "x")?, required_number(value, "y")?),
-    )
+    ax_struct(1, &decode_point(value)?)
 }
 
 fn decode_ax_size(value: &Value) -> Result<CFRetained<CFType>, AdapterError> {
-    ax_struct(
-        2,
-        &CGSize::new(
-            required_number(value, "width")?,
-            required_number(value, "height")?,
-        ),
-    )
+    ax_struct(2, &decode_size(value)?)
 }
 
 fn decode_ax_rect(value: &Value) -> Result<CFRetained<CFType>, AdapterError> {
-    ax_struct(
-        3,
-        &CGRect::new(
-            CGPoint::new(required_number(value, "x")?, required_number(value, "y")?),
-            CGSize::new(
-                required_number(value, "width")?,
-                required_number(value, "height")?,
-            ),
-        ),
-    )
+    ax_struct(3, &CGRect::new(decode_point(value)?, decode_size(value)?))
+}
+
+fn decode_point(value: &Value) -> Result<CGPoint, AdapterError> {
+    Ok(CGPoint::new(
+        required_number(value, "x")?,
+        required_number(value, "y")?,
+    ))
+}
+
+fn decode_size(value: &Value) -> Result<CGSize, AdapterError> {
+    Ok(CGSize::new(
+        required_number(value, "width")?,
+        required_number(value, "height")?,
+    ))
 }
 
 fn decode_ax_range(value: &Value) -> Result<CFRetained<CFType>, AdapterError> {
-    let location = required_u64(value, "location")?
-        .try_into()
-        .map_err(|_| adapter_error("raw_value_unsupported", "range location exceeded CFIndex"))?;
-    let length = required_u64(value, "length")?
-        .try_into()
-        .map_err(|_| adapter_error("raw_value_unsupported", "range length exceeded CFIndex"))?;
-    ax_struct(4, &CFRange { location, length })
+    ax_struct(
+        4,
+        &CFRange {
+            location: decode_cf_index(value, "location")?,
+            length: decode_cf_index(value, "length")?,
+        },
+    )
+}
+
+fn decode_cf_index(value: &Value, field: &str) -> Result<isize, AdapterError> {
+    required_u64(value, field)?.try_into().map_err(|_| {
+        adapter_error(
+            "raw_value_unsupported",
+            &format!("range {field} exceeded CFIndex"),
+        )
+    })
 }
 
 fn decode_ax_reference(
@@ -1385,15 +2086,29 @@ fn decode_ax_array(
     depth: usize,
     items: &mut usize,
 ) -> Result<CFRetained<CFType>, AdapterError> {
-    let values = value
+    let values = required_array_entries(value)?;
+    let values = decode_ax_entries(context, references, values, depth, items)?;
+    Ok(into_type(CFArray::from_retained_objects(&values)))
+}
+
+fn required_array_entries(value: &Value) -> Result<&Vec<Value>, AdapterError> {
+    value
         .get("value")
         .and_then(Value::as_array)
-        .ok_or_else(|| adapter_error("invalid_request", "array value is required"))?;
-    let values = values
+        .ok_or_else(|| adapter_error("invalid_request", "array value is required"))
+}
+
+fn decode_ax_entries(
+    context: &AdapterContext,
+    references: &ReferenceStore,
+    values: &[Value],
+    depth: usize,
+    items: &mut usize,
+) -> Result<Vec<CFRetained<CFType>>, AdapterError> {
+    values
         .iter()
         .map(|value| decode_ax_value(context, references, value, depth + 1, items))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(into_type(CFArray::from_retained_objects(&values)))
+        .collect()
 }
 
 fn decode_ax_dictionary(
@@ -1403,21 +2118,28 @@ fn decode_ax_dictionary(
     depth: usize,
     items: &mut usize,
 ) -> Result<CFRetained<CFType>, AdapterError> {
-    let entries = value
-        .get("value")
-        .and_then(Value::as_object)
-        .ok_or_else(|| adapter_error("invalid_request", "dictionary value is required"))?;
+    let entries = required_dictionary_entries(value)?;
     let keys = entries
         .keys()
         .map(|key| CFString::from_str(key))
         .collect::<Vec<_>>();
-    let values = entries
-        .values()
-        .map(|value| decode_ax_value(context, references, value, depth + 1, items))
-        .collect::<Result<Vec<_>, _>>()?;
+    let values = decode_ax_entries(
+        context,
+        references,
+        &entries.values().cloned().collect::<Vec<_>>(),
+        depth,
+        items,
+    )?;
     let key_refs = keys.iter().map(|key| &**key).collect::<Vec<_>>();
     let value_refs = values.iter().map(|value| &**value).collect::<Vec<_>>();
     Ok(into_type(CFDictionary::from_slices(&key_refs, &value_refs)))
+}
+
+fn required_dictionary_entries(value: &Value) -> Result<&Map<String, Value>, AdapterError> {
+    value
+        .get("value")
+        .and_then(Value::as_object)
+        .ok_or_else(|| adapter_error("invalid_request", "dictionary value is required"))
 }
 
 fn raw_item(depth: usize, items: &mut usize) -> Result<(), AdapterError> {
@@ -1523,22 +2245,7 @@ impl Element {
     }
 
     fn attribute(&self, name: &str) -> Result<CFRetained<CFType>, AdapterError> {
-        let name = CFString::from_str(name);
-        let mut raw = ptr::null();
-        let status = unsafe {
-            AXUIElementCopyAttributeValue(
-                self.0.as_ptr(),
-                CFRetained::as_ptr(&name).as_ptr(),
-                &mut raw,
-            )
-        };
-        if status != AX_SUCCESS {
-            return Err(ax_error(status, "copy attribute", name.to_string()));
-        }
-        let raw: NonNull<CFType> = NonNull::new(raw.cast_mut().cast())
-            .ok_or_else(|| adapter_error("observation_failed", "AX returned a null attribute"))?;
-        // SAFETY: CopyAttributeValue returned a +1 retained CF object.
-        Ok(unsafe { CFRetained::from_raw(raw) })
+        retain_copied_attribute(copy_attribute(self.0.as_ptr(), name)?)
     }
 
     fn elements(&self, name: &str) -> Result<Vec<Element>, AdapterError> {
@@ -1546,18 +2253,7 @@ impl Element {
         let array: CFRetained<CFArray<CFType>> =
             // SAFETY: AXWindows and AXChildren are documented arrays of AXUIElement values.
             unsafe { CFRetained::cast_unchecked(value) };
-        array
-            .iter()
-            .filter_map(|value| {
-                (unsafe { CFGetTypeID(Some(&*value)) } == unsafe { AXUIElementGetTypeID() }).then(
-                    || {
-                        let raw = CFRetained::into_raw(value).cast();
-                        Element(raw)
-                    },
-                )
-            })
-            .collect::<Vec<_>>()
-            .pipe(Ok)
+        Ok(elements_from_array(&array))
     }
 
     pub(crate) fn string(&self, name: &str) -> Option<String> {
@@ -1577,34 +2273,7 @@ impl Element {
     }
 
     pub(crate) fn bounds(&self) -> Result<WindowBounds, AdapterError> {
-        let position = self.attribute("AXPosition")?;
-        let size = self.attribute("AXSize")?;
-        let mut point = CGPoint::ZERO;
-        let mut dimensions = CGSize::ZERO;
-        if !unsafe {
-            AXValueGetValue(
-                CFRetained::as_ptr(&position).as_ptr().cast(),
-                1,
-                (&mut point as *mut CGPoint).cast(),
-            )
-        } || !unsafe {
-            AXValueGetValue(
-                CFRetained::as_ptr(&size).as_ptr().cast(),
-                2,
-                (&mut dimensions as *mut CGSize).cast(),
-            )
-        } {
-            return Err(adapter_error(
-                "observation_failed",
-                "AX window position or size was not a valid AXValue",
-            ));
-        }
-        Ok(WindowBounds {
-            x: point.x,
-            y: point.y,
-            width: dimensions.width,
-            height: dimensions.height,
-        })
+        decode_element_bounds(self.attribute("AXPosition")?, self.attribute("AXSize")?)
     }
 
     fn set_string(&self, attribute: &str, value: &str) -> Result<(), AdapterError> {
@@ -1628,52 +2297,29 @@ impl Element {
     }
 
     fn attribute_settable(&self, attribute: &str) -> Result<bool, AdapterError> {
-        let attribute = CFString::from_str(attribute);
-        let mut settable = false;
-        let status = unsafe {
-            AXUIElementIsAttributeSettable(
-                self.0.as_ptr(),
-                CFRetained::as_ptr(&attribute).as_ptr(),
-                &mut settable,
-            )
-        };
-        (status == AX_SUCCESS)
-            .then_some(settable)
-            .ok_or_else(|| ax_error(status, "inspect settable attribute", attribute.to_string()))
+        inspect_attribute_settable(self.0.as_ptr(), attribute)
     }
 
     fn supports_action(&self, requested: &str) -> Result<bool, AdapterError> {
-        let mut raw = ptr::null();
-        let status = unsafe { AXUIElementCopyActionNames(self.0.as_ptr(), &mut raw) };
-        if status != AX_SUCCESS {
-            return Err(ax_error(status, "copy action names", requested.to_owned()));
-        }
-        let raw: NonNull<CFArray<CFString>> = NonNull::new(raw.cast_mut().cast())
-            .ok_or_else(|| adapter_error("observation_failed", "AX returned null action names"))?;
-        // SAFETY: CopyActionNames returns a +1 retained CFArray of CFString values.
-        let actions = unsafe { CFRetained::from_raw(raw) };
-        Ok(actions.iter().any(|action| action.to_string() == requested))
+        action_names(self.0.as_ptr(), requested)
+            .map(|actions| actions.iter().any(|action| action.to_string() == requested))
     }
 
     fn set_cf(&self, attribute: &str, value: *const c_void) -> Result<(), AdapterError> {
-        let name = CFString::from_str(attribute);
-        let status = unsafe {
-            AXUIElementSetAttributeValue(self.0.as_ptr(), CFRetained::as_ptr(&name).as_ptr(), value)
-        };
-        (status == AX_SUCCESS)
-            .then_some(())
-            .ok_or_else(|| ax_error(status, "set attribute", attribute.to_owned()))
+        require_ax_success(
+            set_attribute(self.0.as_ptr(), attribute, value),
+            "set attribute",
+            attribute,
+        )
     }
 
     fn perform(&self, action: &str) -> Result<(), AdapterError> {
         crate::oracle::record("ax_perform_attempt", json!({ "action": action }));
-        let action_name = CFString::from_str(action);
-        let status = unsafe {
-            AXUIElementPerformAction(self.0.as_ptr(), CFRetained::as_ptr(&action_name).as_ptr())
-        };
-        (status == AX_SUCCESS)
-            .then_some(())
-            .ok_or_else(|| ax_error(status, "perform action", action.to_owned()))
+        require_ax_success(
+            perform_action(self.0.as_ptr(), action),
+            "perform action",
+            action,
+        )
     }
 }
 
@@ -1690,19 +2336,79 @@ impl Drop for Element {
     }
 }
 
-trait Pipe: Sized {
-    fn pipe<T>(self, f: impl FnOnce(Self) -> T) -> T {
-        f(self)
-    }
+fn inspect_attribute_settable(
+    element: *const c_void,
+    attribute: &str,
+) -> Result<bool, AdapterError> {
+    let name = CFString::from_str(attribute);
+    let mut settable = false;
+    let status = unsafe {
+        AXUIElementIsAttributeSettable(element, CFRetained::as_ptr(&name).as_ptr(), &mut settable)
+    };
+    require_ax_success(status, "inspect settable attribute", attribute).map(|()| settable)
 }
-impl<T> Pipe for T {}
+
+fn copy_attribute(element: *const c_void, name: &str) -> Result<*const c_void, AdapterError> {
+    let name = CFString::from_str(name);
+    let mut raw = ptr::null();
+    let status = unsafe {
+        AXUIElementCopyAttributeValue(element, CFRetained::as_ptr(&name).as_ptr(), &mut raw)
+    };
+    require_ax_success(status, "copy attribute", &name.to_string()).map(|()| raw)
+}
+
+fn retain_copied_attribute(raw: *const c_void) -> Result<CFRetained<CFType>, AdapterError> {
+    let raw: NonNull<CFType> = NonNull::new(raw.cast_mut().cast())
+        .ok_or_else(|| adapter_error("observation_failed", "AX returned a null attribute"))?;
+    // SAFETY: CopyAttributeValue returned a +1 retained CF object.
+    Ok(unsafe { CFRetained::from_raw(raw) })
+}
+
+fn elements_from_array(array: &CFArray<CFType>) -> Vec<Element> {
+    array
+        .iter()
+        .filter_map(|value| {
+            (unsafe { CFGetTypeID(Some(&*value)) } == unsafe { AXUIElementGetTypeID() }).then(
+                || {
+                    let raw = CFRetained::into_raw(value).cast();
+                    Element(raw)
+                },
+            )
+        })
+        .collect()
+}
+
+fn action_names(
+    element: *const c_void,
+    requested: &str,
+) -> Result<CFRetained<CFArray<CFString>>, AdapterError> {
+    let mut raw = ptr::null();
+    let status = unsafe { AXUIElementCopyActionNames(element, &mut raw) };
+    require_ax_success(status, "copy action names", requested)?;
+    let raw: NonNull<CFArray<CFString>> = NonNull::new(raw.cast_mut().cast())
+        .ok_or_else(|| adapter_error("observation_failed", "AX returned null action names"))?;
+    // SAFETY: CopyActionNames returns a +1 retained CFArray of CFString values.
+    Ok(unsafe { CFRetained::from_raw(raw) })
+}
+
+fn set_attribute(element: *const c_void, attribute: &str, value: *const c_void) -> i32 {
+    let name = CFString::from_str(attribute);
+    unsafe { AXUIElementSetAttributeValue(element, CFRetained::as_ptr(&name).as_ptr(), value) }
+}
+
+fn perform_action(element: *const c_void, action: &str) -> i32 {
+    let action_name = CFString::from_str(action);
+    unsafe { AXUIElementPerformAction(element, CFRetained::as_ptr(&action_name).as_ptr()) }
+}
+
+fn require_ax_success(status: i32, operation: &str, value: &str) -> Result<(), AdapterError> {
+    (status == AX_SUCCESS)
+        .then_some(())
+        .ok_or_else(|| ax_error(status, operation, value.to_owned()))
+}
 
 fn ax_error(status: i32, operation: &str, value: String) -> AdapterError {
-    let classification = if status == -25211 {
-        "permission_required"
-    } else {
-        "backend_rejected"
-    };
+    let classification = ax_error_class(status);
     AdapterError {
         code: classification.to_owned(),
         message: Some(
@@ -1717,6 +2423,14 @@ fn ax_error(status: i32, operation: &str, value: String) -> AdapterError {
             "classification": classification,
             "operation": operation,
         })),
+    }
+}
+
+fn ax_error_class(status: i32) -> &'static str {
+    if status == -25211 {
+        "permission_required"
+    } else {
+        "backend_rejected"
     }
 }
 
@@ -1796,6 +2510,39 @@ mod tests {
         };
         assert!(close_enough(pinned, pinned));
         assert!(!close_enough(pinned, WindowBounds { x: 13.0, ..pinned }));
+    }
+
+    #[test]
+    fn decode_element_bounds_reads_position_and_size_and_rejects_mismatched_kinds() {
+        let position = decode_ax_point(&json!({"x": 10.0, "y": 20.0})).unwrap();
+        let size = decode_ax_size(&json!({"width": 300.0, "height": 200.0})).unwrap();
+        assert_eq!(
+            decode_element_bounds(position, size).unwrap(),
+            WindowBounds {
+                x: 10.0,
+                y: 20.0,
+                width: 300.0,
+                height: 200.0,
+            }
+        );
+
+        let swapped_position = decode_ax_size(&json!({"width": 1.0, "height": 2.0})).unwrap();
+        let size = decode_ax_size(&json!({"width": 300.0, "height": 200.0})).unwrap();
+        assert_eq!(
+            decode_element_bounds(swapped_position, size)
+                .unwrap_err()
+                .code,
+            "observation_failed"
+        );
+
+        let position = decode_ax_point(&json!({"x": 10.0, "y": 20.0})).unwrap();
+        let swapped_size = decode_ax_point(&json!({"x": 1.0, "y": 2.0})).unwrap();
+        assert_eq!(
+            decode_element_bounds(position, swapped_size)
+                .unwrap_err()
+                .code,
+            "observation_failed"
+        );
     }
 
     #[test]
@@ -2084,6 +2831,413 @@ mod tests {
                 "cycle": {"error": cycle_error.code},
                 "native_error": native_error.details,
             }),
+        );
+    }
+
+    fn test_context(session: &str) -> AdapterContext {
+        AdapterContext {
+            session_id: session.to_owned(),
+            target_id: "macos_test".to_owned(),
+            target_generation: 1,
+            action_sequence: 1,
+            reference_namespace: "n_test".to_owned(),
+            reference_epoch: 1,
+            frame_token: None,
+            mode: manuvra_runtime::ExecutionMode::Background,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+        }
+    }
+
+    fn test_record() -> WindowRecord {
+        WindowRecord {
+            descriptor: manuvra_runtime::TargetDescriptor {
+                target_id: "macos_test".to_owned(),
+                generation: 1,
+                kind: "macos".to_owned(),
+                owner: "Fixture".to_owned(),
+                title: Some("Window".to_owned()),
+                capabilities: Vec::new(),
+            },
+            snapshot: crate::discovery::WindowSnapshot {
+                pid: i32::MAX,
+                window_id: 1,
+                owner: "Fixture".to_owned(),
+                title: Some("Window".to_owned()),
+                bounds: WindowBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 100.0,
+                },
+                is_on_screen: true,
+            },
+            present: true,
+        }
+    }
+
+    fn operation(command: &str, input: Value) -> AdapterOperation {
+        AdapterOperation::new(command.to_owned(), input)
+    }
+
+    #[test]
+    fn public_roles_and_locator_kinds_keep_native_adapter_results() {
+        assert_eq!(public_role("AXButton"), "button");
+        assert_eq!(public_role("AXMenuButton"), "button");
+        assert_eq!(public_role("AXTextField"), "textbox");
+        assert_eq!(public_role("AXTextArea"), "textbox");
+        assert_eq!(public_role("AXComboBox"), "textbox");
+        assert_eq!(public_role("AXStaticText"), "text");
+        assert_eq!(public_role("AXCheckBox"), "checkbox");
+        assert_eq!(public_role("AXRadioButton"), "radio");
+        assert_eq!(public_role("AXWindow"), "window");
+        assert_eq!(public_role("AXMenuItem"), "menuitem");
+        assert_eq!(public_role("AXLink"), "link");
+        assert_eq!(public_role("AXGroup"), "group");
+        assert_eq!(public_role("Custom"), "custom");
+
+        let window = Element::application(std::process::id() as i32).unwrap();
+        let context = test_context("s_locator");
+        let references = ReferenceStore::default();
+        assert_eq!(
+            resolve_locator(
+                &window,
+                &context,
+                &operation(
+                    "action.click",
+                    json!({"locator": {"kind": "point", "x": 1, "y": 1}})
+                ),
+                &references,
+            )
+            .err()
+            .unwrap()
+            .code,
+            "foreground_required"
+        );
+        assert_eq!(
+            resolve_locator(
+                &window,
+                &context,
+                &operation("action.click", json!({"locator": {"kind": "xpath"}})),
+                &references,
+            )
+            .err()
+            .unwrap()
+            .code,
+            "invalid_request"
+        );
+        assert_eq!(
+            resolve_locator(
+                &window,
+                &context,
+                &operation("action.click", json!({})),
+                &references,
+            )
+            .err()
+            .unwrap()
+            .code,
+            "invalid_request"
+        );
+        assert_eq!(
+            resolve_locator(
+                &window,
+                &context,
+                &operation(
+                    "action.click",
+                    json!({"locator": {"kind": "ref", "ref": "e_n_test_1_missing"}})
+                ),
+                &references,
+            )
+            .err()
+            .unwrap()
+            .code,
+            "element_stale"
+        );
+        assert_eq!(
+            unique_semantic_match(Vec::new()).err().unwrap().code,
+            "element_not_found"
+        );
+        assert_eq!(
+            unique_semantic_match(vec![window.clone(), window.clone()])
+                .err()
+                .unwrap()
+                .code,
+            "ambiguous_target"
+        );
+        assert!(unique_semantic_match(vec![window]).is_ok());
+    }
+
+    #[test]
+    fn mutation_prepare_and_invoke_keep_locator_ax_and_background_results() {
+        let window = Element::application(std::process::id() as i32).unwrap();
+        let context = test_context("s_mutation");
+        let mut references = ReferenceStore::default();
+        let (_, reference) = references.issue(&context, &window);
+        let point_click = operation(
+            "action.click",
+            json!({"locator": {"kind": "point", "x": 1, "y": 1}, "button": "left", "count": 1}),
+        );
+        assert!(
+            mutation_element(&window, &context, &point_click, &references)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            background_click_policy(&point_click).unwrap_err().code,
+            "foreground_required"
+        );
+        let right_click = operation(
+            "action.click",
+            json!({"locator": {"kind": "ref", "ref": reference}, "button": "right", "count": 1}),
+        );
+        assert_eq!(
+            background_click_policy(&right_click).unwrap_err().code,
+            "foreground_required"
+        );
+        let left_click = operation(
+            "action.click",
+            json!({"locator": {"kind": "ref", "ref": reference}, "button": "left", "count": 1}),
+        );
+        assert!(background_click_policy(&left_click).is_ok());
+        let press = operation("action.press", json!({"key": "enter"}));
+        assert!(
+            mutation_element(&window, &context, &press, &references)
+                .unwrap()
+                .is_none()
+        );
+        let raw = operation(
+            "raw.ax.set",
+            json!({"ref": reference, "attribute": "AXValue", "value": {"type": "string", "value": "x"}}),
+        );
+        assert!(
+            mutation_element(&window, &context, &raw, &references)
+                .unwrap()
+                .is_some()
+        );
+
+        let cancelled = std::sync::Arc::new(AtomicBool::new(true));
+        let reply = invoke(
+            &test_record(),
+            &context,
+            &operation("observe.tree", json!({})),
+            cancelled,
+            &mut references,
+        );
+        assert_eq!(reply.error.as_ref().unwrap().code, "cancelled");
+        assert_eq!(reply.delivery, manuvra_runtime::AdapterDelivery::Rejected);
+
+        let live = std::sync::Arc::new(AtomicBool::new(false));
+        let missing = invoke(
+            &test_record(),
+            &context,
+            &operation("observe.tree", json!({})),
+            live.clone(),
+            &mut references,
+        );
+        assert_eq!(missing.error.as_ref().unwrap().code, "target_not_found");
+
+        let unsupported = invoke(
+            &test_record(),
+            &context,
+            &operation("action.click", json!({})),
+            live.clone(),
+            &mut references,
+        );
+        assert!(matches!(
+            unsupported.error.as_ref().unwrap().code.as_str(),
+            "target_not_found" | "capability_unavailable"
+        ));
+
+        let prepared = PreparedAx { element: None };
+        let click = invoke_prepared(
+            &test_record(),
+            &context,
+            &left_click,
+            &prepared,
+            live.clone(),
+            &references,
+        );
+        assert_eq!(click.error.as_ref().unwrap().code, "element_not_found");
+        let unknown = invoke_prepared(
+            &test_record(),
+            &context,
+            &operation("observe.tree", json!({})),
+            &prepared,
+            live,
+            &references,
+        );
+        assert_eq!(
+            unknown.error.as_ref().unwrap().code,
+            "capability_unavailable"
+        );
+        assert_eq!(
+            prepare_mutation(&test_record(), &context, &left_click, &references)
+                .err()
+                .unwrap()
+                .code,
+            "target_not_found"
+        );
+        assert_eq!(query_limit(&operation("observe.query", json!({}))), 5);
+        assert_eq!(
+            query_limit(&operation("observe.query", json!({"limit": 9}))),
+            5
+        );
+        assert_eq!(
+            split_query_matches(vec![json!(1), json!(2), json!(3)], 2)["overflow"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            required_semantic(&operation("observe.query", json!({})))
+                .unwrap_err()
+                .code,
+            "invalid_request"
+        );
+        let empty = split_query_matches(Vec::new(), 5);
+        assert_eq!(empty["matches"], json!([]));
+        assert_eq!(typed_ax_value(&window, "next", true), "next");
+        assert_eq!(ax_error_class(-25211), "permission_required");
+        assert_eq!(ax_error_class(-25205), "backend_rejected");
+        assert!(range_equals(
+            CFRange {
+                location: 4,
+                length: 0
+            },
+            text_end_range("A😀Z")
+        ));
+        assert!(!is_window_role(Some("AXButton")));
+        assert!(is_window_role(Some("AXDialog")));
+        assert_eq!(
+            select_unique_window(
+                Vec::new(),
+                WindowBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                },
+                &[]
+            )
+            .err()
+            .unwrap()
+            .code,
+            "target_not_found"
+        );
+        let bounds = WindowBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        };
+        assert_eq!(
+            select_unique_window(
+                vec![window.clone(), window.clone()],
+                bounds,
+                &[(window.clone(), bounds), (window.clone(), bounds)]
+            )
+            .err()
+            .unwrap()
+            .code,
+            "capability_unavailable"
+        );
+        let live = std::sync::Arc::new(AtomicBool::new(false));
+        let empty_semantic = Map::new();
+        assert!(semantic_matches(&window, &empty_semantic));
+        assert!(ancestor_scope_matches(&window, &empty_semantic));
+        let press = operation("action.press", json!({"key": "enter"}));
+        assert!(validate_background_mutation(&press, None).is_ok());
+        assert_eq!(
+            validate_background_mutation(&point_click, None)
+                .err()
+                .unwrap()
+                .code,
+            "foreground_required"
+        );
+        assert_eq!(
+            validate_background_mutation(&raw, None).err().unwrap().code,
+            "element_not_found"
+        );
+        let tree = ax_observe(
+            &window,
+            &context,
+            &operation("observe.tree", json!({})),
+            live.clone(),
+            &mut references,
+        );
+        assert!(tree.is_ok() || tree.err().map(|error| error.code).is_some());
+        assert_eq!(
+            query(
+                &window,
+                &context,
+                &operation("observe.query", json!({})),
+                live.clone(),
+                &mut references,
+            )
+            .err()
+            .unwrap()
+            .code,
+            "invalid_request"
+        );
+        let queried = query(
+            &window,
+            &context,
+            &operation("observe.query", json!({"semantic": {}})),
+            live,
+            &mut references,
+        );
+        assert!(queried.is_ok() || queried.err().is_some());
+        let _ = application_is_frontmost(i32::MAX);
+        let _ = application_is_hidden(i32::MAX);
+        assert!(exact_window_is_main(&test_record()).is_err());
+        assert!(exact_window_is_focused(&test_record()).is_err());
+        assert!(exact_window_is_minimized(&test_record()).is_err());
+        assert!(observer_elements(&test_record()).is_err());
+        assert!(focus_exact_window(&test_record()).is_err());
+        let _ = focused_window_snapshot();
+        assert_eq!(
+            raw_get(
+                &window,
+                &context,
+                &operation("raw.ax.get", json!({"attribute": "AXRole"})),
+                &mut references,
+            )
+            .err()
+            .unwrap()
+            .code,
+            "invalid_request"
+        );
+        let app = Element::application(std::process::id() as i32).unwrap();
+        let _ = collect_observer_elements(app.clone(), app.clone());
+        let _ = collect_ancestor_fields(&app);
+        let _ = app.supports_action("AXPress");
+        let _ = require_settable_value(&app);
+        let _ = validate_background_set(
+            &operation("raw.ax.set", json!({"attribute": "AXValue"})),
+            &app,
+        );
+        let _ = validate_background_perform(
+            &operation("raw.ax.perform", json!({"action": "AXPress"})),
+            &app,
+        );
+        let _ = type_if_settable(&app, &operation("action.type", json!({"text": "x"})));
+        let _ = selected_text_range(&app);
+        let _ = collapse_selection_at_text_end(&app, "x");
+        assert!(maybe_collapse_typed_selection(&app, "x", false).is_ok());
+        let _ = maybe_collapse_typed_selection(&app, "x", true);
+        let _ = constrain_background_or_raw(
+            &context,
+            &operation("action.press", json!({"key": "enter"})),
+            None,
+        );
+        let _ =
+            decode_prepared_raw_set(&context, &operation("action.click", json!({})), &references);
+        let _ = validate_background_type(
+            &operation(
+                "action.type",
+                json!({"locator": {"kind": "point"}, "text": "x"}),
+            ),
+            None,
         );
     }
 }

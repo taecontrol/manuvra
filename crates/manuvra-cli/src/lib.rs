@@ -57,17 +57,29 @@ pub fn invoke_daemon(mut invocation: Invocation) -> Result<RpcResponse, ClientEr
     ensure_compatible_daemon(deadline)?;
     let (mut stream, child) = connect_or_launch(deadline)?;
     let remaining = remaining_request_time(deadline)?;
-    let runtime_budget = remaining
-        .checked_sub(RESPONSE_WRITE_RESERVE)
-        .filter(|budget| *budget >= Duration::from_millis(50))
-        .ok_or(ClientError::Deadline)?;
-    invocation.deadline_ms = runtime_budget.as_millis().min(u128::from(u64::MAX)) as u64;
-    stream.set_read_timeout(Some(remaining))?;
-    stream.set_write_timeout(Some(remaining))?;
-    write_frame(&mut stream, &RpcRequest::invocation(invocation))?;
-    let response = read_frame(&mut stream)?;
+    invocation.deadline_ms = runtime_deadline_ms(remaining)?;
+    let response = exchange_invocation(&mut stream, invocation, remaining)?;
     drop(child);
     Ok(response)
+}
+
+fn runtime_deadline_ms(remaining: Duration) -> Result<u64, ClientError> {
+    remaining
+        .checked_sub(RESPONSE_WRITE_RESERVE)
+        .filter(|budget| *budget >= Duration::from_millis(50))
+        .ok_or(ClientError::Deadline)
+        .map(|budget| budget.as_millis().min(u128::from(u64::MAX)) as u64)
+}
+
+fn exchange_invocation(
+    stream: &mut UnixStream,
+    invocation: Invocation,
+    remaining: Duration,
+) -> Result<RpcResponse, ClientError> {
+    stream.set_read_timeout(Some(remaining))?;
+    stream.set_write_timeout(Some(remaining))?;
+    write_frame(stream, &RpcRequest::invocation(invocation))?;
+    Ok(read_frame(stream)?)
 }
 
 pub fn daemon_status() -> Result<Value, ClientError> {
@@ -135,12 +147,16 @@ fn compatible_daemon_status(deadline: Instant) -> Result<Option<ControlResponse>
 }
 
 fn stop_incompatible_daemon(deadline: Instant) -> Result<(), ClientError> {
+    stop_running_daemon(deadline)?;
+    wait_for_socket_removal(deadline)
+}
+
+fn stop_running_daemon(deadline: Instant) -> Result<(), ClientError> {
     let stopped = send_control(
         ControlAction::Stop,
         deadline.saturating_duration_since(Instant::now()),
     )?;
-    control_value(stopped)?;
-    wait_for_socket_removal(deadline)
+    control_value(stopped).map(|_| ())
 }
 
 fn daemon_absent(error: &ClientError) -> bool {
@@ -155,8 +171,12 @@ fn daemon_absent(error: &ClientError) -> bool {
 }
 
 fn wait_for_socket_removal(deadline: Instant) -> Result<(), ClientError> {
+    wait_for_path_removal(&socket_path(), deadline)
+}
+
+fn wait_for_path_removal(path: &Path, deadline: Instant) -> Result<(), ClientError> {
     while Instant::now() < deadline {
-        if !socket_path().exists() {
+        if !path.exists() {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(5));
@@ -165,13 +185,33 @@ fn wait_for_socket_removal(deadline: Instant) -> Result<(), ClientError> {
 }
 
 fn send_control(action: ControlAction, timeout: Duration) -> Result<ControlResponse, ClientError> {
-    let mut stream = UnixStream::connect(socket_path())?;
-    let timeout = timeout.max(Duration::from_millis(50));
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
+    send_control_at(&socket_path(), action, timeout)
+}
+
+fn send_control_at(
+    path: &Path,
+    action: ControlAction,
+    timeout: Duration,
+) -> Result<ControlResponse, ClientError> {
+    let mut stream = connect_control_stream(path, timeout)?;
     let request = ControlRequest::new(control_request_id(), action);
     write_frame(&mut stream, &request)?;
     let response: ControlResponse = read_frame(&mut stream)?;
+    validate_control_response(&request, response)
+}
+
+fn connect_control_stream(path: &Path, timeout: Duration) -> Result<UnixStream, ClientError> {
+    let stream = UnixStream::connect(path)?;
+    let timeout = timeout.max(Duration::from_millis(50));
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    Ok(stream)
+}
+
+fn validate_control_response(
+    request: &ControlRequest,
+    response: ControlResponse,
+) -> Result<ControlResponse, ClientError> {
     if response.control_protocol != manuvra_protocol::CONTROL_PROTOCOL
         || response.request_id != request.request_id
     {
@@ -212,10 +252,18 @@ fn launch_after_connect_error(
     error: io::Error,
     deadline: Instant,
 ) -> Result<(UnixStream, Option<Child>), ClientError> {
-    match error.kind() {
-        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => launch_and_connect(deadline),
-        _ => Err(ClientError::Io(error)),
+    if connect_error_means_absent(&error) {
+        launch_and_connect(deadline)
+    } else {
+        Err(ClientError::Io(error))
     }
+}
+
+fn connect_error_means_absent(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+    )
 }
 
 fn launch_and_connect(deadline: Instant) -> Result<(UnixStream, Option<Child>), ClientError> {
@@ -243,13 +291,22 @@ fn connect_until_path(path: &Path, deadline: Instant) -> Result<UnixStream, Clie
 }
 
 fn launch_daemon() -> Result<Child, ClientError> {
+    deny_disabled_autostart()?;
+    spawn_installed_daemon(&Installation::current()?)
+}
+
+fn deny_disabled_autostart() -> Result<(), ClientError> {
     if std::env::var_os("MANUVRA_NO_AUTOSTART").is_some() {
-        return Err(ClientError::Launch(
+        Err(ClientError::Launch(
             "daemon autostart is disabled".to_owned(),
-        ));
+        ))
+    } else {
+        Ok(())
     }
-    let installation = Installation::current()?;
-    daemon_launch_command(&installation)
+}
+
+fn spawn_installed_daemon(installation: &Installation) -> Result<Child, ClientError> {
+    daemon_launch_command(installation)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -283,20 +340,14 @@ impl DaemonSocket {
 
     fn bind_at(root: PathBuf) -> Result<Self, io::Error> {
         ensure_runtime_root(&root)?;
-        let lock = open_daemon_lock(&root.join("daemon.lock"))?;
-        acquire_lock(&lock)?;
-        let socket_path = root.join("daemon.sock");
-        remove_stale_socket(&socket_path)?;
-        let listener = UnixListener::bind(&socket_path)?;
-        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
-        let metadata = fs::symlink_metadata(&socket_path)?;
-        validate_socket_metadata(&metadata)?;
+        let lock = exclusive_daemon_lock(&root)?;
+        let bound = bind_private_socket(&root)?;
         Ok(Self {
-            listener,
+            listener: bound.listener,
             _lock: lock,
-            socket_path,
-            socket_device: metadata.dev(),
-            socket_inode: metadata.ino(),
+            socket_path: bound.socket_path,
+            socket_device: bound.device,
+            socket_inode: bound.inode,
         })
     }
 
@@ -321,26 +372,65 @@ impl Drop for DaemonSocket {
     }
 }
 
+fn exclusive_daemon_lock(root: &Path) -> io::Result<File> {
+    let lock = open_daemon_lock(&root.join("daemon.lock"))?;
+    acquire_lock(&lock)?;
+    Ok(lock)
+}
+
+struct BoundDaemonSocket {
+    listener: UnixListener,
+    socket_path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+fn bind_private_socket(root: &Path) -> io::Result<BoundDaemonSocket> {
+    let socket_path = root.join("daemon.sock");
+    remove_stale_socket(&socket_path)?;
+    let listener = UnixListener::bind(&socket_path)?;
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
+    let metadata = fs::symlink_metadata(&socket_path)?;
+    validate_socket_metadata(&metadata)?;
+    Ok(BoundDaemonSocket {
+        listener,
+        socket_path,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
 fn ensure_runtime_root(root: &Path) -> io::Result<()> {
     if root.exists() {
-        let metadata = fs::symlink_metadata(root)?;
-        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "runtime root is unsafe",
-            ));
-        }
-        if metadata.uid() != unsafe { libc::geteuid() } {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "runtime root belongs to a different user",
-            ));
-        }
+        validate_existing_runtime_root(root)?;
     } else {
         fs::create_dir_all(root)?;
     }
     fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
     Ok(())
+}
+
+fn validate_existing_runtime_root(root: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(root)?;
+    if !is_real_directory(&metadata) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "runtime root is unsafe",
+        ));
+    }
+    reject_foreign_uid(metadata.uid(), "runtime root belongs to a different user")
+}
+
+fn is_real_directory(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_dir() && !metadata.file_type().is_symlink()
+}
+
+fn reject_foreign_uid(uid: u32, message: &str) -> io::Result<()> {
+    if uid == unsafe { libc::geteuid() } {
+        Ok(())
+    } else {
+        Err(io::Error::new(io::ErrorKind::PermissionDenied, message))
+    }
 }
 
 fn open_daemon_lock(path: &Path) -> io::Result<File> {
@@ -573,5 +663,109 @@ mod tests {
         let missing = temp.path().join("missing.sock");
         let error = connect_until_path(&missing, Instant::now() + Duration::from_millis(10));
         assert!(error.is_err());
+    }
+
+    #[test]
+    fn connect_absence_and_socket_removal_wait_are_bounded() {
+        assert!(connect_error_means_absent(&io::Error::from(
+            io::ErrorKind::NotFound
+        )));
+        assert!(connect_error_means_absent(&io::Error::from(
+            io::ErrorKind::ConnectionRefused
+        )));
+        assert!(!connect_error_means_absent(&io::Error::from(
+            io::ErrorKind::PermissionDenied
+        )));
+
+        let denied = launch_after_connect_error(
+            io::Error::from(io::ErrorKind::PermissionDenied),
+            Instant::now() + Duration::from_millis(20),
+        );
+        assert!(matches!(denied, Err(ClientError::Io(_))));
+
+        let temp = tempfile::tempdir().unwrap();
+        let gone = temp.path().join("already-gone.sock");
+        wait_for_path_removal(&gone, Instant::now() + Duration::from_millis(20)).unwrap();
+
+        let lingering = temp.path().join("lingering.sock");
+        fs::write(&lingering, b"keep").unwrap();
+        let timeout = wait_for_path_removal(&lingering, Instant::now() + Duration::from_millis(15));
+        assert!(matches!(timeout, Err(ClientError::Deadline)));
+        assert!(lingering.exists());
+    }
+
+    #[test]
+    fn control_exchange_accepts_matching_envelopes_and_rejects_mismatches() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path = temp.path().join("control.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: ControlRequest = read_frame(&mut stream).unwrap();
+            write_frame(
+                &mut stream,
+                &ControlResponse {
+                    control_protocol: manuvra_protocol::CONTROL_PROTOCOL,
+                    request_id: request.request_id,
+                    ok: true,
+                    daemon: serde_json::json!({"running": true}),
+                    error: None,
+                },
+            )
+            .unwrap();
+        });
+        let status =
+            send_control_at(&socket_path, ControlAction::Status, Duration::from_secs(1)).unwrap();
+        assert!(status.ok);
+        assert_eq!(status.daemon["running"], true);
+        server.join().unwrap();
+
+        let mismatched = temp.path().join("mismatch.sock");
+        let listener = UnixListener::bind(&mismatched).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: ControlRequest = read_frame(&mut stream).unwrap();
+            write_frame(
+                &mut stream,
+                &ControlResponse {
+                    control_protocol: 99,
+                    request_id: request.request_id,
+                    ok: true,
+                    daemon: serde_json::json!({}),
+                    error: None,
+                },
+            )
+            .unwrap();
+        });
+        let error = send_control_at(&mismatched, ControlAction::Stop, Duration::from_secs(1));
+        assert!(
+            matches!(error, Err(ClientError::Launch(message)) if message.contains("control response envelope"))
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn runtime_root_rejects_symlinks_and_accepts_an_owned_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let created = temp.path().join("created");
+        ensure_runtime_root(&created).unwrap();
+        ensure_runtime_root(&created).unwrap();
+        assert_eq!(
+            fs::metadata(&created).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let linked = temp.path().join("linked-root");
+        symlink(&created, &linked).unwrap();
+        assert!(ensure_runtime_root(&linked).is_err());
+    }
+
+    #[test]
+    fn runtime_budget_rejects_too_small_remaining_time() {
+        assert!(runtime_deadline_ms(RESPONSE_WRITE_RESERVE + Duration::from_millis(50)).is_ok());
+        assert!(matches!(
+            runtime_deadline_ms(Duration::from_millis(10)),
+            Err(ClientError::Deadline)
+        ));
     }
 }

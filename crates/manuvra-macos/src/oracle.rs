@@ -39,16 +39,33 @@ mod debug {
         if std::env::var_os("MANUVRA_CP07_ORACLE_PATH").is_none() {
             return action();
         }
-        let request = RequestContext {
+        traced_request(context, operation, action)
+    }
+
+    fn traced_request(
+        context: &AdapterContext,
+        operation: &AdapterOperation,
+        action: impl FnOnce() -> AdapterReply,
+    ) -> AdapterReply {
+        let previous = REQUEST.replace(Some(request_context(context, operation)));
+        record("focus_before", crate::ax::focused_window_snapshot());
+        record("operation_begin", Value::Null);
+        let reply = action();
+        record_operation_end(&reply);
+        REQUEST.replace(previous);
+        reply
+    }
+
+    fn request_context(context: &AdapterContext, operation: &AdapterOperation) -> RequestContext {
+        RequestContext {
             session_id: context.session_id.clone(),
             action_sequence: context.action_sequence,
             command: operation.command.clone(),
             mode: context.mode.as_str().to_owned(),
-        };
-        let previous = REQUEST.replace(Some(request));
-        record("focus_before", crate::ax::focused_window_snapshot());
-        record("operation_begin", Value::Null);
-        let reply = action();
+        }
+    }
+
+    fn record_operation_end(reply: &AdapterReply) {
         record(
             "operation_end",
             json!({
@@ -58,53 +75,75 @@ mod debug {
             }),
         );
         record("focus_after", crate::ax::focused_window_snapshot());
-        REQUEST.replace(previous);
-        reply
     }
 
     pub(crate) fn record(kind: &str, details: Value) {
         let Some(path) = std::env::var_os("MANUVRA_CP07_ORACLE_PATH") else {
             return;
         };
+        write_oracle_row(path, kind, details);
+    }
+
+    fn write_oracle_row(path: std::ffi::OsString, kind: &str, details: Value) {
         REQUEST.with_borrow(|request| {
             let Some(request) = request else { return };
-            let row = json!({
-                "monotonic_ms": STARTED.get_or_init(Instant::now).elapsed().as_millis() as u64,
-                "pid": std::process::id(),
-                "session_id": request.session_id,
-                "action_sequence": request.action_sequence,
-                "command": request.command,
-                "mode": request.mode,
-                "kind": kind,
-                "details": details,
-            });
-            let _guard = WRITE_LOCK.lock().expect("CP-07 oracle write lock");
-            if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-                let _ = writeln!(file, "{row}");
-            }
+            append_oracle_row(path, oracle_row(request, kind, details));
         });
     }
 
+    fn oracle_row(request: &RequestContext, kind: &str, details: Value) -> Value {
+        json!({
+            "monotonic_ms": STARTED.get_or_init(Instant::now).elapsed().as_millis() as u64,
+            "pid": std::process::id(),
+            "session_id": request.session_id,
+            "action_sequence": request.action_sequence,
+            "command": request.command,
+            "mode": request.mode,
+            "kind": kind,
+            "details": details,
+        })
+    }
+
+    fn append_oracle_row(path: std::ffi::OsString, row: Value) {
+        let _guard = WRITE_LOCK.lock().expect("CP-07 oracle write lock");
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(file, "{row}");
+        }
+    }
+
     pub(crate) fn barrier(name: &str, deadline: Instant, cancellation: &AtomicBool) {
-        let Some(path) = std::env::var_os("MANUVRA_CP07_BARRIER_PATH") else {
+        let Some(config) = barrier_config() else {
             return;
         };
-        let Ok(config) = fs::read(&path).and_then(|bytes| {
-            serde_json::from_slice::<Value>(&bytes)
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-        }) else {
+        if !barrier_matches(name, &config) {
             return;
-        };
-        let matches = REQUEST.with_borrow(|request| {
+        }
+        wait_for_barrier_release(name, deadline, cancellation, &config);
+    }
+
+    fn barrier_config() -> Option<Value> {
+        let path = std::env::var_os("MANUVRA_CP07_BARRIER_PATH")?;
+        fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+    }
+
+    fn barrier_matches(name: &str, config: &Value) -> bool {
+        REQUEST.with_borrow(|request| {
             request.as_ref().is_some_and(|request| {
                 config["name"] == name
                     && config["session_id"] == request.session_id
                     && config["action_sequence"] == request.action_sequence
             })
-        });
-        if !matches {
-            return;
-        }
+        })
+    }
+
+    fn wait_for_barrier_release(
+        name: &str,
+        deadline: Instant,
+        cancellation: &AtomicBool,
+        config: &Value,
+    ) {
         let Some(reached_path) = config["reached_path"].as_str() else {
             return;
         };
@@ -113,14 +152,58 @@ mod debug {
         };
         record("barrier_reached", json!({"name": name}));
         let _ = fs::write(reached_path, b"reached");
-        while Instant::now() < deadline && !cancellation.load(Ordering::SeqCst) {
-            if std::path::Path::new(release_path).is_file() {
-                record("barrier_released", json!({"name": name}));
-                return;
+        poll_barrier_release(name, deadline, cancellation, release_path);
+    }
+
+    fn poll_barrier_release(
+        name: &str,
+        deadline: Instant,
+        cancellation: &AtomicBool,
+        release_path: &str,
+    ) {
+        if !poll_until_released(name, deadline, cancellation, release_path) {
+            record("barrier_aborted", json!({"name": name}));
+        }
+    }
+
+    fn poll_until_released(
+        name: &str,
+        deadline: Instant,
+        cancellation: &AtomicBool,
+        release_path: &str,
+    ) -> bool {
+        wait_while_open(deadline, cancellation, || {
+            barrier_released(name, release_path)
+        })
+    }
+
+    pub(super) fn wait_while_open(
+        deadline: Instant,
+        cancellation: &AtomicBool,
+        mut released: impl FnMut() -> bool,
+    ) -> bool {
+        loop {
+            if !barrier_should_wait(deadline, cancellation) {
+                return false;
+            }
+            if released() {
+                return true;
             }
             std::thread::park_timeout(Duration::from_millis(5));
         }
-        record("barrier_aborted", json!({"name": name}));
+    }
+
+    fn barrier_should_wait(deadline: Instant, cancellation: &AtomicBool) -> bool {
+        Instant::now() < deadline && !cancellation.load(Ordering::SeqCst)
+    }
+
+    fn barrier_released(name: &str, release_path: &str) -> bool {
+        std::path::Path::new(release_path)
+            .is_file()
+            .then(|| {
+                record("barrier_released", json!({"name": name}));
+            })
+            .is_some()
     }
 
     pub(crate) fn barrier_for(
@@ -132,18 +215,12 @@ mod debug {
         if std::env::var_os("MANUVRA_CP07_BARRIER_PATH").is_none() {
             return;
         }
-        let request = RequestContext {
-            session_id: context.session_id.clone(),
-            action_sequence: context.action_sequence,
-            command: operation.command.clone(),
-            mode: context.mode.as_str().to_owned(),
-        };
-        let previous = REQUEST.replace(Some(request));
+        let previous = REQUEST.replace(Some(request_context(context, operation)));
         barrier(name, context.deadline, cancellation);
         REQUEST.replace(previous);
     }
 
-    fn delivery_name(delivery: &AdapterDelivery) -> &'static str {
+    pub(super) fn delivery_name(delivery: &AdapterDelivery) -> &'static str {
         match delivery {
             AdapterDelivery::Rejected => "rejected",
             AdapterDelivery::Confirmed => "confirmed",
@@ -177,4 +254,77 @@ pub(crate) fn barrier_for(
     _name: &str,
     _cancellation: &AtomicBool,
 ) {
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use manuvra_runtime::{AdapterOperation, AdapterReply, ExecutionMode};
+    use serde_json::json;
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn oracle_helpers_are_noops_without_cp07_paths() {
+        let context = AdapterContext {
+            session_id: "s".to_owned(),
+            target_id: "macos_test".to_owned(),
+            target_generation: 1,
+            action_sequence: 1,
+            reference_namespace: "n".to_owned(),
+            reference_epoch: 1,
+            frame_token: None,
+            mode: ExecutionMode::Background,
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        let operation = AdapterOperation::new("observe.tree".to_owned(), json!({}));
+        let reply = within_request(&context, &operation, || {
+            AdapterReply::confirmed(json!({"ok": true}), None)
+        });
+        assert_eq!(reply.response["ok"], true);
+        record("unused", json!({}));
+        barrier("during_capture", context.deadline, &AtomicBool::new(false));
+        barrier_for(
+            &context,
+            &operation,
+            "during_native_resolution",
+            &AtomicBool::new(false),
+        );
+        assert_eq!(
+            super::debug::delivery_name(&manuvra_runtime::AdapterDelivery::Rejected),
+            "rejected"
+        );
+        assert_eq!(
+            super::debug::delivery_name(&manuvra_runtime::AdapterDelivery::Confirmed),
+            "confirmed"
+        );
+        assert_eq!(
+            super::debug::delivery_name(&manuvra_runtime::AdapterDelivery::Unknown),
+            "unknown"
+        );
+        assert!(super::debug::wait_while_open(
+            Instant::now() + Duration::from_secs(1),
+            &AtomicBool::new(false),
+            || true
+        ));
+        assert!(!super::debug::wait_while_open(
+            Instant::now(),
+            &AtomicBool::new(false),
+            || false
+        ));
+        assert!(!super::debug::wait_while_open(
+            Instant::now() + Duration::from_secs(1),
+            &AtomicBool::new(true),
+            || false
+        ));
+        let mut polls = 0;
+        assert!(super::debug::wait_while_open(
+            Instant::now() + Duration::from_secs(1),
+            &AtomicBool::new(false),
+            || {
+                polls += 1;
+                polls > 1
+            }
+        ));
+    }
 }

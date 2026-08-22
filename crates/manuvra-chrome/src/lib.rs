@@ -61,6 +61,12 @@ struct DiscoveredTarget {
     title: Option<String>,
 }
 
+struct DiscoveryRound {
+    targets: Vec<DiscoveredTarget>,
+    diagnostics: HashMap<String, String>,
+    reachable: HashSet<ChromeEndpoint>,
+}
+
 impl ChromeAdapter {
     pub fn from_env() -> Result<Self, EndpointError> {
         let configured = std::env::var("MANUVRA_CHROME_ENDPOINTS").ok();
@@ -85,106 +91,47 @@ impl ChromeAdapter {
         &self,
         deadline: Option<Instant>,
     ) -> Result<Vec<TargetDescriptor>, AdapterError> {
-        let mut discovered = Vec::new();
-        let mut diagnostics = HashMap::new();
-        let mut reachable = HashSet::new();
+        let discovered = self.discover_until(deadline)?;
+        let mut state = self.state.lock().expect("Chrome adapter state");
+        apply_discovered_targets(&mut state, discovered);
+        Ok(present_descriptors(&state))
+    }
+
+    fn discover_until(&self, deadline: Option<Instant>) -> Result<DiscoveryRound, AdapterError> {
+        let mut discovered = DiscoveryRound {
+            targets: Vec::new(),
+            diagnostics: HashMap::new(),
+            reachable: HashSet::new(),
+        };
         for endpoint in &self.endpoints {
-            let timeout = deadline
-                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-                .unwrap_or(DISCOVERY_TIMEOUT)
-                .min(DISCOVERY_TIMEOUT);
-            if timeout.is_zero() {
-                return Err(adapter_error(
-                    "timed_out",
-                    "target discovery deadline elapsed",
-                ));
-            }
+            let timeout = discovery_budget(deadline)?;
             match discover(endpoint, timeout) {
                 Ok(targets) => {
-                    diagnostics.insert(endpoint.label(), "reachable".to_owned());
-                    reachable.insert(endpoint.clone());
-                    discovered.extend(targets);
+                    discovered
+                        .diagnostics
+                        .insert(endpoint.label(), "reachable".to_owned());
+                    discovered.reachable.insert(endpoint.clone());
+                    discovered.targets.extend(targets);
                 }
                 Err(error) => {
-                    let status = if endpoint::connection_refused_text(&error) {
-                        "refused".to_owned()
-                    } else {
-                        bounded(&error)
-                    };
-                    diagnostics.insert(endpoint.label(), status);
+                    discovered
+                        .diagnostics
+                        .insert(endpoint.label(), endpoint_status(&error));
                 }
             }
         }
-        let mut state = self.state.lock().expect("Chrome adapter state");
-        let seen = discovered
-            .iter()
-            .map(|target| target.target_id.clone())
-            .collect::<HashSet<_>>();
-        for target in discovered {
-            refresh_target(&mut state, target);
-        }
-        for target in state.targets.values_mut() {
-            if reachable.contains(&target.endpoint) {
-                target.present = seen.contains(&target.descriptor.target_id);
-            }
-        }
-        state.diagnostics = diagnostics;
-        Ok(state
-            .targets
-            .values()
-            .filter(|target| target.present)
-            .map(|target| target.descriptor.clone())
-            .collect())
+        Ok(discovered)
     }
 
     fn connection(&self, target_id: &str, raw: bool) -> Result<Arc<CdpClient>, AdapterError> {
         let mut state = self.state.lock().expect("Chrome adapter state");
-        let disconnected = state
-            .targets
-            .get(target_id)
-            .filter(|target| target.present)
-            .and_then(|target| {
-                if raw {
-                    target.raw.as_ref()
-                } else {
-                    target.observation.as_ref()
-                }
-            })
-            .is_some_and(|client| client.is_disconnected());
-        if disconnected {
-            let generation = state.next_generation;
-            state.next_generation = state.next_generation.saturating_add(1);
-            if let Some(target) = state.targets.get_mut(target_id) {
-                target.descriptor.generation = generation;
-                target.observation = None;
-                target.raw = None;
-            }
+        if retire_disconnected(&mut state, target_id, raw) {
             return Err(adapter_error(
                 "target_stale",
                 "Chrome connection incarnation changed",
             ));
         }
-        let target = state
-            .targets
-            .get_mut(target_id)
-            .filter(|target| target.present)
-            .ok_or_else(|| adapter_error("target_not_found", "Chrome target is unavailable"))?;
-        let slot = if raw {
-            &mut target.raw
-        } else {
-            &mut target.observation
-        };
-        if let Some(client) = slot {
-            return Ok(client.clone());
-        }
-        let url = target
-            .endpoint
-            .websocket_url(&target.websocket_path)
-            .map_err(|error| adapter_error("capability_unavailable", &error.to_string()))?;
-        let client = CdpClient::connect(url, !raw)
-            .map_err(|error| adapter_error("capability_unavailable", &error))?;
-        *slot = Some(client.clone());
-        Ok(client)
+        open_or_reuse_client(&mut state, target_id, raw)
     }
 
     fn validate_generation(&self, context: &AdapterContext) -> Result<(), AdapterError> {
@@ -207,30 +154,24 @@ impl ChromeAdapter {
     }
 
     fn evidence(&self, context: &AdapterContext, operation: &AdapterOperation) -> AdapterReply {
-        let kind = operation
+        match operation
             .input
             .get("kind")
             .and_then(Value::as_str)
-            .unwrap_or_default();
-        if kind == "diagnostics" {
-            return self.diagnostics_reply(context);
+            .unwrap_or_default()
+        {
+            "diagnostics" => self.diagnostics_reply(context),
+            "timings" => self.timings_reply(context),
+            kind => self.journal_evidence(context, kind),
         }
-        if kind == "timings" {
-            return self.timings_reply(context);
-        }
+    }
+
+    fn journal_evidence(&self, context: &AdapterContext, kind: &str) -> AdapterReply {
         let client = match self.connection(&context.target_id, false) {
             Ok(client) => client,
             Err(error) => return rejected(error),
         };
-        let cursor = self
-            .state
-            .lock()
-            .expect("Chrome adapter state")
-            .sessions
-            .get(&context.session_id)
-            .filter(|session| session.target_id == context.target_id)
-            .map(|session| session.cursor)
-            .unwrap_or(0);
+        let cursor = self.session_cursor(context);
         let snapshot = client.snapshot_since(cursor);
         if snapshot.overflowed {
             return rejected(adapter_error(
@@ -256,6 +197,17 @@ impl ChromeAdapter {
                 "events": events,
             }),
         )
+    }
+
+    fn session_cursor(&self, context: &AdapterContext) -> u64 {
+        self.state
+            .lock()
+            .expect("Chrome adapter state")
+            .sessions
+            .get(&context.session_id)
+            .filter(|session| session.target_id == context.target_id)
+            .map(|session| session.cursor)
+            .unwrap_or(0)
     }
 
     fn diagnostics_reply(&self, context: &AdapterContext) -> AdapterReply {
@@ -354,6 +306,82 @@ impl ChromeAdapter {
         issued
             .then_some(())
             .ok_or_else(|| adapter_error("element_stale", "element ref was not issued here"))
+    }
+
+    fn dispatch_invoke(
+        &self,
+        context: &AdapterContext,
+        operation: &AdapterOperation,
+        cancellation: Arc<AtomicBool>,
+    ) -> AdapterReply {
+        match operation.command.as_str() {
+            "observe.evidence" => self.evidence(context, operation),
+            command if command.starts_with("observe.") => {
+                self.invoke_observe(context, operation, cancellation)
+            }
+            "raw.cdp" if is_raw_query(operation) => {
+                self.invoke_raw_query(context, operation, cancellation)
+            }
+            _ => self.invoke_mutation(context, operation, cancellation),
+        }
+    }
+
+    fn invoke_observe(
+        &self,
+        context: &AdapterContext,
+        operation: &AdapterOperation,
+        cancellation: Arc<AtomicBool>,
+    ) -> AdapterReply {
+        let observation = match self.connection(&context.target_id, false) {
+            Ok(client) => client,
+            Err(error) => return rejected(error),
+        };
+        let reply = page::observe(&observation, context, operation, cancellation);
+        if matches!(operation.command.as_str(), "observe.query" | "observe.tree") {
+            self.register_observation_refs(context, &reply);
+        }
+        reply
+    }
+
+    fn invoke_raw_query(
+        &self,
+        context: &AdapterContext,
+        operation: &AdapterOperation,
+        cancellation: Arc<AtomicBool>,
+    ) -> AdapterReply {
+        if let Err(error) = self.connection(&context.target_id, false) {
+            return rejected(error);
+        }
+        let raw = match self.connection(&context.target_id, true) {
+            Ok(client) => client,
+            Err(error) => return rejected(error),
+        };
+        page::raw_query(&raw, context, operation, cancellation)
+    }
+
+    fn invoke_mutation(
+        &self,
+        context: &AdapterContext,
+        operation: &AdapterOperation,
+        cancellation: Arc<AtomicBool>,
+    ) -> AdapterReply {
+        let observation = match self.connection(&context.target_id, false) {
+            Ok(client) => client,
+            Err(error) => return rejected(error),
+        };
+        let raw = match raw_client(self, context, operation) {
+            Ok(client) => client,
+            Err(error) => return rejected(error),
+        };
+        let reply = page::mutate(
+            &observation,
+            raw.as_deref(),
+            context,
+            operation,
+            cancellation,
+        );
+        self.record_timing(context, operation, &reply);
+        reply
     }
 }
 
@@ -475,47 +503,124 @@ impl TargetAdapter for ChromeAdapter {
         if let Err(error) = self.validate_generation(context) {
             return rejected(error);
         }
-        if operation.command == "observe.evidence" {
-            return self.evidence(context, operation);
-        }
-        let observation = match self.connection(&context.target_id, false) {
-            Ok(client) => client,
-            Err(error) => return rejected(error),
-        };
-        if operation.command.starts_with("observe.") {
-            let reply = page::observe(&observation, context, operation, cancellation);
-            if matches!(operation.command.as_str(), "observe.query" | "observe.tree") {
-                self.register_observation_refs(context, &reply);
-            }
-            return reply;
-        }
-        if operation.command == "raw.cdp"
-            && operation.input.get("intent").and_then(Value::as_str) == Some("query")
-        {
-            let raw = match self.connection(&context.target_id, true) {
-                Ok(client) => client,
-                Err(error) => return rejected(error),
-            };
-            return page::raw_query(&raw, context, operation, cancellation);
-        }
-        let raw = if operation.command == "raw.cdp" {
-            match self.connection(&context.target_id, true) {
-                Ok(client) => Some(client),
-                Err(error) => return rejected(error),
-            }
-        } else {
-            None
-        };
-        let reply = page::mutate(
-            &observation,
-            raw.as_deref(),
-            context,
-            operation,
-            cancellation,
-        );
-        self.record_timing(context, operation, &reply);
-        reply
+        self.dispatch_invoke(context, operation, cancellation)
     }
+}
+
+fn is_raw_query(operation: &AdapterOperation) -> bool {
+    operation.input.get("intent").and_then(Value::as_str) == Some("query")
+}
+
+fn raw_client(
+    adapter: &ChromeAdapter,
+    context: &AdapterContext,
+    operation: &AdapterOperation,
+) -> Result<Option<Arc<CdpClient>>, AdapterError> {
+    if operation.command != "raw.cdp" {
+        return Ok(None);
+    }
+    adapter.connection(&context.target_id, true).map(Some)
+}
+
+fn discovery_budget(deadline: Option<Instant>) -> Result<Duration, AdapterError> {
+    let timeout = deadline
+        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        .unwrap_or(DISCOVERY_TIMEOUT)
+        .min(DISCOVERY_TIMEOUT);
+    if timeout.is_zero() {
+        return Err(adapter_error(
+            "timed_out",
+            "target discovery deadline elapsed",
+        ));
+    }
+    Ok(timeout)
+}
+
+fn endpoint_status(error: &str) -> String {
+    if endpoint::connection_refused_text(error) {
+        "refused".to_owned()
+    } else {
+        bounded(error)
+    }
+}
+
+fn retire_disconnected(state: &mut State, target_id: &str, raw: bool) -> bool {
+    let disconnected = state
+        .targets
+        .get(target_id)
+        .filter(|target| target.present)
+        .and_then(|target| {
+            if raw {
+                target.raw.as_ref()
+            } else {
+                target.observation.as_ref()
+            }
+        })
+        .is_some_and(|client| client.is_disconnected());
+    if disconnected {
+        let generation = state.next_generation;
+        state.next_generation = state.next_generation.saturating_add(1);
+        if let Some(target) = state.targets.get_mut(target_id) {
+            target.descriptor.generation = generation;
+            target.observation = None;
+            target.raw = None;
+        }
+    }
+    disconnected
+}
+
+fn open_or_reuse_client(
+    state: &mut State,
+    target_id: &str,
+    raw: bool,
+) -> Result<Arc<CdpClient>, AdapterError> {
+    let target = state
+        .targets
+        .get_mut(target_id)
+        .filter(|target| target.present)
+        .ok_or_else(|| adapter_error("target_not_found", "Chrome target is unavailable"))?;
+    let slot = if raw {
+        &mut target.raw
+    } else {
+        &mut target.observation
+    };
+    if let Some(client) = slot {
+        return Ok(client.clone());
+    }
+    let url = target
+        .endpoint
+        .websocket_url(&target.websocket_path)
+        .map_err(|error| adapter_error("capability_unavailable", &error.to_string()))?;
+    let client = CdpClient::connect(url, !raw)
+        .map_err(|error| adapter_error("capability_unavailable", &error))?;
+    *slot = Some(client.clone());
+    Ok(client)
+}
+
+fn apply_discovered_targets(state: &mut State, discovered: DiscoveryRound) {
+    let seen = discovered
+        .targets
+        .iter()
+        .map(|target| target.target_id.clone())
+        .collect::<HashSet<_>>();
+    for target in discovered.targets {
+        refresh_target(state, target);
+    }
+    for target in state.targets.values_mut() {
+        if discovered.reachable.contains(&target.endpoint) {
+            target.present = seen.contains(&target.descriptor.target_id);
+        }
+    }
+    state.diagnostics = discovered.diagnostics;
+}
+
+fn present_descriptors(state: &State) -> Vec<TargetDescriptor> {
+    state
+        .targets
+        .values()
+        .filter(|target| target.present)
+        .map(|target| target.descriptor.clone())
+        .collect()
 }
 
 fn discover(endpoint: &Endpoint, timeout: Duration) -> Result<Vec<DiscoveredTarget>, String> {
@@ -682,6 +787,7 @@ fn bounded(value: &str) -> String {
 mod tests {
     use super::*;
     use manuvra_runtime::{ExecutionMode, TargetAdapter};
+    use std::thread;
     use std::time::Instant;
 
     #[test]
@@ -911,6 +1017,502 @@ mod tests {
                 .any(|warning| warning == "chrome_endpoint_refused"),
             "{}",
             reply.value
+        );
+    }
+
+    fn install_page_fixture(chrome: &crate::transport::test_support::ScriptedChrome) {
+        chrome.reply(
+            "Page.getFrameTree",
+            json!({"frameTree": {"frame": {"id": "main", "loaderId": "loader-1"}}}),
+        );
+        chrome.reply(
+            "Accessibility.getFullAXTree",
+            json!({"nodes": [{
+                "nodeId": "1",
+                "backendDOMNodeId": 42,
+                "role": {"value": "button"},
+                "name": {"value": "Save changes"},
+                "ignored": false
+            }]}),
+        );
+        chrome.reply(
+            "DOM.getBoxModel",
+            json!({"model": {"content": [10, 10, 90, 10, 90, 50, 10, 50]}}),
+        );
+        chrome.reply(
+            "DOM.describeNode",
+            json!({"node": {"attributes": ["id", "save"]}}),
+        );
+        chrome.reply("DOM.resolveNode", json!({"object": {"objectId": "obj-1"}}));
+        chrome.reply(
+            "Runtime.callFunctionOn",
+            json!({"result": {"value": "Save changes"}}),
+        );
+        chrome.reply(
+            "Page.getLayoutMetrics",
+            json!({"visualViewport": {"clientWidth": 800, "clientHeight": 600}}),
+        );
+        chrome.reply("Page.captureScreenshot", json!({"data": fixture_png()}));
+        chrome.reply("Page.navigate", json!({"loaderId": "loader-2"}));
+        chrome.events_after(
+            "Page.navigate",
+            vec![json!({
+                "method": "Page.lifecycleEvent",
+                "params": {"name": "DOMContentLoaded", "loaderId": "loader-2", "frameId": "main"}
+            })],
+        );
+        chrome.events_after(
+            "Input.dispatchMouseEvent",
+            vec![
+                json!({"method": "Page.frameStartedLoading", "params": {"frameId": "main"}}),
+                json!({
+                    "method": "Page.frameNavigated",
+                    "params": {"frame": {"id": "main", "loaderId": "loader-2"}}
+                }),
+                json!({
+                    "method": "Page.lifecycleEvent",
+                    "params": {"name": "load", "loaderId": "loader-2", "frameId": "main"}
+                }),
+            ],
+        );
+    }
+
+    fn fixture_png() -> String {
+        let mut png = vec![0; 24];
+        png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        png[16..20].copy_from_slice(&800_u32.to_be_bytes());
+        png[20..24].copy_from_slice(&600_u32.to_be_bytes());
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, png)
+    }
+
+    fn live_adapter() -> (
+        crate::transport::test_support::ScriptedChrome,
+        ChromeAdapter,
+        TargetDescriptor,
+        AdapterSession,
+    ) {
+        let chrome = crate::transport::test_support::ScriptedChrome::start();
+        install_page_fixture(&chrome);
+        let adapter = ChromeAdapter::new(vec![chrome.endpoint()]);
+        let targets = adapter.targets();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].owner, CHROME_OWNER);
+        let session = AdapterSession {
+            session_id: "session".to_owned(),
+            target_id: targets[0].target_id.clone(),
+            target_generation: targets[0].generation,
+        };
+        adapter
+            .session_opened(&session, Instant::now() + Duration::from_secs(1))
+            .unwrap();
+        (
+            chrome,
+            adapter,
+            targets.into_iter().next().unwrap(),
+            session,
+        )
+    }
+
+    fn live_context(target: &TargetDescriptor) -> AdapterContext {
+        AdapterContext {
+            session_id: "session".to_owned(),
+            target_id: target.target_id.clone(),
+            target_generation: target.generation,
+            action_sequence: 1,
+            reference_namespace: "n_test".to_owned(),
+            reference_epoch: 1,
+            frame_token: None,
+            mode: ExecutionMode::Background,
+            deadline: Instant::now() + Duration::from_secs(2),
+        }
+    }
+
+    #[test]
+    fn adapter_attach_prepare_and_invoke_keep_locator_frame_token_and_dispatch_results() {
+        let (chrome, adapter, target, session) = live_adapter();
+        let context = live_context(&target);
+        let cancellation = Arc::new(AtomicBool::new(false));
+
+        let mut stale = context.clone();
+        stale.target_generation = target.generation + 1;
+        assert_eq!(
+            adapter
+                .invoke(
+                    &stale,
+                    &AdapterOperation::new("observe.screenshot".to_owned(), json!({})),
+                    cancellation.clone()
+                )
+                .error
+                .unwrap()
+                .code,
+            "target_stale"
+        );
+        let mut missing = context.clone();
+        missing.target_id = "chrome_missing".to_owned();
+        assert_eq!(
+            adapter
+                .invoke(
+                    &missing,
+                    &AdapterOperation::new("observe.screenshot".to_owned(), json!({})),
+                    cancellation.clone()
+                )
+                .error
+                .unwrap()
+                .code,
+            "target_not_found"
+        );
+
+        chrome.events_after_once(
+            "Page.captureScreenshot",
+            vec![json!({"method": "DOM.childNodeInserted", "params": {}})],
+        );
+        let screenshot = adapter.invoke(
+            &context,
+            &AdapterOperation::new("observe.screenshot".to_owned(), json!({})),
+            cancellation.clone(),
+        );
+        assert_eq!(
+            screenshot.delivery,
+            manuvra_runtime::AdapterDelivery::Confirmed
+        );
+        assert_eq!(screenshot.screenshot_width, Some(800));
+        let frame_token = screenshot.frame_signature.clone().unwrap();
+
+        let prepared = adapter
+            .prepare(
+                &context,
+                &AdapterOperation::new(
+                    "action.click".to_owned(),
+                    json!({"locator": {"kind": "semantic", "role": "button", "name": "Save changes"}}),
+                ),
+                cancellation.clone(),
+            )
+            .unwrap();
+        assert_eq!(prepared.prepared.unwrap()["target"]["backend_id"], 42);
+
+        let point_stale = adapter.prepare(
+            &context,
+            &AdapterOperation::new(
+                "action.click".to_owned(),
+                json!({"locator": {"kind": "point", "x": 10, "y": 10, "frame_token": "wrong"}}),
+            ),
+            cancellation.clone(),
+        );
+        assert_eq!(point_stale.unwrap_err().code, "frame_stale");
+
+        let point_outside = adapter.prepare(
+            &context,
+            &AdapterOperation::new(
+                "action.click".to_owned(),
+                json!({"locator": {"kind": "point", "x": 900, "y": 10, "frame_token": frame_token}}),
+            ),
+            cancellation.clone(),
+        );
+        assert_eq!(point_outside.unwrap_err().code, "element_not_found");
+
+        let point = adapter
+            .prepare(
+                &context,
+                &AdapterOperation::new(
+                    "action.click".to_owned(),
+                    json!({"locator": {"kind": "point", "x": 10.0, "y": 10.0, "frame_token": screenshot.frame_signature.clone().unwrap()}}),
+                ),
+                cancellation.clone(),
+            )
+            .unwrap();
+        let clicked = adapter.invoke(&context, &point, cancellation.clone());
+        assert_eq!(
+            clicked.delivery,
+            manuvra_runtime::AdapterDelivery::Confirmed
+        );
+        assert_eq!(clicked.response["dispatched"], "click");
+        assert!(clicked.already_settled);
+
+        let typed = adapter.invoke(
+            &context,
+            &{
+                let mut operation = AdapterOperation::new(
+                    "action.type".to_owned(),
+                    json!({"text": "hi", "replace": true}),
+                );
+                operation.prepared =
+                    Some(json!({"target": {"backend_id": 42, "x": 50.0, "y": 30.0}}));
+                operation
+            },
+            cancellation.clone(),
+        );
+        assert_eq!(typed.response["dispatched"], "type");
+
+        let pressed = adapter.invoke(
+            &context,
+            &{
+                let mut operation = AdapterOperation::new(
+                    "action.press".to_owned(),
+                    json!({"key": "Enter", "locator": {"kind": "ref"}}),
+                );
+                operation.prepared =
+                    Some(json!({"target": {"backend_id": 42, "x": 50.0, "y": 30.0}}));
+                operation
+            },
+            cancellation.clone(),
+        );
+        assert_eq!(pressed.response["dispatched"], "press");
+
+        let scrolled = adapter.invoke(
+            &context,
+            &{
+                let mut operation = AdapterOperation::new(
+                    "action.scroll".to_owned(),
+                    json!({"delta_y": 40, "locator": {"kind": "ref"}}),
+                );
+                operation.prepared =
+                    Some(json!({"target": {"backend_id": 42, "x": 50.0, "y": 30.0}}));
+                operation
+            },
+            cancellation.clone(),
+        );
+        assert_eq!(scrolled.response["dispatched"], "scroll");
+        assert_eq!(
+            adapter
+                .invoke(
+                    &context,
+                    &AdapterOperation::new("action.press".to_owned(), json!({"key": "Tab"})),
+                    cancellation.clone(),
+                )
+                .response["dispatched"],
+            "press"
+        );
+        assert_eq!(
+            adapter
+                .invoke(
+                    &context,
+                    &AdapterOperation::new("action.scroll".to_owned(), json!({"delta_x": 1})),
+                    cancellation.clone(),
+                )
+                .response["dispatched"],
+            "scroll"
+        );
+
+        let navigated = adapter.invoke(
+            &context,
+            &AdapterOperation::new(
+                "action.navigate".to_owned(),
+                json!({"url": "https://example.test/"}),
+            ),
+            cancellation.clone(),
+        );
+        assert_eq!(navigated.response["loaderId"], "loader-2");
+
+        let query = adapter.invoke(
+            &context,
+            &AdapterOperation::new(
+                "observe.query".to_owned(),
+                json!({"semantic": {"role": "button", "name": "Save changes", "identifier": "save", "text": "Save changes"}, "limit": 5}),
+            ),
+            cancellation.clone(),
+        );
+        assert_eq!(query.response["matches"][0]["role"], "button");
+        let issued = query.response["matches"][0]["ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let tree = adapter.invoke(
+            &context,
+            &AdapterOperation::new("observe.tree".to_owned(), json!({})),
+            cancellation.clone(),
+        );
+        assert_eq!(tree.response["node_count"], 1);
+
+        let reused = adapter
+            .prepare(
+                &context,
+                &AdapterOperation::new(
+                    "action.click".to_owned(),
+                    json!({"locator": {"kind": "ref", "ref": issued}}),
+                ),
+                cancellation.clone(),
+            )
+            .unwrap();
+        assert_eq!(reused.prepared.unwrap()["target"]["backend_id"], 42);
+        assert_eq!(
+            adapter
+                .prepare(
+                    &context,
+                    &AdapterOperation::new(
+                        "action.click".to_owned(),
+                        json!({"locator": {"kind": "ref", "ref": "e_missing"}})
+                    ),
+                    cancellation.clone(),
+                )
+                .unwrap_err()
+                .code,
+            "element_stale"
+        );
+        assert_eq!(
+            adapter
+                .prepare(
+                    &context,
+                    &AdapterOperation::new(
+                        "action.click".to_owned(),
+                        json!({"locator": {"kind": "unknown"}})
+                    ),
+                    cancellation.clone(),
+                )
+                .unwrap_err()
+                .code,
+            "invalid_request"
+        );
+
+        let raw_query = adapter.invoke(
+            &context,
+            &AdapterOperation::new(
+                "raw.cdp".to_owned(),
+                json!({"intent": "query", "method": "Runtime.evaluate", "params": {"expression": "1"}}),
+            ),
+            cancellation.clone(),
+        );
+        assert_eq!(
+            raw_query.delivery,
+            manuvra_runtime::AdapterDelivery::Confirmed
+        );
+
+        let raw_mutate = adapter.invoke(
+            &context,
+            &AdapterOperation::new(
+                "raw.cdp".to_owned(),
+                json!({"method": "Runtime.evaluate", "params": {}}),
+            ),
+            cancellation.clone(),
+        );
+        assert_eq!(
+            raw_mutate.delivery,
+            manuvra_runtime::AdapterDelivery::Confirmed
+        );
+
+        let diagnostics = adapter.invoke(
+            &context,
+            &AdapterOperation::new(
+                "observe.evidence".to_owned(),
+                json!({"kind": "diagnostics"}),
+            ),
+            cancellation.clone(),
+        );
+        assert_eq!(diagnostics.response["kind"], "diagnostics");
+        let timings = adapter.invoke(
+            &context,
+            &AdapterOperation::new("observe.evidence".to_owned(), json!({"kind": "timings"})),
+            cancellation.clone(),
+        );
+        assert_eq!(timings.response["kind"], "timings");
+        let logs = adapter.invoke(
+            &context,
+            &AdapterOperation::new("observe.evidence".to_owned(), json!({"kind": "logs"})),
+            cancellation.clone(),
+        );
+        assert_eq!(logs.response["kind"], "logs");
+        let unsupported = adapter.invoke(
+            &context,
+            &AdapterOperation::new("observe.unknown".to_owned(), json!({})),
+            cancellation,
+        );
+        assert_eq!(unsupported.error.unwrap().code, "command_unsupported");
+
+        adapter.session_closed(&session);
+        assert_eq!(
+            adapter
+                .session_opened(&session, Instant::now())
+                .unwrap_err()
+                .code,
+            "timed_out"
+        );
+        assert_eq!(
+            adapter.targets_until(Instant::now()).unwrap_err().code,
+            "timed_out"
+        );
+    }
+
+    #[test]
+    fn disconnected_connection_advances_generation_instead_of_silently_retargeting() {
+        let (chrome, adapter, target, _session) = live_adapter();
+        let context = live_context(&target);
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let first = adapter.invoke(
+            &context,
+            &AdapterOperation::new("observe.screenshot".to_owned(), json!({})),
+            cancellation.clone(),
+        );
+        assert_eq!(first.delivery, manuvra_runtime::AdapterDelivery::Confirmed);
+        chrome.disconnect();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let second = loop {
+            let reply = adapter.invoke(
+                &context,
+                &AdapterOperation::new("observe.screenshot".to_owned(), json!({})),
+                cancellation.clone(),
+            );
+            if reply
+                .error
+                .as_ref()
+                .is_some_and(|error| error.code == "target_stale")
+                || Instant::now() >= deadline
+            {
+                break reply;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(second.error.unwrap().code, "target_stale");
+    }
+
+    #[test]
+    fn raw_query_does_not_bypass_a_disconnected_observation_incarnation() {
+        let (chrome, adapter, target, _session) = live_adapter();
+        let context = live_context(&target);
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let first = adapter.invoke(
+            &context,
+            &AdapterOperation::new("observe.screenshot".to_owned(), json!({})),
+            cancellation.clone(),
+        );
+        assert_eq!(first.delivery, manuvra_runtime::AdapterDelivery::Confirmed);
+        chrome.disconnect();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let reply = loop {
+            let reply = adapter.invoke(
+                &context,
+                &AdapterOperation::new(
+                    "raw.cdp".to_owned(),
+                    json!({
+                        "intent": "query",
+                        "method": "Runtime.evaluate",
+                        "params": {"expression": "1"}
+                    }),
+                ),
+                cancellation.clone(),
+            );
+            if reply
+                .error
+                .as_ref()
+                .is_some_and(|error| error.code == "target_stale")
+                || Instant::now() >= deadline
+            {
+                break reply;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(reply.error.unwrap().code, "target_stale");
+    }
+
+    #[test]
+    fn empty_or_malformed_target_lists_are_recorded_without_inventing_pages() {
+        let chrome = crate::transport::test_support::ScriptedChrome::start();
+        chrome.http_body(b"{}".to_vec());
+        let adapter = ChromeAdapter::new(vec![chrome.endpoint()]);
+        assert!(adapter.targets().is_empty());
+        let diagnostics = adapter.diagnostics();
+        assert_ne!(
+            diagnostics["endpoints"][chrome.endpoint().label()],
+            "reachable"
         );
     }
 }

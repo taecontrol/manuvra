@@ -4,7 +4,7 @@ Manuvra is a macOS command-line tool for coding agents that need to observe and 
 
 The first release supports Apple Silicon running macOS 26 or later. It is distributed as MIT-licensed source and compiled locally by Homebrew; it does not ship a notarized executable.
 
-Every commit accepted into `main` passes the reproducible release checks: formatting, linting, tests, source packaging, installed-resource verification, snapshot safety, and deterministic archive generation. Releases publish an exact `main` commit whose CI run succeeded. Permission-dependent behavior is validated separately against the published Homebrew installation because macOS consent and the installed bundle identity do not exist in hosted CI. The CRAP inventory remains visible in CI as an advisory code-health report rather than a release gate.
+Every commit accepted into `main` passes the reproducible release checks: formatting, linting, tests, source packaging, installed-resource verification, snapshot safety, and deterministic archive generation. Releases publish an exact `main` commit whose CI run succeeded. Permission-dependent behavior is validated separately against the published Homebrew installation because macOS consent and the installed bundle identity do not exist in hosted CI. The CRAP inventory uses threshold 8. Hosted CI still reports that inventory as an advisory code-health check rather than a release gate.
 
 ## Install
 
@@ -66,6 +66,8 @@ make lint
 make test
 make crap
 ```
+
+`make crap` fails when any production function scores above 8. Hosted CI still treats that inventory as advisory. See [ADR-0003](docs/adrs/0003-pin-production-crap-at-8.md).
 
 Build an installable bundle in a staging prefix with:
 

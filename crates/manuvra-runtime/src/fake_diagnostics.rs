@@ -132,21 +132,37 @@ impl PermissionSet {
 
 impl PermissionFact {
     fn validate(&self, name: &str) -> Result<(), String> {
+        self.validate_request_preflight(name)?;
+        self.validate_grant_facts(name)?;
+        self.validate_settings_open(name)
+    }
+
+    fn validate_request_preflight(&self, name: &str) -> Result<(), String> {
         if self.prompt_requested == self.before_granted {
-            return Err(format!("{name} request fact contradicts its preflight"));
+            Err(format!("{name} request fact contradicts its preflight"))
+        } else {
+            Ok(())
         }
+    }
+
+    fn validate_grant_facts(&self, name: &str) -> Result<(), String> {
         if self.freshly_granted != (!self.before_granted && self.granted) {
             return Err(format!("{name} freshly-granted fact is inconsistent"));
         }
         if self.residual == self.granted {
             return Err(format!("{name} residual fact is inconsistent"));
         }
-        if self.settings_opened && !self.residual {
-            return Err(format!(
-                "{name} cannot open settings after a successful recheck"
-            ));
-        }
         Ok(())
+    }
+
+    fn validate_settings_open(&self, name: &str) -> Result<(), String> {
+        if self.settings_opened && !self.residual {
+            Err(format!(
+                "{name} cannot open settings after a successful recheck"
+            ))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -290,6 +306,13 @@ fn canonical_temporary_root(root: &Path) -> Result<PathBuf, String> {
 
 fn validate_config_path(path: &Path, canonical_root: &Path) -> Result<PathBuf, String> {
     validate_normal_absolute(path, "config")?;
+    require_regular_config_file(path)?;
+    let canonical = fs::canonicalize(path).map_err(|error| error.to_string())?;
+    require_canonical_containment(&canonical, canonical_root, "config")?;
+    Ok(canonical)
+}
+
+fn require_regular_config_file(path: &Path) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
         return Err("fake diagnostics config must be a regular file".to_owned());
@@ -297,13 +320,21 @@ fn validate_config_path(path: &Path, canonical_root: &Path) -> Result<PathBuf, S
     if metadata.len() > MAX_CONFIG_BYTES {
         return Err("fake diagnostics config exceeds 65536 bytes".to_owned());
     }
-    let canonical = fs::canonicalize(path).map_err(|error| error.to_string())?;
-    require_canonical_containment(&canonical, canonical_root, "config")?;
-    Ok(canonical)
+    Ok(())
 }
 
 fn validate_evidence_path(path: &Path, canonical_root: &Path) -> Result<PathBuf, String> {
     validate_normal_absolute(path, "evidence")?;
+    let canonical_parent = canonical_evidence_parent(path, canonical_root)?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| "fake evidence path has no file name".to_owned())?;
+    let anchored = canonical_parent.join(file_name);
+    validate_evidence_target(&anchored)?;
+    Ok(anchored)
+}
+
+fn canonical_evidence_parent(path: &Path, canonical_root: &Path) -> Result<PathBuf, String> {
     let parent = path
         .parent()
         .ok_or_else(|| "fake evidence path has no parent".to_owned())?;
@@ -312,12 +343,7 @@ fn validate_evidence_path(path: &Path, canonical_root: &Path) -> Result<PathBuf,
     if !canonical_parent.is_dir() {
         return Err("fake evidence parent must already exist".to_owned());
     }
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| "fake evidence path has no file name".to_owned())?;
-    let anchored = canonical_parent.join(file_name);
-    validate_evidence_target(&anchored)?;
-    Ok(anchored)
+    Ok(canonical_parent)
 }
 
 fn validate_normal_absolute(path: &Path, label: &str) -> Result<(), String> {
@@ -348,12 +374,17 @@ fn require_canonical_containment(
 
 fn validate_evidence_target(path: &Path) -> Result<(), String> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
-            Ok(())
-        }
-        Ok(_) => Err("fake evidence target must be a regular file when it exists".to_owned()),
+        Ok(metadata) => require_existing_evidence_file(&metadata),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.to_string()),
+    }
+}
+
+fn require_existing_evidence_file(metadata: &fs::Metadata) -> Result<(), String> {
+    if metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
+        Ok(())
+    } else {
+        Err("fake evidence target must be a regular file when it exists".to_owned())
     }
 }
 
@@ -548,5 +579,90 @@ mod tests {
 
         assert!(evidence_error.contains("escapes the canonical temporary root"));
         assert!(!outside_evidence.exists());
+    }
+
+    #[test]
+    fn permission_and_path_facts_fail_closed_on_inconsistent_or_unsafe_inputs() {
+        let root = tempfile::tempdir().unwrap();
+        let evidence = root.path().join("evidence.json");
+        for (permissions, message) in [
+            (
+                json!({
+                    "before_granted": false,
+                    "prompt_requested": true,
+                    "settings_opened": false,
+                    "granted": true,
+                    "freshly_granted": false,
+                    "residual": false
+                }),
+                "freshly-granted",
+            ),
+            (
+                json!({
+                    "before_granted": false,
+                    "prompt_requested": true,
+                    "settings_opened": false,
+                    "granted": true,
+                    "freshly_granted": true,
+                    "residual": true
+                }),
+                "residual",
+            ),
+            (
+                json!({
+                    "before_granted": false,
+                    "prompt_requested": true,
+                    "settings_opened": true,
+                    "granted": true,
+                    "freshly_granted": true,
+                    "residual": false
+                }),
+                "settings",
+            ),
+        ] {
+            let config = write_config(
+                root.path(),
+                &json!({
+                    "permissions": {
+                        "accessibility": permissions,
+                        "screen_recording": permission(true, true, false),
+                        "post_event": permission(true, true, false)
+                    },
+                    "installation": {"installed": false, "bundle": null},
+                    "evidence_path": evidence
+                }),
+            );
+            let error = match ConfiguredDiagnostics::load(&config, root.path()) {
+                Err(error) => error,
+                Ok(_) => panic!("inconsistent {message} config must fail closed"),
+            };
+            assert!(
+                error.contains(message)
+                    || error.contains("inconsistent")
+                    || error.contains("settings"),
+                "{error}"
+            );
+            assert!(!evidence.exists());
+        }
+
+        let oversized = root.path().join("oversized.json");
+        fs::write(&oversized, vec![b'x'; 65_537]).unwrap();
+        let oversized_error = match ConfiguredDiagnostics::load(&oversized, root.path()) {
+            Err(error) => error,
+            Ok(_) => panic!("oversized config must fail closed"),
+        };
+        assert!(oversized_error.contains("65536"), "{oversized_error}");
+
+        let directory_evidence = root.path().join("evidence-dir");
+        fs::create_dir(&directory_evidence).unwrap();
+        let config = write_config(root.path(), &valid_config(&directory_evidence));
+        let directory_error = match ConfiguredDiagnostics::load(&config, root.path()) {
+            Err(error) => error,
+            Ok(_) => panic!("directory evidence must fail closed"),
+        };
+        assert!(
+            directory_error.contains("regular file"),
+            "{directory_error}"
+        );
     }
 }

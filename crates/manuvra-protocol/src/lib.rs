@@ -404,10 +404,28 @@ fn validate_schema(schema: &Value, value: &Value, root: &Value, path: &str) -> R
     if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
         return validate_schema_reference(reference, value, root, path);
     }
+    validate_inline_schema(schema, value, root, path)
+}
+
+fn validate_inline_schema(
+    schema: &Value,
+    value: &Value,
+    root: &Value,
+    path: &str,
+) -> Result<(), String> {
     validate_alternatives(schema, value, root, path)?;
     validate_condition(schema, value, root, path)?;
     validate_type(schema, value, path)?;
     validate_exact_values(schema, value, path)?;
+    validate_value_kind(schema, value, root, path)
+}
+
+fn validate_value_kind(
+    schema: &Value,
+    value: &Value,
+    root: &Value,
+    path: &str,
+) -> Result<(), String> {
     match value {
         Value::Object(map) => validate_object(schema, map, root, path),
         Value::Array(items) => validate_array(schema, items, root, path),
@@ -514,14 +532,20 @@ fn validate_type(schema: &Value, value: &Value, path: &str) -> Result<(), String
 }
 
 fn value_matches_type(value: &Value, kind: &str) -> bool {
+    match value {
+        Value::Object(_) => kind == "object",
+        Value::Array(_) => kind == "array",
+        Value::String(_) => kind == "string",
+        Value::Number(number) => number_matches_schema_type(number, kind),
+        Value::Bool(_) => kind == "boolean",
+        Value::Null => kind == "null",
+    }
+}
+
+fn number_matches_schema_type(number: &serde_json::Number, kind: &str) -> bool {
     match kind {
-        "object" => value.is_object(),
-        "array" => value.is_array(),
-        "string" => value.is_string(),
-        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
-        "number" => value.is_number(),
-        "boolean" => value.is_boolean(),
-        "null" => value.is_null(),
+        "number" => true,
+        "integer" => number.as_i64().is_some() || number.as_u64().is_some(),
         _ => false,
     }
 }
@@ -548,11 +572,25 @@ fn validate_object(
     path: &str,
 ) -> Result<(), String> {
     validate_required(schema, map, path)?;
+    validate_max_properties(schema, map.len(), path)?;
+    validate_object_properties(schema, map, root, path)
+}
+
+fn validate_max_properties(schema: &Value, length: usize, path: &str) -> Result<(), String> {
     if let Some(maximum) = schema.get("maxProperties").and_then(Value::as_u64)
-        && map.len() as u64 > maximum
+        && length as u64 > maximum
     {
         return Err(format!("{path} has too many properties"));
     }
+    Ok(())
+}
+
+fn validate_object_properties(
+    schema: &Value,
+    map: &Map<String, Value>,
+    root: &Value,
+    path: &str,
+) -> Result<(), String> {
     let properties = schema.get("properties").and_then(Value::as_object);
     for (key, child) in map {
         let child_path = format!("{path}.{key}");
@@ -592,17 +630,33 @@ fn validate_additional_property(
 
 fn validate_array(schema: &Value, items: &[Value], root: &Value, path: &str) -> Result<(), String> {
     validate_array_length(schema, items.len(), path)?;
-    if schema.get("uniqueItems") == Some(&Value::Bool(true)) {
-        for (index, item) in items.iter().enumerate() {
-            if items[..index].contains(item) {
-                return Err(format!("{path} contains duplicate items"));
-            }
+    validate_unique_items(schema, items, path)?;
+    validate_array_items(schema, items, root, path)
+}
+
+fn validate_unique_items(schema: &Value, items: &[Value], path: &str) -> Result<(), String> {
+    if schema.get("uniqueItems") != Some(&Value::Bool(true)) {
+        return Ok(());
+    }
+    for (index, item) in items.iter().enumerate() {
+        if items[..index].contains(item) {
+            return Err(format!("{path} contains duplicate items"));
         }
     }
-    if let Some(item_schema) = schema.get("items") {
-        for (index, item) in items.iter().enumerate() {
-            validate_schema(item_schema, item, root, &format!("{path}[{index}]"))?;
-        }
+    Ok(())
+}
+
+fn validate_array_items(
+    schema: &Value,
+    items: &[Value],
+    root: &Value,
+    path: &str,
+) -> Result<(), String> {
+    let Some(item_schema) = schema.get("items") else {
+        return Ok(());
+    };
+    for (index, item) in items.iter().enumerate() {
+        validate_schema(item_schema, item, root, &format!("{path}[{index}]"))?;
     }
     Ok(())
 }
@@ -929,27 +983,43 @@ pub fn resource_root() -> Result<PathBuf, ProtocolError> {
     if let Some(root) = installed_resource_root(&executable) {
         return Ok(root);
     }
+    source_tree_resource_root()
+}
+
+fn source_tree_resource_root() -> Result<PathBuf, ProtocolError> {
     if cfg!(debug_assertions) {
-        if let Some(root) = std::env::var_os("MANUVRA_RESOURCE_ROOT") {
-            return Ok(fs::canonicalize(root)?);
-        }
-        return Ok(fs::canonicalize(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("assets"),
-        )?);
+        let override_root = std::env::var_os("MANUVRA_RESOURCE_ROOT");
+        return source_assets_root(override_root.as_ref().map(Path::new));
     }
     Err(ProtocolError::InvalidInstallation(
         "executable is outside Manuvra.app/Contents/MacOS".to_owned(),
     ))
 }
 
+fn source_assets_root(override_root: Option<&Path>) -> Result<PathBuf, ProtocolError> {
+    match override_root {
+        Some(root) => Ok(fs::canonicalize(root)?),
+        None => Ok(fs::canonicalize(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("assets"),
+        )?),
+    }
+}
+
 fn installed_resource_root(executable: &Path) -> Option<PathBuf> {
     let macos = executable.parent()?;
     let contents = macos.parent()?;
     let bundle = contents.parent()?;
-    (macos.file_name()?.to_str()? == "MacOS"
-        && contents.file_name()?.to_str()? == "Contents"
-        && bundle.file_name()?.to_str()? == "Manuvra.app")
-        .then(|| contents.join("Resources"))
+    is_manuvra_app_layout(macos, contents, bundle).then(|| contents.join("Resources"))
+}
+
+fn is_manuvra_app_layout(macos: &Path, contents: &Path, bundle: &Path) -> bool {
+    path_named(macos, "MacOS")
+        && path_named(contents, "Contents")
+        && path_named(bundle, "Manuvra.app")
+}
+
+fn path_named(path: &Path, name: &str) -> bool {
+    path.file_name().and_then(|value| value.to_str()) == Some(name)
 }
 
 pub fn release_manifest() -> Value {
@@ -1464,5 +1534,254 @@ mod tests {
             extra.contains("not allowed"),
             "extra target keys must be rejected: {extra}"
         );
+    }
+
+    #[test]
+    fn external_schema_accepts_matching_json_types_and_rejects_mismatches() {
+        let cases = [
+            (json!({"type": "object"}), json!({"ok": true}), json!([])),
+            (json!({"type": "array"}), json!([1]), json!({})),
+            (json!({"type": "string"}), json!("ok"), json!(1)),
+            (json!({"type": "boolean"}), json!(true), json!("true")),
+            (json!({"type": "null"}), json!(null), json!(false)),
+            (json!({"type": "number"}), json!(1.5), json!("1.5")),
+            (json!({"type": "integer"}), json!(1), json!(1.5)),
+        ];
+        for (schema, accepted, rejected) in cases {
+            validate_external_document(&schema, &accepted).unwrap_or_else(|error| {
+                panic!("accepted value rejected: {schema} {accepted} {error}")
+            });
+            let error = validate_external_document(&schema, &rejected)
+                .expect_err("mismatched JSON type must fail");
+            assert!(
+                error.contains("wrong JSON type"),
+                "type mismatch must name the JSON type: {error}"
+            );
+        }
+
+        validate_external_document(&json!({"type": "integer"}), &json!(u64::MAX)).unwrap();
+        validate_external_document(&json!({"type": "number"}), &json!(1)).unwrap();
+        let union = json!({"type": ["string", "null"]});
+        validate_external_document(&union, &json!("ok")).unwrap();
+        validate_external_document(&union, &json!(null)).unwrap();
+        assert!(validate_external_document(&union, &json!(1)).is_err());
+        assert!(
+            validate_external_document(&json!({"type": "date"}), &json!("2026-08-21")).is_err()
+        );
+    }
+
+    #[test]
+    fn external_schema_enforces_object_and_array_constraints() {
+        let object = json!({
+            "type": "object",
+            "required": ["id"],
+            "maxProperties": 1,
+            "additionalProperties": false,
+            "properties": { "id": { "type": "string", "const": "ok" } }
+        });
+        validate_external_document(&object, &json!({"id": "ok"})).unwrap();
+        let missing = validate_external_document(&object, &json!({}))
+            .expect_err("required property must fail");
+        assert!(
+            missing.contains("id is required"),
+            "missing required key must be named: {missing}"
+        );
+        let extra = validate_external_document(&object, &json!({"id": "ok", "n": 1}))
+            .expect_err("maxProperties must fail before extra keys are accepted");
+        assert!(
+            extra.contains("too many properties"),
+            "two properties must exceed maxProperties 1: {extra}"
+        );
+        let closed = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": { "id": { "type": "string" } }
+        });
+        let unknown = validate_external_document(&closed, &json!({"n": 1}))
+            .expect_err("unknown keys must fail additionalProperties");
+        assert!(
+            unknown.contains("not allowed"),
+            "unknown key must be rejected: {unknown}"
+        );
+        let typed_extra = json!({
+            "type": "object",
+            "additionalProperties": { "type": "integer" }
+        });
+        validate_external_document(&typed_extra, &json!({"n": 1})).unwrap();
+        assert!(validate_external_document(&typed_extra, &json!({"n": "1"})).is_err());
+
+        let array = json!({
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 2,
+            "uniqueItems": true,
+            "items": { "type": "integer" }
+        });
+        validate_external_document(&array, &json!([1, 2])).unwrap();
+        let empty = validate_external_document(&array, &json!([])).expect_err("minItems must fail");
+        assert!(
+            empty.contains("too few items"),
+            "empty array must fail minItems: {empty}"
+        );
+        let long =
+            validate_external_document(&array, &json!([1, 2, 3])).expect_err("maxItems must fail");
+        assert!(
+            long.contains("too many items"),
+            "three items must fail maxItems 2: {long}"
+        );
+        let duplicates =
+            validate_external_document(&array, &json!([1, 1])).expect_err("uniqueItems must fail");
+        assert!(
+            duplicates.contains("duplicate items"),
+            "duplicate integers must fail uniqueItems: {duplicates}"
+        );
+        let wrong_item = validate_external_document(&array, &json!([1, "2"]))
+            .expect_err("item schema must fail");
+        assert!(
+            wrong_item.contains("wrong JSON type"),
+            "string item must fail integer items: {wrong_item}"
+        );
+    }
+
+    #[test]
+    fn artifact_export_input_rejects_duplicate_or_empty_artifact_ids() {
+        let unique = json!({
+            "session_id": "s_1",
+            "destination": "/tmp/export",
+            "artifact_ids": ["a_1", "a_2"]
+        });
+        validate_command_input("artifact.export", &unique).unwrap();
+
+        let duplicates = json!({
+            "session_id": "s_1",
+            "destination": "/tmp/export",
+            "artifact_ids": ["a_1", "a_1"]
+        });
+        let error = validate_command_input("artifact.export", &duplicates)
+            .expect_err("duplicate artifact ids must fail uniqueItems");
+        assert!(
+            error.contains("duplicate items"),
+            "duplicate artifact_ids must be rejected: {error}"
+        );
+
+        let empty = json!({
+            "session_id": "s_1",
+            "destination": "/tmp/export",
+            "artifact_ids": []
+        });
+        let error = validate_command_input("artifact.export", &empty)
+            .expect_err("empty artifact ids must fail minItems");
+        assert!(
+            error.contains("too few items"),
+            "empty artifact_ids must be rejected: {error}"
+        );
+    }
+
+    #[test]
+    fn external_schema_follows_local_refs_and_rejects_unknown_refs() {
+        let schema = json!({
+            "$defs": { "token": { "type": "string", "const": "ok" } },
+            "$ref": "#/$defs/token"
+        });
+        validate_external_document(&schema, &json!("ok")).unwrap();
+        let wrong = validate_external_document(&schema, &json!("no"))
+            .expect_err("const through $ref must fail");
+        assert!(
+            wrong.contains("required constant"),
+            "local $ref must keep const rejection: {wrong}"
+        );
+        let unresolved =
+            validate_external_document(&json!({"$ref": "#/$defs/missing"}), &json!("ok"))
+                .expect_err("missing local $ref must fail");
+        assert!(
+            unresolved.contains("unresolved schema reference"),
+            "missing pointer must be unresolved: {unresolved}"
+        );
+        let unsupported = validate_external_document(
+            &json!({"$ref": "https://example.invalid/schema"}),
+            &json!({}),
+        )
+        .expect_err("unknown external $ref must fail");
+        assert!(
+            unsupported.contains("unsupported schema reference"),
+            "unknown $ref must stay unsupported: {unsupported}"
+        );
+    }
+
+    #[test]
+    fn resource_root_and_schema_pointer_resolve_packaged_assets() {
+        let expected = match std::env::var_os("MANUVRA_RESOURCE_ROOT") {
+            Some(root) => fs::canonicalize(root).unwrap(),
+            None => fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets")).unwrap(),
+        };
+        let root = resource_root().unwrap();
+        assert_eq!(root, expected);
+        assert!(root.join("registry.json").is_file());
+        let pointer = schema_pointer_at(&root, "./schemas/error.schema.json").unwrap();
+        assert!(
+            pointer["absolute_path"]
+                .as_str()
+                .unwrap()
+                .ends_with("error.schema.json")
+        );
+        assert!(schema_pointer_at(&root, "./schemas/missing.schema.json").is_err());
+    }
+
+    #[test]
+    fn source_assets_root_prefers_override_then_crate_assets() {
+        let crate_assets =
+            fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets")).unwrap();
+        assert_eq!(source_assets_root(None).unwrap(), crate_assets);
+
+        let override_root = unique_temp_dir("source-assets");
+        fs::create_dir_all(&override_root).unwrap();
+        assert_eq!(
+            source_assets_root(Some(&override_root)).unwrap(),
+            fs::canonicalize(&override_root).unwrap()
+        );
+        fs::remove_dir_all(&override_root).unwrap();
+        assert!(source_assets_root(Some(&override_root)).is_err());
+    }
+
+    #[test]
+    fn installed_resource_root_requires_manuvra_app_layout() {
+        let home = unique_temp_dir("installed-root");
+        let macos = home.join("Manuvra.app/Contents/MacOS");
+        fs::create_dir_all(&macos).unwrap();
+        let executable = macos.join("manuvra");
+        fs::write(&executable, []).unwrap();
+        assert_eq!(
+            installed_resource_root(&executable),
+            Some(home.join("Manuvra.app/Contents/Resources"))
+        );
+
+        let wrong_macos = home.join("Manuvra.app/Contents/bin/manuvra");
+        fs::create_dir_all(wrong_macos.parent().unwrap()).unwrap();
+        fs::write(&wrong_macos, []).unwrap();
+        assert_eq!(installed_resource_root(&wrong_macos), None);
+
+        let wrong_contents = home.join("Manuvra.app/Resources/MacOS/manuvra");
+        fs::create_dir_all(wrong_contents.parent().unwrap()).unwrap();
+        fs::write(&wrong_contents, []).unwrap();
+        assert_eq!(installed_resource_root(&wrong_contents), None);
+
+        let wrong_bundle = home.join("Other.app/Contents/MacOS/manuvra");
+        fs::create_dir_all(wrong_bundle.parent().unwrap()).unwrap();
+        fs::write(&wrong_bundle, []).unwrap();
+        assert_eq!(installed_resource_root(&wrong_bundle), None);
+
+        assert_eq!(installed_resource_root(Path::new("manuvra")), None);
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "manuvra-protocol-s1-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
     }
 }

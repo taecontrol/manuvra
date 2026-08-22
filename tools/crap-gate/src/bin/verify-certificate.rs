@@ -176,7 +176,7 @@ mod tests {
         validate_report(
             &Report {
                 schema_version: 1,
-                threshold: 15.0,
+                threshold: 8.0,
                 entries: certified.clone(),
             },
             true,
@@ -189,12 +189,14 @@ mod tests {
 
     #[test]
     fn missing_coverage_is_pessimistic_and_threshold_is_strict() {
-        let mut missing = entry("missing", 3.0, 50.0);
+        let mut missing = entry("missing", 2.0, 50.0);
         missing.coverage_missing = true;
         assert!(validate_entry(&missing, true).is_err());
         missing.coverage = 0.0;
-        missing.crap = crap_score(3.0, 0.0);
+        missing.crap = crap_score(2.0, 0.0);
         validate_entry(&missing, true).unwrap();
+        let at_pin = entry("at_pin", 8.0, 100.0);
+        validate_entry(&at_pin, true).unwrap();
         let above = entry("above", 5.0, 0.0);
         assert!(validate_entry(&above, true).is_err());
     }

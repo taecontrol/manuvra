@@ -47,7 +47,7 @@ jq -n \
   --arg os "$os" \
   --arg architecture "$architecture" \
   --slurpfile crap_report "$crap_report" \
-  '{schema:$schema,version:$version,source_tree_sha256:$source_tree_sha256,policy:{threshold:15,missing_coverage:"pessimistic",waivers:false},tools:{rustc:$rustc,cargo_crap:$cargo_crap,cargo_llvm_cov:$cargo_llvm_cov},environment:{os:$os,architecture:$architecture},crap_report:($crap_report[0] | .threshold = 15)}' \
+  '{schema:$schema,version:$version,source_tree_sha256:$source_tree_sha256,policy:{threshold:8,missing_coverage:"pessimistic",waivers:false},tools:{rustc:$rustc,cargo_crap:$cargo_crap,cargo_llvm_cov:$cargo_llvm_cov},environment:{os:$os,architecture:$architecture},crap_report:($crap_report[0] | .threshold = 8)}' \
   > "$output"
 
 cargo run --quiet --locked --manifest-path "$source_root/Cargo.toml" \

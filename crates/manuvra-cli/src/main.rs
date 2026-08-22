@@ -531,25 +531,49 @@ fn run_chrome_launch(timeout_ms: u64) -> (Value, i32) {
 }
 
 fn run_purge(all: bool, yes: bool) -> (Value, i32) {
-    if !all {
-        return local_error("invalid_request", "purge requires --all");
-    }
-    if !yes {
-        if !io::stdin().is_terminal() {
-            return local_error("invalid_request", "non-interactive purge requires --yes");
-        }
-        eprint!("Remove Manuvra-owned current-user configuration and temporary state? [y/N] ");
-        let _ = io::stderr().flush();
-        let mut answer = String::new();
-        if io::stdin().read_line(&mut answer).is_err()
-            || !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
-        {
-            return local_error("invalid_request", "purge was not confirmed");
-        }
+    if let Err(message) = authorize_purge(all, yes) {
+        return local_error("invalid_request", message);
     }
     purge_owned_roots()
         .map(|value| (value, 0))
         .unwrap_or_else(|message| local_error("invalid_request", &message))
+}
+
+fn authorize_purge(all: bool, yes: bool) -> Result<(), &'static str> {
+    if !all {
+        Err("purge requires --all")
+    } else if yes {
+        Ok(())
+    } else {
+        confirm_interactive_purge()
+    }
+}
+
+fn confirm_interactive_purge() -> Result<(), &'static str> {
+    if io::stdin().is_terminal() {
+        accepted_purge_answer().ok_or("purge was not confirmed")
+    } else {
+        Err("non-interactive purge requires --yes")
+    }
+}
+
+fn accepted_purge_answer() -> Option<()> {
+    prompt_purge();
+    purge_confirmed(&read_stdin_line()?).then_some(())
+}
+
+fn prompt_purge() {
+    eprint!("Remove Manuvra-owned current-user configuration and temporary state? [y/N] ");
+    let _ = io::stderr().flush();
+}
+
+fn read_stdin_line() -> Option<String> {
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer).ok().map(|_| answer)
+}
+
+fn purge_confirmed(answer: &str) -> bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 fn invocation_request_id(command: &Command, requested: Option<String>) -> String {
@@ -625,82 +649,112 @@ fn build_direct(command: Command) -> Result<BuiltCommand, String> {
             kind,
             cursor,
             limit,
-        } => Ok(remote(
-            "target.list",
-            optional_pairs([
-                (
-                    "kind",
-                    kind.map(|value| Value::String(target_kind(value).to_owned())),
-                ),
-                ("cursor", cursor.map(Value::String)),
-                ("limit", Some(Value::from(limit))),
-            ]),
-        )),
-        Command::Open {
+        } => Ok(build_target_list(kind, cursor, limit)),
+        Command::Doctor {
+            session,
             target_id,
-            role,
-            mode,
-            lease_ttl_ms,
-        } => Ok(remote(
-            "session.open",
-            json!({
-                "target_id": target_id, "role": role_name(role), "mode": mode_name(mode), "lease_ttl_ms": lease_ttl_ms,
-            }),
-        )),
-        Command::Close {
-            session,
-            cancel_running,
-        } => Ok(remote(
-            "session.close",
-            json!({
-                "session_id": session, "cancel_running": cancel_running,
-            }),
-        )),
-        Command::Lease {
-            action,
-            session,
-            ttl_ms,
-        } => Ok(remote(
-            "lease.manage",
-            object_with_optional(
-                json!({"session_id": session, "action": lease_action(action)}),
-                "ttl_ms",
-                ttl_ms.map(Value::from),
-            ),
-        )),
-        Command::Cancel {
-            session,
-            request_id,
-        } => Ok(remote(
-            "request.cancel",
-            json!({
-                "session_id": session, "request_id": request_id,
-            }),
-        )),
+            json: _,
+        } => Ok(build_doctor_command(session, target_id)),
         Command::Export {
             session,
             artifact_ids,
             all,
             destination,
         } => Ok(build_export(session, artifact_ids, all, destination)),
-        Command::Doctor {
-            session,
-            target_id,
-            json: _,
-        } => Ok(remote(
-            "system.doctor",
-            optional_pairs([
-                ("session_id", session.map(Value::String)),
-                ("target_id", target_id.map(Value::String)),
-            ]),
-        )),
-        command @ (Command::Daemon { .. }
-        | Command::Chrome { .. }
-        | Command::Setup { .. }
-        | Command::Migrate { .. }
-        | Command::Purge { .. }) => Ok(build_local_direct(command)),
-        _ => unreachable!("routed command category"),
+        command => Ok(build_session_or_local(command)),
     }
+}
+
+fn build_session_or_local(command: Command) -> BuiltCommand {
+    match command {
+        Command::Open {
+            target_id,
+            role,
+            mode,
+            lease_ttl_ms,
+        } => build_session_open(target_id, role, mode, lease_ttl_ms),
+        Command::Close {
+            session,
+            cancel_running,
+        } => build_session_close(session, cancel_running),
+        Command::Lease {
+            action,
+            session,
+            ttl_ms,
+        } => build_lease_command(action, session, ttl_ms),
+        Command::Cancel {
+            session,
+            request_id,
+        } => build_cancel_command(session, request_id),
+        command => build_local_direct(command),
+    }
+}
+
+fn build_target_list(kind: Option<TargetKind>, cursor: Option<String>, limit: u64) -> BuiltCommand {
+    remote(
+        "target.list",
+        optional_pairs([
+            (
+                "kind",
+                kind.map(|value| Value::String(target_kind(value).to_owned())),
+            ),
+            ("cursor", cursor.map(Value::String)),
+            ("limit", Some(Value::from(limit))),
+        ]),
+    )
+}
+
+fn build_doctor_command(session: Option<String>, target_id: Option<String>) -> BuiltCommand {
+    remote(
+        "system.doctor",
+        optional_pairs([
+            ("session_id", session.map(Value::String)),
+            ("target_id", target_id.map(Value::String)),
+        ]),
+    )
+}
+
+fn build_session_open(
+    target_id: String,
+    role: Role,
+    mode: Mode,
+    lease_ttl_ms: u64,
+) -> BuiltCommand {
+    remote(
+        "session.open",
+        json!({
+            "target_id": target_id, "role": role_name(role), "mode": mode_name(mode), "lease_ttl_ms": lease_ttl_ms,
+        }),
+    )
+}
+
+fn build_session_close(session: String, cancel_running: bool) -> BuiltCommand {
+    remote(
+        "session.close",
+        json!({
+            "session_id": session, "cancel_running": cancel_running,
+        }),
+    )
+}
+
+fn build_lease_command(action: LeaseAction, session: String, ttl_ms: Option<u64>) -> BuiltCommand {
+    remote(
+        "lease.manage",
+        object_with_optional(
+            json!({"session_id": session, "action": lease_action(action)}),
+            "ttl_ms",
+            ttl_ms.map(Value::from),
+        ),
+    )
+}
+
+fn build_cancel_command(session: String, request_id: String) -> BuiltCommand {
+    remote(
+        "request.cancel",
+        json!({
+            "session_id": session, "request_id": request_id,
+        }),
+    )
 }
 
 fn build_local_direct(command: Command) -> BuiltCommand {
@@ -902,27 +956,44 @@ fn build_usage(action: UsageAction) -> BuiltCommand {
 
 fn build_observe(command: ObserveCommand) -> Result<BuiltCommand, String> {
     match command {
-        ObserveCommand::Screenshot { session } => {
-            Ok(remote("observe.screenshot", json!({"session_id": session})))
-        }
         ObserveCommand::Query {
             session,
             semantic,
             limit,
-        } => Ok(remote(
-            "observe.query",
-            json!({
-                "session_id": session, "semantic": semantic_locator(&semantic)?, "limit": limit,
-            }),
-        )),
-        ObserveCommand::Tree { session } => {
-            Ok(remote("observe.tree", json!({"session_id": session})))
+        } => build_observe_query(session, semantic, limit),
+        ObserveCommand::Screenshot { session } => {
+            Ok(observe_session("observe.screenshot", session))
         }
-        ObserveCommand::Logs { session } => Ok(evidence(session, "logs")),
-        ObserveCommand::Events { session } => Ok(evidence(session, "events")),
-        ObserveCommand::Diagnostics { session } => Ok(evidence(session, "diagnostics")),
-        ObserveCommand::Timings { session } => Ok(evidence(session, "timings")),
-        ObserveCommand::Manifest { session } => Ok(evidence(session, "manifest")),
+        ObserveCommand::Tree { session } => Ok(observe_session("observe.tree", session)),
+        command => Ok(build_observe_evidence(command)),
+    }
+}
+
+fn build_observe_query(
+    session: String,
+    semantic: SemanticArgs,
+    limit: u64,
+) -> Result<BuiltCommand, String> {
+    Ok(remote(
+        "observe.query",
+        json!({
+            "session_id": session, "semantic": semantic_locator(&semantic)?, "limit": limit,
+        }),
+    ))
+}
+
+fn observe_session(id: &'static str, session: String) -> BuiltCommand {
+    remote(id, json!({"session_id": session}))
+}
+
+fn build_observe_evidence(command: ObserveCommand) -> BuiltCommand {
+    match command {
+        ObserveCommand::Logs { session } => evidence(session, "logs"),
+        ObserveCommand::Events { session } => evidence(session, "events"),
+        ObserveCommand::Diagnostics { session } => evidence(session, "diagnostics"),
+        ObserveCommand::Timings { session } => evidence(session, "timings"),
+        ObserveCommand::Manifest { session } => evidence(session, "manifest"),
+        _ => unreachable!("non-evidence observe command"),
     }
 }
 
@@ -1019,33 +1090,54 @@ fn action_with_locator(
     Ok(remote(id, mode_input(input, mode)))
 }
 
+enum LocatorForm {
+    Semantic,
+    Reference,
+    Point,
+}
+
 fn locator_value(args: &LocatorArgs) -> Result<Option<Value>, String> {
+    match exclusive_locator_kind(args)? {
+        None => locator_without_kind(args),
+        Some(LocatorForm::Semantic) => semantic_locator(&args.semantic).map(Some),
+        Some(LocatorForm::Reference) => reference_locator(args),
+        Some(LocatorForm::Point) => point_locator(args).map(Some),
+    }
+}
+
+fn exclusive_locator_kind(args: &LocatorArgs) -> Result<Option<LocatorForm>, String> {
     let semantic = has_semantic(&args.semantic) || has_within(&args.semantic);
-    let kinds = usize::from(semantic)
-        + usize::from(args.reference.is_some())
-        + usize::from(args.point.is_some());
-    if kinds > 1 {
-        return Err("choose exactly one semantic, ref, or point locator".to_owned());
+    match (semantic, args.reference.is_some(), args.point.is_some()) {
+        (false, false, false) => Ok(None),
+        (true, false, false) => Ok(Some(LocatorForm::Semantic)),
+        (false, true, false) => Ok(Some(LocatorForm::Reference)),
+        (false, false, true) => Ok(Some(LocatorForm::Point)),
+        _ => Err("choose exactly one semantic, ref, or point locator".to_owned()),
     }
-    if semantic {
-        return semantic_locator(&args.semantic).map(Some);
-    }
-    if let Some(reference) = &args.reference {
-        return Ok(Some(json!({"kind": "ref", "ref": reference})));
-    }
-    if let Some((x, y)) = args.point {
-        let frame = args
-            .frame_token
-            .as_ref()
-            .ok_or_else(|| "--point requires --frame".to_owned())?;
-        return Ok(Some(
-            json!({"kind": "point", "x": x, "y": y, "frame_token": frame}),
-        ));
-    }
+}
+
+fn locator_without_kind(args: &LocatorArgs) -> Result<Option<Value>, String> {
     if args.frame_token.is_some() {
-        return Err("--frame requires --point".to_owned());
+        Err("--frame requires --point".to_owned())
+    } else {
+        Ok(None)
     }
-    Ok(None)
+}
+
+fn reference_locator(args: &LocatorArgs) -> Result<Option<Value>, String> {
+    match &args.reference {
+        Some(reference) => Ok(Some(json!({"kind": "ref", "ref": reference}))),
+        None => Ok(None),
+    }
+}
+
+fn point_locator(args: &LocatorArgs) -> Result<Value, String> {
+    match (args.point, args.frame_token.as_ref()) {
+        (Some((x, y)), Some(frame)) => {
+            Ok(json!({"kind": "point", "x": x, "y": y, "frame_token": frame}))
+        }
+        _ => Err("--point requires --frame".to_owned()),
+    }
 }
 
 fn semantic_locator(args: &SemanticArgs) -> Result<Value, String> {
@@ -1293,72 +1385,133 @@ fn render_doctor(value: &Value) -> String {
         return error;
     }
     let permissions = doctor_permissions(value);
-    let host_supported = value["host"]["supported"].as_bool().unwrap_or(false);
-    let daemon_running = value["daemon"]["control"]["running"]
-        .as_bool()
-        .unwrap_or(false);
-    let warnings = value["warnings"]
+    let warnings = doctor_classified_warnings(value);
+    let ready = doctor_ready(value, &permissions, &warnings);
+    let mut lines = vec![doctor_status_line(ready)];
+    lines.push(doctor_host_line(value));
+    lines.push(doctor_daemon_line(value));
+    lines.extend(render_installation(&value["daemon"]["installation"]));
+    lines.extend(doctor_permission_lines(
+        &value["daemon"]["installation"],
+        &permissions,
+    ));
+    lines.extend(doctor_session_lines(value));
+    lines.extend(doctor_warning_lines(&warnings));
+    lines.extend(doctor_next_step_lines(value, &permissions, &warnings));
+    lines.join("\n") + "\n"
+}
+
+fn doctor_classified_warnings(value: &Value) -> Vec<DoctorWarning> {
+    value["warnings"]
         .as_array()
         .into_iter()
         .flatten()
         .map(classify_doctor_warning)
-        .collect::<Vec<_>>();
-    let all_permissions = permissions
+        .collect()
+}
+
+fn doctor_host_supported(value: &Value) -> bool {
+    value["host"]["supported"].as_bool().unwrap_or(false)
+}
+
+fn doctor_daemon_running(value: &Value) -> bool {
+    value["daemon"]["control"]["running"]
+        .as_bool()
+        .unwrap_or(false)
+}
+
+fn doctor_permissions_complete(permissions: &[(&str, Option<bool>)]) -> bool {
+    permissions
         .iter()
-        .all(|(_, granted)| *granted == Some(true));
-    let actionable_warning = warnings.iter().any(DoctorWarning::action_required);
-    let ready = host_supported && daemon_running && all_permissions && !actionable_warning;
-    let mut lines = vec![format!(
+        .all(|(_, granted)| *granted == Some(true))
+}
+
+fn doctor_ready(
+    value: &Value,
+    permissions: &[(&str, Option<bool>)],
+    warnings: &[DoctorWarning],
+) -> bool {
+    doctor_host_supported(value)
+        && doctor_daemon_running(value)
+        && doctor_permissions_complete(permissions)
+        && !warnings.iter().any(DoctorWarning::action_required)
+}
+
+fn doctor_status_line(ready: bool) -> String {
+    format!(
         "Manuvra doctor: {}",
         if ready { "ready" } else { "action required" }
-    )];
-    lines.push(format!(
+    )
+}
+
+fn doctor_host_line(value: &Value) -> String {
+    format!(
         "Host: {} (requires macOS {})",
-        if host_supported {
+        if doctor_host_supported(value) {
             "supported"
         } else {
             "unsupported"
         },
         value["host"]["minimum_macos"].as_str().unwrap_or("26.0")
-    ));
-    lines.push(format!(
+    )
+}
+
+fn doctor_daemon_line(value: &Value) -> String {
+    format!(
         "Daemon: {}",
-        if daemon_running {
+        if doctor_daemon_running(value) {
             "running"
         } else {
             "not running"
         }
-    ));
-    lines.extend(render_installation(&value["daemon"]["installation"]));
-    lines.push("Permissions (manuvra-daemon):".to_owned());
+    )
+}
+
+fn doctor_permission_lines(
+    installation: &Value,
+    permissions: &[(&str, Option<bool>)],
+) -> Vec<String> {
+    let mut lines = vec!["Permissions (manuvra-daemon):".to_owned()];
     for (name, granted) in permissions {
         lines.push(format!(
             "  [{}] {}",
-            match granted {
-                Some(true) => "granted",
-                Some(false) => "missing",
-                None => "unknown",
-            },
+            permission_grant_label(*granted),
             permission_label(name)
         ));
     }
-    if !all_permissions {
-        lines.push(permission_residual_grant_note(
-            &value["daemon"]["installation"],
-        ));
+    if !doctor_permissions_complete(permissions) {
+        lines.push(permission_residual_grant_note(installation));
     }
+    lines
+}
+
+fn permission_grant_label(granted: Option<bool>) -> &'static str {
+    match granted {
+        Some(true) => "granted",
+        Some(false) => "missing",
+        None => "unknown",
+    }
+}
+
+fn doctor_session_lines(value: &Value) -> Vec<String> {
     let sessions = value["sessions"].as_array().cloned().unwrap_or_default();
-    lines.push(format!("Active sessions: {}", sessions.len()));
-    for session in sessions {
-        lines.push(format!(
-            "  {} -> {} ({}, {})",
-            session["session_id"].as_str().unwrap_or("unknown"),
-            session["target_id"].as_str().unwrap_or("unknown"),
-            session["role"].as_str().unwrap_or("unknown"),
-            session["mode"].as_str().unwrap_or("unknown")
-        ));
-    }
-    lines.push("Warnings:".to_owned());
+    let mut lines = vec![format!("Active sessions: {}", sessions.len())];
+    lines.extend(sessions.into_iter().map(doctor_session_line));
+    lines
+}
+
+fn doctor_session_line(session: Value) -> String {
+    format!(
+        "  {} -> {} ({}, {})",
+        session["session_id"].as_str().unwrap_or("unknown"),
+        session["target_id"].as_str().unwrap_or("unknown"),
+        session["role"].as_str().unwrap_or("unknown"),
+        session["mode"].as_str().unwrap_or("unknown")
+    )
+}
+
+fn doctor_warning_lines(warnings: &[DoctorWarning]) -> Vec<String> {
+    let mut lines = vec!["Warnings:".to_owned()];
     if warnings.is_empty() {
         lines.push("  none".to_owned());
     } else {
@@ -1368,19 +1521,27 @@ fn render_doctor(value: &Value) -> String {
                 .map(|warning| format!("  - {}", warning.display)),
         );
     }
-    lines.push("Next steps:".to_owned());
+    lines
+}
+
+fn doctor_next_step_lines(
+    value: &Value,
+    permissions: &[(&str, Option<bool>)],
+    warnings: &[DoctorWarning],
+) -> Vec<String> {
+    let mut lines = vec!["Next steps:".to_owned()];
     let mut step = 1;
-    if !host_supported {
+    if !doctor_host_supported(value) {
         lines.push(format!("  {step}. Run Manuvra on macOS 26 or later."));
         step += 1;
     }
-    if !daemon_running {
+    if !doctor_daemon_running(value) {
         lines.push(format!(
             "  {step}. Run `manuvra doctor` to start and recheck the daemon."
         ));
         step += 1;
     }
-    if !all_permissions {
+    if !doctor_permissions_complete(permissions) {
         lines.push(format!(
             "  {step}. Run `manuvra setup` to request missing permissions."
         ));
@@ -1396,56 +1557,85 @@ fn render_doctor(value: &Value) -> String {
     if step == 1 {
         lines.push("  none".to_owned());
     }
-    lines.join("\n") + "\n"
+    lines
 }
 
 fn render_setup(value: &Value) -> String {
     if let Some(error) = render_operational_error(value) {
         return error;
     }
-    let residual = ["accessibility", "screen_recording", "post_event"]
+    let residual = residual_permissions(value);
+    let mut lines = vec![setup_status_line(residual.is_empty())];
+    lines.extend(render_installation(&value["installation"]));
+    lines.extend(setup_permission_lines(value));
+    lines.extend(setup_follow_up(value, &residual));
+    lines.join("\n") + "\n"
+}
+
+fn residual_permissions(value: &Value) -> Vec<&'static str> {
+    ["accessibility", "screen_recording", "post_event"]
         .into_iter()
         .filter(|permission| value["permissions"][permission]["residual"] == true)
-        .collect::<Vec<_>>();
-    let mut lines = vec![format!(
+        .collect()
+}
+
+fn setup_status_line(ready: bool) -> String {
+    format!(
         "Manuvra setup: {}",
-        if residual.is_empty() {
+        if ready {
             "permissions ready"
         } else {
             "manual action required"
         }
-    )];
-    lines.extend(render_installation(&value["installation"]));
-    lines.push("Permissions (manuvra-daemon):".to_owned());
+    )
+}
+
+fn setup_permission_lines(value: &Value) -> Vec<String> {
+    let mut lines = vec!["Permissions (manuvra-daemon):".to_owned()];
     for permission in ["accessibility", "screen_recording", "post_event"] {
-        let fact = &value["permissions"][permission];
-        let state = if fact["granted"] == true && fact["freshly_granted"] == true {
-            "granted now"
-        } else if fact["granted"] == true {
-            "already granted"
-        } else if fact["settings_opened"] == true {
-            "request sent; System Settings opened"
-        } else if fact["prompt_requested"] == true {
-            "request sent; still missing"
-        } else {
-            "not available"
-        };
-        lines.push(format!("  [{}] {}", state, permission_label(permission)));
+        lines.push(format!(
+            "  [{}] {}",
+            setup_permission_state(&value["permissions"][permission]),
+            permission_label(permission)
+        ));
     }
+    lines
+}
+
+fn setup_permission_state(fact: &Value) -> &'static str {
+    if fact["granted"] == true && fact["freshly_granted"] == true {
+        "granted now"
+    } else if fact["granted"] == true {
+        "already granted"
+    } else if fact["settings_opened"] == true {
+        "request sent; System Settings opened"
+    } else if fact["prompt_requested"] == true {
+        "request sent; still missing"
+    } else {
+        "not available"
+    }
+}
+
+fn setup_follow_up(value: &Value, residual: &[&str]) -> Vec<String> {
     if residual.is_empty() {
-        lines.push(
+        return vec![
             "No permission prompt or System Settings pane was needed for already granted access."
                 .to_owned(),
-        );
-        lines.push("Next: run `manuvra doctor` to confirm overall readiness.".to_owned());
-        return lines.join("\n") + "\n";
+            "Next: run `manuvra doctor` to confirm overall readiness.".to_owned(),
+        ];
     }
-    lines.push(
+    let mut lines = vec![
         "macOS consent is manual; Manuvra cannot grant itself access or add itself silently."
             .to_owned(),
-    );
-    lines.push(permission_residual_grant_note(&value["installation"]));
-    lines.push("Complete these steps:".to_owned());
+        permission_residual_grant_note(&value["installation"]),
+        "Complete these steps:".to_owned(),
+    ];
+    lines.extend(setup_residual_instructions(value, residual));
+    lines
+}
+
+fn setup_residual_instructions(value: &Value, residual: &[&str]) -> Vec<String> {
+    let mut lines = Vec::new();
     let mut step = 1;
     if residual.contains(&"accessibility") || residual.contains(&"post_event") {
         lines.push(format!(
@@ -1464,7 +1654,7 @@ fn render_setup(value: &Value) -> String {
         step += 1;
     }
     lines.push(format!("  {step}. Run `manuvra doctor` again."));
-    lines.join("\n") + "\n"
+    lines
 }
 
 fn render_operational_error(value: &Value) -> Option<String> {
@@ -1535,26 +1725,32 @@ fn render_signature_identity(installation: &Value) -> Vec<String> {
     let authority = json_string_field(installation, "authority");
     let designated = json_string_field(installation, "designated_requirement");
     if cdhash.is_none() && authority.is_none() && designated.is_none() {
-        return Vec::new();
+        Vec::new()
+    } else {
+        render_present_signature(cdhash, authority, designated)
     }
+}
+
+fn render_present_signature(
+    cdhash: Option<Option<&str>>,
+    authority: Option<Option<&str>>,
+    designated: Option<Option<&str>>,
+) -> Vec<String> {
     let cdhash_value = cdhash.and_then(|value| value);
-    let authority_value = authority.and_then(|value| value);
     let designated_value = designated.and_then(|value| value);
     let mut lines = Vec::new();
     if cdhash.is_some() {
         lines.push(format!("CDHash: {}", cdhash_value.unwrap_or("unavailable")));
     }
     if authority.is_some() {
-        let rendered = authority_value.unwrap_or_else(|| {
-            if cdhash_value.is_some()
-                || designated_value.is_some_and(|value| value.starts_with("cdhash "))
-            {
-                "ad-hoc"
-            } else {
-                "unavailable"
-            }
-        });
-        lines.push(format!("Authority: {rendered}"));
+        lines.push(format!(
+            "Authority: {}",
+            signature_authority_label(
+                authority.and_then(|value| value),
+                cdhash_value,
+                designated_value
+            )
+        ));
     }
     if designated.is_some() {
         lines.push(format!(
@@ -1563,6 +1759,22 @@ fn render_signature_identity(installation: &Value) -> Vec<String> {
         ));
     }
     lines
+}
+
+fn signature_authority_label<'a>(
+    authority: Option<&'a str>,
+    cdhash: Option<&str>,
+    designated: Option<&str>,
+) -> &'a str {
+    match authority {
+        Some(value) => value,
+        None if ad_hoc_signature(cdhash, designated) => "ad-hoc",
+        None => "unavailable",
+    }
+}
+
+fn ad_hoc_signature(cdhash: Option<&str>, designated: Option<&str>) -> bool {
+    cdhash.is_some() || designated.is_some_and(|value| value.starts_with("cdhash "))
 }
 
 fn json_string_field<'a>(value: &'a Value, key: &str) -> Option<Option<&'a str>> {
@@ -2346,5 +2558,244 @@ mod tests {
         assert!(rendered.contains("Do not grant a /tmp prefix"));
         assert!(rendered.contains("Screen & System Audio Recording"));
         assert!(!rendered.contains("Privacy & Security > Accessibility"));
+    }
+
+    #[test]
+    fn doctor_and_setup_renderers_keep_byte_compatible_healthy_missing_and_error_text() {
+        let healthy = render_doctor(&doctor_fixture(true));
+        assert_eq!(
+            healthy,
+            "\
+Manuvra doctor: ready
+Host: supported (requires macOS 26.0)
+Daemon: running
+Installation: installed bundle
+Bundle: /opt/homebrew/opt/manuvra/libexec/Manuvra.app
+Permissions (manuvra-daemon):
+  [granted] Accessibility
+  [granted] Screen & System Audio Recording
+  [granted] Post Event (Accessibility pane)
+Active sessions: 0
+Warnings:
+  none
+Next steps:
+  none
+"
+        );
+
+        let (error, _) = local_error("timed_out", "daemon did not answer");
+        let rendered = render_doctor(&error);
+        assert_eq!(rendered, render_setup(&error));
+        assert!(rendered.starts_with("Manuvra error [timed_out]\n"));
+        assert!(rendered.contains("daemon did not answer"));
+
+        let granted = setup_fact(true, false, true);
+        let ready = setup_fixture(granted.clone(), granted.clone(), granted);
+        assert_eq!(
+            render_setup(&ready),
+            "\
+Manuvra setup: permissions ready
+Installation: development layout
+Bundle: unavailable (development layouts have no canonical Manuvra.app path)
+Permissions (manuvra-daemon):
+  [already granted] Accessibility
+  [already granted] Screen & System Audio Recording
+  [already granted] Post Event (Accessibility pane)
+No permission prompt or System Settings pane was needed for already granted access.
+Next: run `manuvra doctor` to confirm overall readiness.
+"
+        );
+    }
+
+    #[test]
+    fn doctor_renderer_covers_host_daemon_session_and_unknown_permission_sections() {
+        let mut doctor = doctor_fixture(true);
+        doctor["host"]["supported"] = json!(false);
+        doctor["daemon"]["control"]["running"] = json!(false);
+        doctor["daemon"]["adapters"] = json!([{"kind": "chrome"}]);
+        doctor["sessions"] = json!([{
+            "session_id": "s_1",
+            "target_id": "chrome:fake",
+            "role": "actor",
+            "mode": "background"
+        }]);
+        let rendered = render_doctor(&doctor);
+        assert!(rendered.contains("Manuvra doctor: action required"));
+        assert!(rendered.contains("Host: unsupported (requires macOS 26.0)"));
+        assert!(rendered.contains("Daemon: not running"));
+        assert!(rendered.contains("[unknown] Accessibility"));
+        assert!(rendered.contains("Active sessions: 1"));
+        assert!(rendered.contains("  s_1 -> chrome:fake (actor, background)"));
+        assert!(rendered.contains("  1. Run Manuvra on macOS 26 or later."));
+        assert!(rendered.contains("  2. Run `manuvra doctor` to start and recheck the daemon."));
+        assert!(rendered.contains("  3. Run `manuvra setup` to request missing permissions."));
+    }
+
+    #[test]
+    fn setup_renderer_names_freshly_granted_and_unavailable_permission_states() {
+        let mut setup = setup_fixture(
+            setup_fact(false, true, true),
+            json!({
+                "before_granted": false,
+                "prompt_requested": false,
+                "settings_opened": false,
+                "granted": false,
+                "freshly_granted": false,
+                "residual": true
+            }),
+            setup_fact(true, false, true),
+        );
+        setup["installation"] = json!({
+            "installed": true,
+            "bundle": "/opt/homebrew/opt/manuvra/libexec/Manuvra.app"
+        });
+        let rendered = render_setup(&setup);
+        assert!(rendered.contains("[granted now] Accessibility"));
+        assert!(rendered.contains("[not available] Screen & System Audio Recording"));
+        assert!(rendered.contains("[already granted] Post Event (Accessibility pane)"));
+        assert!(rendered.contains(
+            "Open System Settings > Privacy & Security > Screen & System Audio Recording."
+        ));
+        assert!(!rendered.contains("Privacy & Security > Accessibility"));
+    }
+
+    #[test]
+    fn signature_identity_omits_lines_when_codesign_fields_are_absent() {
+        let mut doctor = doctor_fixture(true);
+        doctor["daemon"]["installation"] = json!({
+            "installed": true,
+            "bundle": "/opt/homebrew/opt/manuvra/libexec/Manuvra.app"
+        });
+        let rendered = render_doctor(&doctor);
+        assert!(!rendered.contains("CDHash:"));
+        assert!(!rendered.contains("Authority:"));
+        assert!(!rendered.contains("Designated requirement:"));
+        assert_eq!(
+            render_signature_identity(&json!({"installed": false})),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn locator_forms_encode_ref_point_and_empty_and_reject_incomplete_point() {
+        let reference = locator_value(&LocatorArgs {
+            reference: Some("e_1".to_owned()),
+            ..Default::default()
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(reference, json!({"kind": "ref", "ref": "e_1"}));
+
+        let point = locator_value(&LocatorArgs {
+            point: Some((1.0, 2.0)),
+            frame_token: Some("f_1".to_owned()),
+            ..Default::default()
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            point,
+            json!({"kind": "point", "x": 1.0, "y": 2.0, "frame_token": "f_1"})
+        );
+
+        assert_eq!(locator_value(&LocatorArgs::default()).unwrap(), None);
+        assert_eq!(
+            locator_value(&LocatorArgs {
+                point: Some((1.0, 2.0)),
+                ..Default::default()
+            })
+            .unwrap_err(),
+            "--point requires --frame"
+        );
+        assert_eq!(
+            locator_value(&LocatorArgs {
+                frame_token: Some("f_1".to_owned()),
+                ..Default::default()
+            })
+            .unwrap_err(),
+            "--frame requires --point"
+        );
+    }
+
+    #[test]
+    fn observe_and_direct_builders_keep_registry_command_identities_and_inputs() {
+        match build(&["observe", "logs", "--session", "s_1"]).unwrap() {
+            BuiltCommand::Remote { id, input } => {
+                assert_eq!(id, "observe.evidence");
+                assert_eq!(input, json!({"session_id": "s_1", "kind": "logs"}));
+            }
+            BuiltCommand::Local { .. } => panic!("observe logs is remote"),
+        }
+        match build(&["observe", "manifest", "--session", "s_1"]).unwrap() {
+            BuiltCommand::Remote { id, input } => {
+                assert_eq!(id, "observe.evidence");
+                assert_eq!(input, json!({"session_id": "s_1", "kind": "manifest"}));
+            }
+            BuiltCommand::Local { .. } => panic!("observe manifest is remote"),
+        }
+        match build(&["doctor", "--session", "s_1", "--target", "chrome:fake"]).unwrap() {
+            BuiltCommand::Remote { id, input } => {
+                assert_eq!(id, "system.doctor");
+                assert_eq!(
+                    input,
+                    json!({"session_id": "s_1", "target_id": "chrome:fake"})
+                );
+            }
+            BuiltCommand::Local { .. } => panic!("doctor is remote"),
+        }
+        match build(&["targets", "--kind", "macos"]).unwrap() {
+            BuiltCommand::Remote { id, input } => {
+                assert_eq!(id, "target.list");
+                assert_eq!(input["kind"], "macos");
+                assert_eq!(input["limit"], 10);
+            }
+            BuiltCommand::Local { .. } => panic!("targets is remote"),
+        }
+    }
+
+    #[test]
+    fn build_error_display_and_non_deadline_invoke_errors_keep_catalog_codes() {
+        assert_eq!(
+            BuildError::InvalidRequest("purge requires --all".to_owned()).to_string(),
+            "purge requires --all"
+        );
+        assert_eq!(
+            BuildError::UnknownCommand.to_string(),
+            "unregistered command identity"
+        );
+
+        let (internal, exit) =
+            invoke_non_deadline_error(ClientError::Launch("daemon autostart is disabled".into()));
+        assert_eq!(internal["error"]["code"], "internal_error");
+        assert_eq!(exit, 70);
+
+        let (error, _) = operational_error("daemon_busy", None);
+        let (busy, exit) = invoke_non_deadline_error(ClientError::Control(
+            Box::new(error),
+            json!({"active_sessions": [{"session_id": "s_1"}]}),
+        ));
+        assert_eq!(busy["error"]["code"], "daemon_busy");
+        assert!(busy["error"]["message"].as_str().unwrap().contains("s_1"));
+        assert_eq!(exit, 4);
+    }
+
+    #[test]
+    fn purge_authorization_requires_all_and_yes_or_an_interactive_yes() {
+        assert_eq!(
+            authorize_purge(false, true).unwrap_err(),
+            "purge requires --all"
+        );
+        authorize_purge(true, true).unwrap();
+        assert_eq!(
+            authorize_purge(true, false).unwrap_err(),
+            "non-interactive purge requires --yes"
+        );
+        assert!(purge_confirmed("y\n"));
+        assert!(purge_confirmed("YES"));
+        assert!(!purge_confirmed("n"));
+        let (value, exit) = run_purge(false, true);
+        assert_eq!(value["error"]["code"], "invalid_request");
+        assert_eq!(value["error"]["message"], "purge requires --all");
+        assert_eq!(exit, 2);
     }
 }

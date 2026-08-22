@@ -10,7 +10,7 @@ mod runner;
 
 pub use runner::{GateConfig, run};
 
-pub const ACCEPTED_THRESHOLD: f64 = 15.0;
+pub const ACCEPTED_THRESHOLD: f64 = 8.0;
 pub const EXIT_GATE_FAILED: i32 = 1;
 pub const EXIT_ANALYSIS_FAILED: i32 = 2;
 
@@ -302,12 +302,12 @@ mod tests {
 
     #[test]
     fn formula_and_threshold_are_pinned() {
-        assert_eq!(ACCEPTED_THRESHOLD, 15.0);
+        assert_eq!(ACCEPTED_THRESHOLD, 8.0);
         assert_eq!(crap_score(1.0, 100.0), 1.0);
         assert_eq!(crap_score(4.0, 50.0), 6.0);
         assert_eq!(crap_score(6.0, 0.0), 42.0);
-        assert!(!exceeds_threshold(15.0));
-        assert!(exceeds_threshold(15.0001));
+        assert!(!exceeds_threshold(8.0));
+        assert!(exceeds_threshold(8.0001));
     }
 
     #[test]

@@ -41,7 +41,7 @@ formula_sha=$(shasum -a 256 "$source_root/packaging/manuvra.rb.template" | awk '
 evidence_sha=$(shasum -a 256 "$inventory" | awk '{print $1}')
 build_id=$(jq -er '.doctor.daemon.installation.build_id' "$environment")
 maximum=$(jq '[.entries[].crap] | max' "$crap_report")
-offenders=$(jq '[.entries[] | select(.crap > 15)] | length' "$crap_report")
+offenders=$(jq '[.entries[] | select(.crap > 8)] | length' "$crap_report")
 missing=$(jq '[.entries[] | select(.coverage_missing == true)] | length' "$crap_report")
 
 journey() {
@@ -74,7 +74,7 @@ jq -n \
   --argjson offenders "$offenders" \
   --argjson missing "$missing" \
   --arg local_evidence_sha256 "$evidence_sha" \
-  '{schema:$schema,version:$version,source_tree_sha256:$source_tree_sha256,build_id:$build_id,formula_sha256:$formula_sha256,environment:{os:$os,architecture:$architecture,rust:$rust,homebrew:$homebrew},journeys:{chrome_background:$chrome_background,native_background:$native_background,native_foreground:$native_foreground},latency_p95_ms:$latency,lifecycle:"pass",privacy:"pass",crap:{threshold:15,maximum:$maximum,offenders:$offenders,missing_coverage:$missing},local_evidence_sha256:$local_evidence_sha256}' \
+  '{schema:$schema,version:$version,source_tree_sha256:$source_tree_sha256,build_id:$build_id,formula_sha256:$formula_sha256,environment:{os:$os,architecture:$architecture,rust:$rust,homebrew:$homebrew},journeys:{chrome_background:$chrome_background,native_background:$native_background,native_foreground:$native_foreground},latency_p95_ms:$latency,lifecycle:"pass",privacy:"pass",crap:{threshold:8,maximum:$maximum,offenders:$offenders,missing_coverage:$missing},local_evidence_sha256:$local_evidence_sha256}' \
   > "$output"
 
 cargo run --quiet --locked --manifest-path "$source_root/Cargo.toml" \
