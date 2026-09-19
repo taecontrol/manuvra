@@ -407,7 +407,7 @@ mod tests {
                 Ok(count) => {
                     request.extend_from_slice(&chunk[..count]);
                     let text = String::from_utf8_lossy(&request);
-                    if text.contains('\n') {
+                    if text.contains("\r\n\r\n") {
                         return text.lines().next().map(str::to_owned);
                     }
                 }
