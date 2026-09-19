@@ -1,11 +1,5 @@
 [workspace]
-members = [
-  "crates/manuvra-chrome",
-  "crates/manuvra-macos",
-  "crates/manuvra-protocol",
-  "crates/manuvra-runtime",
-  "crates/manuvra-cli",
-]
+members = ["crates/manuvra-chrome"]
 exclude = ["tools/crap-gate"]
 resolver = "2"
 
@@ -28,9 +22,7 @@ objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSDictionary", "
 objc2-image-io = { version = "0.3.2", features = ["CGImageDestination", "objc2-core-graphics"] }
 objc2-screen-capture-kit = { version = "0.3.2", features = ["SCScreenshotManager", "SCShareableContent", "SCStream", "block2", "objc2-core-foundation", "objc2-core-graphics"] }
 rand = "0.9"
-serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha2 = "0.10"
 tempfile = "3.27"
 thiserror = "2.0"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }

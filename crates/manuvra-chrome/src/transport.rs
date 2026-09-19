@@ -816,8 +816,6 @@ pub(crate) mod test_support {
     struct Script {
         replies: HashMap<String, Value>,
         reject: HashSet<String>,
-        events_after: HashMap<String, Vec<Value>>,
-        events_after_once: HashMap<String, Vec<Value>>,
         pending_events: VecDeque<Value>,
         ping_once: bool,
         invalid_json_methods: HashSet<String>,
@@ -827,7 +825,6 @@ pub(crate) mod test_support {
         omit_content_length: bool,
         hold_after_headers: bool,
         raw_http: Option<Vec<u8>>,
-        shutdown: bool,
     }
 
     impl ScriptedChrome {
@@ -880,22 +877,6 @@ pub(crate) mod test_support {
                 .insert(method.to_owned());
         }
 
-        pub fn events_after(&self, method: &str, events: Vec<Value>) {
-            self.script
-                .lock()
-                .expect("scripted Chrome")
-                .events_after
-                .insert(method.to_owned(), events);
-        }
-
-        pub fn events_after_once(&self, method: &str, events: Vec<Value>) {
-            self.script
-                .lock()
-                .expect("scripted Chrome")
-                .events_after_once
-                .insert(method.to_owned(), events);
-        }
-
         pub fn push_event(&self, method: &str, params: Value) {
             self.script
                 .lock()
@@ -944,10 +925,6 @@ pub(crate) mod test_support {
 
         pub fn raw_http(&self, bytes: Vec<u8>) {
             self.script.lock().expect("scripted Chrome").raw_http = Some(bytes);
-        }
-
-        pub fn disconnect(&self) {
-            self.script.lock().expect("scripted Chrome").shutdown = true;
         }
     }
 
@@ -1064,10 +1041,6 @@ pub(crate) mod test_support {
             .get_mut()
             .set_read_timeout(Some(Duration::from_millis(20)));
         loop {
-            if script.lock().expect("scripted Chrome").shutdown {
-                let _ = socket.close(None);
-                break;
-            }
             flush_control_frames(&mut socket, &script);
             match socket.read() {
                 Ok(Message::Text(text)) => {
@@ -1126,8 +1099,8 @@ pub(crate) mod test_support {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
-        let (reply, events, invalid) = {
-            let mut script = script.lock().expect("scripted Chrome");
+        let (reply, invalid) = {
+            let script = script.lock().expect("scripted Chrome");
             let invalid = script.invalid_json_methods.contains(&method);
             let reply = if script.reject.contains(&method) {
                 json!({"id": id, "error": {"message": "rejected"}})
@@ -1135,23 +1108,12 @@ pub(crate) mod test_support {
                 let result = script.replies.get(&method).cloned().unwrap_or(json!({}));
                 json!({"id": id, "result": result})
             };
-            let mut events = script
-                .events_after
-                .get(&method)
-                .cloned()
-                .unwrap_or_default();
-            if let Some(once) = script.events_after_once.remove(&method) {
-                events.extend(once);
-            }
-            (reply, events, invalid)
+            (reply, invalid)
         };
         if invalid {
             let _ = socket.send(Message::Text("not-json".into()));
             return;
         }
         let _ = socket.send(Message::Text(reply.to_string().into()));
-        for event in events {
-            let _ = socket.send(Message::Text(event.to_string().into()));
-        }
     }
 }
