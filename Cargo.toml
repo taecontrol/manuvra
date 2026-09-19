@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/manuvra-chrome"]
+members = ["crates/manuvra-chrome", "crates/manuvra-contract", "crates/manuvra-cli"]
 exclude = ["tools/crap-gate"]
 resolver = "2"
 
@@ -13,6 +13,8 @@ license = "MIT"
 base64 = "0.22"
 block2 = "0.6"
 clap = { version = "4.6", features = ["derive"] }
+hex = "0.4"
+hmac = "0.12"
 libc = "0.2"
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", features = ["NSRunningApplication", "NSWorkspace"] }
@@ -22,8 +24,12 @@ objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSDictionary", "
 objc2-image-io = { version = "0.3.2", features = ["CGImageDestination", "objc2-core-graphics"] }
 objc2-screen-capture-kit = { version = "0.3.2", features = ["SCScreenshotManager", "SCShareableContent", "SCStream", "block2", "objc2-core-foundation", "objc2-core-graphics"] }
 rand = "0.9"
+schemars = "1.1"
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 tempfile = "3.27"
 thiserror = "2.0"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+url = { version = "2.5", features = ["serde"] }
