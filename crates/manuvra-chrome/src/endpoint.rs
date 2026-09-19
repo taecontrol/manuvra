@@ -108,7 +108,12 @@ impl RequestFailure {
     fn io(error: std::io::Error) -> Self {
         let transient = matches!(
             error.kind(),
-            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            std::io::ErrorKind::WouldBlock
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
         );
         Self {
             error: EndpointError::Io(error.to_string()),
@@ -336,6 +341,24 @@ mod tests {
                 &SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 1).to_string()
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn interrupted_discovery_reads_are_transient() {
+        for kind in [
+            std::io::ErrorKind::WouldBlock,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::UnexpectedEof,
+        ] {
+            assert!(RequestFailure::io(std::io::Error::from(kind)).is_transient());
+        }
+        assert!(
+            !RequestFailure::io(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                .is_transient()
         );
     }
 
