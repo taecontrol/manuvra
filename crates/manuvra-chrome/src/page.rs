@@ -188,6 +188,14 @@ mod tests {
     }
 
     #[test]
+    fn click_dispatches_a_complete_mouse_click() {
+        let chrome = ScriptedChrome::start();
+        let client = chrome.connect_raw();
+
+        click(&client, 25.0, 40.0, deadline(), cancellation()).unwrap();
+    }
+
+    #[test]
     fn screenshot_decodes_png_dimensions() {
         let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
         png.extend_from_slice(&[0; 8]);

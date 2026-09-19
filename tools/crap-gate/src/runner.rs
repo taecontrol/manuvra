@@ -86,7 +86,7 @@ impl Runtime {
 }
 
 fn resolve_tool(explicit: Option<PathBuf>, tool: &str) -> Result<PathBuf> {
-    explicit.map(Ok).unwrap_or_else(|| rustup_find(tool))
+    explicit.map(Ok).unwrap_or_else(|| rust_tool_path(tool))
 }
 
 fn measurement_entries(config: &GateConfig, runtime: &Runtime) -> Result<Vec<crate::Entry>> {
@@ -170,9 +170,29 @@ fn require_version(command: &str, args: &[&str], expected: &str) -> Result<()> {
     Ok(())
 }
 
-fn rustup_find(tool: &str) -> Result<PathBuf> {
-    let output = checked_output(Command::new("rustup").args(["which", tool]), "rustup")?;
-    Ok(PathBuf::from(String::from_utf8(output.stdout)?.trim()))
+fn rust_tool_path(tool: &str) -> Result<PathBuf> {
+    let output = checked_output(
+        Command::new("rustc").args(["--print", "target-libdir"]),
+        "rustc target-libdir",
+    )?;
+    let libdir = PathBuf::from(String::from_utf8(output.stdout)?.trim());
+    let path = tool_beside_target_libdir(&libdir, tool)?;
+    if !path.is_file() {
+        bail!(
+            "{} was not found; install the llvm-tools-preview rustup component",
+            path.display()
+        );
+    }
+    Ok(path)
+}
+
+fn tool_beside_target_libdir(libdir: &Path, tool: &str) -> Result<PathBuf> {
+    let target_dir = libdir
+        .parent()
+        .context("rustc target-libdir had no target directory")?;
+    Ok(target_dir
+        .join("bin")
+        .join(format!("{tool}{}", std::env::consts::EXE_SUFFIX)))
 }
 
 fn generate_rust_lcov(config: &GateConfig, runtime: &Runtime) -> Result<PathBuf> {
@@ -419,6 +439,19 @@ mod tests {
         assert_eq!(runtime.repo_root, root.path().canonicalize().unwrap());
         assert_eq!(runtime.llvm_cov, PathBuf::from("llvm-cov"));
         assert_eq!(runtime.llvm_profdata, PathBuf::from("llvm-profdata"));
+    }
+
+    #[test]
+    fn llvm_tools_are_resolved_beside_the_target_libdir() {
+        let path = tool_beside_target_libdir(
+            Path::new("/toolchain/lib/rustlib/x86_64-unknown-linux-gnu/lib"),
+            "llvm-cov",
+        )
+        .unwrap();
+        assert_eq!(
+            path,
+            Path::new("/toolchain/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-cov")
+        );
     }
 
     #[test]
