@@ -743,9 +743,10 @@ fn write_manifest_and_sync(
 fn checked_run_directory(root: &Path, run_id: &str) -> Result<PathBuf, String> {
     let path = root.join(run_id);
     let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
-    (!metadata.file_type().is_symlink() && metadata.is_dir())
-        .then_some(path)
-        .ok_or_else(|| "evidence run path is not a regular directory".into())
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("evidence run path is not a regular directory".into());
+    }
+    fs::canonicalize(path).map_err(|error| error.to_string())
 }
 
 fn read_complete_manifest(path: &Path, run_id: &str) -> Result<Manifest, String> {
@@ -1294,9 +1295,39 @@ mod tests {
             .unwrap();
         assert_eq!(
             Path::new(&artifact.path),
-            temporary.path().join("r_verify/verification/final.json")
+            fs::canonicalize(temporary.path())
+                .unwrap()
+                .join("r_verify/verification/final.json")
         );
         assert!(artifact.complete);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hosted_tail_replacement_accepts_a_noncanonical_root_alias() {
+        let temporary = TempDir::new().unwrap();
+        let canonical_root = temporary.path().join("evidence");
+        fs::create_dir(&canonical_root).unwrap();
+        let root_alias = temporary.path().join("evidence-alias");
+        std::os::unix::fs::symlink(&canonical_root, &root_alias).unwrap();
+        let job = test_job(false);
+        let redactor = Redactor::for_job(&job).unwrap();
+        publish(
+            &root_alias,
+            "r_alias",
+            bundle("safe", b"png".to_vec()),
+            &redactor,
+        )
+        .unwrap();
+
+        replace_result_cleanup(
+            &root_alias,
+            "r_alias",
+            &json!({"browser":"closed"}),
+            &json!({"state":"expired","evidence":{"complete":true}}),
+            &redactor,
+        )
+        .unwrap();
     }
 
     #[test]

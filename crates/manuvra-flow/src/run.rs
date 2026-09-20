@@ -5496,7 +5496,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outcome.exit_code, 3);
+        #[cfg(target_os = "linux")]
         assert_eq!(outcome.result["reason"]["code"], "browser_unavailable");
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(outcome.result["reason"]["code"], "unsupported_platform");
         assert!(temp.path().join("r_fake/manifest.json").is_file());
     }
 
