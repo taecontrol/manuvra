@@ -12,11 +12,22 @@ The workspace keeps the macOS fallback compiling, but macOS is not a supported r
 
 ## Install
 
+On Linux, build or install the CLI with Cargo:
+
 ```bash
 cargo build --release --locked
 cargo install --path crates/manuvra-cli --locked
 manuvra version
 ```
+
+On macOS, the same CLI is distributed through the existing Homebrew tap:
+
+```bash
+brew install taecontrol/tap/manuvra
+manuvra version
+```
+
+The macOS package currently exposes `version` and the four `schema` contracts. Browser-journey execution remains unsupported on macOS; `run`, `status`, `resume`, and `abort` return `unsupported_platform`. The Homebrew release check builds and tests the formula on macOS so the install channel stays ready while runtime support is restored separately.
 
 At runtime, Manuvra looks for the browser specified by `--browser`, then `MANUVRA_BROWSER`, then known Chromium and Chrome locations. It uses the current Wayland or X11 desktop unless you pass `--headless`.
 
@@ -177,6 +188,10 @@ make crap
 `make live` builds a release binary and runs the Money journey matrix against fresh fixtures. It requires Chromium, a headed desktop, `TYPESAFE_API_KEY`, `jq`, and the Money repository at `/home/guetteluis/Work/personal/money`. Set `MONEY_DIR` to use another checkout. The matrix runs the create-unit, create-account, and record-transaction journeys three times each, followed by one forced escalation round trip. It writes timestamped evidence and a report under `.work/live/money-journey/`.
 
 Contributors and coding agents should follow [docs/CODING_STANDARDS.md](docs/CODING_STANDARDS.md). The [architecture decision records](docs/adrs/) explain the project's design choices.
+
+## Release
+
+Releases are source-only and start from the `release` workflow on `main`. Enter the workspace version from `Cargo.toml` without the leading `v`. The workflow requires a successful CI run for that exact commit, creates a deterministic source archive and GitHub release, installs the rendered formula on macOS, and opens an auto-merge pull request in [`taecontrol/homebrew-tap`](https://github.com/taecontrol/homebrew-tap). Repository secret `HOMEBREW_TAP_TOKEN` provides write access to the tap.
 
 ## License
 

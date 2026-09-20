@@ -37,6 +37,24 @@ jobs:
         run: make lint
       - name: Test
         run: make test
+      - name: Verify macOS source packaging
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          version=$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)
+          first=$(mktemp -d)
+          second=$(mktemp -d)
+          scripts/create-source-archive.sh --version "$version" --output "$first"
+          scripts/create-source-archive.sh --version "$version" --output "$second"
+          cmp "$first/manuvra-$version.tar.gz" "$second/manuvra-$version.tar.gz"
+
+          source_dir=$(mktemp -d)
+          prefix=$(mktemp -d)
+          tar -xzf "$first/manuvra-$version.tar.gz" -C "$source_dir"
+          cargo install --locked --path "$source_dir/manuvra-$version/crates/manuvra-cli" --root "$prefix"
+          test "$("$prefix/bin/manuvra" version | python3 -c 'import json, sys; print(json.load(sys.stdin)["version"])')" = "$version"
+          "$prefix/bin/manuvra" schema job | python3 -c 'import json, sys; assert json.load(sys.stdin)["title"] == "Job"'
+          ruby -c packaging/manuvra.rb.template
       - name: Advisory CRAP inventory
         shell: bash
         run: |
