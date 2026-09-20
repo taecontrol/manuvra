@@ -1,6 +1,8 @@
 #[cfg(target_os = "linux")]
 use crate::endpoint::Endpoint;
-use crate::input::{InputCancellation, PerformError, PerformFact, PreparedInput};
+use crate::input::{
+    InputCancellation, PerformError, PerformFact, PreparedInput, PreparedOperation,
+};
 use crate::observation::Observation;
 use crate::page::{self, Screenshot};
 use crate::transport::{CdpClient, CommandFailure};
@@ -128,8 +130,19 @@ impl OwnedBrowser {
 
     pub fn observe(&self) -> Result<Observation, BrowserError> {
         let value = evaluate(&self.client, SNAPSHOT)?;
-        serde_json::from_value(value)
-            .map_err(|error| BrowserError::InvalidObservation(error.to_string()))
+        let mut observation: Observation = serde_json::from_value(value)
+            .map_err(|error| BrowserError::InvalidObservation(error.to_string()))?;
+        if self.client.snapshot_since(0).events.iter().any(|event| {
+            matches!(
+                event.message.get("method").and_then(Value::as_str),
+                Some("Page.windowOpen" | "Target.targetCreated")
+            )
+        }) {
+            observation.coverage.gaps.push("popup".into());
+            observation.coverage.gaps.sort();
+            observation.coverage.gaps.dedup();
+        }
+        Ok(observation)
     }
 
     pub fn perform(
@@ -137,7 +150,14 @@ impl OwnedBrowser {
         input: PreparedInput,
         cancellation: &InputCancellation,
     ) -> Result<PerformFact, PerformError> {
-        crate::input::perform(&self.client, input, cancellation)
+        let settle_navigation = input.operation == PreparedOperation::Click;
+        let fence = self.client.cursor();
+        let fact = crate::input::perform(&self.client, input, cancellation)?;
+        if settle_navigation {
+            settle_click_navigation(&self.client, fence)
+                .map_err(|error| PerformError::Uncertain(error.to_string()))?;
+        }
+        Ok(fact)
     }
 
     pub fn capture(&self) -> Result<CapturedPage, BrowserError> {
@@ -597,6 +617,23 @@ fn wait_for_document(client: &CdpClient, mut cursor: u64) -> Result<(), BrowserE
     }
 }
 
+fn settle_click_navigation(client: &CdpClient, fence: u64) -> Result<(), BrowserError> {
+    let end = Instant::now() + QUIET_WINDOW;
+    loop {
+        let snapshot = client.snapshot_since(fence);
+        require_navigation_journal(&snapshot)?;
+        if snapshot.events.iter().any(|event| {
+            event.message.get("method").and_then(Value::as_str) == Some("Page.frameNavigated")
+        }) {
+            return wait_for_document(client, fence);
+        }
+        if Instant::now() >= end {
+            return Ok(());
+        }
+        client.wait_for_journal_change(snapshot.last_cursor, Duration::from_millis(25));
+    }
+}
+
 fn update_quiet_since(
     quiet_since: &mut Option<Instant>,
     ready: bool,
@@ -988,6 +1025,46 @@ mod tests {
             command_failure(CommandFailure::Unknown("x".into())),
             "CDP command outcome unknown"
         );
+    }
+
+    #[test]
+    fn confirmed_click_navigation_settles_before_the_next_observation() {
+        let chrome = ScriptedChrome::start();
+        chrome.reply("Runtime.evaluate", json!({"result":{"value":"complete"}}));
+        let client = chrome.connect_raw();
+        let fence = client.cursor();
+        chrome.push_event("Page.frameNavigated", json!({"frame":{"id":"main"}}));
+        command(&client, "Page.enable", json!({})).unwrap();
+
+        settle_click_navigation(&client, fence).unwrap();
+    }
+
+    #[test]
+    fn owned_perform_routes_confirmed_click_through_navigation_settling() {
+        let chrome = ScriptedChrome::start();
+        chrome.reply(
+            "Runtime.evaluate",
+            json!({"result":{"value":{"ok":true,"x":12.0,"y":20.0}}}),
+        );
+        let client = chrome.connect_raw();
+        let mut browser = browser_with_client(client);
+        let fact = browser
+            .perform(
+                PreparedInput {
+                    document_id: "d".into(),
+                    node_id: 7,
+                    operation: PreparedOperation::Click,
+                    text: None,
+                    previous_text: None,
+                    option_node_id: None,
+                    combobox: false,
+                    action_sequence: 1,
+                },
+                &InputCancellation::default(),
+            )
+            .unwrap();
+        assert_eq!(fact.suboperations, ["mouse_press", "mouse_release"]);
+        browser.close().unwrap();
     }
 
     #[test]

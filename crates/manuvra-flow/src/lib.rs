@@ -9,6 +9,7 @@ pub mod verification;
 pub use manuvra_chrome::InputCancellation;
 #[cfg(debug_assertions)]
 pub use manuvra_chrome::{
-    Coverage, Element, Observation, PerformError, PerformFact, PreparedInput, Rect, ViewportState,
+    Coverage, Element, Observation, PerformError, PerformFact, PreparedInput, Rect, SelectOption,
+    ViewportState,
 };
 pub use run::{FlowConfig, FlowOutcome, run};

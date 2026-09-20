@@ -26,6 +26,7 @@ pub struct ActionFact {
     pub value_name: Option<String>,
     pub outcome: Outcome,
     pub readback_matches: Option<bool>,
+    pub suboperations: Vec<String>,
     pub replay_key: String,
     pub basis: String,
 }
@@ -37,6 +38,7 @@ pub enum ActionStop {
     ReadbackMismatch,
     IncompleteEvidence,
     InvalidPermit,
+    Reobserve(String),
 }
 
 pub trait Performer {
@@ -209,30 +211,21 @@ fn prepare(
     basis: &str,
 ) -> Result<PreparedAction, ActionStop> {
     let (candidate, document_id, replay_key, action_sequence) = permit.consume();
-    let target = candidate
-        .target_index
-        .and_then(|index| {
-            observation
-                .elements
-                .iter()
-                .find(|element| element.index == index)
-        })
-        .ok_or(ActionStop::InvalidPermit)?;
-    let text = candidate
-        .value_name
-        .as_deref()
-        .map(|name| values.resolve(name).ok_or(ActionStop::InvalidPermit))
-        .transpose()?;
-    let evidence = json!({"event":"action_prepared","action_sequence":action_sequence,"candidate_id":candidate.id,"operation":candidate.operation,"target":{"role":target.role,"name":target.name,"dialog":target.in_dialog},"value_name":candidate.value_name,"replay_key":replay_key,"outcome":"not_performed","basis":basis});
+    let target = prepared_target(&candidate, observation)?;
+    let text = resolved_text(&candidate, values)?;
+    let option_node_id = selected_option_identity(&candidate, target, text)?;
+    let evidence = json!({"event":"action_prepared","action_sequence":action_sequence,"candidate_id":candidate.id,"operation":candidate.operation,"target":target.map(|target|json!({"role":target.role,"name":target.name,"dialog":target.in_dialog})),"value_name":candidate.value_name,"replay_key":replay_key,"outcome":"not_performed","basis":basis});
+    let operation = prepared_operation(candidate.operation, target)?;
     let input = PreparedInput {
         document_id,
-        node_id: target.node_id,
-        operation: match candidate.operation {
-            Operation::Click => PreparedOperation::Click,
-            Operation::TypeText => PreparedOperation::TypeText,
-            _ => return Err(ActionStop::InvalidPermit),
-        },
+        node_id: target.map_or(0, |target| target.node_id),
+        operation,
         text: text.map(str::to_owned),
+        previous_text: target.map(|target| target.value.clone()),
+        option_node_id,
+        combobox: target.is_some_and(|target| {
+            target.role == "combobox" && candidate.operation == Operation::TypeText
+        }),
         action_sequence,
     };
     Ok(PreparedAction {
@@ -245,23 +238,123 @@ fn prepare(
     })
 }
 
+fn prepared_target<'a>(
+    candidate: &crate::policy::Candidate,
+    observation: &'a Observation,
+) -> Result<Option<&'a manuvra_chrome::Element>, ActionStop> {
+    let target = candidate.target_index.and_then(|index| {
+        observation
+            .elements
+            .iter()
+            .find(|element| element.index == index)
+    });
+    let target_optional = matches!(
+        candidate.operation,
+        Operation::ScrollUp | Operation::ScrollDown
+    );
+    (target.is_some() || target_optional)
+        .then_some(target)
+        .ok_or(ActionStop::InvalidPermit)
+}
+
+fn resolved_text<'a>(
+    candidate: &crate::policy::Candidate,
+    values: &'a Values<'_>,
+) -> Result<Option<&'a str>, ActionStop> {
+    candidate
+        .value_name
+        .as_deref()
+        .map(|name| values.resolve(name).ok_or(ActionStop::InvalidPermit))
+        .transpose()
+}
+
+fn selected_option_identity(
+    candidate: &crate::policy::Candidate,
+    target: Option<&manuvra_chrome::Element>,
+    text: Option<&str>,
+) -> Result<Option<u64>, ActionStop> {
+    if candidate.operation != Operation::Select {
+        return Ok(None);
+    }
+    let expected = text.ok_or(ActionStop::InvalidPermit)?;
+    target
+        .and_then(|target| {
+            target.select_options.iter().find(|option| {
+                !option.disabled && (option.value == expected || option.label == expected)
+            })
+        })
+        .map(|option| Some(option.node_id))
+        .ok_or(ActionStop::InvalidPermit)
+}
+
+fn prepared_operation(
+    operation: Operation,
+    target: Option<&manuvra_chrome::Element>,
+) -> Result<PreparedOperation, ActionStop> {
+    match operation {
+        Operation::Click => Ok(PreparedOperation::Click),
+        Operation::TypeText => Ok(text_operation(target)),
+        Operation::Select => Ok(PreparedOperation::Select),
+        other => prepared_fallback(other),
+    }
+}
+
+fn prepared_fallback(operation: Operation) -> Result<PreparedOperation, ActionStop> {
+    match operation {
+        Operation::ScrollUp => Ok(PreparedOperation::ScrollUp),
+        Operation::ScrollDown => Ok(PreparedOperation::ScrollDown),
+        Operation::Wait | Operation::Blocked => Err(ActionStop::InvalidPermit),
+        Operation::Click | Operation::TypeText | Operation::Select => {
+            unreachable!("input operation")
+        }
+    }
+}
+
+fn text_operation(target: Option<&manuvra_chrome::Element>) -> PreparedOperation {
+    if target
+        .and_then(|target| target.input_type.as_deref())
+        .is_some_and(|kind| matches!(kind, "date" | "time" | "color" | "range"))
+    {
+        PreparedOperation::SetValue
+    } else {
+        PreparedOperation::TypeText
+    }
+}
+
 fn action_fact(
     prepared: PreparedAction,
     dispatched: Result<PerformFact, PerformError>,
 ) -> (ActionFact, Option<ActionStop>) {
-    let (outcome, readback_matches, stop) = match dispatched {
-        Ok(fact) if prepared.candidate.operation == Operation::TypeText => {
-            let matches = fact.readback == prepared.expected_text;
+    let (outcome, readback_matches, stop, suboperations) = match dispatched {
+        Ok(fact)
+            if matches!(
+                prepared.candidate.operation,
+                Operation::TypeText | Operation::Select
+            ) =>
+        {
+            let matches = fact
+                .readback_matches
+                .unwrap_or(fact.readback == prepared.expected_text);
             (
                 Outcome::Observed,
                 Some(matches),
                 (!matches).then_some(ActionStop::ReadbackMismatch),
+                fact.suboperations,
             )
         }
-        Ok(_) => (Outcome::Observed, None, None),
-        Err(
-            PerformError::NotPerformed(_) | PerformError::Rejected(_) | PerformError::Uncertain(_),
-        ) => (Outcome::Uncertain, None, Some(ActionStop::Uncertain)),
+        Ok(fact) => (Outcome::Observed, None, None, fact.suboperations),
+        Err(PerformError::Rejected(_)) => (
+            Outcome::NotPerformed,
+            None,
+            Some(ActionStop::Reobserve(prepared.replay_key.clone())),
+            Vec::new(),
+        ),
+        Err(PerformError::NotPerformed(_) | PerformError::Uncertain(_)) => (
+            Outcome::Uncertain,
+            None,
+            Some(ActionStop::Uncertain),
+            Vec::new(),
+        ),
     };
     let fact = ActionFact {
         candidate_id: prepared.candidate.id,
@@ -270,6 +363,7 @@ fn action_fact(
         value_name: prepared.candidate.value_name,
         outcome,
         readback_matches,
+        suboperations,
         replay_key: prepared.replay_key,
         basis: prepared.basis,
     };
@@ -281,9 +375,10 @@ mod tests {
     use super::*;
     use crate::judgment::{ChoiceJudgment, Judgments};
     use crate::policy::{Next, Policy};
-    use manuvra_chrome::{Coverage, Element, Rect, ViewportState};
+    use manuvra_chrome::{Coverage, Element, Rect, SelectOption, ViewportState};
     use manuvra_contract::{DoneCondition, Job, Step};
     use std::collections::BTreeMap;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
@@ -297,6 +392,21 @@ mod tests {
             self.0.clone()
         }
     }
+    struct CapturingPerformer(Mutex<Option<PreparedInput>>);
+    impl Performer for CapturingPerformer {
+        fn dispatch(
+            &self,
+            input: PreparedInput,
+            _: &InputCancellation,
+        ) -> Result<PerformFact, PerformError> {
+            *self.0.lock().unwrap() = Some(input);
+            Ok(PerformFact {
+                readback: Some("Wanted".into()),
+                readback_matches: Some(true),
+                suboperations: vec![],
+            })
+        }
+    }
     struct CountingPerformer<'a>(&'a AtomicUsize);
     impl Performer for CountingPerformer<'_> {
         fn dispatch(
@@ -307,6 +417,8 @@ mod tests {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(PerformFact {
                 readback: Some("Wanted".into()),
+                readback_matches: None,
+                suboperations: vec![],
             })
         }
     }
@@ -323,7 +435,11 @@ mod tests {
                 ))
             } else {
                 self.0.fetch_add(1, Ordering::SeqCst);
-                Ok(PerformFact { readback: None })
+                Ok(PerformFact {
+                    readback: None,
+                    readback_matches: None,
+                    suboperations: vec![],
+                })
             }
         }
     }
@@ -373,6 +489,7 @@ mod tests {
                 disabled: false,
                 in_dialog: None,
                 operations: vec!["TYPE_TEXT".into()],
+                select_options: vec![],
                 rect: Rect {
                     x: 0.,
                     y: 0.,
@@ -391,15 +508,19 @@ mod tests {
         }
     }
     fn permit(job: &Job, obs: &Observation) -> Permit {
+        permit_for(job, obs, "TYPE_TEXT")
+    }
+    fn permit_for(job: &Job, obs: &Observation, operation: &str) -> Permit {
         let c = |s: &str| ChoiceJudgment {
             choice: s.into(),
             probabilities: BTreeMap::from([(s.into(), 1.)]),
             confidence: 1.,
         };
         let j = Judgments {
-            operation: c("TYPE_TEXT"),
+            operation: c(operation),
             click_target: c("NO_CLICK_TARGET"),
             type_target: c("1"),
+            select_target: c("1"),
             type_value: c("name"),
             step_done: 0.,
             usage: BTreeMap::new(),
@@ -422,6 +543,81 @@ mod tests {
     }
 
     #[test]
+    fn prepare_selects_native_strategies_from_observed_input_semantics() {
+        let job = job();
+        let mut select = observation();
+        select.elements[0].role = "combobox".into();
+        select.elements[0].input_type = None;
+        select.elements[0].operations = vec!["SELECT".into()];
+        select.elements[0].select_options = vec![SelectOption {
+            node_id: 2,
+            label: "Wanted".into(),
+            value: "wanted-id".into(),
+            disabled: false,
+            selected: false,
+        }];
+        let capture = CapturingPerformer(Mutex::new(None));
+        perform(
+            permit_for(&job, &select, "SELECT"),
+            &capture,
+            &select,
+            &Values::new(&job),
+            &mut FakeJournal::default(),
+            &InputCancellation::default(),
+        )
+        .unwrap();
+        let prepared = capture.0.lock().unwrap().clone().unwrap();
+        assert_eq!(prepared.operation, PreparedOperation::Select);
+        assert_eq!(prepared.option_node_id, Some(2));
+
+        for input_type in ["date", "time", "color", "range"] {
+            let mut specialized = observation();
+            specialized.elements[0].input_type = Some(input_type.into());
+            let capture = CapturingPerformer(Mutex::new(None));
+            perform(
+                permit(&job, &specialized),
+                &capture,
+                &specialized,
+                &Values::new(&job),
+                &mut FakeJournal::default(),
+                &InputCancellation::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                capture.0.lock().unwrap().as_ref().unwrap().operation,
+                PreparedOperation::SetValue,
+                "{input_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_operation_mapping_is_closed() {
+        assert_eq!(
+            prepared_fallback(Operation::ScrollUp),
+            Ok(PreparedOperation::ScrollUp)
+        );
+        assert_eq!(
+            prepared_fallback(Operation::ScrollDown),
+            Ok(PreparedOperation::ScrollDown)
+        );
+        assert_eq!(
+            prepared_fallback(Operation::Wait),
+            Err(ActionStop::InvalidPermit)
+        );
+        assert_eq!(
+            prepared_fallback(Operation::Blocked),
+            Err(ActionStop::InvalidPermit)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "input operation")]
+    fn fallback_operation_mapping_rejects_internal_misrouting() {
+        let _ = prepared_fallback(Operation::Click);
+    }
+
+    #[test]
     fn flush_precedes_dispatch_and_readback_mismatch_is_failed() {
         let job = job();
         let obs = observation();
@@ -430,6 +626,8 @@ mod tests {
             permit(&job, &obs),
             &FakePerformer(Ok(PerformFact {
                 readback: Some("Wrong".into()),
+                readback_matches: None,
+                suboperations: vec![],
             })),
             &obs,
             &Values::new(&job),
@@ -501,6 +699,17 @@ mod tests {
             );
             assert_eq!(journal.entries[0]["event"], "action_prepared");
         }
+        let mut remounted = FakeJournal::default();
+        let result = perform(
+            permit(&job, &obs),
+            &FakePerformer(Err(PerformError::Rejected("target_missing".into()))),
+            &obs,
+            &Values::new(&job),
+            &mut remounted,
+            &InputCancellation::default(),
+        );
+        assert!(matches!(result, Err(ActionStop::Reobserve(_))));
+        assert_eq!(remounted.entries[1]["fact"]["outcome"], "not_performed");
         let mut after = FakeJournal {
             entries: vec![],
             fail_at: Some(1),
@@ -509,7 +718,9 @@ mod tests {
             perform(
                 permit(&job, &obs),
                 &FakePerformer(Ok(PerformFact {
-                    readback: Some("Wanted".into())
+                    readback: Some("Wanted".into()),
+                    readback_matches: Some(true),
+                    suboperations: vec!["insert_text".into()],
                 })),
                 &obs,
                 &Values::new(&job),

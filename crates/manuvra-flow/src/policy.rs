@@ -62,6 +62,7 @@ impl Candidate {
 pub enum PolicyStop {
     Uncertain(&'static str),
     Blocked(&'static str),
+    UnsupportedSurface(&'static str),
 }
 
 #[derive(Debug)]
@@ -101,6 +102,7 @@ pub struct Policy {
     actions: u16,
     model_calls: u16,
     step_mutations: u8,
+    fallbacks: u8,
     replay: HashSet<String>,
     allowed_origins: Vec<String>,
     paused_at: Option<Instant>,
@@ -126,6 +128,7 @@ impl Policy {
             actions: 0,
             model_calls: 0,
             step_mutations: 0,
+            fallbacks: 0,
             replay: HashSet::new(),
             allowed_origins,
             paused_at: None,
@@ -135,12 +138,24 @@ impl Policy {
 
     pub fn begin_step(&mut self) {
         self.step_mutations = 0;
+        self.fallbacks = 0;
     }
 
     pub fn check_active(&self) -> Result<(), PolicyStop> {
         (self.active_elapsed() < self.active_timeout)
             .then_some(())
             .ok_or(PolicyStop::Blocked("budget_exhausted"))
+    }
+
+    pub fn check_origin(&self, observation: &Observation) -> Result<(), PolicyStop> {
+        if observation.coverage.gaps.iter().any(|gap| gap == "popup") {
+            return Err(PolicyStop::UnsupportedSurface("popup_or_new_tab"));
+        }
+        let allowed = origin(&observation.url)
+            .is_some_and(|current| self.allowed_origins.iter().any(|origin| origin == &current));
+        allowed
+            .then_some(())
+            .ok_or(PolicyStop::Blocked("origin_not_allowed"))
     }
 
     pub fn record_model_call(&mut self) -> Result<Instant, PolicyStop> {
@@ -164,8 +179,8 @@ impl Policy {
         if let Some(next) = done_first(step, done, done_reobserved) {
             return next;
         }
-        if let Some(capability) = unsupported_capability(observation, judgments) {
-            return Next::Stop(PolicyStop::Blocked(capability));
+        if let Some(surface) = unsupported_surface(observation, judgments) {
+            return Next::Stop(PolicyStop::UnsupportedSurface(surface));
         }
         let Ok(operation) = selected_operation(judgments) else {
             return Next::Stop(PolicyStop::Blocked("provider_invalid_response"));
@@ -173,10 +188,26 @@ impl Policy {
         if let Some(next) = operation_gate(judgments, operation_reobserved) {
             return next;
         }
+        self.decide_operation(step, observation, judgments, operation)
+    }
+
+    fn decide_operation(
+        &mut self,
+        step: &Step,
+        observation: &Observation,
+        judgments: &Judgments,
+        operation: Operation,
+    ) -> Next {
         match operation {
-            Operation::Wait => Next::Wait,
+            Operation::Wait => self.fallback(Next::Wait),
+            Operation::ScrollUp | Operation::ScrollDown => {
+                if let Err(stop) = self.authorize_context(step, observation) {
+                    return Next::Stop(stop);
+                }
+                self.authorize_scroll(observation, operation)
+            }
             Operation::Blocked => Next::Stop(PolicyStop::Blocked("operation_blocked")),
-            Operation::Click | Operation::TypeText => {
+            Operation::Click | Operation::TypeText | Operation::Select => {
                 self.authorize(step, observation, judgments, operation)
             }
         }
@@ -208,7 +239,7 @@ impl Policy {
         let operation = selected_operation(judgments)
             .map_err(|_| PolicyStop::Blocked("provider_invalid_response"))?;
         match operation {
-            Operation::Click | Operation::TypeText => {
+            Operation::Click | Operation::TypeText | Operation::Select => {
                 self.candidate(observation, judgments, operation)
             }
             _ => Err(PolicyStop::Blocked("provider_invalid_response")),
@@ -237,6 +268,47 @@ impl Policy {
             target_input_type: target.input_type.clone(),
             value_name,
         })
+    }
+
+    fn authorize_scroll(&mut self, observation: &Observation, operation: Operation) -> Next {
+        if self.fallbacks >= 8 {
+            return Next::Stop(PolicyStop::Blocked("budget_exhausted"));
+        }
+        let can_scroll = match operation {
+            Operation::ScrollUp => observation.viewport.scroll_y > 0.0,
+            Operation::ScrollDown => {
+                observation.viewport.scroll_y + f64::from(observation.viewport.height)
+                    < observation.viewport.document_height
+            }
+            _ => false,
+        };
+        if !can_scroll {
+            return Next::Stop(PolicyStop::Blocked("operation_blocked"));
+        }
+        let candidate = Candidate {
+            id: format!("c_{}", self.actions + 1),
+            operation,
+            target_index: None,
+            target_name: None,
+            target_identity: TargetIdentity {
+                node_id: None,
+                document_id: observation.document_id.clone(),
+            },
+            target_role: None,
+            target_dialog: None,
+            target_input_type: None,
+            value_name: None,
+        };
+        self.mint(observation, candidate)
+    }
+
+    fn fallback(&mut self, next: Next) -> Next {
+        if self.fallbacks >= 8 {
+            Next::Stop(PolicyStop::Blocked("budget_exhausted"))
+        } else {
+            self.fallbacks += 1;
+            next
+        }
     }
 
     #[cfg(any(target_os = "linux", test))]
@@ -272,6 +344,13 @@ impl Policy {
         candidate
     }
 
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn release_not_performed(&mut self, replay_key: &str) {
+        if self.replay.remove(replay_key) {
+            self.step_mutations = self.step_mutations.saturating_sub(1);
+        }
+    }
+
     fn authorize_context(&self, step: &Step, observation: &Observation) -> Result<(), PolicyStop> {
         if self.actions >= self.max_actions
             || self.step_mutations >= step.mutation_limit
@@ -279,26 +358,36 @@ impl Policy {
         {
             return Err(PolicyStop::Blocked("budget_exhausted"));
         }
-        let allowed = origin(&observation.url)
-            .is_some_and(|current| self.allowed_origins.iter().any(|origin| origin == &current));
-        allowed
-            .then_some(())
-            .ok_or(PolicyStop::Blocked("origin_not_allowed"))
+        self.check_origin(observation)
     }
 
     fn mint(&mut self, observation: &Observation, candidate: Candidate) -> Next {
-        let Some(target) = candidate
+        let replay_key = if let Some(target) = candidate
             .target_index
             .and_then(|index| observation.elements.iter().find(|item| item.index == index))
-        else {
+        {
+            replay_key(observation, target, &candidate)
+        } else if matches!(
+            candidate.operation,
+            Operation::ScrollUp | Operation::ScrollDown
+        ) {
+            scroll_replay_key(observation, candidate.operation)
+        } else {
             return Next::Stop(PolicyStop::Uncertain("candidate_revalidation_failed"));
         };
-        let replay_key = replay_key(observation, target, &candidate);
         if !self.replay.insert(replay_key.clone()) {
             return Next::Stop(PolicyStop::Uncertain("replay_forbidden"));
         }
         self.actions += 1;
-        self.step_mutations += 1;
+        if matches!(
+            candidate.operation,
+            Operation::ScrollUp | Operation::ScrollDown
+        ) {
+            self.fallbacks += 1;
+        } else {
+            self.step_mutations += 1;
+            self.fallbacks = 0;
+        }
         Next::Mutate(Box::new(Permit {
             candidate,
             document_id: observation.document_id.clone(),
@@ -365,6 +454,7 @@ fn candidate_operation_supported(target: &Element, operation: Operation) -> bool
     let expected = match operation {
         Operation::Click => "CLICK",
         Operation::TypeText => "TYPE_TEXT",
+        Operation::Select => "SELECT",
         _ => return false,
     };
     target.operations.iter().any(|item| item == expected)
@@ -400,10 +490,11 @@ fn selected_target<'a>(
     judgments: &Judgments,
     operation: Operation,
 ) -> Result<&'a Element, PolicyStop> {
-    let answer = if operation == Operation::Click {
-        &judgments.click_target
-    } else {
-        &judgments.type_target
+    let answer = match operation {
+        Operation::Click => &judgments.click_target,
+        Operation::TypeText => &judgments.type_target,
+        Operation::Select => &judgments.select_target,
+        _ => return Err(PolicyStop::Blocked("provider_invalid_response")),
     };
     parse_target(observation, &answer.choice)
         .ok_or(PolicyStop::Blocked("provider_invalid_response"))
@@ -413,7 +504,7 @@ fn selected_value(
     judgments: &Judgments,
     operation: Operation,
 ) -> Result<Option<String>, PolicyStop> {
-    if operation != Operation::TypeText {
+    if !matches!(operation, Operation::TypeText | Operation::Select) {
         return Ok(None);
     }
     if judgments.type_value.choice == "NONE_FITS" {
@@ -446,58 +537,41 @@ fn replay_key(observation: &Observation, target: &Element, candidate: &Candidate
     hex::encode(Sha256::digest(stable.to_string().as_bytes()))
 }
 
-fn unsupported_capability(
-    observation: &Observation,
-    judgments: &Judgments,
-) -> Option<&'static str> {
+fn scroll_replay_key(observation: &Observation, operation: Operation) -> String {
+    let stable = serde_json::json!({
+        "operation":operation,
+        "route":observation.route,
+        "scroll_y":observation.viewport.scroll_y,
+        "document_height":observation.viewport.document_height,
+    });
+    hex::encode(Sha256::digest(stable.to_string().as_bytes()))
+}
+
+fn unsupported_surface(observation: &Observation, judgments: &Judgments) -> Option<&'static str> {
     let selected_target = match selected_operation(judgments).ok() {
         Some(Operation::Click) => parse_target(observation, &judgments.click_target.choice),
         Some(Operation::TypeText) => parse_target(observation, &judgments.type_target.choice),
+        Some(Operation::Select) => parse_target(observation, &judgments.select_target.choice),
         _ => None,
     };
+    if selected_target.is_some_and(|element| element.input_type.as_deref() == Some("file")) {
+        return Some("file_input");
+    }
+    selected_target
+        .is_none()
+        .then(|| named_surface_gap(&observation.coverage.gaps))
+        .flatten()
+}
+
+fn named_surface_gap(gaps: &[String]) -> Option<&'static str> {
     [
-        needs_native_select(observation, selected_target).then_some("native_select"),
-        needs_autocomplete(selected_target).then_some("autocomplete_requires_suggestions"),
-        needs_scroll(observation, judgments).then_some("scroll_required"),
-        needs_unsupported_surface(observation, selected_target).then_some("unsupported_surface"),
+        ("cross_origin_frame", "cross_origin_frame"),
+        ("closed_shadow_root", "closed_shadow_root"),
+        ("canvas", "canvas_control"),
+        ("popup", "popup_or_new_tab"),
     ]
     .into_iter()
-    .flatten()
-    .next()
-}
-
-fn needs_unsupported_surface(observation: &Observation, selected: Option<&Element>) -> bool {
-    !observation.coverage.gaps.is_empty() && (observation.elements.is_empty() || selected.is_none())
-}
-
-fn needs_native_select(observation: &Observation, selected: Option<&Element>) -> bool {
-    selected.is_some_and(|element| element.operations.iter().any(|op| op == "SELECT"))
-        || (observation
-            .elements
-            .iter()
-            .any(|element| element.operations == ["SELECT"])
-            && !observation.elements.iter().any(supports_direct_input))
-}
-
-fn supports_direct_input(element: &Element) -> bool {
-    element
-        .operations
-        .iter()
-        .any(|operation| operation == "CLICK" || operation == "TYPE_TEXT")
-}
-
-fn needs_autocomplete(selected: Option<&Element>) -> bool {
-    selected.is_some_and(|element| {
-        element.role == "combobox"
-            && element.operations.iter().any(|op| op == "TYPE_TEXT")
-            && element.expanded != Some(true)
-    })
-}
-
-fn needs_scroll(observation: &Observation, judgments: &Judgments) -> bool {
-    observation.elements.is_empty()
-        && observation.viewport.document_height > f64::from(observation.viewport.height)
-        && judgments.operation.choice != "WAIT"
+    .find_map(|(gap, surface)| gaps.iter().any(|actual| actual == gap).then_some(surface))
 }
 
 #[cfg(test)]
@@ -534,6 +608,7 @@ mod tests {
                 disabled: false,
                 in_dialog: None,
                 operations: vec![operation.into()],
+                select_options: vec![],
                 rect: Rect {
                     x: 1.,
                     y: 1.,
@@ -563,6 +638,7 @@ mod tests {
             operation: choice(operation),
             click_target: choice("1"),
             type_target: choice("1"),
+            select_target: choice("1"),
             type_value: choice("name"),
             step_done: 0.5,
             usage: BTreeMap::new(),
@@ -633,6 +709,30 @@ mod tests {
         assert!(matches!(
             decide_not_done(&mut policy, &step(), &remount, &judgments("CLICK"), false),
             Next::Stop(PolicyStop::Uncertain("replay_forbidden"))
+        ));
+    }
+
+    #[test]
+    fn proven_not_performed_remount_releases_replay_and_mutation_consumption() {
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        let first = decide_not_done(
+            &mut policy,
+            &step(),
+            &observation("CLICK", "button"),
+            &judgments("CLICK"),
+            false,
+        );
+        let Next::Mutate(permit) = first else {
+            panic!("first permit");
+        };
+        let (_, _, replay_key, _) = permit.consume();
+        policy.release_not_performed(&replay_key);
+        assert_eq!(policy.step_mutations(), 0);
+        let mut remounted = observation("CLICK", "button");
+        remounted.elements[0].node_id = 77;
+        assert!(matches!(
+            decide_not_done(&mut policy, &step(), &remounted, &judgments("CLICK"), false),
+            Next::Mutate(_)
         ));
     }
 
@@ -739,17 +839,19 @@ mod tests {
     }
 
     #[test]
-    fn native_select_stops_before_authorization() {
+    fn native_select_is_authorized_by_the_observed_select_target() {
         let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        let mut answer = judgments("SELECT");
+        answer.select_target = choice("1");
         assert!(matches!(
             decide_not_done(
                 &mut policy,
                 &step(),
                 &observation("SELECT", "combobox"),
-                &judgments("CLICK"),
+                &answer,
                 false
             ),
-            Next::Stop(PolicyStop::Blocked("native_select"))
+            Next::Mutate(_)
         ));
     }
 
@@ -975,6 +1077,95 @@ mod tests {
                 false
             ),
             Next::Stop(PolicyStop::Blocked("origin_not_allowed"))
+        ));
+    }
+
+    #[test]
+    fn unsupported_surfaces_are_named_and_popup_is_stopped_immediately() {
+        let mut file = observation("TYPE_TEXT", "textbox");
+        file.elements[0].input_type = Some("file".into());
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        assert!(matches!(
+            decide_not_done(&mut policy, &step(), &file, &judgments("TYPE_TEXT"), false),
+            Next::Stop(PolicyStop::UnsupportedSurface("file_input"))
+        ));
+
+        for (gap, expected) in [
+            ("cross_origin_frame", "cross_origin_frame"),
+            ("closed_shadow_root", "closed_shadow_root"),
+            ("canvas", "canvas_control"),
+        ] {
+            let mut observation = observation("CLICK", "button");
+            observation.elements.clear();
+            observation.coverage.gaps = vec![gap.into()];
+            let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+            assert!(matches!(
+                decide_not_done(
+                    &mut policy,
+                    &step(),
+                    &observation,
+                    &judgments("CLICK"),
+                    false
+                ),
+                Next::Stop(PolicyStop::UnsupportedSurface(surface)) if surface == expected
+            ));
+        }
+
+        let mut popup = observation("CLICK", "button");
+        popup.coverage.gaps = vec!["popup".into()];
+        let policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        assert_eq!(
+            policy.check_origin(&popup),
+            Err(PolicyStop::UnsupportedSurface("popup_or_new_tab"))
+        );
+    }
+
+    #[test]
+    fn scroll_fallbacks_are_bounded_without_consuming_the_step_mutation_limit() {
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        let mut page = observation("CLICK", "button");
+        page.viewport.document_height = 2_000.0;
+        for index in 0..8 {
+            page.viewport.scroll_y = f64::from(index) * 100.0;
+            assert!(matches!(
+                decide_not_done(
+                    &mut policy,
+                    &step(),
+                    &page,
+                    &judgments("SCROLL_DOWN"),
+                    false
+                ),
+                Next::Mutate(_)
+            ));
+            assert_eq!(policy.step_mutations(), 0);
+        }
+        page.viewport.scroll_y = 800.0;
+        assert!(matches!(
+            decide_not_done(
+                &mut policy,
+                &step(),
+                &page,
+                &judgments("SCROLL_DOWN"),
+                false
+            ),
+            Next::Stop(PolicyStop::Blocked("budget_exhausted"))
+        ));
+    }
+
+    #[test]
+    fn wait_fallbacks_are_bounded_and_never_mint_a_permit() {
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        let page = observation("CLICK", "button");
+        for _ in 0..8 {
+            assert!(matches!(
+                decide_not_done(&mut policy, &step(), &page, &judgments("WAIT"), false),
+                Next::Wait
+            ));
+            assert_eq!(policy.step_mutations(), 0);
+        }
+        assert!(matches!(
+            decide_not_done(&mut policy, &step(), &page, &judgments("WAIT"), false),
+            Next::Stop(PolicyStop::Blocked("budget_exhausted"))
         ));
     }
 }

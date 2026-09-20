@@ -596,7 +596,11 @@ impl manuvra_flow::actions::Performer for FaultActionPerformer<'_> {
         )
         .map_err(manuvra_flow::PerformError::Uncertain)?;
         self.boundary.after_dispatch();
-        Ok(manuvra_flow::PerformFact { readback: None })
+        Ok(manuvra_flow::PerformFact {
+            readback: None,
+            readback_matches: None,
+            suboperations: vec![],
+        })
     }
 }
 
@@ -707,6 +711,7 @@ fn fault_observation() -> manuvra_flow::Observation {
             disabled: false,
             in_dialog: None,
             operations: vec!["CLICK".into()],
+            select_options: vec![],
             rect: manuvra_flow::Rect {
                 x: 1.0,
                 y: 1.0,
@@ -736,6 +741,7 @@ fn fault_judgments() -> manuvra_flow::judgment::Judgments {
         operation: choice("CLICK"),
         click_target: choice("1"),
         type_target: choice("NO_TYPE_TEXT_TARGET"),
+        select_target: choice("NO_SELECT_TARGET"),
         type_value: choice("NONE_FITS"),
         step_done: 0.0,
         usage: BTreeMap::new(),

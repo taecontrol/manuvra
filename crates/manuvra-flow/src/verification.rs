@@ -606,6 +606,7 @@ mod tests {
                 disabled: false,
                 in_dialog: Some("Create account".into()),
                 operations: vec!["TYPE_TEXT".into()],
+                select_options: vec![],
                 rect: Rect {
                     x: 1.,
                     y: 1.,

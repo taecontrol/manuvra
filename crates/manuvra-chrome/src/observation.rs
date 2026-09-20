@@ -40,7 +40,18 @@ pub struct Element {
     pub in_dialog: Option<String>,
     #[serde(default)]
     pub operations: Vec<String>,
+    #[serde(default)]
+    pub select_options: Vec<SelectOption>,
     pub rect: Rect,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectOption {
+    pub node_id: u64,
+    pub label: String,
+    pub value: String,
+    pub disabled: bool,
+    pub selected: bool,
 }
 
 fn main_context() -> String {

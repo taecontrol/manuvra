@@ -35,12 +35,33 @@ impl<'a> Values<'a> {
                     .filter(|(_, value)| rendering_matches(value, &element.value))
                     .map(|(name, _)| name)
                     .collect();
+                let select_options: Vec<_> = element
+                    .select_options
+                    .iter()
+                    .map(|option| {
+                        let matches: Vec<_> = self
+                            .values
+                            .iter()
+                            .filter(|(_, value)| {
+                                rendering_matches(value, &option.value)
+                                    || rendering_matches(value, &option.label)
+                            })
+                            .map(|(name, _)| name)
+                            .collect();
+                        json!({
+                            "label":self.mask(&option.label),
+                            "equals_value_names":matches,
+                            "disabled":option.disabled,
+                            "selected":option.selected
+                        })
+                    })
+                    .collect();
                 json!({
                     "index":element.index,"role":element.role,"name":self.mask(&element.name),
                     "input_type":element.input_type,"nonempty":!element.value.trim().is_empty(),
                     "equals_value_names":matches,"checked":element.checked,"selected":element.selected,
                     "expanded":element.expanded,"disabled":element.disabled,"in_dialog":element.in_dialog,
-                    "operations":element.operations
+                    "operations":element.operations,"select_options":select_options
                 })
             })
             .collect();
@@ -110,7 +131,7 @@ fn value_renderings(value: &JobValue) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use manuvra_chrome::{Coverage, Element, Rect, ViewportState};
+    use manuvra_chrome::{Coverage, Element, Rect, SelectOption, ViewportState};
     use manuvra_contract::{Job, ValueFormats};
     use serde_json::json;
 
@@ -141,6 +162,7 @@ mod tests {
                 disabled: false,
                 in_dialog: None,
                 operations: vec!["TYPE_TEXT".into()],
+                select_options: vec![],
                 rect: Rect {
                     x: 0.,
                     y: 0.,
@@ -195,5 +217,63 @@ mod tests {
             Values::new(&job).mask_sensitive("private-742 hidden-815 visible-926"),
             "<value:secret> <value:redacted> visible-926"
         );
+    }
+
+    #[test]
+    fn model_view_exposes_select_matches_without_values_or_browser_identities() {
+        let job = Job::parse(
+            serde_json::to_vec(&json!({
+                "schema_version":1,
+                "target":{"kind":"browser","url":"http://example.test"},
+                "context":{"journey":"x","revision":"x","environment":"x","actor":"x","authority":"x"},
+                "values":{"country":{"value":"secret-country-742","description":"Country","secret":true}},
+                "steps":[{"id":"x","goal":"Choose country","done_when":[{"field":"Country","equals_value":"country"}]}]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap();
+        let mut observation = serde_json::from_value::<Observation>(json!({
+            "document_id":"internal-document-token","url":"http://example.test/","route":"/","title":"x",
+            "elements":[],"viewport":{"width":1,"height":1,"scroll_x":0.0,"scroll_y":0.0,"document_height":1.0}
+        }))
+        .unwrap();
+        observation.elements.push(Element {
+            index: 1,
+            node_id: 981_723,
+            context: "main".into(),
+            role: "combobox".into(),
+            name: "Country".into(),
+            input_type: None,
+            value: String::new(),
+            checked: None,
+            selected: None,
+            expanded: None,
+            disabled: false,
+            in_dialog: None,
+            operations: vec!["SELECT".into()],
+            select_options: vec![SelectOption {
+                node_id: 812_345,
+                label: "secret-country-742".into(),
+                value: "secret-country-742".into(),
+                disabled: false,
+                selected: false,
+            }],
+            rect: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+        });
+
+        let serialized = Values::new(&job).model_view(&observation).to_string();
+        assert!(serialized.contains("country"));
+        assert!(serialized.contains("equals_value_names"));
+        assert!(serialized.contains("<value:country>"));
+        assert!(!serialized.contains("secret-country-742"));
+        assert!(!serialized.contains("981723"));
+        assert!(!serialized.contains("812345"));
+        assert!(!serialized.contains("node_id"));
     }
 }

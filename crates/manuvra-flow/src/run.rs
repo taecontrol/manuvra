@@ -1798,6 +1798,10 @@ fn verification_policy_stop(stop: policy::PolicyStop) -> Stop {
     match stop {
         policy::PolicyStop::Blocked(code) => Stop::blocked(code, BTreeMap::new()),
         policy::PolicyStop::Uncertain(code) => Stop::uncertain(code, BTreeMap::new()),
+        policy::PolicyStop::UnsupportedSurface(surface) => Stop::blocked(
+            "unsupported_surface",
+            BTreeMap::from([("surface".into(), json!(surface))]),
+        ),
     }
 }
 
@@ -1925,7 +1929,7 @@ impl StepDriver<'_> {
                 step_detail(self.redactor, self.step),
             ));
         }
-        let captured = match self.capture() {
+        let captured = match self.capture_guarded() {
             Ok(value) => value,
             Err(stop) => return StepProgress::Stop(stop),
         };
@@ -1942,6 +1946,14 @@ impl StepDriver<'_> {
                 self.natural_done_progress(condition, &captured)
             }
         }
+    }
+
+    fn capture_guarded(&mut self) -> Result<Captured, Stop> {
+        let captured = self.capture()?;
+        self.policy
+            .check_origin(&captured.raw)
+            .map_err(|stop| policy_stop(stop, self.redactor, self.step))?;
+        Ok(captured)
     }
 
     fn natural_done_progress(&mut self, condition: &str, captured: &Captured) -> StepProgress {
@@ -2256,9 +2268,14 @@ impl StepDriver<'_> {
         self.artifacts
             .trace
             .extend(self.journal.entries()[journal_start..].iter().cloned());
-        result
-            .map(|_fact| {
-                self.mutations += 1;
+        match result {
+            Ok(fact) => {
+                if !matches!(
+                    fact.operation,
+                    judgment::Operation::ScrollUp | judgment::Operation::ScrollDown
+                ) {
+                    self.mutations += 1;
+                }
                 self.awaiting_final_done_reobservation = false;
                 debug_assert_eq!(
                     self.artifacts
@@ -2268,10 +2285,15 @@ impl StepDriver<'_> {
                     Some(&json!("action_fact"))
                 );
                 StepProgress::Continue
-            })
-            .unwrap_or_else(|stop| {
-                StepProgress::Stop(self.action_stop(done, captured, judgments, stop))
-            })
+            }
+            Err(actions::ActionStop::Reobserve(replay_key)) => {
+                self.policy.release_not_performed(&replay_key);
+                self.done_unknown_reobserved = false;
+                self.operation_gate_reobserved = false;
+                StepProgress::Continue
+            }
+            Err(stop) => StepProgress::Stop(self.action_stop(done, captured, judgments, stop)),
+        }
     }
 
     fn action_stop(
@@ -2298,6 +2320,9 @@ impl StepDriver<'_> {
                 },
                 "action_outcome_uncertain",
             ),
+            actions::ActionStop::Reobserve(_) => {
+                unreachable!("not-performed actions reobserve before stop mapping")
+            }
             other => self.simple_action_stop(other),
         }
     }
@@ -2329,7 +2354,7 @@ impl StepDriver<'_> {
                 step_detail(self.redactor, self.step),
             )
         } else {
-            debug_assert_eq!(stop, actions::ActionStop::InvalidPermit);
+            debug_assert!(matches!(stop, actions::ActionStop::InvalidPermit));
             Stop::uncertain(
                 "candidate_revalidation_failed",
                 step_detail(self.redactor, self.step),
@@ -2498,6 +2523,11 @@ fn policy_stop(
     match stop {
         policy::PolicyStop::Blocked(code) => Stop::blocked(code, step_detail(redactor, step)),
         policy::PolicyStop::Uncertain(code) => Stop::uncertain(code, step_detail(redactor, step)),
+        policy::PolicyStop::UnsupportedSurface(surface) => {
+            let mut details = step_detail(redactor, step);
+            details.insert("surface".into(), json!(surface));
+            Stop::blocked("unsupported_surface", details)
+        }
     }
 }
 
@@ -2521,7 +2551,7 @@ fn escalate(
         .to_string();
     let offered_candidate = pending.candidate.as_ref().map(policy::Candidate::offered);
     let candidates = offered_candidate.as_ref().map_or_else(
-        || judgments.map(|value|json!({"operation":value.operation,"click_target":value.click_target,"type_target":value.type_target,"type_value":value.type_value})).unwrap_or_else(||json!({})),
+        || judgments.map(|value|json!({"operation":value.operation,"click_target":value.click_target,"type_target":value.type_target,"select_target":value.select_target,"type_value":value.type_value})).unwrap_or_else(||json!({})),
         |candidate| json!([candidate]),
     );
     let latest=artifacts.observations.last().map(|(name,_,png)|json!({"snapshot":format!("observations/{name}.json"),"screenshot":png.as_ref().map(|_|format!("observations/{name}.png"))})).unwrap_or(Value::Null);
@@ -2779,7 +2809,6 @@ fn redacted_observation(raw: &Observation, redactor: &Redactor) -> Result<Value,
         .map(|element| {
             json!({
                 "index":element.index,
-                "context":element.context,
                 "role":element.role,
                 "name":redact(&element.name),
                 "input_type":element.input_type,
@@ -2790,6 +2819,12 @@ fn redacted_observation(raw: &Observation, redactor: &Redactor) -> Result<Value,
                 "disabled":element.disabled,
                 "in_dialog":element.in_dialog.as_ref().map(|dialog|redact(dialog)),
                 "operations":element.operations,
+                "select_options":element.select_options.iter().map(|option|json!({
+                    "label":redact(&option.label),
+                    "value":redact(&option.value),
+                    "disabled":option.disabled,
+                    "selected":option.selected,
+                })).collect::<Vec<_>>(),
                 "rect":element.rect,
             })
         })
@@ -3153,8 +3188,107 @@ mod tests {
     use manuvra_chrome::{Coverage, Element, Rect, RedactionProof, Screenshot, ViewportState};
     use serde_json::json;
     use std::collections::{BTreeMap, VecDeque};
+    #[cfg(target_os = "linux")]
+    use std::io::{Read, Write};
+    #[cfg(target_os = "linux")]
+    use std::net::{TcpListener, TcpStream};
+    #[cfg(target_os = "linux")]
+    use std::sync::Arc;
     use std::sync::Mutex;
+    #[cfg(target_os = "linux")]
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    #[cfg(target_os = "linux")]
+    use std::thread;
     use tempfile::TempDir;
+
+    #[cfg(target_os = "linux")]
+    struct OriginFixture {
+        start_port: u16,
+        foreign_port: u16,
+        stop: Arc<AtomicBool>,
+        workers: Vec<thread::JoinHandle<()>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl OriginFixture {
+        fn start() -> Self {
+            let start = TcpListener::bind("127.0.0.1:0").unwrap();
+            let foreign = TcpListener::bind("127.0.0.1:0").unwrap();
+            start.set_nonblocking(true).unwrap();
+            foreign.set_nonblocking(true).unwrap();
+            let start_port = start.local_addr().unwrap().port();
+            let foreign_port = foreign.local_addr().unwrap().port();
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker = |listener: TcpListener, body: String, stop: Arc<AtomicBool>| {
+                thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        match listener.accept() {
+                            Ok((mut stream, _)) => serve_origin_fixture(&mut stream, &body),
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(error) => panic!("origin fixture failed: {error}"),
+                        }
+                    }
+                })
+            };
+            let start_body = format!(
+                "<!doctype html><title>Origin guard</title><a href=\"http://127.0.0.1:{foreign_port}/landing\">Leave origin</a>"
+            );
+            let foreign_body =
+                "<!doctype html><title>Foreign origin</title><p>Committed foreign origin</p>"
+                    .to_owned();
+            let workers = vec![
+                worker(start, start_body, Arc::clone(&stop)),
+                worker(foreign, foreign_body, Arc::clone(&stop)),
+            ];
+            Self {
+                start_port,
+                foreign_port,
+                stop,
+                workers,
+            }
+        }
+
+        fn start_url(&self) -> String {
+            format!("http://127.0.0.1:{}/", self.start_port)
+        }
+
+        fn foreign_origin(&self) -> String {
+            format!("http://127.0.0.1:{}", self.foreign_port)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for OriginFixture {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            let _ = TcpStream::connect(("127.0.0.1", self.start_port));
+            let _ = TcpStream::connect(("127.0.0.1", self.foreign_port));
+            for worker in self.workers.drain(..) {
+                worker.join().unwrap();
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn serve_origin_fixture(stream: &mut TcpStream, body: &str) {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut buffer).unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+        }
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    }
 
     struct FakeBrowser {
         captures: Mutex<VecDeque<Result<CapturedPage, BrowserError>>>,
@@ -3237,11 +3371,53 @@ mod tests {
                     ("operation".into(), choice("TYPE_TEXT")),
                     ("click_target".into(), choice("NO_CLICK_TARGET")),
                     ("type_target".into(), choice("1")),
+                    ("select_target".into(), choice("NO_SELECT_TARGET")),
                     ("type_value".into(), choice("name")),
                     ("step_done".into(), manuvra_jev::Answer::Noul { noul: 0.01 }),
                 ]),
                 usage: BTreeMap::new(),
                 request_id: Some("recorded-fake".into()),
+                model: "jev-1.13.0".into(),
+            })
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct ClickProvider(AtomicUsize);
+
+    #[cfg(target_os = "linux")]
+    impl manuvra_jev::Evaluator for ClickProvider {
+        fn evaluate(
+            &self,
+            request: &Value,
+            _deadline: Instant,
+        ) -> Result<manuvra_jev::Evaluation, manuvra_jev::JevError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let first = |question: &str| {
+                request["questions"][question]["criteria"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .next()
+                    .unwrap()
+                    .clone()
+            };
+            let choice = |selected: String| manuvra_jev::Answer::Choice {
+                probabilities: BTreeMap::from([(selected.clone(), 1.0)]),
+                choice: selected,
+                confidence: 1.0,
+            };
+            Ok(manuvra_jev::Evaluation {
+                answers: BTreeMap::from([
+                    ("operation".into(), choice("CLICK".into())),
+                    ("click_target".into(), choice(first("click_target"))),
+                    ("type_target".into(), choice(first("type_target"))),
+                    ("select_target".into(), choice(first("select_target"))),
+                    ("type_value".into(), choice(first("type_value"))),
+                    ("step_done".into(), manuvra_jev::Answer::Noul { noul: 0.01 }),
+                ]),
+                usage: BTreeMap::new(),
+                request_id: Some("origin-guard-fixture".into()),
                 model: "jev-1.13.0".into(),
             })
         }
@@ -3266,6 +3442,7 @@ mod tests {
                     ("operation".into(), choice("TYPE_TEXT", confidence)),
                     ("click_target".into(), choice("NO_CLICK_TARGET", 1.0)),
                     ("type_target".into(), choice("1", 1.0)),
+                    ("select_target".into(), choice("NO_SELECT_TARGET", 1.0)),
                     ("type_value".into(), choice("name", 1.0)),
                     ("step_done".into(), manuvra_jev::Answer::Noul { noul: 0.01 }),
                 ]),
@@ -3295,6 +3472,7 @@ mod tests {
                     ("operation".into(), choice("TYPE_TEXT")),
                     ("click_target".into(), choice("NO_CLICK_TARGET")),
                     ("type_target".into(), choice("1")),
+                    ("select_target".into(), choice("NO_SELECT_TARGET")),
                     ("type_value".into(), choice("name")),
                     ("step_done".into(), manuvra_jev::Answer::Noul { noul }),
                 ]),
@@ -3408,6 +3586,64 @@ mod tests {
             None,
             None,
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the local Chromium executable"]
+    fn production_driver_stops_after_committed_navigation_to_a_foreign_origin() {
+        let fixture = OriginFixture::start();
+        let start_url = fixture.start_url();
+        let job = Job::parse(
+            serde_json::to_vec(&json!({
+                "schema_version":1,
+                "target":{"kind":"browser","url":start_url},
+                "context":{"journey":"origin guard","revision":"fixture","environment":"local Chromium","actor":"synthetic","authority":"navigate only"},
+                "steps":[{"id":"leave","goal":"Open Leave origin.","done_when":[{"text_visible":"Never present"}]}]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap();
+        let redactor = Redactor::for_job(&job).unwrap();
+        let mut browser = OwnedBrowser::launch(BrowserConfig {
+            explicit_binary: None,
+            headless: true,
+            width: 1120,
+            height: 780,
+            inherit_process_group: false,
+        })
+        .unwrap();
+        browser.navigate(&start_url).unwrap();
+        let provider = ClickProvider(AtomicUsize::new(0));
+        let mut journal = MemoryJournal::default();
+
+        let artifacts = drive_steps(
+            &job,
+            &redactor,
+            &browser,
+            &provider,
+            &mut journal,
+            &manuvra_chrome::InputCancellation::default(),
+            None,
+            None,
+        );
+
+        let stop = artifacts.stop.expect("foreign origin must stop the run");
+        assert_eq!(stop.state, RunState::Blocked);
+        assert_eq!(
+            stop.code, "origin_not_allowed",
+            "unexpected stop details: {:?}",
+            stop.details
+        );
+        assert_eq!(provider.0.load(Ordering::SeqCst), 1);
+        assert_eq!(journal.0.len(), 2, "only one prepared mutation may run");
+        assert_eq!(journal.0[0]["event"], "action_prepared");
+        assert_eq!(journal.0[1]["event"], "action_fact");
+        assert_eq!(journal.0[1]["fact"]["outcome"], "observed");
+        let committed = browser.observe().unwrap();
+        assert!(committed.url.starts_with(&fixture.foreign_origin()));
+        browser.close().unwrap();
     }
 
     #[test]
@@ -3571,6 +3807,7 @@ mod tests {
             disabled: false,
             in_dialog: None,
             operations: vec!["TYPE_TEXT".into()],
+            select_options: vec![],
             rect: Rect {
                 x: 1.0,
                 y: 1.0,
@@ -4041,6 +4278,7 @@ mod tests {
             disabled: false,
             in_dialog: None,
             operations: vec!["TYPE_TEXT".into()],
+            select_options: vec![],
             rect: Rect {
                 x: 1.0,
                 y: 1.0,
@@ -4086,6 +4324,7 @@ mod tests {
         let mut observation = text_field("");
         observation.document_id = "internal-document-token".into();
         observation.elements[0].node_id = 981_723;
+        observation.elements[0].context = "main/shadow:981723".into();
         let exported = redacted_observation(&observation, &redactor).unwrap();
         let text = exported.to_string();
 
@@ -4095,6 +4334,8 @@ mod tests {
         assert!(!text.contains("981723"));
         assert!(!text.contains("document_id"));
         assert!(!text.contains("node_id"));
+        assert!(!text.contains("main/shadow"));
+        assert!(exported["elements"][0].get("context").is_none());
     }
 
     #[test]
@@ -4115,6 +4356,8 @@ mod tests {
             fallback: empty,
             dispatch_result: Some(Ok(manuvra_chrome::PerformFact {
                 readback: Some("Wanted".into()),
+                readback_matches: None,
+                suboperations: vec![],
             })),
         };
         let evaluator = TypeTextProvider(std::sync::atomic::AtomicUsize::new(0));
@@ -4200,6 +4443,8 @@ mod tests {
             fallback: observed(""),
             dispatch_result: Some(Ok(manuvra_chrome::PerformFact {
                 readback: Some("Wanted".into()),
+                readback_matches: None,
+                suboperations: vec![],
             })),
         };
         let control = DispositionHostedControl {
@@ -4661,6 +4906,11 @@ mod tests {
                 probabilities: BTreeMap::from([("1".into(), 1.0)]),
                 confidence: 1.0,
             },
+            select_target: judgment::ChoiceJudgment {
+                choice: "NO_SELECT_TARGET".into(),
+                probabilities: BTreeMap::from([("NO_SELECT_TARGET".into(), 1.0)]),
+                confidence: 1.0,
+            },
             type_value: judgment::ChoiceJudgment {
                 choice: "name".into(),
                 probabilities: BTreeMap::from([("name".into(), 1.0)]),
@@ -4742,6 +4992,7 @@ mod tests {
             operation: choice(operation),
             click_target: choice("1"),
             type_target: choice("1"),
+            select_target: choice("1"),
             type_value: choice("name"),
             step_done: 0.0,
             usage: BTreeMap::new(),
@@ -4772,6 +5023,7 @@ mod tests {
             disabled: false,
             in_dialog: None,
             operations: vec!["TYPE_TEXT".into()],
+            select_options: vec![],
             rect: Rect {
                 x: 1.0,
                 y: 1.0,
@@ -4831,6 +5083,7 @@ mod tests {
             disabled: false,
             in_dialog: None,
             operations: vec!["TYPE_TEXT".into()],
+            select_options: vec![],
             rect: Rect {
                 x: 1.0,
                 y: 1.0,
@@ -4999,6 +5252,7 @@ mod tests {
             disabled: false,
             in_dialog: None,
             operations: vec!["TYPE_TEXT".into()],
+            select_options: vec![],
             rect: Rect {
                 x: 1.0,
                 y: 1.0,
@@ -5018,6 +5272,8 @@ mod tests {
             fallback: completed,
             dispatch_result: Some(Ok(manuvra_chrome::PerformFact {
                 readback: Some("Wanted".into()),
+                readback_matches: None,
+                suboperations: vec![],
             })),
         };
         let provider = TypeTextProvider(std::sync::atomic::AtomicUsize::new(0));
@@ -5066,6 +5322,7 @@ mod tests {
             disabled: false,
             in_dialog: None,
             operations: vec!["TYPE_TEXT".into()],
+            select_options: vec![],
             rect: Rect {
                 x: 1.0,
                 y: 1.0,
@@ -5085,6 +5342,8 @@ mod tests {
             fallback: completed,
             dispatch_result: Some(Ok(manuvra_chrome::PerformFact {
                 readback: Some("Wanted".into()),
+                readback_matches: None,
+                suboperations: vec![],
             })),
         };
         let provider = ConfidenceSequenceProvider(Mutex::new(VecDeque::from([0.69, 0.95])));
