@@ -360,6 +360,7 @@ pub struct EvidenceBundle {
     pub steps: Vec<(String, Value)>,
     pub escalations: Vec<(String, Value)>,
     pub dispositions: Vec<(String, Value)>,
+    pub verification: Option<Value>,
     pub trace: Vec<Value>,
     pub cleanup: Value,
     pub result: Value,
@@ -454,6 +455,9 @@ fn validate_replacement_roles(roles: &BTreeMap<&str, usize>) -> Result<(), Strin
             ));
         }
     }
+    if roles.get("verification").copied().unwrap_or_default() > 1 {
+        return Err("existing evidence must contain at most one verification artifact".into());
+    }
     let allowed = [
         "normalized_job",
         "provenance",
@@ -466,6 +470,7 @@ fn validate_replacement_roles(roles: &BTreeMap<&str, usize>) -> Result<(), Strin
         "step",
         "escalation",
         "disposition",
+        "verification",
     ];
     roles
         .keys()
@@ -567,6 +572,7 @@ fn role_matches_relative_path(role: &str, relative: &Path) -> bool {
         ("trace", "trace.jsonl"),
         ("cleanup", "cleanup.json"),
         ("result", "result.json"),
+        ("verification", "verification/final.json"),
     ];
     const NESTED: &[(&str, &str, &str)] = &[
         ("observation", "observations/", ".json"),
@@ -801,7 +807,22 @@ impl Publication {
         self.write_steps(bundle.steps)?;
         self.write_named("escalations", "escalation", bundle.escalations)?;
         self.write_named("dispositions", "disposition", bundle.dispositions)?;
+        self.write_verification(bundle.verification)?;
         self.write_tail(bundle.trace, &bundle.cleanup, &bundle.result)
+    }
+
+    fn write_verification(&mut self, verification: Option<Value>) -> Result<(), String> {
+        if let Some(verification) = verification {
+            write_json(
+                &self.stage,
+                &self.final_dir,
+                "verification/final.json",
+                "verification",
+                &verification,
+                &mut self.artifacts,
+            )?;
+        }
+        Ok(())
     }
 
     fn write_headers(&mut self, bundle: &EvidenceBundle) -> Result<(), String> {
@@ -1209,6 +1230,7 @@ mod tests {
             steps: vec![("s".into(), json!({"done":"satisfied"}))],
             escalations: Vec::new(),
             dispositions: Vec::new(),
+            verification: None,
             trace: vec![json!({"event":text})],
             cleanup: json!({"browser":"closed"}),
             result: json!({"state":"passed"}),
@@ -1251,6 +1273,30 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn publisher_manifests_final_verification_at_the_contract_path() {
+        let temporary = TempDir::new().unwrap();
+        let job = test_job(false);
+        let redactor = Redactor::for_job(&job).unwrap();
+        let mut evidence = bundle("safe", b"png".to_vec());
+        evidence.verification = Some(json!({"phase":"verification","expectations":[]}));
+        publish(temporary.path(), "r_verify", evidence, &redactor).unwrap();
+        let manifest: Manifest = serde_json::from_slice(
+            &fs::read(temporary.path().join("r_verify/manifest.json")).unwrap(),
+        )
+        .unwrap();
+        let artifact = manifest
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.role == "verification")
+            .unwrap();
+        assert_eq!(
+            Path::new(&artifact.path),
+            temporary.path().join("r_verify/verification/final.json")
+        );
+        assert!(artifact.complete);
     }
 
     #[test]

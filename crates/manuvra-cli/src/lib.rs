@@ -1001,9 +1001,20 @@ fn validate_evidence_shape(
     result: &Value,
     require_terminal: bool,
 ) -> Result<(), String> {
+    validate_terminal_shape(result, require_terminal)?;
+    validate_flow_artifact_shape(manifest, result)?;
+    validate_verification_artifact_shape(manifest, result)?;
+    validate_passed_verdict_shape(result)
+}
+
+fn validate_terminal_shape(result: &Value, require_terminal: bool) -> Result<(), String> {
     if require_terminal && result.get("terminal").and_then(Value::as_bool) != Some(true) {
         return Err("complete evidence does not contain a terminal result".into());
     }
+    Ok(())
+}
+
+fn validate_flow_artifact_shape(manifest: &Manifest, result: &Value) -> Result<(), String> {
     let short = manifest.artifacts.len() == 2;
     let admission_reason = result
         .pointer("/reason/code")
@@ -1012,9 +1023,62 @@ fn validate_evidence_shape(
     let admission_cleanup = result.pointer("/cleanup/browser").and_then(Value::as_str)
         == Some("not_started")
         && result.pointer("/cleanup/profile").and_then(Value::as_str) == Some("not_created");
-    (!short || (admission_reason && admission_cleanup))
-        .then_some(())
-        .ok_or_else(|| "prior result is missing required flow artifacts".into())
+    if short && !(admission_reason && admission_cleanup) {
+        return Err("prior result is missing required flow artifacts".into());
+    }
+    Ok(())
+}
+
+fn validate_verification_artifact_shape(manifest: &Manifest, result: &Value) -> Result<(), String> {
+    let verification_count = manifest
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.role == "verification")
+        .count();
+    if verification_count > 1 {
+        return Err("prior manifest repeats singleton role verification".into());
+    }
+    let expectations_evaluated = result
+        .pointer("/verdict/expectations")
+        .and_then(Value::as_array)
+        .is_some_and(|expectations| {
+            expectations.iter().any(|expectation| {
+                expectation.get("result").and_then(Value::as_str) != Some("not_run")
+            })
+        });
+    let verification_phase =
+        result.pointer("/escalation/phase").and_then(Value::as_str) == Some("verification");
+    let passed = result.get("state").and_then(Value::as_str) == Some("passed");
+    if (passed || expectations_evaluated || verification_phase) && verification_count != 1 {
+        return Err("prior result is missing its final verification artifact".into());
+    }
+    Ok(())
+}
+
+fn validate_passed_verdict_shape(result: &Value) -> Result<(), String> {
+    if result.get("state").and_then(Value::as_str) != Some("passed") {
+        return Ok(());
+    }
+    let overall_satisfied =
+        result.pointer("/verdict/overall").and_then(Value::as_str) == Some("satisfied");
+    let all_satisfied = ["/verdict/steps", "/verdict/expectations"]
+        .into_iter()
+        .all(|pointer| verdict_array_is_satisfied(result, pointer));
+    if !overall_satisfied || !all_satisfied {
+        return Err("passed result contains an incomplete verdict".into());
+    }
+    Ok(())
+}
+
+fn verdict_array_is_satisfied(result: &Value, pointer: &str) -> bool {
+    result
+        .pointer(pointer)
+        .and_then(Value::as_array)
+        .is_some_and(|verdicts| {
+            verdicts
+                .iter()
+                .all(|verdict| verdict.get("result").and_then(Value::as_str) == Some("satisfied"))
+        })
 }
 
 fn read_published_result(artifacts: &BTreeMap<String, PathBuf>) -> Result<Value, String> {
@@ -1130,7 +1194,14 @@ fn record_singleton_role(
     artifact: &manuvra_contract::Artifact,
     path: PathBuf,
 ) -> Result<(), String> {
-    const SINGLETONS: &[&str] = &["normalized_job", "result", "provenance", "trace", "cleanup"];
+    const SINGLETONS: &[&str] = &[
+        "normalized_job",
+        "result",
+        "provenance",
+        "trace",
+        "cleanup",
+        "verification",
+    ];
     if !SINGLETONS.contains(&artifact.role.as_str()) {
         return Ok(());
     }
@@ -1210,6 +1281,7 @@ fn role_matches_path(role: &str, path: &Path) -> bool {
         ("provenance", "provenance.json"),
         ("trace", "trace.jsonl"),
         ("cleanup", "cleanup.json"),
+        ("verification", "verification/final.json"),
     ];
     if let Some((_, wanted)) = EXACT.iter().find(|(candidate, _)| candidate == &role) {
         return text == *wanted;
@@ -1453,7 +1525,7 @@ pub(crate) fn internal_error(message: String) -> Invocation {
 
 #[cfg(all(test, target_os = "linux"))]
 mod boundary_tests {
-    use super::{remove_confirmed_dead_socket, validate_evidence_shape};
+    use super::{remove_confirmed_dead_socket, role_matches_path, validate_evidence_shape};
     use manuvra_contract::{Artifact, Manifest, SchemaVersion};
     use serde_json::json;
     use std::os::unix::net::UnixListener;
@@ -1498,5 +1570,62 @@ mod boundary_tests {
         let checkpoint = json!({"terminal":false,"state":"uncertain"});
         assert!(validate_evidence_shape(&manifest, &checkpoint, false).is_ok());
         assert!(validate_evidence_shape(&manifest, &checkpoint, true).is_err());
+    }
+
+    #[test]
+    fn final_verification_role_has_one_exact_safe_path() {
+        assert!(role_matches_path(
+            "verification",
+            std::path::Path::new("verification/final.json")
+        ));
+        assert!(!role_matches_path(
+            "verification",
+            std::path::Path::new("verification/other.json")
+        ));
+        assert!(!role_matches_path(
+            "verification",
+            std::path::Path::new("../verification/final.json")
+        ));
+    }
+
+    #[test]
+    fn passed_recovery_requires_one_verification_artifact_and_satisfied_verdicts() {
+        let artifact = |role: &str| Artifact {
+            role: role.into(),
+            path: format!("/e/{role}.json"),
+            digest: "0".repeat(64),
+            complete: true,
+        };
+        let mut manifest = Manifest {
+            schema_version: SchemaVersion,
+            run_id: "r_passed".into(),
+            complete: true,
+            artifacts: vec![
+                artifact("normalized_job"),
+                artifact("result"),
+                artifact("provenance"),
+                artifact("trace"),
+                artifact("cleanup"),
+            ],
+        };
+        let passed = json!({
+            "terminal":true,
+            "state":"passed",
+            "verdict":{
+                "overall":"satisfied",
+                "steps":[{"result":"satisfied"}],
+                "expectations":[{"result":"satisfied"}]
+            }
+        });
+        assert!(validate_evidence_shape(&manifest, &passed, true).is_err());
+        manifest.artifacts.push(artifact("verification"));
+        assert!(validate_evidence_shape(&manifest, &passed, true).is_ok());
+        manifest.artifacts.push(artifact("verification"));
+        assert!(validate_evidence_shape(&manifest, &passed, true).is_err());
+
+        manifest.artifacts.pop();
+        let mut unresolved = passed;
+        unresolved["verdict"]["expectations"][0]["result"] = json!("unresolved");
+        assert!(validate_evidence_shape(&manifest, &unresolved, true).is_err());
     }
 }

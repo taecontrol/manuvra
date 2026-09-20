@@ -1,7 +1,7 @@
 use crate::evidence::{self, EvidenceBundle, Redactor};
 #[cfg(any(target_os = "linux", test))]
 use crate::verification::{
-    DoneResult, check_done, check_natural_done, natural_numeric_literals_satisfied,
+    DoneResult, check_done, check_natural_done, natural_numeric_literals_satisfied, verify,
 };
 #[cfg(any(target_os = "linux", test))]
 use crate::{actions, judgment, policy, values::Values};
@@ -236,7 +236,7 @@ fn finish_browser_run(
                 None,
             );
             let cleanup = cleanup_browser(&mut browser, redactor, &mut artifacts.stop);
-            let (state, reason, exit_code, overall) = terminal_fields(artifacts.stop);
+            let (state, reason, exit_code, overall) = terminal_fields(artifacts.stop.clone());
             run_result(
                 job,
                 &config,
@@ -244,11 +244,12 @@ fn finish_browser_run(
                 state,
                 reason,
                 overall,
-                artifacts.verdicts,
+                artifacts.verdicts.clone(),
                 artifacts.escalation.clone(),
                 cleanup.clone(),
             )
-            .and_then(|result| {
+            .and_then(|mut result| {
+                apply_artifact_verdict(&mut result, &artifacts)?;
                 publish_bundle(
                     job,
                     config,
@@ -259,6 +260,7 @@ fn finish_browser_run(
                     artifacts.steps,
                     artifacts.escalations,
                     artifacts.dispositions,
+                    artifacts.verification,
                     artifacts.trace,
                     cleanup,
                     result,
@@ -445,6 +447,8 @@ fn finish_hosted_terminal(
         cleanup.clone(),
         machine.artifacts.caller_assisted,
     )?;
+    let mut result = result;
+    apply_artifact_verdict(&mut result, &machine.artifacts)?;
     let outcome = publish_bundle(
         job,
         config,
@@ -455,6 +459,7 @@ fn finish_hosted_terminal(
         machine.artifacts.steps,
         machine.artifacts.escalations,
         machine.artifacts.dispositions,
+        machine.artifacts.verification,
         machine.artifacts.trace,
         cleanup,
         result,
@@ -472,6 +477,7 @@ struct HostedMachine<'a> {
     values: Values<'a>,
     policy: policy::Policy,
     index: usize,
+    verification_complete: bool,
     artifacts: RunArtifacts,
 }
 
@@ -486,6 +492,7 @@ impl<'a> HostedMachine<'a> {
             values: Values::new(job),
             policy,
             index: 0,
+            verification_complete: false,
             artifacts: RunArtifacts::new(job, redactor),
         }
     }
@@ -572,6 +579,29 @@ impl<'a> HostedMachine<'a> {
                 self.policy.begin_step();
             }
         }
+        self.drive_final_verification(browser, evaluator);
+    }
+
+    fn drive_final_verification(
+        &mut self,
+        browser: &impl DriveBrowser,
+        evaluator: &impl manuvra_jev::Evaluator,
+    ) {
+        if self.verification_complete || self.artifacts.stop.is_some() {
+            return;
+        }
+        match verify_final(
+            self.job,
+            self.redactor,
+            browser,
+            evaluator,
+            &self.values,
+            &mut self.policy,
+            &mut self.artifacts,
+        ) {
+            VerificationProgress::Complete => self.verification_complete = true,
+            VerificationProgress::Stop(stop) => self.artifacts.stop = Some(stop),
+        }
     }
 
     fn apply(
@@ -597,17 +627,26 @@ impl<'a> HostedMachine<'a> {
                 None
             }
             Disposition::Advance(advance) => {
-                self.apply_advance(&advance.rationale, browser);
+                if self.artifacts.pending_verification.is_some() {
+                    self.apply_verification_advance(&advance.rationale, browser, evaluator);
+                } else {
+                    self.apply_advance(&advance.rationale, browser);
+                }
                 None
             }
             Disposition::Execute(execute) => {
-                self.apply_execute(
-                    &execute.candidate_id,
-                    browser,
-                    evaluator,
-                    journal,
-                    cancellation,
-                );
+                if self.artifacts.pending_verification.is_some() {
+                    let _ = execute;
+                    self.reissue_verification("execute_not_permitted");
+                } else {
+                    self.apply_execute(
+                        &execute.candidate_id,
+                        browser,
+                        evaluator,
+                        journal,
+                        cancellation,
+                    );
+                }
                 None
             }
         }
@@ -617,6 +656,119 @@ impl<'a> HostedMachine<'a> {
         self.artifacts.stop = None;
         self.artifacts.escalation = None;
         self.artifacts.pending = None;
+        self.artifacts.pending_verification = None;
+    }
+
+    fn apply_verification_advance(
+        &mut self,
+        rationale: &str,
+        browser: &impl DriveBrowser,
+        evaluator: &impl manuvra_jev::Evaluator,
+    ) {
+        let Some(pending) = self.artifacts.pending_verification.clone() else {
+            return;
+        };
+        if rationale.trim().is_empty() || !pending.attestable() {
+            self.reissue_verification("advance_not_permitted");
+            return;
+        }
+        let observation = match capture_verification_advance(
+            self.job,
+            self.redactor,
+            browser,
+            &mut self.artifacts,
+        ) {
+            Ok(observation) => observation,
+            Err(stop) => {
+                self.finish_verification_with_stop(stop);
+                return;
+            }
+        };
+        let prior_hash = relevant_state_hash(&pending.observation);
+        let current_hash = relevant_state_hash(&observation);
+        let identity_unchanged = pending.observation.document_id == observation.document_id;
+        let facts_unchanged = prior_hash == current_hash;
+        self.artifacts.trace.push(json!({
+            "event":"verification_disposition_check",
+            "kind":"advance",
+            "document_identity_unchanged":identity_unchanged,
+            "relevant_facts_unchanged":facts_unchanged,
+            "prior_state_hash":prior_hash,
+            "current_state_hash":current_hash,
+        }));
+        if !(identity_unchanged && facts_unchanged) {
+            self.recheck_changed_verification(observation, evaluator);
+            return;
+        }
+        self.accept_verification_attestation(rationale);
+    }
+
+    fn accept_verification_attestation(&mut self, rationale: &str) {
+        for verdict in &mut self.artifacts.expectation_verdicts {
+            if verdict.result == VerdictResult::Unresolved {
+                verdict.result = VerdictResult::Satisfied;
+            }
+        }
+        if let Some(Value::Object(record)) = &mut self.artifacts.verification {
+            record.insert("basis".into(), json!("caller_attestation"));
+            record.insert(
+                "rationale".into(),
+                json!(self.redactor.redact_export_text(rationale)),
+            );
+            record.insert(
+                "expectations".into(),
+                serde_json::to_value(&self.artifacts.expectation_verdicts).unwrap_or(Value::Null),
+            );
+        }
+        self.artifacts.caller_assisted = true;
+        self.verification_complete = true;
+        self.clear_pause();
+    }
+
+    fn recheck_changed_verification(
+        &mut self,
+        observation: Observation,
+        evaluator: &impl manuvra_jev::Evaluator,
+    ) {
+        self.artifacts.stop = None;
+        self.artifacts.escalation = None;
+        self.artifacts.pending_verification = None;
+        let report = match evaluate_final(
+            self.job,
+            &observation,
+            &self.values,
+            evaluator,
+            &mut self.policy,
+        ) {
+            Ok(report) => report,
+            Err(stop) => {
+                self.finish_verification_with_stop(stop);
+                return;
+            }
+        };
+        match record_verification(
+            report,
+            observation,
+            self.redactor,
+            &mut self.artifacts,
+            "verification_state_changed",
+        ) {
+            VerificationProgress::Complete => self.verification_complete = true,
+            VerificationProgress::Stop(stop) => self.artifacts.stop = Some(stop),
+        }
+    }
+
+    fn finish_verification_with_stop(&mut self, stop: Stop) {
+        self.clear_pause();
+        self.artifacts.stop = Some(stop);
+    }
+
+    fn reissue_verification(&mut self, reason: &'static str) {
+        self.artifacts.stop = Some(escalate_verification(
+            &mut self.artifacts,
+            self.redactor,
+            reason,
+        ));
     }
 
     fn apply_advance(&mut self, rationale: &str, browser: &impl DriveBrowser) {
@@ -1003,7 +1155,10 @@ fn relevant_state(observation: &Observation) -> Value {
     json!({
         "url": observation.url,
         "route": observation.route,
+        "title": observation.title,
         "dialogs": observation.dialogs,
+        "dialog_texts": observation.dialog_texts,
+        "focused": observation.focused,
         "visible_text": observation.visible_text,
         "covered_text": observation.covered_text,
         "elements": observation.elements,
@@ -1035,11 +1190,13 @@ fn publish_active_hosted_stop(
             details: BTreeMap::new(),
         }),
         VerdictResult::Unresolved,
-        artifacts.verdicts,
-        artifacts.escalation,
+        artifacts.verdicts.clone(),
+        artifacts.escalation.clone(),
         cleanup.clone(),
         artifacts.caller_assisted,
     )?;
+    let mut result = result;
+    apply_artifact_verdict(&mut result, &artifacts)?;
     publish_bundle(
         job,
         config,
@@ -1050,6 +1207,7 @@ fn publish_active_hosted_stop(
         artifacts.steps,
         artifacts.escalations,
         artifacts.dispositions,
+        artifacts.verification,
         artifacts.trace,
         cleanup,
         result,
@@ -1105,6 +1263,7 @@ fn publish_pause_checkpoint(
         retained.clone(),
         artifacts.caller_assisted,
     )?;
+    apply_artifact_verdict(&mut checkpoint, artifacts)?;
     checkpoint["terminal"] = json!(false);
     publish_bundle(
         job,
@@ -1116,6 +1275,7 @@ fn publish_pause_checkpoint(
         artifacts.steps.clone(),
         artifacts.escalations.clone(),
         artifacts.dispositions.clone(),
+        artifacts.verification.clone(),
         artifacts.trace.clone(),
         retained,
         checkpoint,
@@ -1278,9 +1438,12 @@ struct RunArtifacts {
     dispositions: Vec<(String, Value)>,
     trace: Vec<Value>,
     verdicts: Vec<StepVerdict>,
+    expectation_verdicts: Vec<ExpectationVerdict>,
+    verification: Option<Value>,
     stop: Option<Stop>,
     escalation: Option<Escalation>,
     pending: Option<PendingEscalation>,
+    pending_verification: Option<PendingVerification>,
     caller_assisted: bool,
 }
 
@@ -1292,6 +1455,30 @@ struct PendingEscalation {
     candidate: Option<policy::Candidate>,
     observation: Observation,
     ambiguous_mutation: bool,
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone)]
+struct PendingVerification {
+    verdicts: Vec<ExpectationVerdict>,
+    observation: Observation,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl PendingVerification {
+    fn attestable(&self) -> bool {
+        self.verdicts
+            .iter()
+            .any(|verdict| verdict.result == VerdictResult::Unresolved)
+            && self
+                .verdicts
+                .iter()
+                .all(|verdict| verdict.result != VerdictResult::NotSatisfied)
+            && self.verdicts.iter().all(|verdict| {
+                verdict.result != VerdictResult::Unresolved
+                    || verdict.noul.is_some_and(|noul| noul > 0.20)
+            })
+    }
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1313,9 +1500,21 @@ impl RunArtifacts {
                     basis: None,
                 })
                 .collect(),
+            expectation_verdicts: job
+                .expectations
+                .iter()
+                .map(|expectation| ExpectationVerdict {
+                    id: redactor.redact_export_text(&expectation.id),
+                    result: VerdictResult::NotRun,
+                    noul: None,
+                    numeric_checks: Vec::new(),
+                })
+                .collect(),
+            verification: None,
             stop: None,
             escalation: None,
             pending: None,
+            pending_verification: None,
             caller_assisted: false,
         }
     }
@@ -1424,7 +1623,193 @@ fn drive_steps(
             break;
         }
     }
+    if artifacts.stop.is_none()
+        && let VerificationProgress::Stop(stop) = verify_final(
+            job,
+            redactor,
+            browser,
+            evaluator,
+            &values,
+            &mut policy,
+            &mut artifacts,
+        )
+    {
+        artifacts.stop = Some(stop);
+    }
     artifacts
+}
+
+#[cfg(any(target_os = "linux", test))]
+enum VerificationProgress {
+    Complete,
+    Stop(Stop),
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[allow(clippy::too_many_arguments)]
+fn verify_final(
+    job: &Job,
+    redactor: &Redactor,
+    browser: &impl DriveBrowser,
+    evaluator: &impl manuvra_jev::Evaluator,
+    values: &Values<'_>,
+    policy: &mut policy::Policy,
+    artifacts: &mut RunArtifacts,
+) -> VerificationProgress {
+    let captured = match capture_final(job, redactor, browser, artifacts) {
+        Ok(captured) => captured,
+        Err(stop) => return VerificationProgress::Stop(stop),
+    };
+    if !captured.redaction_verified {
+        return VerificationProgress::Stop(Stop::blocked(
+            "redaction_unverifiable",
+            BTreeMap::new(),
+        ));
+    }
+    let report = match evaluate_final(job, &captured.raw, values, evaluator, policy) {
+        Ok(report) => report,
+        Err(stop) => return VerificationProgress::Stop(stop),
+    };
+    record_verification(
+        report,
+        captured.raw,
+        redactor,
+        artifacts,
+        "verification_uncertain",
+    )
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn capture_final(
+    job: &Job,
+    redactor: &Redactor,
+    browser: &impl DriveBrowser,
+    artifacts: &mut RunArtifacts,
+) -> Result<Captured, Stop> {
+    let captured = capture_step(
+        browser,
+        redactor,
+        job.steps.len() + 1,
+        artifacts.observations.len() + 1,
+    )
+    .map_err(control_stop)?;
+    artifacts.observations.push(captured.artifact.clone());
+    artifacts.trace.push(json!({
+        "event":"final_verification_observation",
+        "redaction_verified":captured.redaction_verified,
+    }));
+    Ok(captured)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn capture_verification_advance(
+    job: &Job,
+    redactor: &Redactor,
+    browser: &impl DriveBrowser,
+    artifacts: &mut RunArtifacts,
+) -> Result<Observation, Stop> {
+    let captured = capture_final(job, redactor, browser, artifacts)?;
+    if captured.redaction_verified {
+        Ok(captured.raw)
+    } else {
+        Err(Stop::blocked("redaction_unverifiable", BTreeMap::new()))
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn evaluate_final(
+    job: &Job,
+    observation: &Observation,
+    values: &Values<'_>,
+    evaluator: &impl manuvra_jev::Evaluator,
+    policy: &mut policy::Policy,
+) -> Result<crate::verification::VerificationReport, Stop> {
+    let deadline = if job.expectations.is_empty() {
+        Instant::now()
+    } else {
+        policy
+            .record_model_call()
+            .map_err(verification_policy_stop)?
+    };
+    verify(&job.expectations, observation, values, evaluator, deadline)
+        .map_err(|error| verification_provider_stop(&error))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn record_verification(
+    report: crate::verification::VerificationReport,
+    observation: Observation,
+    redactor: &Redactor,
+    artifacts: &mut RunArtifacts,
+    uncertainty_reason: &'static str,
+) -> VerificationProgress {
+    artifacts.expectation_verdicts = redacted_expectation_verdicts(&report.verdicts, redactor);
+    artifacts.verification = Some(redacted_value(&report.record, redactor));
+    match report.outcome {
+        DoneResult::Satisfied => VerificationProgress::Complete,
+        DoneResult::NotSatisfied => {
+            VerificationProgress::Stop(Stop::failed("expectation_not_met", BTreeMap::new()))
+        }
+        DoneResult::Unknown => {
+            artifacts.pending_verification = Some(PendingVerification {
+                verdicts: artifacts.expectation_verdicts.clone(),
+                observation,
+            });
+            VerificationProgress::Stop(escalate_verification(
+                artifacts,
+                redactor,
+                uncertainty_reason,
+            ))
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn redacted_expectation_verdicts(
+    verdicts: &[ExpectationVerdict],
+    redactor: &Redactor,
+) -> Vec<ExpectationVerdict> {
+    serde_json::from_value(redacted_value(&verdicts, redactor)).unwrap_or_else(|_| {
+        verdicts
+            .iter()
+            .map(|verdict| ExpectationVerdict {
+                id: redactor.redact_export_text(&verdict.id),
+                result: verdict.result,
+                noul: verdict.noul,
+                numeric_checks: verdict
+                    .numeric_checks
+                    .iter()
+                    .map(|check| manuvra_contract::NumericCheck {
+                        literal: redactor.redact_export_text(&check.literal),
+                        present: check.present,
+                        within_text: check
+                            .within_text
+                            .as_ref()
+                            .map(|text| redactor.redact_export_text(text)),
+                    })
+                    .collect(),
+            })
+            .collect()
+    })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn verification_policy_stop(stop: policy::PolicyStop) -> Stop {
+    match stop {
+        policy::PolicyStop::Blocked(code) => Stop::blocked(code, BTreeMap::new()),
+        policy::PolicyStop::Uncertain(code) => Stop::uncertain(code, BTreeMap::new()),
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn verification_provider_stop(error: &manuvra_jev::JevError) -> Stop {
+    match error {
+        manuvra_jev::JevError::InvalidResponse(_) | manuvra_jev::JevError::ModelChanged => {
+            Stop::blocked("provider_invalid_response", BTreeMap::new())
+        }
+        manuvra_jev::JevError::Deadline => Stop::blocked("budget_exhausted", BTreeMap::new()),
+        _ => Stop::blocked("provider_unavailable", BTreeMap::new()),
+    }
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -2192,6 +2577,56 @@ fn allowed_dispositions(
 }
 
 #[cfg(any(target_os = "linux", test))]
+fn escalate_verification(
+    artifacts: &mut RunArtifacts,
+    redactor: &Redactor,
+    reason: &'static str,
+) -> Stop {
+    let id = format!("e_{}", artifacts.escalations.len() + 1);
+    let stopped = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .to_string();
+    let observation = artifacts
+        .observations
+        .last()
+        .map(|(name, _, png)| {
+            json!({
+                "snapshot":format!("observations/{name}.json"),
+                "screenshot":png.as_ref().map(|_|format!("observations/{name}.png")),
+            })
+        })
+        .unwrap_or(Value::Null);
+    let payload = redacted_value(
+        &json!({
+            "id":id,
+            "phase":"verification",
+            "expectations":artifacts.expectation_verdicts,
+            "observation":observation,
+            "verification":"verification/final.json",
+            "gate_reason":reason,
+            "stopped_at":stopped,
+        }),
+        redactor,
+    );
+    artifacts.escalations.push((id.clone(), payload));
+    artifacts.escalation = Some(Escalation {
+        id: id.clone(),
+        phase: "verification".into(),
+        step_id: None,
+        expires_at: stopped,
+        payload: format!("escalations/{id}.json"),
+        dispositions: vec![
+            DispositionKind::Advance,
+            DispositionKind::RetryObservation,
+            DispositionKind::Abort,
+        ],
+    });
+    Stop::uncertain(reason, BTreeMap::new())
+}
+
+#[cfg(any(target_os = "linux", test))]
 fn natural_noul(step: &manuvra_contract::Step, judgments: &judgment::Judgments) -> Option<f64> {
     matches!(step.done_when, DoneCondition::NaturalLanguage(_)).then_some(judgments.step_done)
 }
@@ -2460,6 +2895,7 @@ fn publish_browser_error_with_provenance(
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        None,
         vec![json!({"event":"stop","reason":code})],
         cleanup,
         result,
@@ -2513,6 +2949,7 @@ fn publish_without_browser(
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        None,
         vec![json!({"event":"stop","reason":code})],
         cleanup,
         result,
@@ -2603,6 +3040,35 @@ fn run_result_with_assistance(
     })
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn apply_artifact_verdict(result: &mut Value, artifacts: &RunArtifacts) -> Result<(), String> {
+    result["verdict"]["expectations"] =
+        serde_json::to_value(&artifacts.expectation_verdicts).unwrap_or(Value::Null);
+    result["verdict"]["caller_assisted"] = json!(artifacts.caller_assisted);
+    let passed = result.get("state").and_then(Value::as_str) == Some("passed");
+    let complete = result
+        .pointer("/evidence/complete")
+        .and_then(Value::as_bool)
+        == Some(true);
+    let steps_satisfied = artifacts
+        .verdicts
+        .iter()
+        .all(|verdict| verdict.result == VerdictResult::Satisfied);
+    let expectations_satisfied = artifacts
+        .expectation_verdicts
+        .iter()
+        .all(|verdict| verdict.result == VerdictResult::Satisfied);
+    if passed
+        && (!complete
+            || artifacts.verification.is_none()
+            || !steps_satisfied
+            || !expectations_satisfied)
+    {
+        return Err("passed result requires complete satisfied verification evidence".into());
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn publish_bundle(
     job: &Job,
@@ -2614,6 +3080,7 @@ fn publish_bundle(
     steps: Vec<(String, Value)>,
     escalations: Vec<(String, Value)>,
     dispositions: Vec<(String, Value)>,
+    verification: Option<Value>,
     trace: Vec<Value>,
     cleanup: Cleanup,
     result: Value,
@@ -2633,6 +3100,7 @@ fn publish_bundle(
         steps,
         escalations,
         dispositions,
+        verification,
         trace,
         cleanup: serde_json::to_value(cleanup).map_err(|e| e.to_string())?,
         result,
@@ -2703,7 +3171,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .pop_front()
-                .expect("scripted capture")
+                .unwrap_or_else(|| observation_page(self.fallback.clone()))
                 .map(|mut page| {
                     page.redaction.sensitive_values_checked = sensitive.len();
                     page
@@ -2832,6 +3300,34 @@ mod tests {
                 ]),
                 usage: BTreeMap::new(),
                 request_id: Some("recorded-natural-sequence".into()),
+                model: "jev-1.13.0".into(),
+            })
+        }
+    }
+
+    struct ExpectationSequenceProvider {
+        nouls: Mutex<VecDeque<f64>>,
+        requests: Mutex<Vec<Value>>,
+    }
+
+    impl manuvra_jev::Evaluator for ExpectationSequenceProvider {
+        fn evaluate(
+            &self,
+            request: &Value,
+            _deadline: Instant,
+        ) -> Result<manuvra_jev::Evaluation, manuvra_jev::JevError> {
+            self.requests.lock().unwrap().push(request.clone());
+            let noul = self.nouls.lock().unwrap().pop_front().expect("Noul");
+            let answers = request["questions"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(|id| (id.clone(), manuvra_jev::Answer::Noul { noul }))
+                .collect();
+            Ok(manuvra_jev::Evaluation {
+                answers,
+                usage: BTreeMap::new(),
+                request_id: Some("expectation-sequence".into()),
                 model: "jev-1.13.0".into(),
             })
         }
@@ -3044,6 +3540,21 @@ mod tests {
         })).unwrap().as_slice()).unwrap()
     }
 
+    fn expectation_job() -> Job {
+        Job::parse(
+            serde_json::to_vec(&json!({
+                "schema_version":1,
+                "target":{"kind":"browser","url":"http://127.0.0.1:4351/"},
+                "context":{"journey":"verify","revision":"fixture","environment":"fake","actor":"synthetic","authority":"observe"},
+                "steps":[{"id":"ready","goal":"observe","done_when":[{"text_visible":"Ready"}]}],
+                "expectations":[{"id":"balance","claim":"The final balance is 12.34."}]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap()
+    }
+
     fn text_field(value: &str) -> Observation {
         let mut observation = observed("");
         observation.elements.push(Element {
@@ -3068,6 +3579,444 @@ mod tests {
             },
         });
         observation
+    }
+
+    #[test]
+    fn final_verification_uses_a_fresh_observation_and_fails_missing_literals() {
+        let job = expectation_job();
+        let redactor = Redactor::for_job(&job).unwrap();
+        let browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::from([
+                page("Ready"),
+                page("Ready balance 112.34"),
+            ])),
+            fallback: observed("Ready balance 112.34"),
+            dispatch_result: None,
+        };
+        let provider = ExpectationSequenceProvider {
+            nouls: Mutex::new(VecDeque::from([0.95])),
+            requests: Mutex::new(Vec::new()),
+        };
+        let artifacts = drive_steps(
+            &job,
+            &redactor,
+            &browser,
+            &provider,
+            &mut MemoryJournal::default(),
+            &manuvra_chrome::InputCancellation::default(),
+            None,
+            None,
+        );
+        assert_eq!(artifacts.observations.len(), 2);
+        assert_eq!(artifacts.stop.unwrap().code, "expectation_not_met");
+        assert_eq!(
+            artifacts.expectation_verdicts[0].result,
+            VerdictResult::NotSatisfied
+        );
+        assert_eq!(artifacts.expectation_verdicts[0].noul, Some(0.95));
+        assert!(!artifacts.expectation_verdicts[0].numeric_checks[0].present);
+        assert!(artifacts.verification.is_some());
+    }
+
+    #[test]
+    fn verification_uncertainty_allows_attestation_but_refuses_execute() {
+        let job = expectation_job();
+        let redactor = Redactor::for_job(&job).unwrap();
+        let final_page = observed("Ready balance 12.34");
+        let browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::from([
+                page("Ready"),
+                observation_page(final_page.clone()),
+            ])),
+            fallback: final_page,
+            dispatch_result: None,
+        };
+        let provider = ExpectationSequenceProvider {
+            nouls: Mutex::new(VecDeque::from([0.50])),
+            requests: Mutex::new(Vec::new()),
+        };
+        let control = RecordingHostedControl::default();
+        let cancellation = manuvra_chrome::InputCancellation::default();
+        let mut journal = MemoryJournal::default();
+        let mut machine = HostedMachine::new(&job, &redactor);
+        machine.drive(
+            &browser,
+            &provider,
+            &mut journal,
+            &cancellation,
+            None,
+            &control,
+        );
+        let escalation = machine.artifacts.escalation.clone().unwrap();
+        assert_eq!(escalation.phase, "verification");
+        assert_eq!(escalation.step_id, None);
+        assert_eq!(
+            escalation.dispositions,
+            [
+                DispositionKind::Advance,
+                DispositionKind::RetryObservation,
+                DispositionKind::Abort,
+            ]
+        );
+        machine.apply(
+            DispositionRequest {
+                schema_version: SchemaVersion,
+                escalation_id: escalation.id.clone(),
+                disposition: Disposition::Execute(manuvra_contract::ExecuteDisposition {
+                    kind: manuvra_contract::ExecuteKind::Execute,
+                    candidate_id: "not-offered".into(),
+                }),
+            },
+            &browser,
+            &provider,
+            &mut journal,
+            &cancellation,
+        );
+        assert_eq!(
+            machine.artifacts.stop.as_ref().unwrap().code,
+            "execute_not_permitted"
+        );
+        assert!(!machine.verification_complete);
+        let escalation_id = machine.artifacts.escalation.as_ref().unwrap().id.clone();
+        machine.apply(
+            DispositionRequest {
+                schema_version: SchemaVersion,
+                escalation_id,
+                disposition: Disposition::Advance(manuvra_contract::AdvanceDisposition {
+                    kind: manuvra_contract::AdvanceKind::Advance,
+                    rationale: "Observed the final account facts directly.".into(),
+                }),
+            },
+            &browser,
+            &provider,
+            &mut journal,
+            &cancellation,
+        );
+        assert!(machine.verification_complete);
+        assert!(machine.artifacts.stop.is_none());
+        assert!(machine.artifacts.caller_assisted);
+        assert_eq!(
+            machine.artifacts.expectation_verdicts[0].result,
+            VerdictResult::Satisfied
+        );
+        assert_eq!(
+            machine.artifacts.verification.as_ref().unwrap()["basis"],
+            "caller_attestation"
+        );
+    }
+
+    #[test]
+    fn verification_attestation_rechecks_changed_facts_and_numeric_scopes() {
+        let mut job = expectation_job();
+        job.expectations[0].exact_literals = vec![manuvra_contract::ExactLiteral {
+            literal: "12.34".into(),
+            within_text: Some("Wallet".into()),
+        }];
+        let redactor = Redactor::for_job(&job).unwrap();
+        let initial = observed("Ready\nWallet balance 12.34");
+        let changed = observed("Ready\nWallet balance 12.34\nWallet reserve 12.34");
+        let browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::from([
+                page("Ready"),
+                observation_page(initial),
+                observation_page(changed),
+            ])),
+            fallback: observed("Ready\nWallet balance 12.34\nWallet reserve 12.34"),
+            dispatch_result: None,
+        };
+        let provider = ExpectationSequenceProvider {
+            nouls: Mutex::new(VecDeque::from([0.50, 0.50])),
+            requests: Mutex::new(Vec::new()),
+        };
+        let control = RecordingHostedControl::default();
+        let cancellation = manuvra_chrome::InputCancellation::default();
+        let mut journal = MemoryJournal::default();
+        let mut machine = HostedMachine::new(&job, &redactor);
+        machine.drive(
+            &browser,
+            &provider,
+            &mut journal,
+            &cancellation,
+            None,
+            &control,
+        );
+        let escalation = machine.artifacts.escalation.clone().unwrap();
+        machine.apply(
+            DispositionRequest {
+                schema_version: SchemaVersion,
+                escalation_id: escalation.id,
+                disposition: Disposition::Advance(manuvra_contract::AdvanceDisposition {
+                    kind: manuvra_contract::AdvanceKind::Advance,
+                    rationale: "Caller attests the prior final facts.".into(),
+                }),
+            },
+            &browser,
+            &provider,
+            &mut journal,
+            &cancellation,
+        );
+        assert!(!machine.verification_complete);
+        assert!(!machine.artifacts.caller_assisted);
+        assert_eq!(machine.artifacts.observations.len(), 3);
+        assert_eq!(
+            machine.artifacts.stop.as_ref().unwrap().code,
+            "verification_state_changed"
+        );
+        assert_eq!(
+            machine.artifacts.expectation_verdicts[0].result,
+            VerdictResult::Unresolved
+        );
+        assert_eq!(provider.requests.lock().unwrap().len(), 2);
+        let check = machine
+            .artifacts
+            .trace
+            .iter()
+            .find(|entry| entry["event"] == "verification_disposition_check")
+            .unwrap();
+        assert_eq!(check["document_identity_unchanged"], true);
+        assert_eq!(check["relevant_facts_unchanged"], false);
+    }
+
+    #[test]
+    fn verification_attestation_rechecks_document_identity() {
+        let job = expectation_job();
+        let redactor = Redactor::for_job(&job).unwrap();
+        let initial = observed("Ready balance 12.34");
+        let mut remounted = initial.clone();
+        remounted.document_id = "remounted-document".into();
+        let browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::from([
+                page("Ready"),
+                observation_page(initial),
+                observation_page(remounted.clone()),
+            ])),
+            fallback: remounted,
+            dispatch_result: None,
+        };
+        let provider = ExpectationSequenceProvider {
+            nouls: Mutex::new(VecDeque::from([0.50, 0.50])),
+            requests: Mutex::new(Vec::new()),
+        };
+        let control = RecordingHostedControl::default();
+        let cancellation = manuvra_chrome::InputCancellation::default();
+        let mut journal = MemoryJournal::default();
+        let mut machine = HostedMachine::new(&job, &redactor);
+        machine.drive(
+            &browser,
+            &provider,
+            &mut journal,
+            &cancellation,
+            None,
+            &control,
+        );
+        let escalation_id = machine.artifacts.escalation.as_ref().unwrap().id.clone();
+        machine.apply(
+            DispositionRequest {
+                schema_version: SchemaVersion,
+                escalation_id,
+                disposition: Disposition::Advance(manuvra_contract::AdvanceDisposition {
+                    kind: manuvra_contract::AdvanceKind::Advance,
+                    rationale: "Caller attests the prior final facts.".into(),
+                }),
+            },
+            &browser,
+            &provider,
+            &mut journal,
+            &cancellation,
+        );
+        assert!(!machine.verification_complete);
+        assert_eq!(
+            machine.artifacts.stop.as_ref().unwrap().code,
+            "verification_state_changed"
+        );
+        let check = machine
+            .artifacts
+            .trace
+            .iter()
+            .find(|entry| entry["event"] == "verification_disposition_check")
+            .unwrap();
+        assert_eq!(check["document_identity_unchanged"], false);
+        assert_eq!(check["relevant_facts_unchanged"], true);
+    }
+
+    #[test]
+    fn verification_attestation_rechecks_focus_used_by_provider() {
+        let job = expectation_job();
+        let redactor = Redactor::for_job(&job).unwrap();
+        let mut initial = text_field("");
+        initial.visible_text = "Ready balance 12.34".into();
+        let mut focus_changed = initial.clone();
+        focus_changed.focused = Some(1);
+        let browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::from([
+                page("Ready"),
+                observation_page(initial),
+                observation_page(focus_changed.clone()),
+            ])),
+            fallback: focus_changed,
+            dispatch_result: None,
+        };
+        let provider = ExpectationSequenceProvider {
+            nouls: Mutex::new(VecDeque::from([0.50, 0.50])),
+            requests: Mutex::new(Vec::new()),
+        };
+        let control = RecordingHostedControl::default();
+        let cancellation = manuvra_chrome::InputCancellation::default();
+        let mut journal = MemoryJournal::default();
+        let mut machine = HostedMachine::new(&job, &redactor);
+        machine.drive(
+            &browser,
+            &provider,
+            &mut journal,
+            &cancellation,
+            None,
+            &control,
+        );
+        let escalation_id = machine.artifacts.escalation.as_ref().unwrap().id.clone();
+        machine.apply(
+            DispositionRequest {
+                schema_version: SchemaVersion,
+                escalation_id,
+                disposition: Disposition::Advance(manuvra_contract::AdvanceDisposition {
+                    kind: manuvra_contract::AdvanceKind::Advance,
+                    rationale: "Caller attests the prior final facts.".into(),
+                }),
+            },
+            &browser,
+            &provider,
+            &mut journal,
+            &cancellation,
+        );
+        assert!(!machine.verification_complete);
+        assert!(!machine.artifacts.caller_assisted);
+        assert_eq!(
+            machine.artifacts.stop.as_ref().unwrap().code,
+            "verification_state_changed"
+        );
+        assert_eq!(provider.requests.lock().unwrap().len(), 2);
+        let check = machine
+            .artifacts
+            .trace
+            .iter()
+            .find(|entry| entry["event"] == "verification_disposition_check")
+            .unwrap();
+        assert_eq!(check["document_identity_unchanged"], true);
+        assert_eq!(check["relevant_facts_unchanged"], false);
+    }
+
+    #[test]
+    fn retry_observation_rechecks_final_expectations_without_resetting_the_run() {
+        let job = expectation_job();
+        let redactor = Redactor::for_job(&job).unwrap();
+        let final_page = observed("Ready balance 12.34");
+        let browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::from([
+                page("Ready"),
+                observation_page(final_page.clone()),
+                observation_page(final_page.clone()),
+            ])),
+            fallback: final_page,
+            dispatch_result: None,
+        };
+        let provider = ExpectationSequenceProvider {
+            nouls: Mutex::new(VecDeque::from([0.50, 0.95])),
+            requests: Mutex::new(Vec::new()),
+        };
+        let control = RecordingHostedControl::default();
+        let cancellation = manuvra_chrome::InputCancellation::default();
+        let mut journal = MemoryJournal::default();
+        let mut machine = HostedMachine::new(&job, &redactor);
+        machine.drive(
+            &browser,
+            &provider,
+            &mut journal,
+            &cancellation,
+            None,
+            &control,
+        );
+        let escalation_id = machine.artifacts.escalation.as_ref().unwrap().id.clone();
+        machine.apply(
+            DispositionRequest {
+                schema_version: SchemaVersion,
+                escalation_id,
+                disposition: Disposition::RetryObservation(
+                    manuvra_contract::RetryObservationDisposition {
+                        kind: manuvra_contract::RetryObservationKind::RetryObservation,
+                    },
+                ),
+            },
+            &browser,
+            &provider,
+            &mut journal,
+            &cancellation,
+        );
+        machine.drive(
+            &browser,
+            &provider,
+            &mut journal,
+            &cancellation,
+            None,
+            &control,
+        );
+        assert!(machine.verification_complete);
+        assert!(machine.artifacts.stop.is_none());
+        assert_eq!(machine.artifacts.observations.len(), 3);
+        assert_eq!(machine.artifacts.expectation_verdicts[0].noul, Some(0.95));
+    }
+
+    #[test]
+    fn verification_maps_every_policy_and_provider_failure_truthfully() {
+        for (stop, code, state) in [
+            (
+                policy::PolicyStop::Blocked("budget_exhausted"),
+                "budget_exhausted",
+                RunState::Blocked,
+            ),
+            (
+                policy::PolicyStop::Uncertain("policy_uncertain"),
+                "policy_uncertain",
+                RunState::Uncertain,
+            ),
+        ] {
+            let mapped = verification_policy_stop(stop);
+            assert_eq!(mapped.code, code);
+            assert_eq!(mapped.state, state);
+        }
+        for (error, code) in [
+            (
+                manuvra_jev::JevError::InvalidResponse("bad".into()),
+                "provider_invalid_response",
+            ),
+            (
+                manuvra_jev::JevError::ModelChanged,
+                "provider_invalid_response",
+            ),
+            (manuvra_jev::JevError::Deadline, "budget_exhausted"),
+            (manuvra_jev::JevError::Unavailable, "provider_unavailable"),
+        ] {
+            assert_eq!(verification_provider_stop(&error).code, code);
+        }
+    }
+
+    #[test]
+    fn passed_result_requires_complete_satisfied_final_verification() {
+        let job = expectation_job();
+        let redactor = Redactor::for_job(&job).unwrap();
+        let mut artifacts = RunArtifacts::new(&job, &redactor);
+        let mut result = json!({
+            "state":"passed",
+            "evidence":{"complete":true},
+            "verdict":{"expectations":[],"caller_assisted":false}
+        });
+        assert!(apply_artifact_verdict(&mut result, &artifacts).is_err());
+
+        artifacts.verdicts[0].result = VerdictResult::Satisfied;
+        artifacts.expectation_verdicts[0].result = VerdictResult::Satisfied;
+        artifacts.verification = Some(json!({"phase":"verification"}));
+        assert!(apply_artifact_verdict(&mut result, &artifacts).is_ok());
+
+        result["evidence"]["complete"] = json!(false);
+        assert!(apply_artifact_verdict(&mut result, &artifacts).is_err());
     }
 
     #[test]
@@ -4084,7 +5033,7 @@ mod tests {
             None,
         );
         assert!(artifacts.stop.is_none());
-        assert_eq!(artifacts.observations.len(), 3);
+        assert_eq!(artifacts.observations.len(), 4);
         assert_eq!(artifacts.decisions.len(), 1);
         assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(artifacts.verdicts[0].result, VerdictResult::Satisfied);
@@ -4151,7 +5100,7 @@ mod tests {
             None,
         );
         assert!(artifacts.stop.is_none());
-        assert_eq!(artifacts.observations.len(), 4);
+        assert_eq!(artifacts.observations.len(), 5);
         assert_eq!(artifacts.decisions.len(), 2);
         assert_eq!(artifacts.verdicts[0].result, VerdictResult::Satisfied);
         assert_eq!(provider.0.lock().unwrap().len(), 0);

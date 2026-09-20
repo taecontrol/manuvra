@@ -5,12 +5,14 @@ use std::collections::BTreeMap;
 
 pub struct Values<'a> {
     values: &'a BTreeMap<String, JobValue>,
+    redact_values: &'a [String],
 }
 
 impl<'a> Values<'a> {
     pub fn new(job: &'a Job) -> Self {
         Self {
             values: &job.values,
+            redact_values: job.options.redact_values.as_deref().unwrap_or(&[]),
         }
     }
 
@@ -62,10 +64,21 @@ impl<'a> Values<'a> {
     }
 
     pub(crate) fn mask(&self, text: &str) -> String {
+        self.mask_matching(text, |_, _| true)
+    }
+
+    pub(crate) fn mask_sensitive(&self, text: &str) -> String {
+        self.mask_matching(text, |name, value| {
+            value.secret || self.redact_values.iter().any(|redacted| redacted == name)
+        })
+    }
+
+    fn mask_matching(&self, text: &str, include: impl Fn(&str, &JobValue) -> bool) -> String {
         let mut output = text.to_owned();
         let mut renderings: Vec<_> = self
             .values
             .iter()
+            .filter(|(name, value)| include(name, value))
             .flat_map(|(name, value)| {
                 value_renderings(value)
                     .into_iter()
@@ -157,5 +170,30 @@ mod tests {
             iso: None,
             display: None,
         };
+    }
+
+    #[test]
+    fn sensitive_mask_leaves_public_values_but_removes_secret_and_redacted_values() {
+        let job = Job::parse(
+            serde_json::to_vec(&json!({
+                "schema_version":1,
+                "target":{"kind":"browser","url":"http://example.test"},
+                "context":{"journey":"x","revision":"x","environment":"x","actor":"x","authority":"x"},
+                "values":{
+                    "secret":{"value":"private-742","description":"secret","secret":true},
+                    "redacted":{"value":"hidden-815","description":"redacted"},
+                    "public":{"value":"visible-926","description":"public"}
+                },
+                "steps":[{"id":"x","goal":"observe","done_when":[{"url_contains":"example.test"}]}],
+                "options":{"redact_values":["redacted"]}
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(
+            Values::new(&job).mask_sensitive("private-742 hidden-815 visible-926"),
+            "<value:secret> <value:redacted> visible-926"
+        );
     }
 }

@@ -1,7 +1,14 @@
+use crate::values::Values;
 use manuvra_chrome::{Element, Observation};
-use manuvra_contract::{Assertion, AssertionScope, JobValue};
+use manuvra_contract::{
+    Assertion, AssertionScope, Expectation, ExpectationVerdict, JobValue, NumericCheck,
+    VerdictResult,
+};
+use manuvra_jev::{Answer, Evaluator, JevError};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -9,6 +16,254 @@ pub enum DoneResult {
     Satisfied,
     NotSatisfied,
     Unknown,
+}
+
+#[derive(Debug, Clone)]
+pub struct VerificationReport {
+    pub verdicts: Vec<ExpectationVerdict>,
+    pub outcome: DoneResult,
+    pub record: Value,
+}
+
+pub fn verify(
+    expectations: &[Expectation],
+    observation: &Observation,
+    values: &Values<'_>,
+    evaluator: &(impl Evaluator + ?Sized),
+    deadline: Instant,
+) -> Result<VerificationReport, JevError> {
+    if expectations.is_empty() {
+        return Ok(VerificationReport {
+            verdicts: Vec::new(),
+            outcome: DoneResult::Satisfied,
+            record: json!({"phase":"verification","expectations":[],"provider":null}),
+        });
+    }
+    let request = expectation_request(expectations, observation, values);
+    let evaluation = evaluator.evaluate(&request, deadline)?;
+    let nouls = expectation_nouls(expectations, &evaluation.answers)?;
+    let verdicts = expectations
+        .iter()
+        .zip(nouls.iter().copied())
+        .map(|(expectation, noul)| expectation_verdict(expectation, observation, values, noul))
+        .collect::<Vec<_>>();
+    let outcome = aggregate_expectations(&verdicts);
+    Ok(VerificationReport {
+        record: json!({
+            "phase":"verification",
+            "expectations":verdicts,
+            "provider":{
+                "model":evaluation.model,
+                "request_id":evaluation.request_id,
+                "usage":evaluation.usage,
+                "request":request,
+                "nouls":nouls,
+            }
+        }),
+        verdicts,
+        outcome,
+    })
+}
+
+fn expectation_request(
+    expectations: &[Expectation],
+    observation: &Observation,
+    values: &Values<'_>,
+) -> Value {
+    let questions = expectations
+        .iter()
+        .enumerate()
+        .map(|(index, expectation)| {
+            let claim = values.mask(&expectation.claim);
+            (
+                expectation_question_id(index),
+                json!({
+                    "type":"noul",
+                    "instructions":format!("Is this exact claim true in the final page state: {claim}"),
+                    "criteria":{
+                        "true":format!("Every part of this claim is true now: {claim}"),
+                        "false":format!("At least one part of this claim is false now: {claim}")
+                    }
+                }),
+            )
+        })
+        .collect::<Map<_, _>>();
+    json!({
+        "model":"jev-latest",
+        "state":{
+            "phase":"final_verification",
+            "page":values.model_view(observation),
+            "claims":expectations.iter().enumerate().map(|(index, expectation)|json!({
+                "question_id":expectation_question_id(index),
+                "claim":values.mask(&expectation.claim)
+            })).collect::<Vec<_>>()
+        },
+        "questions":questions
+    })
+}
+
+fn expectation_nouls(
+    expectations: &[Expectation],
+    answers: &BTreeMap<String, Answer>,
+) -> Result<Vec<f64>, JevError> {
+    if answers.len() != expectations.len() {
+        return Err(JevError::InvalidResponse(
+            "expectation answer ids do not match claims".into(),
+        ));
+    }
+    expectations
+        .iter()
+        .enumerate()
+        .map(
+            |(index, _)| match answers.get(&expectation_question_id(index)) {
+                Some(Answer::Noul { noul }) if noul.is_finite() && (0.0..=1.0).contains(noul) => {
+                    Ok(*noul)
+                }
+                Some(Answer::Noul { .. }) => Err(JevError::InvalidResponse(
+                    "expectation Noul was outside 0 to 1".into(),
+                )),
+                _ => Err(JevError::InvalidResponse(format!(
+                    "answer {} was not an expectation Noul",
+                    expectation_question_id(index)
+                ))),
+            },
+        )
+        .collect()
+}
+
+fn expectation_question_id(index: usize) -> String {
+    format!("claim_{:04}", index + 1)
+}
+
+fn expectation_verdict(
+    expectation: &Expectation,
+    observation: &Observation,
+    values: &Values<'_>,
+    noul: f64,
+) -> ExpectationVerdict {
+    let checks = expectation_numeric_checks(expectation, observation, values);
+    let any_missing = checks
+        .iter()
+        .any(|check| check.state == NumericState::Missing);
+    let any_ambiguous = checks
+        .iter()
+        .any(|check| check.state == NumericState::Ambiguous);
+    let result = if noul <= 0.20 || any_missing {
+        VerdictResult::NotSatisfied
+    } else if any_ambiguous || noul < 0.80 {
+        VerdictResult::Unresolved
+    } else {
+        VerdictResult::Satisfied
+    };
+    ExpectationVerdict {
+        id: expectation.id.clone(),
+        result,
+        noul: Some(noul),
+        numeric_checks: checks.into_iter().map(|check| check.exported).collect(),
+    }
+}
+
+fn aggregate_expectations(verdicts: &[ExpectationVerdict]) -> DoneResult {
+    if verdicts
+        .iter()
+        .any(|verdict| verdict.result == VerdictResult::NotSatisfied)
+    {
+        DoneResult::NotSatisfied
+    } else if verdicts
+        .iter()
+        .any(|verdict| verdict.result != VerdictResult::Satisfied)
+    {
+        DoneResult::Unknown
+    } else {
+        DoneResult::Satisfied
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NumericState {
+    Present,
+    Missing,
+    Ambiguous,
+}
+
+struct EvaluatedNumericCheck {
+    exported: NumericCheck,
+    state: NumericState,
+}
+
+fn expectation_numeric_checks(
+    expectation: &Expectation,
+    observation: &Observation,
+    values: &Values<'_>,
+) -> Vec<EvaluatedNumericCheck> {
+    let numeric_claim = values.mask_sensitive(&expectation.claim);
+    let scoped_literals = expectation
+        .exact_literals
+        .iter()
+        .filter(|exact| exact.within_text.is_some())
+        .map(|exact| exact.literal.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut requested = BTreeMap::new();
+    for literal in numeric_literals(&numeric_claim) {
+        if !scoped_literals.contains(literal) {
+            requested.insert((literal.to_owned(), None), ());
+        }
+    }
+    for exact in &expectation.exact_literals {
+        requested.insert((exact.literal.clone(), exact.within_text.clone()), ());
+    }
+    requested
+        .into_iter()
+        .map(|((literal, within_text), ())| {
+            let state = numeric_check_state(observation, &literal, within_text.as_deref());
+            EvaluatedNumericCheck {
+                exported: NumericCheck {
+                    literal,
+                    present: state == NumericState::Present,
+                    within_text,
+                },
+                state,
+            }
+        })
+        .collect()
+}
+
+fn numeric_check_state(
+    observation: &Observation,
+    literal: &str,
+    within_text: Option<&str>,
+) -> NumericState {
+    let Some(scope) = within_text else {
+        return if observation_contains_numeric_literal(observation, literal) {
+            NumericState::Present
+        } else {
+            NumericState::Missing
+        };
+    };
+    let containers = text_containers(observation)
+        .filter(|container| container.contains(scope))
+        .collect::<Vec<_>>();
+    if containers.len() != 1 {
+        NumericState::Ambiguous
+    } else if numeric_literal_present(containers[0], literal) {
+        NumericState::Present
+    } else {
+        NumericState::Missing
+    }
+}
+
+fn text_containers(observation: &Observation) -> impl Iterator<Item = &str> {
+    observation
+        .visible_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .chain(observation.dialog_texts.values().map(String::as_str))
+        .chain(observation.elements.iter().flat_map(|element| {
+            [element.name.as_str(), element.value.as_str()]
+                .into_iter()
+                .filter(|text| !text.is_empty())
+        }))
 }
 
 pub fn check_natural_done(condition: &str, observation: &Observation, noul: f64) -> DoneResult {
@@ -299,6 +554,32 @@ mod tests {
         TextVisible, UrlContains,
     };
     use std::collections::BTreeMap;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    struct CapturingExpectationEvaluator(Mutex<Option<Value>>);
+
+    impl Evaluator for CapturingExpectationEvaluator {
+        fn evaluate(
+            &self,
+            request: &Value,
+            _deadline: Instant,
+        ) -> Result<manuvra_jev::Evaluation, JevError> {
+            *self.0.lock().unwrap() = Some(request.clone());
+            let answers = request["questions"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(|id| (id.clone(), Answer::Noul { noul: 0.95 }))
+                .collect();
+            Ok(manuvra_jev::Evaluation {
+                answers,
+                usage: BTreeMap::new(),
+                request_id: Some("verification-capture".into()),
+                model: "jev-1.13.0".into(),
+            })
+        }
+    }
 
     fn observation() -> Observation {
         Observation {
@@ -355,6 +636,20 @@ mod tests {
         )])
     }
 
+    fn job_without_values() -> manuvra_contract::Job {
+        manuvra_contract::Job::parse(
+            serde_json::to_vec(&json!({
+                "schema_version":1,
+                "target":{"kind":"browser","url":"http://example.test"},
+                "context":{"journey":"verify","revision":"r","environment":"e","actor":"a","authority":"a"},
+                "steps":[{"id":"ready","goal":"observe","done_when":[{"url_contains":"example.test"}]}]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn natural_done_bands_are_inclusive_at_the_accepted_boundaries() {
         let observation = observation();
@@ -405,6 +700,177 @@ mod tests {
             ["-12.34", "+7", "0"]
         );
         assert!(numeric_literals("A sign + without digits").is_empty());
+    }
+
+    #[test]
+    fn expectation_bands_and_numeric_checks_are_code_owned() {
+        let job = job_without_values();
+        let values = Values::new(&job);
+        let mut observed = observation();
+        observed.visible_text = "Wallet\nBalance 12.34\nDelta -7 and +2".into();
+        let expectation = Expectation {
+            id: "balance".into(),
+            claim: "The balance is 12.34 and delta is -7 with +2 entries.".into(),
+            exact_literals: Vec::new(),
+        };
+        for (noul, result) in [
+            (0.19, VerdictResult::NotSatisfied),
+            (0.20, VerdictResult::NotSatisfied),
+            (0.21, VerdictResult::Unresolved),
+            (0.79, VerdictResult::Unresolved),
+            (0.80, VerdictResult::Satisfied),
+            (0.81, VerdictResult::Satisfied),
+        ] {
+            assert_eq!(
+                expectation_verdict(&expectation, &observed, &values, noul).result,
+                result
+            );
+        }
+        observed.visible_text = "Balance 112.34, delta -70, +20 entries".into();
+        let verdict = expectation_verdict(&expectation, &observed, &values, 0.95);
+        assert_eq!(verdict.result, VerdictResult::NotSatisfied);
+        assert!(verdict.numeric_checks.iter().all(|check| !check.present));
+    }
+
+    #[test]
+    fn missing_literal_overrides_high_noul_and_low_noul_overrides_present_literal() {
+        let job = job_without_values();
+        let values = Values::new(&job);
+        let mut observed = observation();
+        observed.visible_text = "Balance 12.34".into();
+        let expectation = Expectation {
+            id: "balance".into(),
+            claim: "The balance is 12.34.".into(),
+            exact_literals: Vec::new(),
+        };
+        assert_eq!(
+            expectation_verdict(&expectation, &observed, &values, 0.10).result,
+            VerdictResult::NotSatisfied
+        );
+        observed.visible_text = "No balance is shown".into();
+        assert_eq!(
+            expectation_verdict(&expectation, &observed, &values, 0.95).result,
+            VerdictResult::NotSatisfied
+        );
+    }
+
+    #[test]
+    fn within_text_requires_exactly_one_container() {
+        let job = job_without_values();
+        let values = Values::new(&job);
+        let mut observed = observation();
+        let expectation = Expectation {
+            id: "wallet".into(),
+            claim: "The wallet exists.".into(),
+            exact_literals: vec![manuvra_contract::ExactLiteral {
+                literal: "12.34".into(),
+                within_text: Some("Review wallet".into()),
+            }],
+        };
+        observed.visible_text = "Review wallet balance 12.34".into();
+        assert_eq!(
+            expectation_verdict(&expectation, &observed, &values, 0.95).result,
+            VerdictResult::Satisfied
+        );
+        observed.visible_text = "Other wallet balance 12.34".into();
+        assert_eq!(
+            expectation_verdict(&expectation, &observed, &values, 0.95).result,
+            VerdictResult::Unresolved
+        );
+        observed.visible_text = "Review wallet balance 12.34\nReview wallet pending 12.34".into();
+        assert_eq!(
+            expectation_verdict(&expectation, &observed, &values, 0.95).result,
+            VerdictResult::Unresolved
+        );
+        observed.visible_text = "Review wallet balance 112.34".into();
+        assert_eq!(
+            expectation_verdict(&expectation, &observed, &values, 0.95).result,
+            VerdictResult::NotSatisfied
+        );
+        observed.visible_text = "Other wallet balance 12.34".into();
+        assert_eq!(
+            expectation_verdict(&expectation, &observed, &values, 0.10).result,
+            VerdictResult::NotSatisfied,
+            "a confidently false semantic judgment cannot be attested past an ambiguous scope"
+        );
+    }
+
+    #[test]
+    fn exact_literal_evaluation_is_independent_of_declaration_order() {
+        let job = job_without_values();
+        let values = Values::new(&job);
+        let mut observed = observation();
+        observed.visible_text = "Wallet balance 12.34\nReserve balance 12.34".into();
+        let exact = |within_text: Option<&str>| manuvra_contract::ExactLiteral {
+            literal: "12.34".into(),
+            within_text: within_text.map(str::to_owned),
+        };
+        let expectation = |exact_literals| Expectation {
+            id: "balance".into(),
+            claim: "The final balance is 12.34.".into(),
+            exact_literals,
+        };
+        let forward = expectation_numeric_checks(
+            &expectation(vec![exact(None), exact(Some("Wallet"))]),
+            &observed,
+            &values,
+        )
+        .into_iter()
+        .map(|check| check.exported)
+        .collect::<Vec<_>>();
+        let reverse = expectation_numeric_checks(
+            &expectation(vec![exact(Some("Wallet")), exact(None)]),
+            &observed,
+            &values,
+        )
+        .into_iter()
+        .map(|check| check.exported)
+        .collect::<Vec<_>>();
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.len(), 2);
+    }
+
+    #[test]
+    fn verification_asks_one_noul_per_claim_without_exposing_secret_values() {
+        let job = manuvra_contract::Job::parse(
+            serde_json::to_vec(&json!({
+                "schema_version":1,
+                "target":{"kind":"browser","url":"http://example.test"},
+                "context":{"journey":"verify","revision":"r","environment":"e","actor":"a","authority":"a"},
+                "values":{"account_name":{"value":"classified-wallet-742","description":"Account name","secret":true}},
+                "steps":[{"id":"ready","goal":"observe","done_when":[{"url_contains":"example.test"}]}],
+                "expectations":[
+                    {"id":"account","claim":"The classified-wallet-742 account exists."},
+                    {"id":"balance","claim":"The classified-wallet-742 account has balance 12.34."}
+                ]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap();
+        let mut observed = observation();
+        observed.visible_text = "classified-wallet-742\n12.34".into();
+        let evaluator = CapturingExpectationEvaluator(Mutex::new(None));
+        let report = verify(
+            &job.expectations,
+            &observed,
+            &Values::new(&job),
+            &evaluator,
+            Instant::now(),
+        )
+        .unwrap();
+        let request = evaluator.0.lock().unwrap().clone().unwrap();
+        let request_text = request.to_string();
+        assert_eq!(request["questions"].as_object().unwrap().len(), 2);
+        assert!(!request_text.contains("classified-wallet-742"));
+        assert!(request_text.contains("<value:account_name>"));
+        assert_eq!(report.outcome, DoneResult::Satisfied);
+        assert!(report.verdicts.iter().all(|verdict| {
+            verdict
+                .numeric_checks
+                .iter()
+                .all(|check| check.literal != "742")
+        }));
     }
 
     #[test]

@@ -545,9 +545,6 @@ impl Job {
     }
 
     pub fn first_unsupported_feature(&self) -> Option<&'static str> {
-        if !self.expectations.is_empty() {
-            return Some("expectations");
-        }
         None
     }
 
@@ -735,8 +732,34 @@ impl Expectation {
     fn validate(&self) -> Result<(), ValidationError> {
         validate_nonempty("expectation.id", &self.id)?;
         validate_nonempty(&format!("expectation {} claim", self.id), &self.claim)?;
-        validate_all(self.exact_literals.iter().map(ExactLiteral::validate))
+        validate_all(self.exact_literals.iter().map(ExactLiteral::validate))?;
+        validate_exact_literals(&self.exact_literals)
     }
+}
+
+fn validate_exact_literals(literals: &[ExactLiteral]) -> Result<(), ValidationError> {
+    let mut pairs = BTreeSet::new();
+    let mut shapes = BTreeMap::<&str, bool>::new();
+    for exact in literals {
+        let pair = (exact.literal.as_str(), exact.within_text.as_deref());
+        if !pairs.insert(pair) {
+            return Err(ValidationError::new(format!(
+                "exact_literals contains duplicate literal {} with the same scope",
+                exact.literal
+            )));
+        }
+        let scoped = exact.within_text.is_some();
+        if shapes
+            .insert(exact.literal.as_str(), scoped)
+            .is_some_and(|prior| prior != scoped)
+        {
+            return Err(ValidationError::new(format!(
+                "exact_literals literal {} cannot be both scoped and unscoped",
+                exact.literal
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl ExactLiteral {
@@ -993,6 +1016,44 @@ mod tests {
     }
 
     #[test]
+    fn rejects_order_independent_conflicts_in_exact_literal_scoping() {
+        for literals in [
+            json!([
+                {"literal": "12.34"},
+                {"literal": "12.34", "within_text": "Wallet"}
+            ]),
+            json!([
+                {"literal": "12.34", "within_text": "Wallet"},
+                {"literal": "12.34"}
+            ]),
+        ] {
+            let mut value = valid_job();
+            value["expectations"] = json!([{
+                "id": "balance",
+                "claim": "The final balance is 12.34",
+                "exact_literals": literals
+            }]);
+            let error = parse(&value).unwrap_err();
+            assert!(error.message.contains("both scoped and unscoped"));
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_exact_literal_scope() {
+        let mut value = valid_job();
+        value["expectations"] = json!([{
+            "id": "balance",
+            "claim": "The final balance is 12.34",
+            "exact_literals": [
+                {"literal": "12.34", "within_text": "Wallet"},
+                {"literal": "12.34", "within_text": "Wallet"}
+            ]
+        }]);
+        let error = parse(&value).unwrap_err();
+        assert!(error.message.contains("duplicate literal"));
+    }
+
+    #[test]
     fn accepts_the_design_brief_job_fixture() {
         let job = Job::parse(include_bytes!("../tests/fixtures/create-account.json")).unwrap();
         assert_eq!(job.steps.len(), 9);
@@ -1097,7 +1158,7 @@ mod tests {
     }
 
     #[test]
-    fn names_the_first_feature_not_supported_by_current_build() {
+    fn accepted_job_features_are_supported_by_current_build() {
         let mut natural = valid_job();
         natural["steps"][0]["done_when"] = json!("The account exists");
         assert_eq!(parse(&natural).unwrap().first_unsupported_feature(), None);
@@ -1106,7 +1167,7 @@ mod tests {
         expectation["expectations"] = json!([{"id": "account", "claim": "Account exists"}]);
         assert_eq!(
             parse(&expectation).unwrap().first_unsupported_feature(),
-            Some("expectations")
+            None
         );
 
         let mut option = valid_job();
