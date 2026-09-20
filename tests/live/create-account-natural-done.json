@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "target": {"kind": "browser", "url": "http://127.0.0.1:4351/"},
+  "context": {"journey": "Create one account with natural-language completion conditions and no final expectations", "revision": "doctor-confirmed live candidate", "environment": "fresh money fixture", "actor": "synthetic owner", "authority": "create validation state only in this fixture"},
+  "values": {
+    "account_name": {"value": "Review wallet", "description": "Name of the new account"},
+    "unit_symbol": {"value": "USD", "description": "Symbol of the new currency"},
+    "unit_name": {"value": "US dollar", "description": "Name of the new currency"},
+    "opening_balance": {"value": "12.34", "description": "Opening balance"}
+  },
+  "steps": [
+    {"id":"open","goal":"Open the account creation dialog.","done_when":"The Create account dialog is visible with Account name and Currency or asset fields."},
+    {"id":"name","goal":"Fill Account name with the caller-provided account_name value.","requires_values":["account_name"],"done_when":"The Account name field is nonempty."},
+    {"id":"currency","goal":"Open Currency or asset.","done_when":"The Currency or asset choices are visible, including + New currency or asset."},
+    {"id":"new-unit","goal":"Choose + New currency or asset.","done_when":"The Create currency or asset dialog is visible with Symbol and Unit name fields."},
+    {"id":"symbol","goal":"Fill Symbol using the caller-provided unit_symbol value.","requires_values":["unit_symbol"],"done_when":"The Symbol field is nonempty."},
+    {"id":"unit-name","goal":"Fill Unit name using the caller-provided unit_name value.","requires_values":["unit_name"],"done_when":"The Unit name field is nonempty."},
+    {"id":"use-unit","goal":"Confirm the new unit with Use unit.","done_when":"The account dialog is visible and Currency or asset shows USD."},
+    {"id":"balance","goal":"Fill Opening balance with the caller-provided opening_balance.","requires_values":["opening_balance"],"done_when":"The Opening balance field is nonempty and nonzero."},
+    {"id":"submit","goal":"Submit Create account.","done_when":"The account dialog is closed and the account list contains an account row with a nonzero displayed amount."}
+  ],
+  "expectations": [],
+  "options": {"allowed_origins":["http://127.0.0.1:4351"]}
+}

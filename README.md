@@ -1,64 +1,197 @@
 # Manuvra
 
-Manuvra is a macOS command-line tool for coding agents that need to observe and control an exact Chrome tab or native application window. It returns compact, truthful JSON results and keeps screenshots, accessibility trees, logs, and diagnostics in referenced files.
+Manuvra runs browser journeys for coding agents. A JSON job gives it a start URL, ordered goals, named values, completion conditions, and final expectations. Manuvra opens a dedicated Chromium, asks TypeSafe Jev for typed judgments, and applies its safety rules in Rust before it changes the page. Each command returns one JSON result and a path to the run's evidence manifest.
 
-The first release supports Apple Silicon running macOS 26 or later. It is distributed as MIT-licensed source and compiled locally by Homebrew; it does not ship a notarized executable.
+Use Manuvra with a disposable application fixture and synthetic data. The caller starts and resets the application, defines which effects are allowed, checks persisted state, and cleans up afterward. Manuvra owns its browser process and browser evidence.
 
-Every commit accepted into `main` passes the reproducible release checks: formatting, linting, tests, source packaging, installed-resource verification, snapshot safety, and deterministic archive generation. Releases publish an exact `main` commit whose CI run succeeded. Permission-dependent behavior is validated separately against the published Homebrew installation because macOS consent and the installed bundle identity do not exist in hosted CI. The CRAP inventory uses threshold 8. Hosted CI still reports that inventory as an advisory code-health check rather than a release gate.
+## Requirements
+
+Manuvra runs on Linux and requires Chromium or Google Chrome. Building it from source requires Rust 1.95 or newer. Jobs that need Jev judgments also require `TYPESAFE_API_KEY`.
+
+The workspace keeps the macOS fallback compiling, but macOS is not a supported runtime platform.
 
 ## Install
 
+On Omarchy, install the latest Linux release with the bundled `mise`:
+
+```bash
+MISE_MINIMUM_RELEASE_AGE=0 mise use -g github:taecontrol/manuvra@latest
+manuvra version
+```
+
+The same command works on other Linux systems with `mise`. Releases contain native x64 and ARM64 archives, and `mise` selects the matching one. Run `omarchy update mise` to update Manuvra along with other mise-managed tools.
+
+If Chromium is not already installed on Omarchy, add it with:
+
+```bash
+omarchy pkg add chromium
+```
+
+To build from source instead:
+
+```bash
+cargo build --release --locked
+cargo install --path crates/manuvra-cli --locked
+manuvra version
+```
+
+On macOS, the same CLI is distributed through the existing Homebrew tap:
+
 ```bash
 brew install taecontrol/tap/manuvra
-manuvra doctor
-manuvra setup
-manuvra doctor
+manuvra version
 ```
 
-In a terminal, `doctor` and `setup` explain their results in plain language. Use `manuvra doctor --json` or `manuvra setup --json` for JSON explicitly; redirected and piped output remains compact JSON automatically.
+The macOS package currently exposes `version` and the four `schema` contracts. Browser-journey execution remains unsupported on macOS; `run`, `status`, `resume`, and `abort` return `unsupported_platform`. The Homebrew release check builds and tests the formula on macOS so the install channel stays ready while runtime support is restored separately.
 
-macOS stores one code requirement per bundle ID `com.taecontrol.manuvra`. Toggling Manuvra in a privacy pane rebinds that row. Only one `Manuvra.app` can hold Accessibility, Screen & System Audio Recording, and Post Event at a time. Post Event is the Accessibility pane, not a third list.
+At runtime, Manuvra looks for the browser specified by `--browser`, then `MANUVRA_BROWSER`, then known Chromium and Chrome locations. It uses the current Wayland or X11 desktop unless you pass `--headless`.
 
-Homebrew bottles stay ad-hoc (`codesign --sign -`). Another computer needs no local certificate: `brew install`, then grant that Homebrew app once. A local certificate is only needed on a machine that will rebuild a local prefix and wants the grant to survive rebuilds.
+Manuvra stores durable run records under `XDG_STATE_HOME`, or the user's standard XDG state directory when that variable is unset. It requires `XDG_RUNTIME_DIR` for private control sockets and other short-lived state. The caller chooses a separate evidence root for each `run` command.
 
-An install or upgrade may require authorization again because the formula signs ad-hoc. `setup` asks macOS for only the missing permissions from the `manuvra-daemon` identity, rechecks, and opens the relevant privacy panes. Manuvra never edits the TCC database, silently grants itself access, or guarantees that a request will add it to a privacy list.
+## Write a job
 
-Follow the numbered instructions printed by `setup`. Enable the exact bundle path `doctor` printed. Other `Manuvra.app` copies share that TCC row and stay missing. Do not grant a `/tmp` prefix; extra copies steal the same row. When Manuvra is absent from a pane, click **Add**, select that exact path, enable its switch, and rerun `manuvra doctor`. Development builds report that no canonical bundle path exists instead of inventing one. `doctor` reports `authority` and `designated_requirement` beside `cdhash`. A new CDHash is not a new grant identity when those stay the same.
-
-## Agent workflow
+Ask the installed binary for its current contracts before writing input:
 
 ```bash
-npx skills add taecontrol/manuvra
+manuvra schema job
+manuvra schema result
+manuvra schema disposition
+manuvra schema manifest
 ```
 
-Use that skill when an agent must observe or control an exact local Chrome or macOS window on Apple Silicon running macOS 26 or later.
+This example creates one synthetic account in a local fixture:
 
-Chrome tabs are discoverable only when loopback CDP is up. `manuvra chrome launch` starts or reuses a dedicated-profile instance; it does not open a site or touch the daily Chrome. `targets`, `doctor`, and `open` never start Chrome.
+```json
+{
+  "schema_version": 1,
+  "target": {"kind": "browser", "url": "http://127.0.0.1:4351/"},
+  "context": {
+    "journey": "Create one synthetic account",
+    "revision": "<tested commit or build id>",
+    "environment": "fresh disposable fixture",
+    "actor": "synthetic owner",
+    "authority": "create one synthetic account in this fixture"
+  },
+  "values": {
+    "account_name": {
+      "value": "Validation wallet 7f3a",
+      "description": "Unique name for the synthetic account"
+    }
+  },
+  "steps": [
+    {
+      "id": "open",
+      "goal": "Open the account creation dialog.",
+      "done_when": [{"dialog_open": "Create account"}]
+    },
+    {
+      "id": "name",
+      "goal": "Fill Account name with account_name.",
+      "requires_values": ["account_name"],
+      "done_when": [
+        {"field": "Account name", "equals_value": "account_name"}
+      ]
+    },
+    {
+      "id": "submit",
+      "goal": "Submit Create account.",
+      "done_when": [
+        {"dialog_closed": "Create account"},
+        {"text_visible": "Validation wallet 7f3a"}
+      ]
+    }
+  ],
+  "expectations": [
+    {
+      "id": "account-visible",
+      "claim": "The final page shows the Validation wallet 7f3a account."
+    }
+  ],
+  "options": {
+    "allowed_origins": ["http://127.0.0.1:4351"]
+  }
+}
+```
+
+Write each step as one visible transition. The `goal` says what the browser should do, while `done_when` describes the state that must follow. Structured conditions can check visible or absent text, field values, open or closed dialogs, and URL fragments. Use natural-language conditions only when the structured forms cannot express the required state.
+
+Values have stable names so Jev can select a value without inventing one. Mark sensitive values with `"secret": true`. Keep jobs that contain classified values outside the repository and restrict their file mode to `0600`.
+
+The [Manuvra skill](skills/manuvra/SKILL.md) contains the full job-authoring and recovery procedure for coding agents. The schemas printed by the installed binary remain the authority for accepted fields and limits.
+
+## Start a run
+
+Give every invocation a request id. The id lets you recover the same response if stdout is lost.
 
 ```bash
-manuvra chrome launch
-manuvra targets
-manuvra open --target <target-id>
-manuvra observe screenshot --session <session-id>
-manuvra click --session <session-id> --role button --name Save
-manuvra close --session <session-id>
+manuvra run \
+  --request-id account-check-1 \
+  --job /tmp/create-account.json \
+  --evidence /tmp/manuvra-evidence \
+  --wait-ms 30000 > /tmp/account-check-1-result.json
+
+jq . /tmp/account-check-1-result.json
 ```
 
-Run `manuvra --help` for the complete packaged guide and `manuvra commands list` for machine-readable discovery.
+Every invocation writes exactly one JSON object to stdout. The JSON is authoritative. Exit codes classify the checkpoint:
 
-## Update and uninstall
+- `0` means passed.
+- `2` means uncertain and waiting for a disposition.
+- `3` means blocked.
+- `4` means failed.
+- `5` means aborted or expired.
+- `6` means still running.
+- `64` means invalid input or a request conflict.
+- `70` means an internal failure occurred before Manuvra could publish a recoverable result.
+
+## Follow or resume a run
+
+A result has a `run_id`, `state`, and `terminal` flag. A `running` result means the host still owns the browser. Wait for another checkpoint with:
 
 ```bash
-brew upgrade taecontrol/tap/manuvra
-manuvra doctor
-
-manuvra daemon stop
-brew uninstall taecontrol/tap/manuvra
+manuvra status r_example --wait-ms 30000
 ```
 
-Configuration and exported evidence are retained on uninstall. Run `manuvra purge --all` before uninstall only when you intend to remove Manuvra-owned current-user state.
+If the original command's stdout was lost, recover its run through the request id:
+
+```bash
+manuvra status --request-id account-check-1
+```
+
+An `uncertain` result includes an escalation payload and the dispositions allowed at that point. Inspect the payload and choose only one of the listed dispositions. Submit it with a new request id:
+
+```bash
+manuvra resume r_example \
+  --request-id account-check-1-resume-1 \
+  --input /tmp/disposition.json
+```
+
+The disposition schema supports four choices. `execute` authorizes one offered candidate. `advance` attests an allowed natural-language condition and requires a rationale. `retry_observation` asks Manuvra to inspect the page again. `abort` ends the run. Manuvra rechecks page state and its safety rules before it acts on caller authority.
+
+Stop any live run directly when it should no longer continue:
+
+```bash
+manuvra abort r_example --request-id account-check-1-abort
+```
+
+Request ids are idempotency keys. Reusing an id with the same input recovers the existing response. Reusing it with different input returns a conflict.
+
+## Verify the result
+
+Each run has a private directory beneath the requested evidence root. Its `manifest.json` lists every artifact by role, absolute path, SHA-256 digest, and completeness. Depending on the run, evidence includes the redacted job, provenance, checkpoints, observations, screenshots, decisions, step facts, action trace, escalations, dispositions, final verification, and cleanup state.
+
+A `passed` result means Manuvra completed the browser steps and final expectations with complete evidence. It does not prove that the application persisted the intended effect. Before treating the run as product proof:
+
+1. Verify the manifest and artifact digests.
+2. Inspect the first divergence or escalation and the final verification.
+3. Query the application's own persistence layer for the expected entities and duplicate count.
+4. Confirm that the browser, its profile, and the application fixture were cleaned up.
+
+Product validation should derive Pass, Fail, or Inconclusive from those facts rather than copy Manuvra's verdict.
 
 ## Development
+
+Run the local gates with:
 
 ```bash
 make fmt
@@ -67,28 +200,21 @@ make test
 make crap
 ```
 
-`make crap` fails when any production function scores above 8. Hosted CI still treats that inventory as advisory. See [ADR-0003](docs/adrs/0003-pin-production-crap-at-8.md).
+`make live` builds a release binary and runs the Money journey matrix against fresh fixtures. It requires Chromium, a headed desktop, `TYPESAFE_API_KEY`, `jq`, and the Money repository at `/home/guetteluis/Work/personal/money`. Set `MONEY_DIR` to use another checkout. The matrix runs the create-unit, create-account, and record-transaction journeys three times each, followed by one forced escalation round trip. It writes timestamped evidence and a report under `.work/live/money-journey/`.
 
-Build an installable bundle in a staging prefix with:
+Contributors and coding agents should follow [docs/CODING_STANDARDS.md](docs/CODING_STANDARDS.md). The [architecture decision records](docs/adrs/) explain the project's design choices.
 
-```bash
-scripts/package-manuvra.sh --prefix /absolute/staging/prefix
-```
+## Release
 
-`package-manuvra.sh --prefix DIR` always writes `DIR/libexec/Manuvra.app`. It does not write `~/Applications/Manuvra.app`. That default path is ad-hoc, the same identity Homebrew and hosted CI use. `packaging/manuvra.rb.template` must not pass `--identity`, and it deletes `MANUVRA_CODESIGN_IDENTITY` so a local named identity cannot leak into a bottle.
+Releases start from the `release` workflow on `main`. Enter the workspace version from `Cargo.toml` without the leading `v`. The workflow requires a successful CI run for that exact commit, then:
 
-The recommended grant path is a single signed copy you keep at `~/Applications/Manuvra.app`, signed with `--identity "Manuvra Local"` or `MANUVRA_CODESIGN_IDENTITY`. Enable the exact bundle path `doctor` prints. Do not grant a `/tmp` prefix.
+1. Builds deterministic Linux x64 and ARM64 archives and publishes their SHA-256 checksums.
+2. Creates GitHub build-provenance attestations for both Linux archives.
+3. Publishes those binaries with the deterministic source archive.
+4. Installs the published binaries through `mise` on native x64 and ARM64 runners.
+5. Installs the rendered formula on macOS and opens an auto-merge pull request in [`taecontrol/homebrew-tap`](https://github.com/taecontrol/homebrew-tap).
 
-To keep Accessibility, Screen & System Audio Recording, and Post Event grants across rebuilds of that same local prefix, sign with a persistent identity the human already created and trusted. Manuvra never creates a certificate, runs `add-trusted-cert`, or edits the TCC database.
-
-```bash
-# After the human creates and trusts a local code-signing certificate:
-scripts/package-manuvra.sh --prefix /absolute/stable/prefix --identity "Manuvra Local"
-# or
-MANUVRA_CODESIGN_IDENTITY="Manuvra Local" scripts/package-manuvra.sh --prefix /absolute/stable/prefix
-```
-
-`--identity` wins over `MANUVRA_CODESIGN_IDENTITY`. Create the certificate once in Keychain Access: Certificate Assistant → Create a Certificate; name it `Manuvra Local`; identity type Self Signed Root; certificate type Code Signing; then Trust → Code Signing → Always Trust. `manuvra doctor --json` reports `daemon.installation.authority` and `daemon.installation.designated_requirement` as well as `cdhash`. A new CDHash after a rebuild is not a new grant identity when authority and designated requirement stay the same. `brew upgrade` may still ask again because bottles remain ad-hoc.
+Repository secret `HOMEBREW_TAP_TOKEN` provides write access to the tap. The release workflow does not modify Omarchy; Omarchy consumes the ordinary GitHub release through `mise`.
 
 ## License
 

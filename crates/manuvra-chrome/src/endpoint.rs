@@ -59,20 +59,6 @@ impl Endpoint {
 
     pub fn get_json(&self, path: &str, timeout: Duration) -> Result<Value, EndpointError> {
         self.request_json("GET", path, timeout)
-            .map_err(RequestFailure::into_endpoint)
-    }
-
-    pub(crate) fn get_json_for_probe(
-        &self,
-        path: &str,
-        timeout: Duration,
-    ) -> Result<Value, RequestFailure> {
-        self.request_json("GET", path, timeout)
-    }
-
-    pub(crate) fn put_json(&self, path: &str, timeout: Duration) -> Result<Value, EndpointError> {
-        self.request_json("PUT", path, timeout)
-            .map_err(RequestFailure::into_endpoint)
     }
 
     fn request_json(
@@ -80,65 +66,21 @@ impl Endpoint {
         method: &str,
         path: &str,
         timeout: Duration,
-    ) -> Result<Value, RequestFailure> {
-        let mut stream =
-            TcpStream::connect_timeout(&self.address, timeout).map_err(RequestFailure::io)?;
+    ) -> Result<Value, EndpointError> {
+        let mut stream = TcpStream::connect_timeout(&self.address, timeout)
+            .map_err(|error| EndpointError::Io(error.to_string()))?;
         stream
             .set_read_timeout(Some(timeout))
             .and_then(|()| stream.set_write_timeout(Some(timeout)))
-            .map_err(RequestFailure::io)?;
+            .map_err(|error| EndpointError::Io(error.to_string()))?;
         let host = self.label();
         write!(
             stream,
             "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nAccept: application/json\r\n\r\n"
         )
-        .map_err(RequestFailure::io)?;
+        .map_err(|error| EndpointError::Io(error.to_string()))?;
         let response = read_response(&mut stream)?;
-        parse_http_json(&response).map_err(RequestFailure::definitive)
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct RequestFailure {
-    error: EndpointError,
-    transient: bool,
-}
-
-impl RequestFailure {
-    fn io(error: std::io::Error) -> Self {
-        let transient = matches!(
-            error.kind(),
-            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-        );
-        Self {
-            error: EndpointError::Io(error.to_string()),
-            transient,
-        }
-    }
-
-    fn definitive(error: EndpointError) -> Self {
-        Self {
-            error,
-            transient: false,
-        }
-    }
-
-    fn into_endpoint(self) -> EndpointError {
-        self.error
-    }
-
-    pub(crate) fn is_connection_refused(&self) -> bool {
-        self.error.is_connection_refused()
-    }
-
-    pub(crate) fn is_transient(&self) -> bool {
-        self.transient
-    }
-}
-
-impl std::fmt::Display for RequestFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.error, formatter)
+        parse_http_json(&response)
     }
 }
 
@@ -156,7 +98,7 @@ fn push_configured_endpoint(
     Ok(())
 }
 
-fn read_response(stream: &mut TcpStream) -> Result<Vec<u8>, RequestFailure> {
+fn read_response(stream: &mut TcpStream) -> Result<Vec<u8>, EndpointError> {
     let mut response = Vec::new();
     let mut chunk = [0_u8; 8192];
     while read_discovery_chunk(stream, &mut response, &mut chunk)? {}
@@ -167,19 +109,19 @@ fn read_discovery_chunk(
     stream: &mut TcpStream,
     response: &mut Vec<u8>,
     chunk: &mut [u8],
-) -> Result<bool, RequestFailure> {
+) -> Result<bool, EndpointError> {
     match stream.read(chunk) {
         Ok(0) => Ok(false),
         Ok(count) => Ok(!append_discovery_bytes(response, &chunk[..count])?),
         Err(error) if discovery_read_is_complete(response, &error) => Ok(false),
-        Err(error) => Err(RequestFailure::io(error)),
+        Err(error) => Err(EndpointError::Io(error.to_string())),
     }
 }
 
-fn append_discovery_bytes(response: &mut Vec<u8>, chunk: &[u8]) -> Result<bool, RequestFailure> {
+fn append_discovery_bytes(response: &mut Vec<u8>, chunk: &[u8]) -> Result<bool, EndpointError> {
     response.extend_from_slice(chunk);
     if response.len() > MAX_DISCOVERY_BYTES {
-        return Err(RequestFailure::definitive(EndpointError::TooLarge));
+        return Err(EndpointError::TooLarge);
     }
     Ok(response_complete(response))
 }

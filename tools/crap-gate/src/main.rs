@@ -14,10 +14,6 @@ struct Args {
     #[arg(long)]
     rust_root: PathBuf,
     #[arg(long)]
-    swift_package: Option<PathBuf>,
-    #[arg(long)]
-    swift_root: Vec<PathBuf>,
-    #[arg(long)]
     exclude: Vec<String>,
     #[arg(long)]
     rust_coverage_ignore_regex: Option<String>,
@@ -27,10 +23,6 @@ struct Args {
     cargo_crap: String,
     #[arg(long, default_value = "cargo-llvm-cov")]
     cargo_llvm_cov: String,
-    #[arg(long, default_value = "swift")]
-    swift: String,
-    #[arg(long, default_value = "tools/swift-crap-analyzer")]
-    swift_analyzer_package: PathBuf,
     #[arg(long)]
     llvm_cov: Option<PathBuf>,
     #[arg(long)]
@@ -44,15 +36,11 @@ impl From<Args> for GateConfig {
             repo_root: args.repo_root,
             rust_manifest: args.rust_manifest,
             rust_root: args.rust_root,
-            swift_package: args.swift_package,
-            swift_root: args.swift_root,
             exclude: args.exclude,
             rust_coverage_ignore_regex: args.rust_coverage_ignore_regex,
             report_json: args.report_json,
             cargo_crap: args.cargo_crap,
             cargo_llvm_cov: args.cargo_llvm_cov,
-            swift: args.swift,
-            swift_analyzer_package: args.swift_analyzer_package,
             llvm_cov: args.llvm_cov,
             llvm_profdata: args.llvm_profdata,
         }

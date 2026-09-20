@@ -1,22 +1,20 @@
 class Manuvra < Formula
-  desc "Shell-driven Chrome and native macOS control for coding agents"
+  desc "Jev-guided browser journeys for coding agents"
   homepage "https://github.com/taecontrol/manuvra"
   url "https://github.com/taecontrol/manuvra/releases/download/v@VERSION@/manuvra-@VERSION@.tar.gz"
   sha256 "@SHA256@"
   license "MIT"
 
+  depends_on :macos
+  depends_on "cmake" => :build
   depends_on "rust" => :build
-  depends_on "jq" => :build
-  depends_on macos: :tahoe
 
   def install
-    odie "Manuvra supports Apple Silicon only" unless Hardware::CPU.arm?
-    ENV.delete("MANUVRA_CODESIGN_IDENTITY")
-    system "./scripts/package-manuvra.sh", "--prefix", prefix
+    system "cargo", "install", *std_cargo_args(path: "crates/manuvra-cli")
   end
 
   test do
-    assert_match '"registry_version":"1.0.0"', shell_output("#{bin}/manuvra commands list --limit 1")
-    assert_match '"running":false', shell_output("#{bin}/manuvra daemon status")
+    assert_match "\"version\":\"#{version}\"", shell_output("#{bin}/manuvra version")
+    assert_match "\"title\":\"Job\"", shell_output("#{bin}/manuvra schema job")
   end
 end

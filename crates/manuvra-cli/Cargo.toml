@@ -9,23 +9,17 @@ license.workspace = true
 name = "manuvra"
 path = "src/main.rs"
 
-[[bin]]
-name = "manuvra-daemon"
-path = "src/daemon.rs"
-
 [dependencies]
 clap.workspace = true
-manuvra-protocol = { path = "../manuvra-protocol" }
-manuvra-chrome = { path = "../manuvra-chrome" }
-manuvra-macos = { path = "../manuvra-macos" }
-manuvra-runtime = { path = "../manuvra-runtime" }
+hex.workspace = true
+hmac.workspace = true
 libc.workspace = true
+manuvra-contract = { path = "../manuvra-contract" }
+manuvra-flow = { path = "../manuvra-flow" }
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
-tokio.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
-sha2.workspace = true
 tempfile.workspace = true

@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "target": {"kind": "browser", "url": "http://127.0.0.1:4351/"},
+  "context": {
+    "journey": "Confirm a closed dialog is not open",
+    "revision": "verified-by-money-doctor",
+    "environment": "fresh local money fixture",
+    "actor": "synthetic owner",
+    "authority": "observe only"
+  },
+  "steps": [
+    {"id": "dialog-open", "goal": "Observe the Create account dialog.", "done_when": [{"dialog_open": "Create account"}]}
+  ],
+  "options": {"allowed_origins": ["http://127.0.0.1:4351"]}
+}

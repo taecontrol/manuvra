@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "target": {"kind": "browser", "url": "http://127.0.0.1:4351/"},
+  "context": {
+    "journey": "Observe the fresh Money accounts page",
+    "revision": "verified-by-money-doctor",
+    "environment": "fresh local money fixture",
+    "actor": "synthetic owner",
+    "authority": "observe only"
+  },
+  "steps": [
+    {"id": "accounts-ready", "goal": "Observe the account creation control.", "done_when": [{"text_visible": "+ Create account"}]}
+  ],
+  "options": {"allowed_origins": ["http://127.0.0.1:4351"], "viewport": {"width": 1120, "height": 780}}
+}

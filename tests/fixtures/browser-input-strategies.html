@@ -1,0 +1,97 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Browser input strategies</title>
+<style>
+  body { font: 16px sans-serif; margin: 16px; }
+  section { margin: 12px 0; }
+  #below { margin-top: 1400px; }
+</style>
+<section>
+  <label for="native-select">Native choice</label>
+  <select id="native-select">
+    <option value="">Choose</option>
+    <optgroup label="Grouped choices">
+      <option value="wanted-id">Wanted</option>
+    </optgroup>
+  </select>
+  <select id="other-select" aria-label="Other native choice">
+    <option value="other-id">Other option</option>
+  </select>
+  <output id="select-events"></output>
+</section>
+<section>
+  <label for="combo">Search choice</label>
+  <input id="combo" role="combobox" aria-expanded="false">
+  <button id="combo-option" role="option" hidden>Wanted option</button>
+  <output id="enter-count">0</output>
+</section>
+<section>
+  <label for="keyboard-only">Keyboard only</label>
+  <input id="keyboard-only">
+  <label for="garbled">Garbled</label>
+  <input id="garbled">
+</section>
+<section>
+  <label for="date">Date</label><input id="date" type="date">
+  <output id="date-events"></output>
+</section>
+<section id="shadow-host"></section>
+<section id="slot-host"><button slot="control" id="slotted">Slotted control</button></section>
+<iframe id="same-frame" title="Same-origin fixture" srcdoc="<button id='frame-button' onclick='parent.document.querySelector(&quot;#frame-result&quot;).textContent=&quot;clicked&quot;'>Frame control</button>"></iframe>
+<output id="frame-result"></output>
+<iframe title="Cross-origin fixture" src="http://127.0.0.1:9/"></iframe>
+<section id="closed-host"></section>
+<canvas width="40" height="40"></canvas>
+<label for="file">File</label><input id="file" type="file">
+<button id="popup">Open popup</button>
+<a id="off-origin" href="https://example.invalid/">Leave origin</a>
+<section id="below"><button id="below-button">Below viewport</button></section>
+<script>
+  const select = document.querySelector('#native-select');
+  select.addEventListener('input', () => document.querySelector('#select-events').textContent += 'input ');
+  select.addEventListener('change', () => document.querySelector('#select-events').textContent += 'change');
+
+  const combo = document.querySelector('#combo');
+  combo.addEventListener('input', () => setTimeout(() => {
+    combo.setAttribute('aria-expanded', 'true');
+    document.querySelector('#combo-option').hidden = false;
+  }, 220));
+  combo.addEventListener('keydown', event => {
+    if (event.key === 'Enter') document.querySelector('#enter-count').textContent = String(Number(document.querySelector('#enter-count').textContent) + 1);
+  });
+  document.querySelector('#combo-option').addEventListener('click', event => event.currentTarget.textContent = 'Selected option');
+
+  const keyboardOnly = document.querySelector('#keyboard-only');
+  keyboardOnly.addEventListener('beforeinput', event => {
+    if (event.inputType === 'insertText') event.preventDefault();
+  });
+  keyboardOnly.addEventListener('keydown', event => {
+    if (event.key.length === 1) {
+      event.preventDefault();
+      keyboardOnly.value += event.key;
+      keyboardOnly.dispatchEvent(new Event('input', {bubbles: true}));
+    }
+  });
+
+  const garbled = document.querySelector('#garbled');
+  garbled.addEventListener('beforeinput', event => {
+    if (event.inputType === 'insertText') {
+      event.preventDefault();
+      garbled.value = 'garbled';
+      garbled.dispatchEvent(new Event('input', {bubbles: true}));
+    }
+  });
+
+  const date = document.querySelector('#date');
+  date.addEventListener('input', () => document.querySelector('#date-events').textContent += 'input ');
+  date.addEventListener('change', () => document.querySelector('#date-events').textContent += 'change');
+
+  const shadow = document.querySelector('#shadow-host').attachShadow({mode: 'open'});
+  shadow.innerHTML = '<button id="shadow-button">Shadow control</button><output id="shadow-result"></output>';
+  shadow.querySelector('button').addEventListener('click', () => shadow.querySelector('output').textContent = 'clicked');
+  const slots = document.querySelector('#slot-host').attachShadow({mode: 'open'});
+  slots.innerHTML = '<slot name="control"></slot>';
+  document.querySelector('#slotted').addEventListener('click', () => document.querySelector('#slotted').textContent = 'Slotted clicked');
+  document.querySelector('#closed-host').attachShadow({mode: 'closed'}).innerHTML = '<button>Closed control</button>';
+  document.querySelector('#popup').addEventListener('click', () => window.open('about:blank', '_blank'));
+</script>

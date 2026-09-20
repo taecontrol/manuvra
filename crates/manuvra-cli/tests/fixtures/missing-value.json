@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "target": {"kind": "browser", "url": "http://127.0.0.1:4351/"},
+  "context": {
+    "journey": "Block before filling a missing account name",
+    "revision": "admission-contract",
+    "environment": "contract fixture",
+    "actor": "synthetic owner",
+    "authority": "no application mutation"
+  },
+  "values": {
+    "private_note": {
+      "value": "classified-fixture-secret",
+      "description": "Secret marker",
+      "formats": {"iso": "secret-iso-form", "display": "secret-display-form"},
+      "secret": true
+    },
+    "redacted_note": {
+      "value": "classified-fixture-redacted",
+      "description": "Redacted marker",
+      "formats": {"iso": "redacted-iso-form", "display": "redacted-display-form"}
+    }
+  },
+  "steps": [
+    {
+      "id": "name",
+      "goal": "Fill Account name with account_name.",
+      "requires_values": ["account_name"],
+      "done_when": [{"field": "Account name", "equals_value": "account_name"}]
+    }
+  ],
+  "expectations": [],
+  "options": {
+    "allowed_origins": ["http://127.0.0.1:4351"],
+    "redact_values": ["redacted_note"]
+  }
+}

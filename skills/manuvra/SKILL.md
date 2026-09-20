@@ -1,98 +1,190 @@
 ---
 name: manuvra
-description: "Observes and controls one exact Chrome tab or native macOS window through the manuvra CLI. Use when an agent needs to click, type, press keys, scroll, navigate, screenshot, or query accessibility on a local Chrome or macOS window on Apple Silicon running macOS 26 or later. Prefer manuvra for that work over ad-hoc screenshot or desktop-automation scripts. Do not use for Linux, Windows, hosted CI browsers, Playwright suites, or remote machines."
+description: "Run an application journey in a dedicated Chromium with Manuvra and return evidence-backed UI validation. Use to execute a browser flow from a URL, recover or resume a Manuvra run, inspect its evidence, or prove a browser-visible change against an isolated fixture. Not for general browsing, scraping, or production data."
 license: MIT
-compatibility: "Requires Apple Silicon, macOS 26 or later, and a Homebrew install of manuvra."
 ---
 
 # Manuvra
 
-Observe or control one exact local Chrome tab/window or native macOS window. Verbs, flags, defaults, and errors come from the installed CLI, not this file. Commands print one JSON object; large evidence is an absolute path. Export anything that must survive; `close` deletes the rest.
+Manuvra is a local browser-flow executor for coding agents. Give its CLI a versioned JSON **job** containing a start URL, ordered goals, caller-supplied values, completion conditions, and final expectations. It drives one dedicated Chromium, gates mutations, stops when it cannot continue safely, and returns one JSON result plus a manifest of screenshots and machine-readable evidence.
 
-Use this skill only on Apple Silicon running macOS 26 or later, for one discoverable Chrome or macOS target. Do not use it for Linux, Windows, Intel Macs, older macOS, hosted CI browsers, Playwright or other in-process web-test drivers, SSH, or a machine whose human cannot grant Accessibility, Screen & System Audio Recording, and Post Event.
+Use Manuvra against an isolated application fixture with synthetic data. You own the application process, fixture reset, authorization for its effects, persistence inspection, and cleanup. Manuvra owns only its Chromium and browser evidence. A Manuvra `passed` result proves the recorded browser journey. Combine it with an application-owned persistence check before claiming the product behavior passed.
 
-## Become ready
+## 1. Establish the run boundary
 
-If `manuvra` is missing or `manuvra doctor` is not ready:
-
-```bash
-brew install taecontrol/tap/manuvra
-manuvra doctor
-manuvra setup
-manuvra doctor
-```
-
-Piped `doctor` and `setup` print JSON. In a terminal they print plain language unless you pass `--json`.
-
-`doctor` reports bundle, daemon, permission state, and codesign identity (`cdhash`, `authority`, `designated_requirement` on `daemon.installation`). It does not prompt or open System Settings. Only `setup` asks macOS for missing permissions, and only from the `manuvra-daemon` identity. A new CDHash is not a new grant identity when `authority` and `designated_requirement` stay the same.
-
-The human grants permission. Do not edit the TCC database, create or trust a certificate, run `add-trusted-cert`, claim a silent grant, or skip the numbered instructions `setup` prints.
-
-If a permission is missing, enable the exact bundle path `doctor` printed. Other `Manuvra.app` copies share one TCC row for `com.taecontrol.manuvra` and stay missing; toggling Manuvra rebinds that row. Do not grant a `/tmp` prefix. Post Event is the Accessibility pane, not a third list. If Manuvra is absent from a pane, the human clicks **Add**, selects that exact path, and enables it.
-
-`brew install` needs no local certificate; grant that Homebrew app once. Homebrew stays ad-hoc, so `brew upgrade` may require a new grant. A local certificate is only if that machine will rebuild a local prefix and wants the grant to survive. The packager writes `prefix/libexec/Manuvra.app`; the project README names `~/Applications/Manuvra.app` as the recommended grant copy and the Keychain steps.
-
-After a first grant, the human closes System Settings. Then run `manuvra daemon stop` and repeat the `doctor` / `setup` / `doctor` path above. A grant that is still invisible is usually a live daemon that has not restarted.
-
-Ready when `doctor` reports the installed bundle, a usable daemon, and the permissions the next command needs. If `doctor` reports legacy development state, run the migrate command printed by `manuvra --help`.
-
-If `doctor` reports `chrome_endpoint_refused`, or Chrome targets are missing because loopback CDP is refused, run `manuvra chrome launch`. Do not expect `targets`, `doctor`, or `open` to start Chrome.
+Confirm that the CLI and its live contract are available:
 
 ```bash
-manuvra chrome launch
-manuvra targets --kind chrome
+command -v manuvra
+manuvra version
+manuvra schema job > /tmp/manuvra-job-schema.json
+manuvra schema result > /tmp/manuvra-result-schema.json
+manuvra schema disposition > /tmp/manuvra-disposition-schema.json
+manuvra schema manifest > /tmp/manuvra-manifest-schema.json
 ```
 
-Read `daemon.adapters` only from a successful `manuvra doctor` JSON object that contains that array. If the array is missing, wait and rerun `doctor`. `manuvra daemon status` reports the daemon without touching a target; it is not a doctor document and does not carry adapters.
+If `manuvra` is missing while working in its source checkout, install it with `cargo install --path crates/manuvra-cli --locked`. Otherwise report that the CLI is unavailable. Confirm `TYPESAFE_API_KEY` is present without printing it. Locate Chromium with `command -v chromium || command -v chromium-browser || command -v google-chrome`. You can later pass an explicit executable with `--browser`.
 
-## Run a session
+Launch or reset a disposable application fixture and record:
 
-Every command after `open` needs `--session`. There is no implicit current session. Treat target IDs, element references, and frame tokens as opaque; do not parse or reconstruct them.
+- the exact commit or build identity being exercised;
+- its start URL and exact allowed origin (`scheme://host[:port]`);
+- the synthetic actor and the effects this run is authorized to create;
+- an application-owned query that will prove the expected persisted state and expose duplicates.
+
+This stage is complete when the fixture is reachable, its revision is independently known, the allowed effects are bounded, and a persistence check is ready.
+
+## 2. Author one job
+
+Start from this shape and replace the illustrative labels and claims with the application's visible language:
+
+```json
+{
+  "schema_version": 1,
+  "target": {"kind": "browser", "url": "http://127.0.0.1:4351/"},
+  "context": {
+    "journey": "Create one synthetic account",
+    "revision": "<tested commit or build id>",
+    "environment": "fresh disposable fixture",
+    "actor": "synthetic owner",
+    "authority": "create one synthetic account in this fixture"
+  },
+  "values": {
+    "account_name": {
+      "value": "Agent validation wallet 7f3a",
+      "description": "Unique name for the synthetic account"
+    }
+  },
+  "steps": [
+    {
+      "id": "open",
+      "goal": "Open the account creation dialog.",
+      "done_when": [{"dialog_open": "Create account"}]
+    },
+    {
+      "id": "name",
+      "goal": "Fill Account name with account_name.",
+      "requires_values": ["account_name"],
+      "done_when": [{"field": "Account name", "equals_value": "account_name"}]
+    },
+    {
+      "id": "submit",
+      "goal": "Submit Create account.",
+      "done_when": [
+        {"dialog_closed": "Create account"},
+        {"text_visible": "Agent validation wallet 7f3a"}
+      ]
+    }
+  ],
+  "expectations": [
+    {
+      "id": "account-visible",
+      "claim": "The final page shows the Agent validation wallet 7f3a account."
+    }
+  ],
+  "options": {
+    "allowed_origins": ["http://127.0.0.1:4351"]
+  }
+}
+```
+
+Authoring rules:
+
+- Write goals and natural-language conditions in English. Make each step one observable UI transition. Opening a chooser and selecting an option are separate steps.
+- Describe intent in `goal` and the resulting state in `done_when`. A list of assertions is a conjunction. Prefer the structured forms `text_visible`, `text_absent`, `field` + `nonempty`, `field` + `equals_value`, `dialog_open`, `dialog_closed`, and `url_contains`. Use a natural-language string only when those forms cannot express the condition.
+- Match field and dialog names to visible accessible labels. Manuvra requires one unambiguous visible match. Use a field's optional `dialog` or `role`, or a text assertion's `scope`, when the page repeats a label.
+- Put every literal to be entered in `values` under a stable semantic name. Refer to that name from `requires_values` and `equals_value`. Keep the literal in `values`. Mark credentials or sensitive values with `"secret": true`, and list other values requiring evidence redaction in `options.redact_values`.
+- Keep jobs containing classified values outside the repository in a caller-owned file with mode `0600`.
+- Use unique synthetic values so persistence queries can distinguish this run. Bound browser navigation with `options.allowed_origins`.
+- Reserve `expectations` for final user-visible claims. Add `exact_literals` when an exact string or number must be present, and `within_text` when it must occur in one specific observed text container.
+
+Treat `manuvra schema job` as authoritative for optional fields, limits, and assertion shapes. Job authoring is complete when every named value reference exists, every step has an observable postcondition, final expectations describe the required visible outcome, and the context states the exact candidate and authority.
+
+## 3. Start the run
+
+Choose a new request id for this invocation and a caller-owned evidence root. Capture stdout as one JSON object even when the process exits nonzero:
 
 ```bash
-manuvra targets
-manuvra open --target <target-id>
-manuvra observe screenshot --session <session-id>
-manuvra observe query --session <session-id> --role button --name Save
-manuvra click --session <session-id> --role button --name Save
-manuvra export --session <session-id> --all --destination /absolute/output/path
-manuvra close --session <session-id>
+request_id="journey-$(date +%s)-$RANDOM"
+job="/absolute/path/to/job.json"
+evidence_root="/absolute/path/to/evidence"
+result="/tmp/$request_id-result.json"
+
+if manuvra run \
+  --request-id "$request_id" \
+  --job "$job" \
+  --evidence "$evidence_root" \
+  --wait-ms 30000 > "$result"
+then
+  exit_code=0
+else
+  exit_code=$?
+fi
+
+jq . "$result"
+run_id=$(jq -r '.run_id' "$result")
 ```
 
-1. `targets` lists currently discoverable targets with presentation `owner` and `title`, plus capabilities. Choose by those labels when they uniquely identify the window or tab. Use the returned `target_id` as opaque; do not parse or reconstruct it.
-2. `open` returns a session ID. Default role is actor; default mode is `background`.
-3. Observe before the first mutation. Keep the session ID, element references, and `frame_token`.
-4. Perform one explicit action. For a locator, mode, or verb not shown here, resolve the command ID from `manuvra commands list`, then run `manuvra <verb> --help` or `manuvra commands get <command-id>`. Do not pass a capability ID such as `common.press` to `commands get`.
-5. Read `outcome`, `delivery`, `observation`, and `error` together. Do not infer success from exit status or `delivery` alone.
-6. `export` anything that must survive, then `close`. `close` deletes all session artifacts.
+Add `--headless` only when a visible browser is unnecessary. Add `--browser /absolute/path/to/chromium` when discovery cannot find the intended executable.
 
-`owner` and `title` are presentation labels only. They are not identity. `title` may be JSON `null`. If title is JSON `null` or several targets share the same labels, fall back to the before/after probe: record macos `target_id` values from `manuvra targets --kind macos`; open or wait for the window; list macos targets again and keep only IDs that were not already recorded; `open` one remaining candidate and confirm with `observe query` and/or `observe screenshot`; if it is the wrong window, `close` and try the next new ID. Done when query or screenshot shows the intended window.
+The JSON result is authoritative. The exit code only classifies it. Starting is complete when the result is valid JSON and contains `request_id`, `run_id`, `state`, and `terminal`.
 
-Background never activates the target or injects global input. If the result is `foreground_required`, retry that invocation with `--mode foreground` only when visible activation is intended. The override does not change the session default.
+## 4. Drive the run to a terminal result
 
-`type` always needs an explicit locator. Matching is exact: zero hits are `element_not_found`; several hits are `ambiguous_target`. The tool never picks a fuzzy or ordinal winner. If a semantic query or click is ambiguous, narrow with `--within-role` / `--within-name` or click a returned `ref`. Do not retry the same unconstrained semantic click.
+Branch on `state`:
 
-If the actor lease expired, mutation returns `actor_lease_expired`. Observation still works. Recover with the `lease` commands in `manuvra --help`. Expiry never reacquires the lease.
+- `running`: wait on the same run with `manuvra status "$run_id" --wait-ms 30000 > "$result"`.
+- `uncertain`: inspect `escalation.payload` and the snapshot, screenshot, recent actions, and candidates it references. Choose only a kind listed in `escalation.dispositions`.
+- `passed`, `failed`, `blocked`, `aborted`, or `expired`: the run is terminal. Continue to evidence validation.
 
-- `observed`: the backend confirmed its primitive and required post-action state was captured. That does not prove the application-level effect you wanted. If a click was meant to navigate, observe (query and/or screenshot) before the next mutation.
-- `not_performed`: nothing dispatched, or the backend rejected it with no effect.
-- `uncertain`: dispatch happened or may have happened; confirmation or evidence is incomplete.
+After lost stdout, recover the existing run with `manuvra status --request-id "$request_id"`. Reuse a request id only to recover that exact invocation. Give every new `resume` or `abort` invocation its own request id.
 
-If a command fails, run the exact `help_command` from the JSON error. If `effects` is `possible` or `outcome` is `uncertain`, observe before retrying.
+For an uncertain run, create a disposition matching `manuvra schema disposition`:
 
-## Live catalog
+- `execute`: use the exact offered `candidate_id` only when its operation, target, and value still express the intended step.
+- `advance`: include a concrete `rationale` and use it only when offered for an uncertain natural-language condition or final claim that the evidence visibly establishes.
+- `retry_observation`: use when fresher browser evidence can resolve the uncertainty.
+- `abort`: use when authority, intent, or safe continuation is absent.
 
-Command IDs come from the installed registry. Resolve them with `manuvra commands list` and inspect one with `manuvra commands get action.press`. Capability IDs such as `common.press` appear on a target; they are not command IDs. `system.commands.get` is the lookup command.
+Example `execute` disposition:
 
-Load these when you need a verb, flag, schema, or error that this file does not spell:
+```json
+{
+  "schema_version": 1,
+  "escalation_id": "<result.escalation.id>",
+  "disposition": {
+    "kind": "execute",
+    "candidate_id": "<candidate id from the escalation payload>"
+  }
+}
+```
+
+Submit it and capture the next checkpoint:
 
 ```bash
-manuvra --help
-manuvra commands list
-manuvra commands get action.press
-manuvra commands schema action.press --side input
-manuvra commands errors <code>
-manuvra <verb> --help
+manuvra resume "$run_id" \
+  --request-id "$resume_request_id" \
+  --input "$disposition_file" > "$result"
 ```
 
-Use raw CDP or Accessibility only when no common action can express the work. Load that command's help first. Raw still requires a session, authority, target pinning, deadlines, artifacts, and modes.
+Capture nonzero exit codes from `status` and `resume` in the same way as `run`. They classify the JSON checkpoint rather than replacing it. If authority is withdrawn before the run becomes terminal, stop it with `manuvra abort "$run_id" --request-id "$abort_request_id"`.
+
+Repeat status and disposition handling until `terminal` is `true`. A disposition supplies bounded caller authority. Manuvra still re-observes and enforces target freshness, origin, budgets, replay guards, and code-owned verification.
+
+## 5. Validate evidence and product state
+
+Read the terminal JSON and the manifest at `evidence.manifest`.
+
+For a successful Manuvra run, require all of the following:
+
+- `state` is `passed`, `terminal` is `true`, and `verdict.overall` is `satisfied`;
+- `evidence.complete` and the manifest's `complete` are `true`;
+- every manifest artifact marked complete exists at its absolute path and its SHA-256 equals `digest`;
+- the normalized job, provenance, observations, action trace, step facts, final verification, and cleanup agree with the result;
+- any escalation and disposition remain visible, and `verdict.caller_assisted` truthfully reports assistance.
+
+For any other terminal state, preserve `reason`, the first divergence or escalation, and the last trustworthy observation. Report the run as stopped rather than rerunning it away.
+
+Query the application's own persistence seam after the browser run. Record the exact matching entities and counts, including zero unexpected duplicates, then clean up the fixture. The task is complete only when the report identifies the tested revision and binary, job and terminal result, manifest integrity, visible outcome, persistence facts, caller assistance, and cleanup. If a Product Validator consumes the run, give it those facts and let it independently return Pass, Fail, or Inconclusive.
+
+Exit codes are `0` passed, `2` uncertain, `3` blocked, `4` failed, `5` aborted or expired, `6` running, `64` invalid input or request conflict, and `70` internal failure without a recoverable result.

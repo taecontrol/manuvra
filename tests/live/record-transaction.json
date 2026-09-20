@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "target": {"kind": "browser", "url": "http://127.0.0.1:4351/"},
+  "context": {"journey": "Create one account and record one income transaction", "revision": "doctor-confirmed live candidate", "environment": "fresh money fixture", "actor": "synthetic owner", "authority": "create validation state only in this fixture"},
+  "values": {
+    "account_name": {"value": "Transaction wallet", "description": "Name of the account that receives the transaction"},
+    "unit_symbol": {"value": "USD", "description": "Symbol of the new currency"},
+    "unit_name": {"value": "US dollar", "description": "Name of the new currency"},
+    "opening_balance": {"value": "12.34", "description": "Opening balance of the account"},
+    "transaction_amount": {"value": "5.66", "description": "Amount of the income transaction"},
+    "transaction_note": {"value": "Review income", "description": "Note of the income transaction"}
+  },
+  "steps": [
+    {"id":"open-account-dialog","goal":"Open the account creation dialog.","done_when":[{"dialog_open":"Create account"}]},
+    {"id":"account-name","goal":"Fill Account name with account_name.","requires_values":["account_name"],"done_when":[{"field":"Account name","equals_value":"account_name"}]},
+    {"id":"open-unit-list","goal":"Open Currency or asset.","done_when":[{"text_visible":"+ New currency or asset"}]},
+    {"id":"open-unit-dialog","goal":"Choose + New currency or asset.","done_when":[{"dialog_open":"New currency or asset"}]},
+    {"id":"unit-symbol","goal":"Fill Symbol with unit_symbol.","requires_values":["unit_symbol"],"done_when":[{"field":"Symbol","equals_value":"unit_symbol"}]},
+    {"id":"unit-name","goal":"Fill Unit name with unit_name.","requires_values":["unit_name"],"done_when":[{"field":"Unit name","equals_value":"unit_name"}]},
+    {"id":"use-unit","goal":"Confirm the new unit with Use unit.","done_when":[{"dialog_closed":"New currency or asset"},{"dialog_open":"Create account"},{"text_visible":"USD"}]},
+    {"id":"opening-balance","goal":"Fill Opening balance with opening_balance.","requires_values":["opening_balance"],"done_when":[{"field":"Opening balance","equals_value":"opening_balance"}]},
+    {"id":"create-account","goal":"Submit Create account.","done_when":[{"dialog_closed":"Create account"},{"text_visible":"Transaction wallet"},{"text_visible":"12.34"}]},
+    {"id":"open-account","goal":"Open the Transaction wallet account.","done_when":[{"text_visible":"Transaction wallet"},{"text_visible":"Add transaction"}]},
+    {"id":"open-transaction","goal":"Open the Add transaction form.","done_when":[{"dialog_open":"Add transaction"}]},
+    {"id":"transaction-amount","goal":"Fill Amount with transaction_amount.","requires_values":["transaction_amount"],"done_when":[{"field":"Amount","equals_value":"transaction_amount"}]},
+    {"id":"transaction-note","goal":"Fill Note with transaction_note.","requires_values":["transaction_note"],"done_when":[{"field":"Note","equals_value":"transaction_note"}]},
+    {"id":"save-transaction","goal":"Save the populated transaction.","done_when":[{"dialog_closed":"Add transaction"},{"text_visible":"Review income"},{"text_visible":"5.66"}]}
+  ],
+  "expectations": [
+    {"id":"transaction","claim":"The final page shows the Review income transaction for 5.66."},
+    {"id":"balance","claim":"The Transaction wallet balance is 18.00."}
+  ],
+  "options": {"allowed_origins":["http://127.0.0.1:4351"]}
+}
