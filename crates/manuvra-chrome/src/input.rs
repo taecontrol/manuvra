@@ -1,6 +1,8 @@
 use crate::transport::{CdpClient, CommandOutcome};
 use serde_json::{Value, json};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -20,24 +22,39 @@ pub struct PreparedInput {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct InputCancellation(Arc<AtomicBool>);
+pub struct InputCancellation {
+    cancelled: Arc<AtomicBool>,
+    #[cfg(test)]
+    cancel_at_boundary: Arc<AtomicUsize>,
+}
 
 impl InputCancellation {
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.cancelled.store(true, Ordering::SeqCst);
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.cancelled.load(Ordering::SeqCst)
     }
 
     fn shared(&self) -> Arc<AtomicBool> {
-        self.0.clone()
+        self.cancelled.clone()
     }
 
     #[cfg(test)]
-    fn test_signal(&self) -> Arc<AtomicBool> {
-        self.shared()
+    fn cancel_before_boundary(&self, boundary: usize) {
+        assert!(boundary > 0);
+        self.cancel_at_boundary.store(boundary, Ordering::SeqCst);
+    }
+
+    fn enter_suboperation(&self) {
+        #[cfg(test)]
+        {
+            let remaining = self.cancel_at_boundary.load(Ordering::SeqCst);
+            if remaining > 0 && self.cancel_at_boundary.fetch_sub(1, Ordering::SeqCst) == 1 {
+                self.cancel();
+            }
+        }
     }
 }
 
@@ -219,6 +236,7 @@ fn command_after_suboperation(
     params: Value,
     cancellation: &InputCancellation,
 ) -> Result<Value, PerformError> {
+    cancellation.enter_suboperation();
     match client.command(method, params, deadline(), cancellation.shared()) {
         CommandOutcome::Confirmed(value) => Ok(value.get("result").cloned().unwrap_or(Value::Null)),
         CommandOutcome::Rejected(_) => Err(PerformError::Uncertain(
@@ -401,7 +419,11 @@ mod tests {
 
     #[test]
     fn shared_cancellation_between_compound_suboperations_is_truthfully_uncertain() {
-        for operation in [PreparedOperation::Click, PreparedOperation::TypeText] {
+        for (operation, boundary) in [
+            (PreparedOperation::Click, 1),
+            (PreparedOperation::TypeText, 1),
+            (PreparedOperation::TypeText, 2),
+        ] {
             let chrome = ScriptedChrome::start();
             chrome.reply(
                 "Runtime.evaluate",
@@ -411,20 +433,7 @@ mod tests {
                 chrome.reply("Runtime.evaluate", json!({"result":{"value":true}}));
             }
             let cancellation = InputCancellation::default();
-            let boundary = if operation == PreparedOperation::Click {
-                "Input.dispatchMouseEvent"
-            } else {
-                "Runtime.evaluate"
-            };
-            chrome.cancel_after(
-                boundary,
-                if operation == PreparedOperation::TypeText {
-                    2
-                } else {
-                    1
-                },
-                cancellation.test_signal(),
-            );
+            cancellation.cancel_before_boundary(boundary);
             let client = chrome.connect_raw();
             let result = perform(&client, input(operation), &cancellation);
             assert!(

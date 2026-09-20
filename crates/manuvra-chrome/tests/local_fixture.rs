@@ -75,6 +75,7 @@ fn production_snapshot_and_masking_cover_truncation_split_nodes_and_zero_masks()
         headless: true,
         width: 1120,
         height: 780,
+        inherit_process_group: false,
     })
     .unwrap();
     browser.navigate(&server.url()).unwrap();

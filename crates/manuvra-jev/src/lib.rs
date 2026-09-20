@@ -74,6 +74,10 @@ impl Client {
         Self::new(key, ENDPOINT)
     }
 
+    pub fn from_key(key: String) -> Result<Self, JevError> {
+        Self::new(key, ENDPOINT)
+    }
+
     pub fn new(key: String, endpoint: impl Into<String>) -> Result<Self, JevError> {
         let http = HttpClient::builder()
             .connect_timeout(ATTEMPT_TIMEOUT)

@@ -1,5 +1,12 @@
+mod client;
 mod evidence;
+#[cfg(target_os = "linux")]
+mod host;
+#[cfg(target_os = "linux")]
+mod process;
 mod store;
+#[cfg(target_os = "linux")]
+mod watchdog;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -13,7 +20,7 @@ use serde_json::{Value, json};
 const EXIT_PASSED: u8 = 0;
 const EXIT_BLOCKED: u8 = 3;
 const EXIT_INVALID: u8 = 64;
-const EXIT_INTERNAL: u8 = 70;
+pub(crate) const EXIT_INTERNAL: u8 = 70;
 
 #[derive(Debug, Parser)]
 #[command(name = "manuvra", disable_version_flag = true)]
@@ -35,6 +42,8 @@ enum Command {
         browser: Option<PathBuf>,
         #[arg(long)]
         headless: bool,
+        #[arg(long)]
+        wait_ms: Option<u64>,
     },
     Resume {
         run_id: String,
@@ -120,6 +129,18 @@ pub fn invoke(args: impl IntoIterator<Item = OsString>) -> Invocation {
     cli.command.execute()
 }
 
+pub fn internal_main(command: &str) -> Option<u8> {
+    match command {
+        #[cfg(target_os = "linux")]
+        "__host" => Some(host::main().map_or(EXIT_INTERNAL, |()| EXIT_PASSED)),
+        #[cfg(target_os = "linux")]
+        "__watchdog" => Some(watchdog::main().map_or(EXIT_INTERNAL, |()| EXIT_PASSED)),
+        #[cfg(not(target_os = "linux"))]
+        "__host" | "__watchdog" => Some(EXIT_BLOCKED),
+        _ => None,
+    }
+}
+
 impl Command {
     fn execute(self) -> Invocation {
         match self {
@@ -129,17 +150,41 @@ impl Command {
                 evidence,
                 browser,
                 headless,
-            } => run(&request_id, &job, &evidence, browser.as_deref(), headless),
+                wait_ms,
+            } => run(
+                &request_id,
+                &job,
+                &evidence,
+                browser.as_deref(),
+                headless,
+                wait_ms,
+            ),
             Self::Schema { kind } => Invocation::success(schema(kind.into())),
             Self::Version => Invocation::success(json!({
                 "schema_version": 1,
                 "version": env!("CARGO_PKG_VERSION")
             })),
-            Self::Resume { .. } => not_implemented("resume"),
-            Self::Status { .. } => not_implemented("status"),
-            Self::Abort { .. } => not_implemented("abort"),
+            Self::Resume {
+                run_id, request_id, ..
+            } => validate_resume_identifiers(&run_id, &request_id),
+            Self::Status {
+                run_id,
+                request_id,
+                wait_ms,
+            } => client::status(run_id.as_deref(), request_id.as_deref(), wait_ms),
+            Self::Abort { run_id, request_id } => client::abort(&run_id, &request_id),
         }
     }
+}
+
+fn validate_resume_identifiers(run_id: &str, request_id: &str) -> Invocation {
+    if let Err(message) = validate_run_id(run_id) {
+        return Invocation::error("invalid_run_id", message, EXIT_INVALID);
+    }
+    if let Err(message) = validate_request_id(request_id) {
+        return Invocation::error("invalid_request_id", message, EXIT_INVALID);
+    }
+    not_implemented("resume")
 }
 
 impl From<SchemaArg> for SchemaKind {
@@ -167,8 +212,17 @@ fn run(
     evidence_root: &Path,
     browser: Option<&Path>,
     headless: bool,
+    wait_ms: Option<u64>,
 ) -> Invocation {
-    try_run(request_id, job_path, evidence_root, browser, headless).unwrap_or_else(|error| error)
+    try_run(
+        request_id,
+        job_path,
+        evidence_root,
+        browser,
+        headless,
+        wait_ms,
+    )
+    .unwrap_or_else(|error| error)
 }
 
 fn try_run(
@@ -177,6 +231,7 @@ fn try_run(
     evidence_root: &Path,
     browser: Option<&Path>,
     headless: bool,
+    wait_ms: Option<u64>,
 ) -> Result<Invocation, Invocation> {
     if evidence_root.to_str().is_none() {
         return Err(Invocation::error(
@@ -187,7 +242,7 @@ fn try_run(
     }
     match prepare_run(request_id, job_path, evidence_root, browser, headless)? {
         PreparedRun::Existing(invocation) => Ok(invocation),
-        PreparedRun::New(prepared) => publish_new_run(prepared),
+        PreparedRun::New(prepared) => publish_new_run(prepared, wait_ms),
     }
 }
 
@@ -205,6 +260,8 @@ struct Prepared {
     _request_lock: store::RequestLock,
     browser: Option<PathBuf>,
     headless: bool,
+    #[cfg(target_os = "linux")]
+    existing_intent: bool,
 }
 
 fn prepare_run(
@@ -217,17 +274,33 @@ fn prepare_run(
     validate_request_id(request_id)
         .map_err(|message| Invocation::error("invalid_request_id", message, EXIT_INVALID))?;
     let job = load_job(job_path)?;
+    let (admission, existing, browser) = admit_run(request_id, browser, headless, job)?;
+    finish_preparation(
+        request_id,
+        evidence_root,
+        admission,
+        existing,
+        browser.as_deref(),
+        headless,
+    )
+}
+
+fn admit_run(
+    request_id: &str,
+    browser: Option<&Path>,
+    headless: bool,
+    job: Job,
+) -> Result<(Admission, RequestLookup, Option<PathBuf>), Invocation> {
     let redactor = evidence::Redactor::for_job(&job).map_err(internal_error)?;
     let state_root =
         store::state_root().map_err(|error| internal_error(redactor.redact_text(&error)))?;
+    reject_sensitive_internal_path(&state_root, &redactor, "state")?;
     let request_lock = store::lock_request(&state_root, request_id)
         .map_err(|error| internal_error(redactor.redact_text(&error)))?;
     let browser = effective_browser_selection(browser);
     let digest = canonical_digest(&state_root, &job, browser.as_deref(), headless, &redactor)?;
     let existing = lookup_request(&state_root, request_id, &digest, &redactor)?;
-    finish_preparation(
-        request_id,
-        evidence_root,
+    Ok((
         Admission {
             job,
             redactor,
@@ -236,9 +309,24 @@ fn prepare_run(
             digest,
         },
         existing,
-        browser.as_deref(),
-        headless,
-    )
+        browser,
+    ))
+}
+
+fn reject_sensitive_internal_path(
+    path: &Path,
+    redactor: &evidence::Redactor,
+    purpose: &str,
+) -> Result<(), Invocation> {
+    (!redactor.contains_sensitive(&path.to_string_lossy()))
+        .then_some(())
+        .ok_or_else(|| {
+            Invocation::error(
+                "invalid_input",
+                format!("{purpose} path contains a classified value rendering"),
+                EXIT_INVALID,
+            )
+        })
 }
 
 fn effective_browser_selection(explicit: Option<&Path>) -> Option<PathBuf> {
@@ -263,17 +351,22 @@ fn finish_preparation(
     browser: Option<&Path>,
     headless: bool,
 ) -> Result<PreparedRun, Invocation> {
-    let intent = match existing {
+    let (intent, existing_intent) = match existing {
         RequestLookup::Complete(invocation) => return Ok(PreparedRun::Existing(invocation)),
-        RequestLookup::Intent(intent) => intent,
-        RequestLookup::Missing => create_intent(
-            request_id,
-            evidence_root,
-            &admission.redactor,
-            &admission.state_root,
-            admission.digest,
-        )?,
+        RequestLookup::Intent(intent) => (intent, true),
+        RequestLookup::Missing => (
+            create_intent(
+                request_id,
+                evidence_root,
+                &admission.redactor,
+                &admission.state_root,
+                admission.digest,
+            )?,
+            false,
+        ),
     };
+    #[cfg(not(target_os = "linux"))]
+    let _ = existing_intent;
     Ok(PreparedRun::New(Box::new(Prepared {
         job: admission.job,
         intent,
@@ -283,6 +376,8 @@ fn finish_preparation(
         _request_lock: admission.request_lock,
         browser: browser.map(Path::to_path_buf),
         headless,
+        #[cfg(target_os = "linux")]
+        existing_intent,
     })))
 }
 
@@ -323,20 +418,62 @@ fn reject_sensitive_evidence_path(
     }
 }
 
-fn publish_new_run(prepared: Box<Prepared>) -> Result<Invocation, Invocation> {
+fn publish_new_run(
+    prepared: Box<Prepared>,
+    wait_ms: Option<u64>,
+) -> Result<Invocation, Invocation> {
+    if let Some(stop) = admission_stop(&prepared) {
+        return publish_admission_stop(prepared, stop);
+    }
+    publish_executable_run(prepared, wait_ms)
+}
+
+fn admission_stop(prepared: &Prepared) -> Option<evidence::BlockedStop> {
+    prepared
+        .job
+        .first_missing_value()
+        .map(|missing| evidence::BlockedStop::missing_value(missing.value_name, missing.step_id))
+        .or_else(|| {
+            prepared
+                .job
+                .first_unsupported_feature()
+                .map(evidence::BlockedStop::unsupported)
+        })
+}
+
+fn publish_admission_stop(
+    prepared: Box<Prepared>,
+    stop: evidence::BlockedStop,
+) -> Result<Invocation, Invocation> {
     if let Some((result, exit_code)) = recover_flow_result(&prepared)
         .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))?
     {
         return finalize(prepared, result, exit_code);
     }
-    if let Some(missing) = prepared.job.first_missing_value() {
-        return publish_blocked(
-            prepared,
-            evidence::BlockedStop::missing_value(missing.value_name, missing.step_id),
-        );
+    publish_blocked(prepared, stop)
+}
+
+#[cfg(target_os = "linux")]
+fn publish_executable_run(
+    prepared: Box<Prepared>,
+    wait_ms: Option<u64>,
+) -> Result<Invocation, Invocation> {
+    if prepared.existing_intent {
+        return attach_or_recover_background_run(prepared, wait_ms);
     }
-    if let Some(feature) = prepared.job.first_unsupported_feature() {
-        return publish_blocked(prepared, evidence::BlockedStop::unsupported(feature));
+    start_background_run(prepared, wait_ms)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn publish_executable_run(
+    prepared: Box<Prepared>,
+    wait_ms: Option<u64>,
+) -> Result<Invocation, Invocation> {
+    let _ = wait_ms;
+    if let Some((result, exit_code)) = recover_flow_result(&prepared)
+        .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))?
+    {
+        return finalize(prepared, result, exit_code);
     }
     let outcome = manuvra_flow::run(
         &prepared.job,
@@ -351,6 +488,459 @@ fn publish_new_run(prepared: Box<Prepared>) -> Result<Invocation, Invocation> {
     )
     .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))?;
     finalize(prepared, outcome.result, outcome.exit_code)
+}
+
+#[cfg(target_os = "linux")]
+fn start_background_run(
+    prepared: Box<Prepared>,
+    wait_ms: Option<u64>,
+) -> Result<Invocation, Invocation> {
+    start_new_background_run(prepared, wait_ms)
+}
+
+#[cfg(target_os = "linux")]
+fn attach_or_recover_background_run(
+    prepared: Box<Prepared>,
+    wait_ms: Option<u64>,
+) -> Result<Invocation, Invocation> {
+    match existing_control_after_bootstrap(&prepared)? {
+        Some(control) => attach_to_existing_control(prepared, control, wait_ms),
+        None => recover_existing_without_control(prepared),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn existing_control_after_bootstrap(
+    prepared: &Prepared,
+) -> Result<Option<store::RunControl>, Invocation> {
+    let mut control = store::read_run_control(&prepared.state_root, &prepared.intent.run_id)
+        .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))?;
+    if control.as_ref().is_some_and(control_is_bootstrapping) {
+        control = reconcile_abandoned_bootstrap(prepared)?;
+        if control.as_ref().is_some_and(control_is_bootstrapping) {
+            await_host_readiness(prepared)?;
+            control = store::read_run_control(&prepared.state_root, &prepared.intent.run_id)
+                .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))?;
+        }
+    }
+    Ok(control)
+}
+
+#[cfg(target_os = "linux")]
+fn reconcile_abandoned_bootstrap(
+    prepared: &Prepared,
+) -> Result<Option<store::RunControl>, Invocation> {
+    let Some(_publication_lock) =
+        store::try_lock_existing_run(&prepared.state_root, &prepared.intent.run_id)
+            .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))?
+    else {
+        return store::read_run_control(&prepared.state_root, &prepared.intent.run_id)
+            .map_err(|error| internal_error(prepared.redactor.redact_text(&error)));
+    };
+    reconcile_abandoned_bootstrap_locked(prepared)
+}
+
+#[cfg(target_os = "linux")]
+fn reconcile_abandoned_bootstrap_locked(
+    prepared: &Prepared,
+) -> Result<Option<store::RunControl>, Invocation> {
+    store::read_run_control(&prepared.state_root, &prepared.intent.run_id)
+        .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))?
+        .map(|control| reconcile_abandoned_control(prepared, control))
+        .transpose()
+}
+
+#[cfg(target_os = "linux")]
+fn reconcile_abandoned_control(
+    prepared: &Prepared,
+    mut control: store::RunControl,
+) -> Result<store::RunControl, Invocation> {
+    validate_existing_control(prepared, &control)?;
+    if !control_is_bootstrapping(&control) {
+        return Ok(control);
+    }
+    if !bootstrap_has_no_owner(&control) || !bootstrap_socket_is_absent(prepared, &control.socket)?
+    {
+        return Ok(control);
+    }
+    publish_abandoned_bootstrap(prepared, &mut control)?;
+    Ok(control)
+}
+
+#[cfg(target_os = "linux")]
+fn bootstrap_has_no_owner(control: &store::RunControl) -> bool {
+    control.host.is_none() && control.watchdog.is_none()
+}
+
+#[cfg(target_os = "linux")]
+fn bootstrap_socket_is_absent(prepared: &Prepared, socket: &Path) -> Result<bool, Invocation> {
+    match fs::symlink_metadata(socket) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Ok(_) => Ok(false),
+        Err(error) => Err(internal_error(prepared.redactor.redact_text(&format!(
+            "cannot inspect bootstrapping run socket: {error}"
+        )))),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn publish_abandoned_bootstrap(
+    prepared: &Prepared,
+    control: &mut store::RunControl,
+) -> Result<(), Invocation> {
+    control.sequence = control.sequence.saturating_add(1);
+    control.pause_deadline_unix_ms = None;
+    control.result["state"] = json!("blocked");
+    control.result["terminal"] = json!(true);
+    control.result["reason"] = json!({"code":"host_lost","current_action":"none"});
+    control.result["evidence"]["complete"] = json!(false);
+    control.result["cleanup"] = json!({
+        "browser":"not_started",
+        "profile":"not_created",
+        "application_state":"caller_owned"
+    });
+    store::write_run_control(&prepared.state_root, control)
+        .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))
+}
+
+#[cfg(target_os = "linux")]
+fn control_is_bootstrapping(control: &store::RunControl) -> bool {
+    control.result.get("terminal").and_then(Value::as_bool) != Some(true) && control.host.is_none()
+}
+
+#[cfg(target_os = "linux")]
+fn attach_to_existing_control(
+    prepared: Box<Prepared>,
+    control: store::RunControl,
+    wait_ms: Option<u64>,
+) -> Result<Invocation, Invocation> {
+    validate_existing_control(&prepared, &control)?;
+    if control.result.get("terminal").and_then(Value::as_bool) == Some(true) {
+        return recover_or_return_terminal_control(prepared, control, wait_ms);
+    }
+    if client::request_host_ready(
+        &control.socket,
+        &prepared.intent.run_id,
+        &prepared.intent.job_digest,
+    )
+    .is_err()
+    {
+        confirm_dead_or_reject_unreachable_host(&prepared, &control)?;
+    }
+    Ok(wait_existing_run(prepared, wait_ms))
+}
+
+#[cfg(target_os = "linux")]
+fn recover_or_return_terminal_control(
+    prepared: Box<Prepared>,
+    control: store::RunControl,
+    wait_ms: Option<u64>,
+) -> Result<Invocation, Invocation> {
+    if control
+        .result
+        .pointer("/evidence/complete")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        let (result, exit_code) = recover_flow_result(&prepared)
+            .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))?
+            .ok_or_else(|| internal_error("terminal run has no published evidence".into()))?;
+        return finalize(prepared, result, exit_code);
+    }
+    Ok(wait_existing_run(prepared, wait_ms))
+}
+
+#[cfg(target_os = "linux")]
+fn recover_existing_without_control(prepared: Box<Prepared>) -> Result<Invocation, Invocation> {
+    let (result, exit_code) = required_recovered_result(&prepared)?;
+    finalize(prepared, result, exit_code)
+}
+
+#[cfg(target_os = "linux")]
+fn required_recovered_result(prepared: &Prepared) -> Result<(Value, u8), Invocation> {
+    recover_flow_result(prepared)
+        .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))
+        .and_then(|recovered| {
+            recovered.ok_or_else(|| {
+                internal_error(
+                    "existing browser run has no recoverable host control; it will not be restarted"
+                        .into(),
+                )
+            })
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn wait_existing_run(prepared: Box<Prepared>, wait_ms: Option<u64>) -> Invocation {
+    let run_id = prepared.intent.run_id.clone();
+    drop(prepared);
+    client::wait_for_run(&run_id, wait_ms.or(Some(15_000)))
+}
+
+#[cfg(target_os = "linux")]
+fn confirm_dead_or_reject_unreachable_host(
+    prepared: &Prepared,
+    control: &store::RunControl,
+) -> Result<(), Invocation> {
+    let acquired = store::try_lock_existing_run(&prepared.state_root, &prepared.intent.run_id)
+        .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))?;
+    if let Some(lock) = acquired {
+        remove_confirmed_dead_socket(&control.socket)
+            .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))?;
+        drop(lock);
+        return Ok(());
+    }
+    let lock_present = store::run_lock_present(&prepared.state_root, &prepared.intent.run_id)
+        .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))?;
+    Err(internal_error(if lock_present {
+        "existing run host holds its lock but failed the live IPC identity check".into()
+    } else {
+        "existing browser run has no death-detection lock; it will not be restarted".into()
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn remove_confirmed_dead_socket(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::FileTypeExt;
+
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() => fs::remove_file(path)
+            .map_err(|error| format!("cannot remove confirmed dead host socket: {error}")),
+        Ok(_) => Err("confirmed dead host socket path is not an owned socket".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "cannot inspect confirmed dead host socket: {error}"
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_existing_control(
+    prepared: &Prepared,
+    control: &store::RunControl,
+) -> Result<(), Invocation> {
+    if control.ipc_version != process::IPC_VERSION
+        || control.run_id != prepared.intent.run_id
+        || control.request_id != prepared.intent.public_request_id
+        || control.job_digest != prepared.intent.job_digest
+        || control.evidence_root != prepared.intent.evidence_root
+    {
+        return Err(internal_error(
+            "existing run control does not match the admitted request".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn start_new_background_run(
+    prepared: Box<Prepared>,
+    wait_ms: Option<u64>,
+) -> Result<Invocation, Invocation> {
+    let runtime_dir = validated_runtime_run_dir(&prepared)?;
+    let (host, watchdog, lifetime) = host_bootstrap(&prepared, runtime_dir);
+    let run_lock = initialize_run_basis(&prepared, &watchdog)?;
+    caller_bootstrap_fault(&prepared, &watchdog.runtime_dir)?;
+    process::spawn_watchdog(host, watchdog, &run_lock)
+        .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))?;
+    drop(run_lock);
+    await_host_readiness(&prepared)?;
+    let run_id = prepared.intent.run_id.clone();
+    drop(prepared);
+    let wait = wait_ms.unwrap_or(lifetime.saturating_add(15_000));
+    Ok(client::wait_for_run(&run_id, Some(wait)))
+}
+
+#[cfg(target_os = "linux")]
+fn initialize_run_basis(
+    prepared: &Prepared,
+    watchdog: &process::WatchdogBootstrap,
+) -> Result<store::RunLock, Invocation> {
+    let lock = store::lock_run(&prepared.state_root, &prepared.intent.run_id)
+        .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))?;
+    let control = store::RunControl {
+        schema_version: SchemaVersion,
+        ipc_version: process::IPC_VERSION,
+        sequence: 0,
+        run_id: prepared.intent.run_id.clone(),
+        request_id: prepared.intent.public_request_id.clone(),
+        job_digest: prepared.intent.job_digest.clone(),
+        evidence_root: prepared.intent.evidence_root.clone(),
+        started_unix_ms: watchdog.started_unix_ms,
+        lifetime_deadline_unix_ms: watchdog.lifetime_deadline_unix_ms,
+        pause_deadline_unix_ms: None,
+        host: None,
+        watchdog: None,
+        socket: watchdog.runtime_dir.join("control.sock"),
+        result: watchdog.initial_result.clone(),
+    };
+    store::write_run_control(&prepared.state_root, &control)
+        .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))?;
+    Ok(lock)
+}
+
+#[cfg(all(target_os = "linux", debug_assertions))]
+fn caller_bootstrap_fault(prepared: &Prepared, runtime_dir: &Path) -> Result<(), Invocation> {
+    match std::env::var("MANUVRA_TEST_CALLER_BOOTSTRAP_FAULT").as_deref() {
+        Ok("after_run_basis") => publish_caller_fault_marker(prepared, runtime_dir),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(all(target_os = "linux", debug_assertions))]
+fn publish_caller_fault_marker(prepared: &Prepared, runtime_dir: &Path) -> Result<(), Invocation> {
+    store::atomic_write_private(
+        &runtime_dir.join("caller-bootstrap-fault.ready"),
+        b"ready\n",
+    )
+    .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))?;
+    park_caller_forever()
+}
+
+#[cfg(all(target_os = "linux", debug_assertions))]
+fn park_caller_forever() -> ! {
+    loop {
+        std::thread::park();
+    }
+}
+
+#[cfg(all(target_os = "linux", not(debug_assertions)))]
+fn caller_bootstrap_fault(_: &Prepared, _: &Path) -> Result<(), Invocation> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validated_runtime_run_dir(prepared: &Prepared) -> Result<PathBuf, Invocation> {
+    let runtime_root = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .ok_or_else(|| internal_error("XDG_RUNTIME_DIR is required for background runs".into()))?;
+    reject_sensitive_internal_path(&runtime_root, &prepared.redactor, "runtime")?;
+    process::runtime_run_dir(&prepared.intent.run_id)
+        .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))
+}
+
+#[cfg(target_os = "linux")]
+fn host_bootstrap(
+    prepared: &Prepared,
+    runtime_dir: PathBuf,
+) -> (process::HostBootstrap, process::WatchdogBootstrap, u64) {
+    let started = process::now_unix_ms();
+    let lifetime = u64::from(prepared.job.options.lifetime_ms.unwrap_or(900_000));
+    let pause = u64::from(prepared.job.options.pause_timeout_ms.unwrap_or(300_000));
+    let host = process::HostBootstrap {
+        job: prepared.job.clone(),
+        intent: prepared.intent.clone(),
+        lookup_request_id: prepared.lookup_request_id.clone(),
+        state_root: prepared.state_root.clone(),
+        browser: prepared.browser.clone(),
+        headless: prepared.headless,
+        provider_key: std::env::var("TYPESAFE_API_KEY")
+            .ok()
+            .filter(|value| !value.is_empty()),
+        runtime_dir: runtime_dir.clone(),
+        started_unix_ms: started,
+        lifetime_deadline_unix_ms: started.saturating_add(lifetime),
+        pause_timeout_ms: pause,
+        watchdog: None,
+        liveness_fd: None,
+    };
+    let watchdog = process::WatchdogBootstrap {
+        intent: prepared.intent.clone(),
+        state_root: prepared.state_root.clone(),
+        runtime_dir: runtime_dir.clone(),
+        started_unix_ms: started,
+        lifetime_deadline_unix_ms: started.saturating_add(lifetime),
+        initial_result: initial_watchdog_result(prepared),
+        watchdog: None,
+    };
+    (host, watchdog, lifetime)
+}
+
+#[cfg(target_os = "linux")]
+fn initial_watchdog_result(prepared: &Prepared) -> Value {
+    let manifest = prepared
+        .intent
+        .evidence_root
+        .join(&prepared.intent.run_id)
+        .join("manifest.json");
+    json!({
+        "schema_version":1,
+        "request_id":prepared.intent.public_request_id,
+        "run_id":prepared.intent.run_id,
+        "state":"running",
+        "terminal":false,
+        "reason":null,
+        "verdict":{
+            "overall":"unresolved",
+            "steps":prepared.job.steps.iter().enumerate().map(|(index,step)|json!({
+                "id":prepared.redactor.redact_export_text(&step.id),
+                "result":if index == 0 {"unresolved"} else {"not_run"}
+            })).collect::<Vec<_>>(),
+            "expectations":prepared.job.expectations.iter().map(|expectation|json!({
+                "id":prepared.redactor.redact_export_text(&expectation.id),
+                "result":"not_run",
+                "numeric_checks":[]
+            })).collect::<Vec<_>>(),
+            "caller_assisted":false
+        },
+        "evidence":{"manifest":manifest,"complete":false},
+        "escalation":null,
+        "cleanup":{"browser":"not_started","profile":"not_created","application_state":"caller_owned"}
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn await_host_readiness(prepared: &Prepared) -> Result<(), Invocation> {
+    let readiness_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if host_is_ready(prepared)? {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= readiness_deadline {
+            return Err(internal_error(
+                "run host did not complete the IPC readiness handshake".into(),
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn host_is_ready(prepared: &Prepared) -> Result<bool, Invocation> {
+    let Some(control) = store::read_run_control(&prepared.state_root, &prepared.intent.run_id)
+        .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))?
+    else {
+        return Ok(false);
+    };
+    validate_readiness_control(prepared, &control)?;
+    if control.result.get("terminal").and_then(Value::as_bool) == Some(true) {
+        return Ok(true);
+    }
+    Ok(client::request_host_ready(
+        &control.socket,
+        &prepared.intent.run_id,
+        &prepared.intent.job_digest,
+    )
+    .is_ok())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_readiness_control(
+    prepared: &Prepared,
+    control: &store::RunControl,
+) -> Result<(), Invocation> {
+    if control.ipc_version != process::IPC_VERSION {
+        return Err(internal_error(
+            "run host IPC version is incompatible".into(),
+        ));
+    }
+    if control.run_id != prepared.intent.run_id || control.job_digest != prepared.intent.job_digest
+    {
+        return Err(internal_error(
+            "run host readiness control does not match the admitted run".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn recover_flow_result(prepared: &Prepared) -> Result<Option<(Value, u8)>, String> {
@@ -412,6 +1002,9 @@ fn validate_published_evidence(
 }
 
 fn validate_evidence_shape(manifest: &Manifest, result: &Value) -> Result<(), String> {
+    if result.get("terminal").and_then(Value::as_bool) != Some(true) {
+        return Err("complete evidence does not contain a terminal result".into());
+    }
     let short = manifest.artifacts.len() == 2;
     let admission_reason = result
         .pointer("/reason/code")
@@ -688,7 +1281,7 @@ fn validate_result_identity(
         .ok_or_else(|| "prior result identity or evidence reference is inconsistent".into())
 }
 
-fn result_exit_code(result: &Value) -> Result<u8, String> {
+pub(crate) fn result_exit_code(result: &Value) -> Result<u8, String> {
     const STATES: &[(&str, u8)] = &[
         ("passed", 0),
         ("uncertain", 2),
@@ -822,6 +1415,19 @@ fn validate_request_id(request_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn validate_run_id(run_id: &str) -> Result<(), String> {
+    let suffix = run_id.strip_prefix("r_").ok_or_else(|| {
+        "run_id must use the generated r_ followed by 16 ASCII alphanumeric characters format"
+            .to_owned()
+    })?;
+    (suffix.len() == 16 && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+        .then_some(())
+        .ok_or_else(|| {
+            "run_id must use the generated r_ followed by 16 ASCII alphanumeric characters format"
+                .to_owned()
+        })
+}
+
 fn canonical_digest(
     state_root: &Path,
     job: &Job,
@@ -839,6 +1445,31 @@ fn canonical_digest(
         .map_err(|error| internal_error(redactor.redact_text(&error)))
 }
 
-fn internal_error(message: String) -> Invocation {
+pub(crate) fn internal_error(message: String) -> Invocation {
     Invocation::error("internal", message, EXIT_INTERNAL)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod boundary_tests {
+    use super::remove_confirmed_dead_socket;
+    use std::os::unix::net::UnixListener;
+    use tempfile::TempDir;
+
+    #[test]
+    fn confirmed_dead_socket_removal_is_bounded_to_sockets() {
+        let temporary = TempDir::new().unwrap();
+        let absent = temporary.path().join("absent.sock");
+        assert!(remove_confirmed_dead_socket(&absent).is_ok());
+
+        let socket = temporary.path().join("owned.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        assert!(remove_confirmed_dead_socket(&socket).is_ok());
+        assert!(!socket.exists());
+        drop(listener);
+
+        let ordinary = temporary.path().join("ordinary");
+        std::fs::write(&ordinary, b"not a socket").unwrap();
+        assert!(remove_confirmed_dead_socket(&ordinary).is_err());
+        assert_eq!(std::fs::read(&ordinary).unwrap(), b"not a socket");
+    }
 }

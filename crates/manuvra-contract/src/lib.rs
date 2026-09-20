@@ -547,7 +547,7 @@ impl Job {
         if !self.expectations.is_empty() {
             return Some("expectations");
         }
-        self.options.first_unsupported_feature()
+        None
     }
 
     fn expectation_ids(&self) -> impl Iterator<Item = &str> {
@@ -604,16 +604,6 @@ impl JobOptions {
             1,
             1000,
         )
-    }
-
-    fn first_unsupported_feature(&self) -> Option<&'static str> {
-        [
-            (self.pause_timeout_ms.is_some(), "options.pause_timeout_ms"),
-            (self.lifetime_ms.is_some(), "options.lifetime_ms"),
-            (self.debug.is_some(), "options.debug"),
-        ]
-        .into_iter()
-        .find_map(|(present, name)| present.then_some(name))
     }
 }
 
@@ -1120,10 +1110,7 @@ mod tests {
 
         let mut option = valid_job();
         option["options"]["pause_timeout_ms"] = json!(100_000);
-        assert_eq!(
-            parse(&option).unwrap().first_unsupported_feature(),
-            Some("options.pause_timeout_ms")
-        );
+        assert_eq!(parse(&option).unwrap().first_unsupported_feature(), None);
     }
 
     #[test]

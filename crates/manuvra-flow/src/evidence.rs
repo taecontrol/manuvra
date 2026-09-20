@@ -18,6 +18,16 @@ pub struct Redactor {
 
 impl Redactor {
     pub fn for_job(job: &Job) -> Result<Self, String> {
+        let provider_key = std::env::var("TYPESAFE_API_KEY")
+            .ok()
+            .filter(|key| !key.is_empty());
+        Self::for_job_with_provider_key(job, provider_key.as_deref())
+    }
+
+    pub fn for_job_with_provider_key(
+        job: &Job,
+        provider_key: Option<&str>,
+    ) -> Result<Self, String> {
         let explicit = job.options.redact_values.as_deref().unwrap_or_default();
         let classified: Vec<_> = job
             .values
@@ -42,9 +52,9 @@ impl Redactor {
             .map(str::to_owned)
             .collect();
         let rendered_sensitive_values = renderings.clone();
-        let provider_key = std::env::var("TYPESAFE_API_KEY")
-            .ok()
-            .filter(|key| !key.is_empty());
+        let provider_key = provider_key
+            .filter(|key| !key.is_empty())
+            .map(str::to_owned);
         let used = job_characters(job);
         let mut markers = (0xE000..=0xF8FF).filter_map(char::from_u32).filter(|c| {
             !used.contains(c) && !provider_key.as_ref().is_some_and(|key| key.contains(*c))
@@ -379,6 +389,192 @@ pub fn publish(
     publication.write_manifest(run_id, complete)?;
     publication.commit(root, redactor)?;
     Ok(result)
+}
+
+pub fn replace_result_cleanup(
+    root: &Path,
+    run_id: &str,
+    cleanup: &impl Serialize,
+    result: &Value,
+    redactor: &Redactor,
+) -> Result<(), String> {
+    checked_run_directory(root, run_id).and_then(|run_dir| {
+        replace_tail_in_directory(run_dir, run_id, cleanup, result, Some(redactor))
+    })
+}
+
+/// Replaces a hosted checkpoint after the secret-owning host is confirmed dead.
+///
+/// The caller must derive `cleanup` and `result` exclusively from the already exported,
+/// leak-scanned checkpoint. This boundary deliberately does not require the watchdog to retain
+/// the job values or provider key merely to publish a terminal timeout/crash fact.
+pub fn replace_result_cleanup_from_checkpoint(
+    root: &Path,
+    run_id: &str,
+    cleanup: &impl Serialize,
+    result: &Value,
+) -> Result<(), String> {
+    checked_run_directory(root, run_id)
+        .and_then(|run_dir| replace_tail_in_directory(run_dir, run_id, cleanup, result, None))
+}
+
+fn replace_tail_in_directory(
+    run_dir: PathBuf,
+    run_id: &str,
+    cleanup: &impl Serialize,
+    result: &Value,
+    redactor: Option<&Redactor>,
+) -> Result<(), String> {
+    let manifest_path = run_dir.join("manifest.json");
+    read_complete_manifest(&manifest_path, run_id).and_then(|manifest| {
+        serialized_tail(cleanup, result).and_then(|(cleanup_bytes, result_bytes)| {
+            replace_tail_artifacts(
+                &run_dir,
+                &manifest_path,
+                manifest,
+                cleanup_bytes,
+                result_bytes,
+                redactor,
+            )
+        })
+    })
+}
+
+fn serialized_tail(cleanup: &impl Serialize, result: &Value) -> Result<(Vec<u8>, Vec<u8>), String> {
+    pretty(cleanup)
+        .and_then(|cleanup_bytes| pretty(result).map(|result_bytes| (cleanup_bytes, result_bytes)))
+}
+
+fn replace_tail_artifacts(
+    run_dir: &Path,
+    manifest_path: &Path,
+    mut manifest: Manifest,
+    cleanup_bytes: Vec<u8>,
+    result_bytes: Vec<u8>,
+    redactor: Option<&Redactor>,
+) -> Result<(), String> {
+    if let Some(redactor) = redactor {
+        reject_tail_leak(redactor, &cleanup_bytes, &result_bytes)?;
+    }
+    mark_tail_replacement_incomplete(run_dir, manifest_path, &mut manifest)?;
+    replace_artifact(
+        run_dir,
+        &mut manifest,
+        "cleanup",
+        "cleanup.json",
+        &cleanup_bytes,
+    )?;
+    replace_artifact(
+        run_dir,
+        &mut manifest,
+        "result",
+        "result.json",
+        &result_bytes,
+    )?;
+    manifest.complete = true;
+    validate_and_write_tail(
+        run_dir,
+        manifest_path,
+        &manifest,
+        &cleanup_bytes,
+        &result_bytes,
+        redactor,
+    )
+}
+
+fn validate_and_write_tail(
+    run_dir: &Path,
+    manifest_path: &Path,
+    manifest: &Manifest,
+    cleanup_bytes: &[u8],
+    result_bytes: &[u8],
+    _redactor: Option<&Redactor>,
+) -> Result<(), String> {
+    write_tail_files(run_dir, cleanup_bytes, result_bytes)?;
+    write_manifest_and_sync(run_dir, manifest_path, manifest)
+}
+
+fn mark_tail_replacement_incomplete(
+    run_dir: &Path,
+    manifest_path: &Path,
+    manifest: &mut Manifest,
+) -> Result<(), String> {
+    for (role, relative) in [("cleanup", "cleanup.json"), ("result", "result.json")] {
+        let expected = run_dir.join(relative);
+        let artifact = manifest
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.role == role)
+            .ok_or_else(|| format!("evidence manifest has no {role} artifact"))?;
+        if Path::new(&artifact.path) != expected {
+            return Err(format!("evidence {role} artifact has an unexpected path"));
+        }
+        artifact.complete = false;
+    }
+    manifest.complete = false;
+    write_manifest_and_sync(run_dir, manifest_path, manifest)
+}
+
+fn write_tail_files(run_dir: &Path, cleanup: &[u8], result: &[u8]) -> Result<(), String> {
+    write_atomic(&run_dir.join("cleanup.json"), cleanup)?;
+    write_atomic(&run_dir.join("result.json"), result)
+}
+
+fn write_manifest_and_sync(
+    run_dir: &Path,
+    manifest_path: &Path,
+    manifest: &Manifest,
+) -> Result<(), String> {
+    pretty(manifest)
+        .and_then(|bytes| write_atomic(manifest_path, &bytes))
+        .and_then(|()| sync_dir(run_dir))
+}
+
+fn checked_run_directory(root: &Path, run_id: &str) -> Result<PathBuf, String> {
+    let path = root.join(run_id);
+    let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+    (!metadata.file_type().is_symlink() && metadata.is_dir())
+        .then_some(path)
+        .ok_or_else(|| "evidence run path is not a regular directory".into())
+}
+
+fn read_complete_manifest(path: &Path, run_id: &str) -> Result<Manifest, String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    let regular = !metadata.file_type().is_symlink() && metadata.is_file();
+    let bytes = regular
+        .then(|| fs::read(path).map_err(|error| error.to_string()))
+        .ok_or_else(|| "evidence manifest is not a regular file".to_owned())??;
+    let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    (manifest.run_id == run_id && manifest.complete)
+        .then_some(manifest)
+        .ok_or_else(|| "cannot replace an incomplete or mismatched evidence bundle".into())
+}
+
+fn reject_tail_leak(redactor: &Redactor, cleanup: &[u8], result: &[u8]) -> Result<(), String> {
+    (!redactor.contains_export_leak(cleanup) && !redactor.contains_export_leak(result))
+        .then_some(())
+        .ok_or_else(|| "evidence leak scan rejected hosted terminal result".into())
+}
+
+fn replace_artifact(
+    run_dir: &Path,
+    manifest: &mut Manifest,
+    role: &str,
+    relative: &str,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let expected = run_dir.join(relative);
+    let artifact = manifest
+        .artifacts
+        .iter_mut()
+        .find(|artifact| artifact.role == role)
+        .ok_or_else(|| format!("evidence manifest has no {role} artifact"))?;
+    (Path::new(&artifact.path) == expected)
+        .then_some(())
+        .ok_or_else(|| format!("evidence {role} artifact has an unexpected path"))?;
+    artifact.digest = hex::encode(Sha256::digest(bytes));
+    artifact.complete = true;
+    Ok(())
 }
 
 struct Publication {
@@ -725,6 +921,16 @@ mod tests {
         assert!(!text.contains("token"));
     }
 
+    #[test]
+    fn inherited_provider_key_is_part_of_redaction_and_terminal_leak_scanning() {
+        let job = test_job(false);
+        let key = "provider-key-from-bootstrap";
+        let redactor = Redactor::for_job_with_provider_key(&job, Some(key)).unwrap();
+        assert!(!redactor.redact_export_text(key).contains(key));
+        assert!(redactor.contains_sensitive(key));
+        assert!(redactor.contains_export_leak(key.as_bytes()));
+    }
+
     fn test_job(secret: bool) -> Job {
         serde_json::from_value(json!({"schema_version":1,"target":{"kind":"browser","url":"http://127.0.0.1/"},"context":{"journey":"j","revision":"r","environment":"e","actor":"a","authority":"a"},"values":{"marker":{"value":"classified-marker","description":"marker","secret":secret}},"steps":[{"id":"s","goal":"g","done_when":[{"url_contains":"/"}]}]})).unwrap()
     }
@@ -797,6 +1003,76 @@ mod tests {
         .unwrap();
         assert!(!manifest.complete);
         assert_eq!(result["evidence"]["complete"], false);
+    }
+
+    #[test]
+    fn hosted_terminal_tail_replacement_updates_manifest_digests() {
+        let temporary = TempDir::new().unwrap();
+        let job = test_job(false);
+        let redactor = Redactor::for_job(&job).unwrap();
+        publish(
+            temporary.path(),
+            "r_hosted",
+            bundle("safe", b"png".to_vec()),
+            &redactor,
+        )
+        .unwrap();
+        let cleanup = json!({"browser":"closed"});
+        let result = json!({"state":"expired","evidence":{"complete":true}});
+        replace_result_cleanup(temporary.path(), "r_hosted", &cleanup, &result, &redactor).unwrap();
+        let manifest: Manifest = serde_json::from_slice(
+            &fs::read(temporary.path().join("r_hosted/manifest.json")).unwrap(),
+        )
+        .unwrap();
+        for artifact in manifest
+            .artifacts
+            .iter()
+            .filter(|artifact| matches!(artifact.role.as_str(), "cleanup" | "result"))
+        {
+            assert_eq!(
+                artifact.digest,
+                hex::encode(Sha256::digest(fs::read(&artifact.path).unwrap()))
+            );
+        }
+    }
+
+    #[test]
+    fn interrupted_hosted_tail_never_leaves_a_complete_stale_manifest() {
+        let temporary = TempDir::new().unwrap();
+        let job = test_job(false);
+        let redactor = Redactor::for_job(&job).unwrap();
+        publish(
+            temporary.path(),
+            "r_interrupted",
+            bundle("safe", b"png".to_vec()),
+            &redactor,
+        )
+        .unwrap();
+        let run_dir = temporary.path().join("r_interrupted");
+        fs::write(
+            run_dir.join(format!("cleanup.tmp-{}", std::process::id())),
+            b"occupied",
+        )
+        .unwrap();
+        let error = replace_result_cleanup(
+            temporary.path(),
+            "r_interrupted",
+            &json!({"browser":"closed"}),
+            &json!({"state":"expired","evidence":{"complete":true}}),
+            &redactor,
+        )
+        .unwrap_err();
+        assert!(error.contains("exists"));
+        let manifest: Manifest =
+            serde_json::from_slice(&fs::read(run_dir.join("manifest.json")).unwrap()).unwrap();
+        assert!(!manifest.complete);
+        assert!(
+            manifest
+                .artifacts
+                .iter()
+                .filter(|artifact| matches!(artifact.role.as_str(), "cleanup" | "result"))
+                .all(|artifact| !artifact.complete)
+        );
     }
 
     #[test]

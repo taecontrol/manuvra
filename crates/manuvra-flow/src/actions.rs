@@ -90,9 +90,25 @@ impl DurableJournal {
     }
 
     pub fn remove(self) -> Result<(), String> {
+        let parent = self.path.parent().map(Path::to_path_buf);
         drop(self.file);
-        fs::remove_file(self.path).map_err(|error| error.to_string())
+        fs::remove_file(self.path).map_err(|error| error.to_string())?;
+        sync_parent(parent.as_deref())
     }
+
+    pub fn clear(&mut self) -> Result<(), String> {
+        self.file.sync_all().map_err(|error| error.to_string())?;
+        fs::remove_file(&self.path).map_err(|error| error.to_string())?;
+        sync_parent(self.path.parent())
+    }
+}
+
+fn sync_parent(parent: Option<&Path>) -> Result<(), String> {
+    parent
+        .ok_or_else(|| "action journal path has no parent".to_owned())
+        .and_then(|path| File::open(path).map_err(|error| error.to_string()))?
+        .sync_all()
+        .map_err(|error| error.to_string())
 }
 
 impl ActionJournal for DurableJournal {
@@ -507,5 +523,11 @@ mod tests {
         assert_eq!(journal.entries().len(), 1);
         journal.remove().unwrap();
         assert!(!path.exists());
+
+        let clear_path = root.path().join(".clear-test.action-journal.jsonl");
+        let mut journal = DurableJournal::open(root.path(), "clear-test", &redactor).unwrap();
+        journal.append(&json!({"event":"clear_test"})).unwrap();
+        journal.clear().unwrap();
+        assert!(!clear_path.exists());
     }
 }

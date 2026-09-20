@@ -23,6 +23,7 @@ use std::sync::OnceLock;
 #[cfg(any(target_os = "linux", test))]
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[derive(Clone)]
 pub struct FlowConfig {
     pub request_id: String,
     pub run_id: String,
@@ -34,6 +35,24 @@ pub struct FlowConfig {
 pub struct FlowOutcome {
     pub result: Value,
     pub exit_code: u8,
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostedTermination {
+    Aborted,
+    PauseDeadlineElapsed,
+    LifetimeElapsed,
+    WatchdogLost,
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub trait HostedControl {
+    fn cancellation(&self) -> manuvra_chrome::InputCancellation;
+    fn pause_deadline_unix_ms(&self) -> u64;
+    fn publish_checkpoint(&self, result: &Value) -> Result<(), String>;
+    fn wait_while_paused(&self) -> HostedTermination;
+    fn termination(&self) -> Option<HostedTermination>;
 }
 
 pub fn run(job: &Job, config: FlowConfig, redactor: &Redactor) -> Result<FlowOutcome, String> {
@@ -52,13 +71,44 @@ pub fn run(job: &Job, config: FlowConfig, redactor: &Redactor) -> Result<FlowOut
 }
 
 #[cfg(target_os = "linux")]
+pub fn run_hosted(
+    job: &Job,
+    config: FlowConfig,
+    redactor: &Redactor,
+    provider_key: Option<String>,
+    control: &dyn HostedControl,
+) -> Result<FlowOutcome, String> {
+    run_linux_with(job, config, redactor, provider_key, Some(control))
+}
+
+#[cfg(target_os = "linux")]
 fn run_linux(job: &Job, config: FlowConfig, redactor: &Redactor) -> Result<FlowOutcome, String> {
-    let started = StartedBrowser::launch(browser_config(job, &config), target_url(job))
-        .and_then(StartedBrowser::navigate);
+    run_linux_with(job, config, redactor, None, None)
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux_with(
+    job: &Job,
+    config: FlowConfig,
+    redactor: &Redactor,
+    provider_key: Option<String>,
+    control: Option<&dyn HostedControl>,
+) -> Result<FlowOutcome, String> {
+    let started = StartedBrowser::launch(
+        browser_config(job, &config, control.is_some()),
+        target_url(job),
+    )
+    .and_then(StartedBrowser::navigate);
     match started {
-        Ok(started) => {
-            finish_browser_run(job, config, redactor, started.browser, started.provenance)
-        }
+        Ok(started) => finish_browser_run(
+            job,
+            config,
+            redactor,
+            started.browser,
+            started.provenance,
+            provider_key,
+            control,
+        ),
         Err(StartupFailure::Launch(error)) => publish_browser_error(job, config, redactor, error),
         Err(StartupFailure::AfterLaunch(failure)) => publish_browser_error_with_provenance(
             job,
@@ -146,11 +196,52 @@ fn finish_browser_run(
     redactor: &Redactor,
     mut browser: OwnedBrowser,
     provenance: Value,
+    provider_key: Option<String>,
+    control: Option<&dyn HostedControl>,
 ) -> Result<FlowOutcome, String> {
     actions::DurableJournal::open(&config.evidence_root, &config.run_id, redactor).and_then(
         |mut journal| {
-            let evaluator = LazyEvaluator::default();
-            let mut artifacts = drive_steps(job, redactor, &browser, &evaluator, &mut journal);
+            let evaluator = LazyEvaluator::new(provider_key);
+            let cancellation = control.map(HostedControl::cancellation).unwrap_or_default();
+            let mut artifacts = drive_steps(
+                job,
+                redactor,
+                &browser,
+                &evaluator,
+                &mut journal,
+                &cancellation,
+                Some(&config),
+                control,
+            );
+            if let Some(termination) = control.and_then(HostedControl::termination) {
+                return publish_active_hosted_stop(
+                    job,
+                    config,
+                    redactor,
+                    &mut browser,
+                    provenance,
+                    artifacts,
+                    &mut journal,
+                    termination,
+                );
+            }
+            if artifacts
+                .stop
+                .as_ref()
+                .is_some_and(|stop| stop.state == RunState::Uncertain)
+                && let Some(control) = control
+            {
+                return pause_hosted_run(
+                    job,
+                    config,
+                    redactor,
+                    &mut browser,
+                    provenance,
+                    artifacts,
+                    &mut journal,
+                    control,
+                );
+            }
             let cleanup = cleanup_browser(&mut browser, redactor, &mut artifacts.stop);
             let (state, reason, exit_code, overall) = terminal_fields(artifacts.stop);
             run_result(
@@ -188,13 +279,236 @@ fn finish_browser_run(
 }
 
 #[cfg(target_os = "linux")]
-fn browser_config(job: &Job, config: &FlowConfig) -> BrowserConfig {
+#[allow(clippy::too_many_arguments)]
+fn publish_active_hosted_stop(
+    job: &Job,
+    config: FlowConfig,
+    redactor: &Redactor,
+    browser: &mut OwnedBrowser,
+    provenance: Value,
+    artifacts: RunArtifacts,
+    journal: &mut actions::DurableJournal,
+    termination: HostedTermination,
+) -> Result<FlowOutcome, String> {
+    let cleanup = cleanup_started_browser(browser);
+    let (state, code, exit_code) = hosted_termination_fields(termination);
+    let result = run_result(
+        job,
+        &config,
+        redactor,
+        state,
+        Some(Reason {
+            code: code.into(),
+            details: BTreeMap::new(),
+        }),
+        VerdictResult::Unresolved,
+        artifacts.verdicts,
+        artifacts.escalation,
+        cleanup.clone(),
+    )?;
+    publish_bundle(
+        job,
+        config,
+        redactor,
+        provenance,
+        artifacts.observations,
+        artifacts.decisions,
+        artifacts.steps,
+        artifacts.escalations,
+        artifacts.trace,
+        cleanup,
+        result,
+        exit_code,
+    )
+    .inspect(|_| {
+        let _ = journal.clear();
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn pause_hosted_run(
+    job: &Job,
+    config: FlowConfig,
+    redactor: &Redactor,
+    browser: &mut OwnedBrowser,
+    provenance: Value,
+    mut artifacts: RunArtifacts,
+    journal: &mut actions::DurableJournal,
+    control: &dyn HostedControl,
+) -> Result<FlowOutcome, String> {
+    set_hosted_escalation_deadline(&mut artifacts, control.pause_deadline_unix_ms());
+    publish_pause_checkpoint(job, &config, redactor, provenance, &artifacts).and_then(|published| {
+        continue_paused_run(
+            job, &config, redactor, browser, artifacts, journal, control, published,
+        )
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn continue_paused_run(
+    job: &Job,
+    config: &FlowConfig,
+    redactor: &Redactor,
+    browser: &mut OwnedBrowser,
+    artifacts: RunArtifacts,
+    journal: &mut actions::DurableJournal,
+    control: &dyn HostedControl,
+    published: FlowOutcome,
+) -> Result<FlowOutcome, String> {
+    control.publish_checkpoint(&published.result)?;
+    let termination = control.wait_while_paused();
+    let cleanup = cleanup_started_browser(browser);
+    finalize_hosted_stop(job, config, redactor, artifacts, cleanup, termination)
+        .and_then(|outcome| publish_terminal_checkpoint(control, journal, outcome))
+}
+
+#[cfg(target_os = "linux")]
+fn publish_terminal_checkpoint(
+    control: &dyn HostedControl,
+    journal: &mut actions::DurableJournal,
+    outcome: FlowOutcome,
+) -> Result<FlowOutcome, String> {
+    control.publish_checkpoint(&outcome.result).map(|()| {
+        let _ = journal.clear();
+        outcome
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn set_hosted_escalation_deadline(artifacts: &mut RunArtifacts, deadline: u64) {
+    if let Some(escalation) = &mut artifacts.escalation {
+        escalation.expires_at = deadline.to_string();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn publish_pause_checkpoint(
+    job: &Job,
+    config: &FlowConfig,
+    redactor: &Redactor,
+    provenance: Value,
+    artifacts: &RunArtifacts,
+) -> Result<FlowOutcome, String> {
+    let (state, reason, exit_code, overall) = terminal_fields(artifacts.stop.clone());
+    let retained = Cleanup {
+        browser: "alive".into(),
+        profile: "retained".into(),
+        application_state: "caller_owned".into(),
+    };
+    let mut checkpoint = run_result(
+        job,
+        config,
+        redactor,
+        state,
+        reason,
+        overall,
+        artifacts.verdicts.clone(),
+        artifacts.escalation.clone(),
+        retained.clone(),
+    )?;
+    checkpoint["terminal"] = json!(false);
+    publish_bundle(
+        job,
+        config.clone(),
+        redactor,
+        provenance,
+        artifacts.observations.clone(),
+        artifacts.decisions.clone(),
+        artifacts.steps.clone(),
+        artifacts.escalations.clone(),
+        artifacts.trace.clone(),
+        retained,
+        checkpoint,
+        exit_code,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn finalize_hosted_stop(
+    job: &Job,
+    config: &FlowConfig,
+    redactor: &Redactor,
+    artifacts: RunArtifacts,
+    cleanup: Cleanup,
+    termination: HostedTermination,
+) -> Result<FlowOutcome, String> {
+    let (state, code, final_exit) = hosted_termination_fields(termination);
+    hosted_terminal_result(
+        job, config, redactor, artifacts, cleanup, state, code, final_exit,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn hosted_termination_fields(termination: HostedTermination) -> (RunState, &'static str, u8) {
+    match termination {
+        HostedTermination::Aborted => (RunState::Aborted, "caller_aborted", 5),
+        HostedTermination::PauseDeadlineElapsed => {
+            (RunState::Expired, "resume_deadline_elapsed", 5)
+        }
+        HostedTermination::LifetimeElapsed => (RunState::Expired, "lifetime_elapsed", 5),
+        HostedTermination::WatchdogLost => (RunState::Blocked, "watchdog_lost", 3),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn hosted_terminal_result(
+    job: &Job,
+    config: &FlowConfig,
+    redactor: &Redactor,
+    artifacts: RunArtifacts,
+    cleanup: Cleanup,
+    state: RunState,
+    code: &str,
+    final_exit: u8,
+) -> Result<FlowOutcome, String> {
+    let final_result = run_result(
+        job,
+        config,
+        redactor,
+        state,
+        Some(Reason {
+            code: code.into(),
+            details: BTreeMap::new(),
+        }),
+        VerdictResult::Unresolved,
+        artifacts.verdicts,
+        artifacts.escalation,
+        cleanup.clone(),
+    )?;
+    replace_hosted_tail(config, &cleanup, &final_result, redactor).map(|()| FlowOutcome {
+        result: final_result,
+        exit_code: final_exit,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn replace_hosted_tail(
+    config: &FlowConfig,
+    cleanup: &Cleanup,
+    final_result: &Value,
+    redactor: &Redactor,
+) -> Result<(), String> {
+    evidence::replace_result_cleanup(
+        &config.evidence_root,
+        &config.run_id,
+        cleanup,
+        final_result,
+        redactor,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn browser_config(job: &Job, config: &FlowConfig, hosted: bool) -> BrowserConfig {
     let (width, height) = viewport(job);
     BrowserConfig {
         explicit_binary: config.browser.clone(),
         headless: config.headless,
         width,
         height,
+        inherit_process_group: hosted,
     }
 }
 
@@ -260,8 +574,20 @@ trait DriveBrowser: BrowserPage + actions::Performer {}
 impl<T: BrowserPage + actions::Performer> DriveBrowser for T {}
 
 #[cfg(target_os = "linux")]
-#[derive(Default)]
-struct LazyEvaluator(OnceLock<Result<manuvra_jev::Client, manuvra_jev::JevError>>);
+struct LazyEvaluator {
+    client: OnceLock<Result<manuvra_jev::Client, manuvra_jev::JevError>>,
+    provider_key: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+impl LazyEvaluator {
+    fn new(provider_key: Option<String>) -> Self {
+        Self {
+            client: OnceLock::new(),
+            provider_key,
+        }
+    }
+}
 
 #[cfg(target_os = "linux")]
 impl manuvra_jev::Evaluator for LazyEvaluator {
@@ -270,8 +596,14 @@ impl manuvra_jev::Evaluator for LazyEvaluator {
         request: &Value,
         deadline: Instant,
     ) -> Result<manuvra_jev::Evaluation, manuvra_jev::JevError> {
-        self.0
-            .get_or_init(manuvra_jev::Client::from_environment)
+        self.client
+            .get_or_init(|| {
+                self.provider_key
+                    .clone()
+                    .map_or_else(manuvra_jev::Client::from_environment, |key| {
+                        manuvra_jev::Client::from_key(key)
+                    })
+            })
             .as_ref()
             .map_err(Clone::clone)?
             .evaluate(request, deadline)
@@ -290,6 +622,7 @@ impl BrowserPage for OwnedBrowser {
 }
 
 #[cfg(any(target_os = "linux", test))]
+#[derive(Clone)]
 struct RunArtifacts {
     observations: Vec<(String, Value, Option<Vec<u8>>)>,
     decisions: Vec<(String, Value)>,
@@ -326,6 +659,7 @@ impl RunArtifacts {
 }
 
 #[cfg(any(target_os = "linux", test))]
+#[derive(Clone)]
 struct Stop {
     state: RunState,
     code: &'static str,
@@ -378,17 +712,20 @@ impl Stop {
 }
 
 #[cfg(any(target_os = "linux", test))]
+#[allow(clippy::too_many_arguments)]
 fn drive_steps(
     job: &Job,
     redactor: &Redactor,
     browser: &impl DriveBrowser,
     evaluator: &impl manuvra_jev::Evaluator,
     journal: &mut impl actions::ActionJournal,
+    cancellation: &manuvra_chrome::InputCancellation,
+    config: Option<&FlowConfig>,
+    control: Option<&dyn HostedControl>,
 ) -> RunArtifacts {
     let mut artifacts = RunArtifacts::new(job, redactor);
     let mut policy = policy::Policy::new(&job.options, target_url_for_policy(job));
     let values = Values::new(job);
-    let cancellation = manuvra_chrome::InputCancellation::default();
     for (index, step) in job.steps.iter().enumerate() {
         policy.begin_step();
         let outcome = evaluate_step(
@@ -398,7 +735,7 @@ fn drive_steps(
             evaluator,
             journal,
             &values,
-            &cancellation,
+            cancellation,
             &mut policy,
             index,
             step,
@@ -408,8 +745,57 @@ fn drive_steps(
             artifacts.stop = Some(stop);
             break;
         }
+        if let (Some(config), Some(control)) = (config, control)
+            && let Err(error) =
+                publish_active_checkpoint(job, config, redactor, &mut artifacts, index, control)
+        {
+            artifacts.stop = Some(Stop::blocked(
+                "evidence_unavailable",
+                BTreeMap::from([(
+                    "message".into(),
+                    json!(redactor.redact_external_text(&error)),
+                )]),
+            ));
+            break;
+        }
     }
     artifacts
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn publish_active_checkpoint(
+    job: &Job,
+    config: &FlowConfig,
+    redactor: &Redactor,
+    artifacts: &mut RunArtifacts,
+    completed_index: usize,
+    control: &dyn HostedControl,
+) -> Result<(), String> {
+    if let Some(next) = artifacts.verdicts.get_mut(completed_index + 1) {
+        next.result = VerdictResult::Unresolved;
+        next.basis = None;
+    }
+    let manifest = config
+        .evidence_root
+        .join(&config.run_id)
+        .join("manifest.json");
+    control.publish_checkpoint(&json!({
+        "schema_version":1,
+        "request_id":config.request_id,
+        "run_id":config.run_id,
+        "state":"running",
+        "terminal":false,
+        "reason":null,
+        "verdict":{
+            "overall":VerdictResult::Unresolved,
+            "steps":artifacts.verdicts,
+            "expectations":job.expectations.iter().map(|expectation| json!({"id":redactor.redact_export_text(&expectation.id),"result":"not_run","numeric_checks":[]})).collect::<Vec<_>>(),
+            "caller_assisted":false
+        },
+        "evidence":{"manifest":manifest,"complete":false},
+        "escalation":null,
+        "cleanup":{"browser":"alive","profile":"retained","application_state":"caller_owned"}
+    }))
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -481,6 +867,12 @@ impl StepDriver<'_> {
     }
 
     fn drive_iteration(&mut self) -> StepProgress {
+        if self.cancellation.is_cancelled() {
+            return StepProgress::Stop(Stop::uncertain(
+                "action_outcome_uncertain",
+                step_detail(self.redactor, self.step),
+            ));
+        }
         let captured = match self.capture() {
             Ok(value) => value,
             Err(stop) => return StepProgress::Stop(stop),
@@ -742,6 +1134,18 @@ impl StepDriver<'_> {
         next: policy::Next,
     ) -> StepProgress {
         match next {
+            policy::Next::Mutate(permit) if self.force_stop_before_first_mutation() => {
+                drop(permit);
+                StepProgress::Stop(escalate(
+                    self.artifacts,
+                    self.redactor,
+                    self.index,
+                    self.step,
+                    done,
+                    Some(judgments),
+                    "debug_forced_stop",
+                ))
+            }
             policy::Next::Mutate(permit) => self.mutate(done, captured, judgments, permit),
             policy::Next::Stop(stop) => {
                 StepProgress::Stop(self.policy_stop(done, captured, judgments, stop))
@@ -753,6 +1157,16 @@ impl StepDriver<'_> {
                 unreachable!("earlier next variants were handled")
             }
         }
+    }
+
+    fn force_stop_before_first_mutation(&self) -> bool {
+        self.mutations == 0
+            && self
+                .job
+                .options
+                .debug
+                .as_ref()
+                .is_some_and(|debug| debug.force_stop_at_step == self.step.id)
     }
 
     fn mutate(
@@ -1602,6 +2016,32 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingHostedControl(Mutex<Vec<Value>>);
+
+    impl HostedControl for RecordingHostedControl {
+        fn cancellation(&self) -> manuvra_chrome::InputCancellation {
+            manuvra_chrome::InputCancellation::default()
+        }
+
+        fn pause_deadline_unix_ms(&self) -> u64 {
+            u64::MAX
+        }
+
+        fn publish_checkpoint(&self, result: &Value) -> Result<(), String> {
+            self.0.lock().unwrap().push(result.clone());
+            Ok(())
+        }
+
+        fn wait_while_paused(&self) -> HostedTermination {
+            HostedTermination::Aborted
+        }
+
+        fn termination(&self) -> Option<HostedTermination> {
+            None
+        }
+    }
+
     fn drive_fake(job: &Job, redactor: &Redactor, browser: &FakeBrowser) -> RunArtifacts {
         drive_steps(
             job,
@@ -1609,7 +2049,71 @@ mod tests {
             browser,
             &NoProvider,
             &mut MemoryJournal::default(),
+            &manuvra_chrome::InputCancellation::default(),
+            None,
+            None,
         )
+    }
+
+    #[test]
+    fn completed_steps_publish_running_checkpoints_with_the_next_step_unresolved() {
+        let job = Job::parse(
+            serde_json::to_vec(&json!({
+                "schema_version":1,
+                "target":{"kind":"browser","url":"http://example.test/ready"},
+                "context":{"journey":"checkpoint","revision":"r","environment":"e","actor":"a","authority":"a"},
+                "values":{},
+                "steps":[
+                    {"id":"first","goal":"observe first","done_when":[{"url_contains":"/ready"}]},
+                    {"id":"second","goal":"observe second","done_when":[{"url_contains":"/ready"}]}
+                ]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap();
+        let redactor = Redactor::for_job(&job).unwrap();
+        let observation = Observation {
+            url: "http://example.test/ready".into(),
+            route: "/ready".into(),
+            ..observed("ready")
+        };
+        let browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::from([
+                observation_page(observation.clone()),
+                observation_page(observation.clone()),
+            ])),
+            fallback: observation,
+            dispatch_result: None,
+        };
+        let temporary = tempfile::tempdir().unwrap();
+        let config = FlowConfig {
+            request_id: "checkpoint-request".into(),
+            run_id: "r_checkpoint".into(),
+            evidence_root: temporary.path().to_path_buf(),
+            browser: None,
+            headless: true,
+        };
+        let control = RecordingHostedControl::default();
+        let artifacts = drive_steps(
+            &job,
+            &redactor,
+            &browser,
+            &NoProvider,
+            &mut MemoryJournal::default(),
+            &manuvra_chrome::InputCancellation::default(),
+            Some(&config),
+            Some(&control),
+        );
+        assert!(artifacts.stop.is_none());
+        let checkpoints = control.0.lock().unwrap();
+        assert_eq!(checkpoints.len(), 2);
+        assert_eq!(checkpoints[0]["verdict"]["steps"][0]["result"], "satisfied");
+        assert_eq!(
+            checkpoints[0]["verdict"]["steps"][1]["result"],
+            "unresolved"
+        );
+        assert_eq!(checkpoints[0]["evidence"]["complete"], false);
     }
 
     fn observed(text: &str) -> Observation {
@@ -1681,6 +2185,57 @@ mod tests {
         })).unwrap().as_slice()).unwrap()
     }
 
+    #[test]
+    fn debug_force_stop_publishes_uncertainty_before_first_dispatch() {
+        let mut job = mutation_job();
+        job.options.debug = Some(manuvra_contract::DebugOptions {
+            force_stop_at_step: "fill".into(),
+        });
+        let redactor = Redactor::for_job(&job).unwrap();
+        let mut observation = observed("");
+        observation.elements.push(Element {
+            index: 1,
+            node_id: 7,
+            context: "main".into(),
+            role: "textbox".into(),
+            name: "Name".into(),
+            input_type: Some("text".into()),
+            value: String::new(),
+            checked: None,
+            selected: None,
+            expanded: None,
+            disabled: false,
+            in_dialog: None,
+            operations: vec!["TYPE_TEXT".into()],
+            rect: Rect {
+                x: 1.0,
+                y: 1.0,
+                width: 20.0,
+                height: 10.0,
+            },
+        });
+        let browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::from([observation_page(observation.clone())])),
+            fallback: observation,
+            dispatch_result: None,
+        };
+        let provider = TypeTextProvider(std::sync::atomic::AtomicUsize::new(0));
+        let mut journal = MemoryJournal::default();
+        let artifacts = drive_steps(
+            &job,
+            &redactor,
+            &browser,
+            &provider,
+            &mut journal,
+            &manuvra_chrome::InputCancellation::default(),
+            None,
+            None,
+        );
+        assert_eq!(artifacts.stop.unwrap().code, "debug_forced_stop");
+        assert!(journal.0.is_empty());
+        assert!(artifacts.escalation.is_some());
+    }
+
     fn mutation_judgments(operation: &str, confidence: f64) -> judgment::Judgments {
         let choice = |selected: &str| judgment::ChoiceJudgment {
             choice: selected.into(),
@@ -1738,7 +2293,16 @@ mod tests {
         };
         let provider = NaturalDoneSequenceProvider(Mutex::new(VecDeque::from([0.50, 0.50])));
         let mut journal = MemoryJournal::default();
-        let artifacts = drive_steps(&job, &redactor, &browser, &provider, &mut journal);
+        let artifacts = drive_steps(
+            &job,
+            &redactor,
+            &browser,
+            &provider,
+            &mut journal,
+            &manuvra_chrome::InputCancellation::default(),
+            None,
+            None,
+        );
         assert_eq!(artifacts.stop.as_ref().unwrap().code, "done_uncertain");
         assert_eq!(artifacts.observations.len(), 2);
         assert_eq!(artifacts.decisions.len(), 2);
@@ -1962,7 +2526,16 @@ mod tests {
         };
         let provider = TypeTextProvider(std::sync::atomic::AtomicUsize::new(0));
         let mut journal = MemoryJournal::default();
-        let artifacts = drive_steps(&job, &redactor, &browser, &provider, &mut journal);
+        let artifacts = drive_steps(
+            &job,
+            &redactor,
+            &browser,
+            &provider,
+            &mut journal,
+            &manuvra_chrome::InputCancellation::default(),
+            None,
+            None,
+        );
         assert!(artifacts.stop.is_none());
         assert_eq!(artifacts.observations.len(), 3);
         assert_eq!(artifacts.decisions.len(), 1);
@@ -2020,7 +2593,16 @@ mod tests {
         };
         let provider = ConfidenceSequenceProvider(Mutex::new(VecDeque::from([0.69, 0.95])));
         let mut journal = MemoryJournal::default();
-        let artifacts = drive_steps(&job, &redactor, &browser, &provider, &mut journal);
+        let artifacts = drive_steps(
+            &job,
+            &redactor,
+            &browser,
+            &provider,
+            &mut journal,
+            &manuvra_chrome::InputCancellation::default(),
+            None,
+            None,
+        );
         assert!(artifacts.stop.is_none());
         assert_eq!(artifacts.observations.len(), 4);
         assert_eq!(artifacts.decisions.len(), 2);
@@ -2161,5 +2743,26 @@ mod tests {
         assert_eq!(outcome.exit_code, 3);
         assert_eq!(outcome.result["reason"]["code"], "browser_unavailable");
         assert!(temp.path().join("r_fake/manifest.json").is_file());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hosted_termination_has_closed_truthful_result_fields() {
+        assert_eq!(
+            hosted_termination_fields(HostedTermination::Aborted),
+            (RunState::Aborted, "caller_aborted", 5)
+        );
+        assert_eq!(
+            hosted_termination_fields(HostedTermination::PauseDeadlineElapsed),
+            (RunState::Expired, "resume_deadline_elapsed", 5)
+        );
+        assert_eq!(
+            hosted_termination_fields(HostedTermination::LifetimeElapsed),
+            (RunState::Expired, "lifetime_elapsed", 5)
+        );
+        assert_eq!(
+            hosted_termination_fields(HostedTermination::WatchdogLost),
+            (RunState::Blocked, "watchdog_lost", 3)
+        );
     }
 }

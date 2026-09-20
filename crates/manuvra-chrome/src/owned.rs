@@ -44,6 +44,7 @@ pub struct BrowserConfig {
     pub headless: bool,
     pub width: u16,
     pub height: u16,
+    pub inherit_process_group: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +87,7 @@ pub struct OwnedBrowser {
     profile: PathBuf,
     client: Arc<CdpClient>,
     provenance: BrowserProvenance,
+    owns_process_group: bool,
     closed: bool,
 }
 
@@ -206,7 +208,7 @@ impl OwnedBrowser {
         if self.closed {
             return Ok(());
         }
-        terminate(&mut self.child).map_err(BrowserError::Control)?;
+        terminate(&mut self.child, self.owns_process_group).map_err(BrowserError::Control)?;
         fs::remove_dir_all(&self.profile)
             .map_err(|error| BrowserError::Control(safe_error(&error.to_string())))?;
         self.closed = true;
@@ -269,7 +271,7 @@ impl PreparedBrowser {
 
     fn spawn(self) -> Result<StartingBrowser, BrowserError> {
         let mut command = browser_command(&self.binary, &self.profile, &self.config);
-        configure_linux_child(&mut command);
+        configure_linux_child(&mut command, !self.config.inherit_process_group);
         let child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
@@ -329,6 +331,7 @@ impl StartingBrowser {
                 },
                 display_mode: display_mode(prepared.config.headless).into(),
             },
+            owns_process_group: !prepared.config.inherit_process_group,
             closed: false,
         })
     }
@@ -345,7 +348,11 @@ fn display_mode(headless: bool) -> &'static str {
 #[cfg(target_os = "linux")]
 impl Drop for StartingBrowser {
     fn drop(&mut self) {
-        cleanup_starting_child(self.child.as_mut());
+        let owns_process_group = self
+            .prepared
+            .as_ref()
+            .is_none_or(|prepared| !prepared.config.inherit_process_group);
+        cleanup_starting_child(self.child.as_mut(), owns_process_group);
         cleanup_starting_profile(self.prepared.as_ref());
     }
 }
@@ -359,9 +366,9 @@ fn take_child(value: &mut Option<Child>) -> Child {
     value.take().expect("Chromium child")
 }
 #[cfg(target_os = "linux")]
-fn cleanup_starting_child(child: Option<&mut Child>) {
+fn cleanup_starting_child(child: Option<&mut Child>, owns_process_group: bool) {
     if let Some(child) = child {
-        let _ = terminate(child);
+        let _ = terminate(child, owns_process_group);
     }
 }
 #[cfg(target_os = "linux")]
@@ -378,9 +385,11 @@ impl Drop for OwnedBrowser {
 }
 
 #[cfg(target_os = "linux")]
-fn configure_linux_child(command: &mut Command) {
+fn configure_linux_child(command: &mut Command, own_process_group: bool) {
     use std::os::unix::process::CommandExt;
-    command.process_group(0);
+    if own_process_group {
+        command.process_group(0);
+    }
     unsafe {
         command.pre_exec(|| {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
@@ -660,13 +669,72 @@ fn masking_script(sensitive: &[String]) -> Result<String, BrowserError> {
 }
 
 #[cfg(target_os = "linux")]
-fn terminate(child: &mut Child) -> Result<(), String> {
+fn terminate(child: &mut Child, owns_process_group: bool) -> Result<(), String> {
+    if !owns_process_group {
+        return terminate_process(child);
+    }
     let process_group = child.id() as i32;
     signal_process_group(process_group, libc::SIGTERM)?;
     if wait_for_process_group_exit(child, process_group, Duration::from_secs(2)) {
         return Ok(());
     }
     force_terminate_process_group(child, process_group)
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_process(child: &mut Child) -> Result<(), String> {
+    let pid = child_pid(child)?;
+    signal_process(pid)?;
+    if wait_for_process_exit(child, Duration::from_secs(2))? {
+        Ok(())
+    } else {
+        force_terminate_process(child)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn child_pid(child: &Child) -> Result<i32, String> {
+    child
+        .id()
+        .try_into()
+        .map_err(|_| "Chromium process id does not fit pid_t".to_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn signal_process(pid: i32) -> Result<(), String> {
+    let result = unsafe { libc::kill(pid, libc::SIGTERM) };
+    if result == -1 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+        Err(safe_error(&std::io::Error::last_os_error().to_string()))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_process_exit(child: &mut Child, timeout: Duration) -> Result<bool, String> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if child
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    Ok(false)
+}
+
+#[cfg(target_os = "linux")]
+fn force_terminate_process(child: &mut Child) -> Result<(), String> {
+    let signaled = child.kill().map_err(|error| safe_error(&error.to_string()));
+    signaled.and_then(|()| {
+        child
+            .wait()
+            .map(|_| ())
+            .map_err(|error| safe_error(&error.to_string()))
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -709,7 +777,7 @@ fn process_group_exists(process_group: i32) -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn terminate(child: &mut Child) -> Result<(), String> {
+fn terminate(child: &mut Child, _owns_process_group: bool) -> Result<(), String> {
     child.kill().map_err(|error| error.to_string())?;
     child.wait().map_err(|error| error.to_string())?;
     Ok(())
@@ -795,6 +863,7 @@ mod tests {
             headless: true,
             width: 800,
             height: 600,
+            inherit_process_group: false,
         };
         let success_profile = private_profile().unwrap();
         let starting = PreparedBrowser {
@@ -842,6 +911,7 @@ mod tests {
                     headless: true,
                     width: 800,
                     height: 600,
+                    inherit_process_group: false,
                 },
             }),
             child: Some(child),
@@ -860,6 +930,7 @@ mod tests {
             headless: false,
             width: 1120,
             height: 780,
+            inherit_process_group: false,
         };
         let command = browser_command(Path::new("/usr/bin/chromium"), temporary.path(), &config);
         assert!(
@@ -1022,11 +1093,39 @@ mod tests {
                 },
                 display_mode: "headless".into(),
             },
+            owns_process_group: true,
             closed: false,
         };
         browser.close().unwrap();
         assert!(!profile.exists());
         browser.close().unwrap();
+    }
+
+    #[test]
+    fn close_terminates_only_the_browser_when_it_inherits_the_host_group() {
+        let profile = private_profile().unwrap();
+        let chrome = ScriptedChrome::start();
+        let client = chrome.connect_raw();
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let mut browser = OwnedBrowser {
+            child,
+            profile,
+            client,
+            provenance: BrowserProvenance {
+                browser_path: "fake".into(),
+                browser_version: "fake".into(),
+                viewport: ProvenanceViewport {
+                    width: 1,
+                    height: 1,
+                },
+                display_mode: "headless".into(),
+            },
+            owns_process_group: false,
+            closed: false,
+        };
+        browser.close().unwrap();
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
     }
 
     #[test]
@@ -1061,6 +1160,7 @@ mod tests {
                 },
                 display_mode: "headless".into(),
             },
+            owns_process_group: true,
             closed: false,
         };
         browser.close().unwrap();
@@ -1097,6 +1197,7 @@ mod tests {
                 },
                 display_mode: "headless".into(),
             },
+            owns_process_group: true,
             closed: false,
         }
     }

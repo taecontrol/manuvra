@@ -1,6 +1,8 @@
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 
 use hmac::{Hmac, Mac};
@@ -44,6 +46,53 @@ pub struct RequestLock {
     _file: File,
 }
 
+#[cfg(target_os = "linux")]
+pub struct RunLock {
+    _file: File,
+}
+
+#[cfg(target_os = "linux")]
+impl RunLock {
+    pub fn inherited_fd(&self) -> Result<RawFd, String> {
+        let fd = self._file.as_raw_fd();
+        set_fd_cloexec(fd, false)?;
+        Ok(fd)
+    }
+
+    pub fn restore_cloexec(&self) -> Result<(), String> {
+        set_fd_cloexec(self._file.as_raw_fd(), true)
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub start_ticks: u64,
+    pub session_id: u32,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunControl {
+    pub schema_version: SchemaVersion,
+    pub ipc_version: u16,
+    pub sequence: u64,
+    pub run_id: String,
+    pub request_id: String,
+    pub job_digest: String,
+    pub evidence_root: PathBuf,
+    pub started_unix_ms: u64,
+    pub lifetime_deadline_unix_ms: u64,
+    pub pause_deadline_unix_ms: Option<u64>,
+    pub host: Option<ProcessIdentity>,
+    pub watchdog: Option<ProcessIdentity>,
+    pub socket: PathBuf,
+    pub result: Value,
+}
+
 pub fn state_root() -> Result<PathBuf, String> {
     if let Some(root) = env::var_os("XDG_STATE_HOME") {
         return Ok(PathBuf::from(root).join("manuvra"));
@@ -84,6 +133,178 @@ pub fn lock_request(root: &Path, request_id: &str) -> Result<RequestLock, String
     create_private_dir(&requests_dir)?;
     let path = requests_dir.join(format!("{}.lock", request_index_name(request_id)));
     lock_file(&path, "request")
+}
+
+#[cfg(target_os = "linux")]
+pub fn lock_run(root: &Path, run_id: &str) -> Result<RunLock, String> {
+    let directory = run_state_dir(root, run_id)?;
+    let path = directory.join("run.lock");
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    set_file_creation_options(&mut options);
+    let file = options
+        .open(&path)
+        .map_err(|error| format!("cannot open run lock {}: {error}", path.display()))?;
+    validate_private_file(&file, &path, "run lock")?;
+    File::lock(&file).map_err(|error| format!("cannot lock run {}: {error}", path.display()))?;
+    Ok(RunLock { _file: file })
+}
+
+#[cfg(target_os = "linux")]
+pub fn adopt_inherited_run_lock(root: &Path, run_id: &str, fd: RawFd) -> Result<RunLock, String> {
+    if fd < 0 {
+        return Err("inherited run lock descriptor is invalid".into());
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    let path = root.join("runs").join(run_id).join("run.lock");
+    validate_private_file(&file, &path, "inherited run lock")?;
+    validate_inherited_lock_path(&file, &path)?;
+    File::lock(&file).map_err(|error| {
+        format!(
+            "cannot confirm inherited run lock {}: {error}",
+            path.display()
+        )
+    })?;
+    set_fd_cloexec(file.as_raw_fd(), true)?;
+    Ok(RunLock { _file: file })
+}
+
+#[cfg(target_os = "linux")]
+fn validate_inherited_lock_path(file: &File, path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let descriptor = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect inherited run lock: {error}"))?;
+    let path_metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect run lock {}: {error}", path.display()))?;
+    (!path_metadata.file_type().is_symlink()
+        && descriptor.dev() == path_metadata.dev()
+        && descriptor.ino() == path_metadata.ino())
+    .then_some(())
+    .ok_or_else(|| "inherited run lock does not match durable run state".into())
+}
+
+#[cfg(target_os = "linux")]
+fn set_fd_cloexec(fd: RawFd, enabled: bool) -> Result<(), String> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags == -1 {
+        return Err(format!(
+            "cannot inspect run lock descriptor: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let updated = if enabled {
+        flags | libc::FD_CLOEXEC
+    } else {
+        flags & !libc::FD_CLOEXEC
+    };
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, updated) } == -1 {
+        return Err(format!(
+            "cannot configure run lock inheritance: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub fn try_lock_existing_run(root: &Path, run_id: &str) -> Result<Option<RunLock>, String> {
+    let path = root.join("runs").join(run_id).join("run.lock");
+    open_run_lock_for_inspection(&path)?
+        .map(|file| try_lock_inspected_run(file, &path))
+        .transpose()
+        .map(Option::flatten)
+}
+
+#[cfg(target_os = "linux")]
+pub fn run_lock_present(root: &Path, run_id: &str) -> Result<bool, String> {
+    let path = root.join("runs").join(run_id).join("run.lock");
+    open_run_lock_for_inspection(&path)?.map_or(Ok(false), |file| {
+        validate_private_file(&file, &path, "run lock").map(|()| true)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn try_lock_inspected_run(file: File, path: &Path) -> Result<Option<RunLock>, String> {
+    validate_private_file(&file, path, "run lock")?;
+    match File::try_lock(&file) {
+        Ok(()) => Ok(Some(RunLock { _file: file })),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(error) => Err(format!(
+            "cannot inspect run lock {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_run_lock_for_inspection(path: &Path) -> Result<Option<File>, String> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    set_no_follow(&mut options);
+    match options.open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("cannot open run lock {}: {error}", path.display())),
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn write_run_control(root: &Path, control: &RunControl) -> Result<(), String> {
+    let directory = run_state_dir(root, &control.run_id)?;
+    let bytes = serde_json::to_vec_pretty(control).map_err(|error| error.to_string())?;
+    atomic_write_private(&directory.join("control.json"), &bytes)
+}
+
+#[cfg(target_os = "linux")]
+pub fn read_run_control(root: &Path, run_id: &str) -> Result<Option<RunControl>, String> {
+    let path = root.join("runs").join(run_id).join("control.json");
+    match read_private_file(&path, "run control") {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| format!("invalid run control {}: {error}", path.display())),
+        Err(SecureReadError::NotFound) => Ok(None),
+        Err(SecureReadError::Invalid(message)) => Err(message),
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn unresolved_action(evidence_root: &Path, run_id: &str) -> Result<bool, String> {
+    let journal = evidence_root.join(format!(".{run_id}.action-journal.jsonl"));
+    let bytes = match read_private_file(&journal, "action journal") {
+        Ok(bytes) => bytes,
+        Err(SecureReadError::NotFound) => return Ok(false),
+        Err(SecureReadError::Invalid(message)) => return Err(message),
+    };
+    let text = String::from_utf8(bytes).map_err(|_| "action journal is not UTF-8".to_owned())?;
+    text.lines().try_fold(false, |unresolved, line| {
+        let value: Value = serde_json::from_str(line)
+            .map_err(|error| format!("invalid action journal entry: {error}"))?;
+        match value.get("event").and_then(Value::as_str) {
+            Some("action_prepared") => Ok(true),
+            Some("action_fact") if unresolved => Ok(false),
+            Some("action_fact") => Err("action journal closes no prepared action".into()),
+            _ => Ok(unresolved),
+        }
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub fn request_run_id(root: &Path, request_id: &str) -> Result<Option<String>, String> {
+    Ok(lookup_request(root, request_id)?.map(|entry| match entry {
+        RequestEntry::Intent(intent) => intent.run_id,
+        RequestEntry::Complete(record) => record.run_id,
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn run_state_dir(root: &Path, run_id: &str) -> Result<PathBuf, String> {
+    let runs = root.join("runs");
+    create_private_dir(&runs)?;
+    let directory = runs.join(run_id);
+    create_private_dir(&directory)?;
+    Ok(directory)
 }
 
 pub fn keyed_digest(root: &Path, input: &[u8]) -> Result<String, String> {
@@ -205,6 +426,20 @@ pub fn finalize_request(
     let requests_dir = root.join("requests");
     create_private_dir(&requests_dir)?;
     atomic_write_private(&request_index_path(root, lookup_request_id), &bytes)
+}
+
+#[cfg(target_os = "linux")]
+pub fn finalize_control_request(
+    root: &Path,
+    lookup_request_id: &str,
+    record: &RequestRecord,
+) -> Result<(), String> {
+    tagged_bytes(&RequestEntry::Complete(record.clone())).and_then(|bytes| {
+        let requests_dir = root.join("requests");
+        create_private_dir(&requests_dir).and_then(|()| {
+            atomic_write_private(&request_index_path(root, lookup_request_id), &bytes)
+        })
+    })
 }
 
 fn tagged_bytes(entry: &RequestEntry) -> Result<Vec<u8>, String> {
@@ -364,7 +599,9 @@ fn open_existing_private(path: &Path, purpose: &str) -> Result<File, SecureReadE
 #[cfg(unix)]
 fn set_file_creation_options(options: &mut OpenOptions) {
     use std::os::unix::fs::OpenOptionsExt;
-    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    options
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
 }
 
 #[cfg(not(unix))]
@@ -373,7 +610,7 @@ fn set_file_creation_options(_options: &mut OpenOptions) {}
 #[cfg(unix)]
 fn set_no_follow(options: &mut OpenOptions) {
     use std::os::unix::fs::OpenOptionsExt;
-    options.custom_flags(libc::O_NOFOLLOW);
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
 }
 
 #[cfg(not(unix))]
