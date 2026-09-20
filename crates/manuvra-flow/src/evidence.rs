@@ -3,7 +3,7 @@ use rand::RngCore;
 use serde::Serialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -258,7 +258,6 @@ fn is_protocol_collision(value: &str) -> bool {
         "browser_path",
         "browser_version",
         "display_mode",
-        "document_id",
         "route",
         "title",
         "dialogs",
@@ -268,7 +267,6 @@ fn is_protocol_collision(value: &str) -> bool {
         "dialog_texts",
         "elements",
         "index",
-        "node_id",
         "input_type",
         "value",
         "checked",
@@ -361,6 +359,7 @@ pub struct EvidenceBundle {
     pub decisions: Vec<(String, Value)>,
     pub steps: Vec<(String, Value)>,
     pub escalations: Vec<(String, Value)>,
+    pub dispositions: Vec<(String, Value)>,
     pub trace: Vec<Value>,
     pub cleanup: Value,
     pub result: Value,
@@ -374,9 +373,7 @@ pub fn publish(
 ) -> Result<Value, String> {
     create_private_dir(root)?;
     let final_dir = root.join(run_id);
-    if final_dir.exists() {
-        return Err("evidence directory already exists".into());
-    }
+    let replacing = validate_replacement(&final_dir, run_id, redactor)?;
     let stage = staged_directory(root, run_id)?;
     let result = bundle.result.clone();
     let mut publication = Publication {
@@ -387,8 +384,215 @@ pub fn publish(
     let complete = bundle.complete;
     publication.write_bundle(bundle)?;
     publication.write_manifest(run_id, complete)?;
-    publication.commit(root, redactor)?;
+    commit_publication(publication, root, redactor, replacing)?;
     Ok(result)
+}
+
+fn commit_publication(
+    publication: Publication,
+    root: &Path,
+    redactor: &Redactor,
+    replacing: bool,
+) -> Result<(), String> {
+    if replacing {
+        publication.commit_replacing(root, redactor)
+    } else {
+        publication.commit(root, redactor)
+    }
+}
+
+fn validate_replacement(
+    final_dir: &Path,
+    run_id: &str,
+    redactor: &Redactor,
+) -> Result<bool, String> {
+    let Some(run_dir) = existing_replacement_directory(final_dir)? else {
+        return Ok(false);
+    };
+    let manifest = read_complete_manifest(&final_dir.join("manifest.json"), run_id)?;
+    validate_replacement_artifacts(&run_dir, &manifest)?;
+    reject_leaks(&run_dir, redactor)?;
+    Ok(true)
+}
+
+fn existing_replacement_directory(path: &Path) -> Result<Option<PathBuf>, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("evidence run path is not a regular directory".into());
+    }
+    fs::canonicalize(path)
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
+fn validate_replacement_artifacts(run_dir: &Path, manifest: &Manifest) -> Result<(), String> {
+    let mut listed = BTreeSet::new();
+    let mut roles = BTreeMap::new();
+    for artifact in &manifest.artifacts {
+        validate_replacement_artifact(run_dir, artifact, &mut listed)?;
+        *roles.entry(artifact.role.as_str()).or_insert(0_usize) += 1;
+    }
+    validate_replacement_roles(&roles)?;
+    let mut actual = BTreeSet::new();
+    collect_evidence_files(run_dir, &mut actual)?;
+    actual.remove(&run_dir.join("manifest.json"));
+    (actual == listed)
+        .then_some(())
+        .ok_or_else(|| "existing evidence contains unmanifested or missing artifacts".into())
+}
+
+fn validate_replacement_roles(roles: &BTreeMap<&str, usize>) -> Result<(), String> {
+    const SINGLETONS: &[&str] = &["normalized_job", "provenance", "trace", "cleanup", "result"];
+    for role in SINGLETONS {
+        if roles.get(role) != Some(&1) {
+            return Err(format!(
+                "existing evidence must contain exactly one {role} artifact"
+            ));
+        }
+    }
+    let allowed = [
+        "normalized_job",
+        "provenance",
+        "trace",
+        "cleanup",
+        "result",
+        "observation",
+        "screenshot",
+        "decision",
+        "step",
+        "escalation",
+        "disposition",
+    ];
+    roles
+        .keys()
+        .find(|role| !allowed.contains(role))
+        .map_or(Ok(()), |role| {
+            Err(format!("existing evidence contains unexpected role {role}"))
+        })
+}
+
+fn validate_replacement_artifact(
+    run_dir: &Path,
+    artifact: &Artifact,
+    listed: &mut BTreeSet<PathBuf>,
+) -> Result<(), String> {
+    validate_replacement_header(artifact)?;
+    let canonical = canonical_replacement_artifact(run_dir, artifact)?;
+    if !listed.insert(canonical.clone()) {
+        return Err("existing evidence manifest repeats an artifact path".into());
+    }
+    replacement_digest_matches(&canonical, &artifact.digest)
+}
+
+fn validate_replacement_header(artifact: &Artifact) -> Result<(), String> {
+    (artifact.complete && valid_artifact_digest(&artifact.digest))
+        .then_some(())
+        .ok_or_else(|| "existing evidence manifest contains an incomplete artifact".into())
+}
+
+fn canonical_replacement_artifact(run_dir: &Path, artifact: &Artifact) -> Result<PathBuf, String> {
+    let recorded = Path::new(&artifact.path);
+    let metadata = fs::symlink_metadata(recorded).map_err(|error| error.to_string())?;
+    regular_artifact(&metadata)?;
+    let canonical = fs::canonicalize(recorded).map_err(|error| error.to_string())?;
+    exact_in_run_path(run_dir, recorded, &canonical)?;
+    let relative = canonical
+        .strip_prefix(run_dir)
+        .map_err(|_| "existing evidence artifact escapes its run directory")?;
+    role_matches_relative_path(&artifact.role, relative)
+        .then_some(canonical)
+        .ok_or_else(|| "existing evidence artifact role has an unexpected path".into())
+}
+
+fn regular_artifact(metadata: &fs::Metadata) -> Result<(), String> {
+    (!metadata.file_type().is_symlink() && metadata.is_file())
+        .then_some(())
+        .ok_or_else(|| "existing evidence artifact is not a regular file".into())
+}
+
+fn exact_in_run_path(run_dir: &Path, recorded: &Path, canonical: &Path) -> Result<(), String> {
+    (recorded == canonical && canonical.starts_with(run_dir))
+        .then_some(())
+        .ok_or_else(|| "existing evidence artifact escapes its run directory".into())
+}
+
+fn replacement_digest_matches(path: &Path, digest: &str) -> Result<(), String> {
+    let bytes = fs::read(path).map_err(|error| error.to_string())?;
+    (hex::encode(Sha256::digest(bytes)) == digest)
+        .then_some(())
+        .ok_or_else(|| "existing evidence artifact digest does not match its manifest".into())
+}
+
+fn collect_evidence_files(directory: &Path, files: &mut BTreeSet<PathBuf>) -> Result<(), String> {
+    fs::read_dir(directory)
+        .map_err(|error| error.to_string())?
+        .try_for_each(|entry| {
+            let path = entry.map_err(|error| error.to_string())?.path();
+            collect_evidence_path(&path, files)
+        })
+}
+
+fn collect_evidence_path(path: &Path, files: &mut BTreeSet<PathBuf>) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink() {
+        return Err("existing evidence contains a symlink".into());
+    }
+    if metadata.is_dir() {
+        return collect_evidence_files(path, files);
+    }
+    let canonical = metadata
+        .is_file()
+        .then(|| fs::canonicalize(path).map_err(|error| error.to_string()))
+        .ok_or_else(|| "existing evidence contains an unsupported file type".to_owned())??;
+    files.insert(canonical);
+    Ok(())
+}
+
+fn valid_artifact_digest(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn role_matches_relative_path(role: &str, relative: &Path) -> bool {
+    let text = relative.to_string_lossy();
+    const EXACT: &[(&str, &str)] = &[
+        ("normalized_job", "job.json"),
+        ("provenance", "provenance.json"),
+        ("trace", "trace.jsonl"),
+        ("cleanup", "cleanup.json"),
+        ("result", "result.json"),
+    ];
+    const NESTED: &[(&str, &str, &str)] = &[
+        ("observation", "observations/", ".json"),
+        ("screenshot", "observations/", ".png"),
+        ("decision", "decisions/", ".json"),
+        ("step", "steps/", ".json"),
+        ("escalation", "escalations/", ".json"),
+        ("disposition", "dispositions/", ".json"),
+    ];
+    EXACT
+        .iter()
+        .any(|(expected_role, path)| role == *expected_role && text == *path)
+        || NESTED.iter().any(|(expected_role, prefix, suffix)| {
+            role == *expected_role && safe_artifact_leaf(&text, prefix, suffix)
+        })
+}
+
+fn safe_artifact_leaf(path: &str, prefix: &str, suffix: &str) -> bool {
+    path.strip_prefix(prefix)
+        .and_then(|leaf| leaf.strip_suffix(suffix))
+        .is_some_and(|leaf| {
+            !leaf.is_empty()
+                && leaf
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        })
 }
 
 pub fn replace_result_cleanup(
@@ -596,6 +800,7 @@ impl Publication {
         self.write_named("decisions", "decision", bundle.decisions)?;
         self.write_steps(bundle.steps)?;
         self.write_named("escalations", "escalation", bundle.escalations)?;
+        self.write_named("dispositions", "disposition", bundle.dispositions)?;
         self.write_tail(bundle.trace, &bundle.cleanup, &bundle.result)
     }
 
@@ -730,6 +935,65 @@ impl Publication {
             .map_err(|e| format!("cannot publish evidence: {e}"))?;
         sync_dir(root)
     }
+
+    fn commit_replacing(self, root: &Path, redactor: &Redactor) -> Result<(), String> {
+        if let Err(error) = reject_leaks(&self.stage, redactor) {
+            let _ = fs::remove_dir_all(&self.stage);
+            return Err(error);
+        }
+        reject_leaks(&self.final_dir, redactor)?;
+        #[cfg(target_os = "linux")]
+        {
+            exchange_directories(&self.stage, &self.final_dir)?;
+            sync_dir(root)?;
+            let _ = fs::remove_dir_all(&self.stage);
+            sync_dir(root)
+        }
+        #[cfg(not(target_os = "linux"))]
+        self.commit_replacing_portably(root)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn commit_replacing_portably(self, root: &Path) -> Result<(), String> {
+        let mut random = [0u8; 8];
+        rand::rng().fill_bytes(&mut random);
+        let backup = root.join(format!(".evidence-{}.previous", hex::encode(random)));
+        fs::rename(&self.final_dir, &backup)
+            .map_err(|error| format!("cannot stage prior evidence: {error}"))?;
+        if let Err(error) = fs::rename(&self.stage, &self.final_dir) {
+            let _ = fs::rename(&backup, &self.final_dir);
+            return Err(format!("cannot replace evidence: {error}"));
+        }
+        sync_dir(root)?;
+        fs::remove_dir_all(backup).map_err(|error| error.to_string())?;
+        sync_dir(root)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn exchange_directories(left: &Path, right: &Path) -> Result<(), String> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let left = CString::new(left.as_os_str().as_bytes())
+        .map_err(|_| "evidence staging path contains NUL".to_owned())?;
+    let right = CString::new(right.as_os_str().as_bytes())
+        .map_err(|_| "evidence destination path contains NUL".to_owned())?;
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            left.as_ptr(),
+            libc::AT_FDCWD,
+            right.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    (result == 0).then_some(()).ok_or_else(|| {
+        format!(
+            "cannot atomically replace evidence: {}",
+            std::io::Error::last_os_error()
+        )
+    })
 }
 
 fn trace_lines(trace: Vec<Value>) -> Result<String, String> {
@@ -944,6 +1208,7 @@ mod tests {
             decisions: Vec::new(),
             steps: vec![("s".into(), json!({"done":"satisfied"}))],
             escalations: Vec::new(),
+            dispositions: Vec::new(),
             trace: vec![json!({"event":text})],
             cleanup: json!({"browser":"closed"}),
             result: json!({"state":"passed"}),
@@ -986,6 +1251,190 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn hosted_republication_atomically_replaces_its_own_complete_bundle() {
+        let temporary = TempDir::new().unwrap();
+        let job = test_job(false);
+        let redactor = Redactor::for_job(&job).unwrap();
+        publish(
+            temporary.path(),
+            "r_replace",
+            bundle("first", vec![1, 2, 3]),
+            &redactor,
+        )
+        .unwrap();
+        let second = publish(
+            temporary.path(),
+            "r_replace",
+            bundle("second", vec![4, 5, 6]),
+            &redactor,
+        )
+        .unwrap();
+        assert_eq!(second["state"], "passed");
+        let trace = fs::read_to_string(temporary.path().join("r_replace/trace.jsonl")).unwrap();
+        assert!(trace.contains("second"));
+        assert!(!trace.contains("first"));
+        let manifest: Manifest = serde_json::from_slice(
+            &fs::read(temporary.path().join("r_replace/manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(manifest.complete);
+        assert!(manifest.artifacts.iter().all(|artifact| artifact.complete));
+    }
+
+    #[test]
+    fn hosted_republication_refuses_corrupt_or_unmanifested_prior_evidence() {
+        for corruption in ["digest", "extra"] {
+            let temporary = TempDir::new().unwrap();
+            let job = test_job(false);
+            let redactor = Redactor::for_job(&job).unwrap();
+            publish(
+                temporary.path(),
+                "r_corrupt",
+                bundle("first", vec![1, 2, 3]),
+                &redactor,
+            )
+            .unwrap();
+            let run_dir = temporary.path().join("r_corrupt");
+            if corruption == "digest" {
+                fs::write(run_dir.join("trace.jsonl"), b"tampered\n").unwrap();
+            } else {
+                fs::write(run_dir.join("extra.json"), b"{}\n").unwrap();
+            }
+            let error = publish(
+                temporary.path(),
+                "r_corrupt",
+                bundle("second", vec![4, 5, 6]),
+                &redactor,
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("digest") || error.contains("unmanifested"),
+                "unexpected validation error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn replacement_rejects_incomplete_roles_duplicates_unknown_roles_and_unsafe_leaves() {
+        for corruption in ["missing", "duplicate", "unknown", "nested"] {
+            let temporary = TempDir::new().unwrap();
+            let job = test_job(false);
+            let redactor = Redactor::for_job(&job).unwrap();
+            publish(
+                temporary.path(),
+                "r_shape",
+                bundle("first", vec![1, 2, 3]),
+                &redactor,
+            )
+            .unwrap();
+            let run_dir = temporary.path().join("r_shape");
+            let manifest_path = run_dir.join("manifest.json");
+            let mut manifest: Manifest =
+                serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+            match corruption {
+                "missing" => {
+                    manifest
+                        .artifacts
+                        .retain(|artifact| artifact.role != "provenance");
+                    fs::remove_file(run_dir.join("provenance.json")).unwrap();
+                }
+                "duplicate" => {
+                    let cleanup = manifest
+                        .artifacts
+                        .iter()
+                        .find(|artifact| artifact.role == "cleanup")
+                        .unwrap()
+                        .clone();
+                    manifest.artifacts.push(cleanup);
+                }
+                "unknown" => {
+                    manifest
+                        .artifacts
+                        .iter_mut()
+                        .find(|artifact| artifact.role == "observation")
+                        .unwrap()
+                        .role = "unknown".into();
+                }
+                "nested" => {
+                    let old = run_dir.join("observations/o_1.json");
+                    let nested = run_dir.join("observations/nested/o_1.json");
+                    fs::create_dir_all(nested.parent().unwrap()).unwrap();
+                    fs::rename(&old, &nested).unwrap();
+                    manifest
+                        .artifacts
+                        .iter_mut()
+                        .find(|artifact| artifact.role == "observation")
+                        .unwrap()
+                        .path = fs::canonicalize(&nested)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
+                }
+                _ => unreachable!(),
+            }
+            fs::write(
+                &manifest_path,
+                serde_json::to_vec_pretty(&manifest).unwrap(),
+            )
+            .unwrap();
+            let error = publish(
+                temporary.path(),
+                "r_shape",
+                bundle("second", vec![4, 5, 6]),
+                &redactor,
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("exactly one")
+                    || error.contains("repeats")
+                    || error.contains("unexpected"),
+                "{corruption}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn replacement_leak_scans_the_old_bundle_before_atomic_exchange() {
+        let temporary = TempDir::new().unwrap();
+        let job = test_job(true);
+        let redactor = Redactor::for_job(&job).unwrap();
+        publish(
+            temporary.path(),
+            "r_old_leak",
+            bundle("safe", vec![1, 2, 3]),
+            &redactor,
+        )
+        .unwrap();
+        let run_dir = temporary.path().join("r_old_leak");
+        let trace_path = run_dir.join("trace.jsonl");
+        fs::write(&trace_path, b"classified-marker\n").unwrap();
+        let manifest_path = run_dir.join("manifest.json");
+        let mut manifest: Manifest =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.role == "trace")
+            .unwrap()
+            .digest = hex::encode(Sha256::digest(fs::read(&trace_path).unwrap()));
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let error = publish(
+            temporary.path(),
+            "r_old_leak",
+            bundle("replacement", vec![4, 5, 6]),
+            &redactor,
+        )
+        .unwrap_err();
+        assert!(error.contains("leak scan"), "{error}");
+        assert_eq!(fs::read(&trace_path).unwrap(), b"classified-marker\n");
     }
 
     #[test]

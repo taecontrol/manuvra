@@ -18,14 +18,17 @@ pub fn check_natural_done(condition: &str, observation: &Observation, noul: f64)
     if noul < 0.80 {
         return DoneResult::Unknown;
     }
-    if numeric_literals(condition)
-        .iter()
-        .all(|literal| observation_contains_numeric_literal(observation, literal))
-    {
+    if natural_numeric_literals_satisfied(condition, observation) {
         DoneResult::Satisfied
     } else {
         DoneResult::NotSatisfied
     }
+}
+
+pub fn natural_numeric_literals_satisfied(condition: &str, observation: &Observation) -> bool {
+    numeric_literals(condition)
+        .iter()
+        .all(|literal| observation_contains_numeric_literal(observation, literal))
 }
 
 pub fn check_done(

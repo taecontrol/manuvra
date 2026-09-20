@@ -1,6 +1,8 @@
 use crate::evidence::{self, EvidenceBundle, Redactor};
 #[cfg(any(target_os = "linux", test))]
-use crate::verification::{DoneResult, check_done, check_natural_done};
+use crate::verification::{
+    DoneResult, check_done, check_natural_done, natural_numeric_literals_satisfied,
+};
 #[cfg(any(target_os = "linux", test))]
 use crate::{actions, judgment, policy, values::Values};
 #[cfg(target_os = "linux")]
@@ -8,13 +10,13 @@ use manuvra_chrome::{BrowserConfig, OwnedBrowser};
 #[cfg(any(target_os = "linux", test))]
 use manuvra_chrome::{BrowserError, CapturedPage, Observation};
 #[cfg(any(target_os = "linux", test))]
-use manuvra_contract::DispositionKind;
-#[cfg(any(target_os = "linux", test))]
 use manuvra_contract::DoneCondition;
 use manuvra_contract::{
     Cleanup, Escalation, EvidenceRef, ExpectationVerdict, Job, Reason, RunResult, RunState,
     SchemaVersion, StepVerdict, Verdict, VerdictResult,
 };
+#[cfg(any(target_os = "linux", test))]
+use manuvra_contract::{Disposition, DispositionKind, DispositionRequest};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -47,11 +49,18 @@ pub enum HostedTermination {
 }
 
 #[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone)]
+pub enum HostedEvent {
+    Disposition(DispositionRequest),
+    Termination(HostedTermination),
+}
+
+#[cfg(any(target_os = "linux", test))]
 pub trait HostedControl {
     fn cancellation(&self) -> manuvra_chrome::InputCancellation;
     fn pause_deadline_unix_ms(&self) -> u64;
     fn publish_checkpoint(&self, result: &Value) -> Result<(), String>;
-    fn wait_while_paused(&self) -> HostedTermination;
+    fn wait_while_paused(&self, escalation_id: &str) -> HostedEvent;
     fn termination(&self) -> Option<HostedTermination>;
 }
 
@@ -203,6 +212,19 @@ fn finish_browser_run(
         |mut journal| {
             let evaluator = LazyEvaluator::new(provider_key);
             let cancellation = control.map(HostedControl::cancellation).unwrap_or_default();
+            if let Some(control) = control {
+                return finish_hosted_browser_run(
+                    job,
+                    config,
+                    redactor,
+                    &mut browser,
+                    provenance,
+                    &evaluator,
+                    &mut journal,
+                    &cancellation,
+                    control,
+                );
+            }
             let mut artifacts = drive_steps(
                 job,
                 redactor,
@@ -211,37 +233,8 @@ fn finish_browser_run(
                 &mut journal,
                 &cancellation,
                 Some(&config),
-                control,
+                None,
             );
-            if let Some(termination) = control.and_then(HostedControl::termination) {
-                return publish_active_hosted_stop(
-                    job,
-                    config,
-                    redactor,
-                    &mut browser,
-                    provenance,
-                    artifacts,
-                    &mut journal,
-                    termination,
-                );
-            }
-            if artifacts
-                .stop
-                .as_ref()
-                .is_some_and(|stop| stop.state == RunState::Uncertain)
-                && let Some(control) = control
-            {
-                return pause_hosted_run(
-                    job,
-                    config,
-                    redactor,
-                    &mut browser,
-                    provenance,
-                    artifacts,
-                    &mut journal,
-                    control,
-                );
-            }
             let cleanup = cleanup_browser(&mut browser, redactor, &mut artifacts.stop);
             let (state, reason, exit_code, overall) = terminal_fields(artifacts.stop);
             run_result(
@@ -265,6 +258,7 @@ fn finish_browser_run(
                     artifacts.decisions,
                     artifacts.steps,
                     artifacts.escalations,
+                    artifacts.dispositions,
                     artifacts.trace,
                     cleanup,
                     result,
@@ -280,19 +274,758 @@ fn finish_browser_run(
 
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
+fn finish_hosted_browser_run(
+    job: &Job,
+    config: FlowConfig,
+    redactor: &Redactor,
+    browser: &mut impl HostedBrowser,
+    provenance: Value,
+    evaluator: &impl manuvra_jev::Evaluator,
+    journal: &mut actions::DurableJournal,
+    cancellation: &manuvra_chrome::InputCancellation,
+    control: &dyn HostedControl,
+) -> Result<FlowOutcome, String> {
+    let mut machine = HostedMachine::new(job, redactor);
+    loop {
+        if !machine.is_paused() {
+            machine.drive(
+                browser,
+                evaluator,
+                journal,
+                cancellation,
+                Some(&config),
+                control,
+            );
+        }
+        if let Some(termination) = control.termination() {
+            return publish_active_hosted_stop(
+                job,
+                config,
+                redactor,
+                browser,
+                provenance,
+                machine.artifacts,
+                journal,
+                termination,
+            );
+        }
+        if machine.is_uncertain() {
+            if let Some(outcome) = handle_hosted_pause(
+                job,
+                &config,
+                redactor,
+                browser,
+                provenance.clone(),
+                evaluator,
+                journal,
+                cancellation,
+                control,
+                &mut machine,
+            )? {
+                return Ok(outcome);
+            }
+            continue;
+        }
+        return finish_hosted_terminal(
+            job, config, redactor, browser, provenance, machine, journal, control,
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn handle_hosted_pause(
+    job: &Job,
+    config: &FlowConfig,
+    redactor: &Redactor,
+    browser: &mut impl HostedBrowser,
+    provenance: Value,
+    evaluator: &impl manuvra_jev::Evaluator,
+    journal: &mut actions::DurableJournal,
+    cancellation: &manuvra_chrome::InputCancellation,
+    control: &dyn HostedControl,
+    machine: &mut HostedMachine<'_>,
+) -> Result<Option<FlowOutcome>, String> {
+    set_hosted_escalation_deadline(&mut machine.artifacts, control.pause_deadline_unix_ms());
+    let published = publish_pause_checkpoint(
+        job,
+        config,
+        redactor,
+        provenance.clone(),
+        &machine.artifacts,
+    )?;
+    control.publish_checkpoint(&published.result)?;
+    let escalation_id = machine.escalation_id()?;
+    machine.policy.pause();
+    match control.wait_while_paused(&escalation_id) {
+        HostedEvent::Termination(termination) => finalize_paused_termination(
+            job,
+            config,
+            redactor,
+            browser,
+            provenance,
+            journal,
+            control,
+            machine,
+            termination,
+        )
+        .map(Some),
+        HostedEvent::Disposition(request) => {
+            machine.policy.resume();
+            machine
+                .apply(request, browser, evaluator, journal, cancellation)
+                .map_or(Ok(None), |termination| {
+                    finalize_paused_termination(
+                        job,
+                        config,
+                        redactor,
+                        browser,
+                        provenance,
+                        journal,
+                        control,
+                        machine,
+                        termination,
+                    )
+                    .map(Some)
+                })
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn finalize_paused_termination(
+    job: &Job,
+    config: &FlowConfig,
+    redactor: &Redactor,
+    browser: &mut impl HostedBrowser,
+    provenance: Value,
+    journal: &mut actions::DurableJournal,
+    control: &dyn HostedControl,
+    machine: &mut HostedMachine<'_>,
+    termination: HostedTermination,
+) -> Result<FlowOutcome, String> {
+    let artifacts = std::mem::replace(&mut machine.artifacts, RunArtifacts::new(job, redactor));
+    publish_active_hosted_stop(
+        job,
+        config.clone(),
+        redactor,
+        browser,
+        provenance,
+        artifacts,
+        journal,
+        termination,
+    )
+    .and_then(|outcome| publish_terminal_checkpoint(control, journal, outcome))
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn finish_hosted_terminal(
+    job: &Job,
+    config: FlowConfig,
+    redactor: &Redactor,
+    browser: &mut impl HostedBrowser,
+    provenance: Value,
+    machine: HostedMachine<'_>,
+    journal: &mut actions::DurableJournal,
+    control: &dyn HostedControl,
+) -> Result<FlowOutcome, String> {
+    let cleanup = browser.cleanup_hosted();
+    let (state, reason, exit_code, overall) = terminal_fields(machine.artifacts.stop.clone());
+    let result = run_result_with_assistance(
+        job,
+        &config,
+        redactor,
+        state,
+        reason,
+        overall,
+        machine.artifacts.verdicts.clone(),
+        machine.artifacts.escalation.clone(),
+        cleanup.clone(),
+        machine.artifacts.caller_assisted,
+    )?;
+    let outcome = publish_bundle(
+        job,
+        config,
+        redactor,
+        provenance,
+        machine.artifacts.observations,
+        machine.artifacts.decisions,
+        machine.artifacts.steps,
+        machine.artifacts.escalations,
+        machine.artifacts.dispositions,
+        machine.artifacts.trace,
+        cleanup,
+        result,
+        exit_code,
+    )?;
+    control.publish_checkpoint(&outcome.result)?;
+    let _ = journal.clear();
+    Ok(outcome)
+}
+
+#[cfg(any(target_os = "linux", test))]
+struct HostedMachine<'a> {
+    job: &'a Job,
+    redactor: &'a Redactor,
+    values: Values<'a>,
+    policy: policy::Policy,
+    index: usize,
+    artifacts: RunArtifacts,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl<'a> HostedMachine<'a> {
+    fn new(job: &'a Job, redactor: &'a Redactor) -> Self {
+        let mut policy = policy::Policy::new(&job.options, target_url_for_policy(job));
+        policy.begin_step();
+        Self {
+            job,
+            redactor,
+            values: Values::new(job),
+            policy,
+            index: 0,
+            artifacts: RunArtifacts::new(job, redactor),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn is_uncertain(&self) -> bool {
+        self.artifacts
+            .stop
+            .as_ref()
+            .is_some_and(|stop| stop.state == RunState::Uncertain)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn is_paused(&self) -> bool {
+        self.is_uncertain() && self.artifacts.escalation.is_some()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn escalation_id(&self) -> Result<String, String> {
+        self.artifacts
+            .escalation
+            .as_ref()
+            .map(|value| value.id.clone())
+            .ok_or_else(|| "uncertain run has no escalation".to_owned())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn drive(
+        &mut self,
+        browser: &impl DriveBrowser,
+        evaluator: &impl manuvra_jev::Evaluator,
+        journal: &mut impl actions::ActionJournal,
+        cancellation: &manuvra_chrome::InputCancellation,
+        config: Option<&FlowConfig>,
+        control: &dyn HostedControl,
+    ) {
+        self.artifacts.stop = None;
+        self.artifacts.escalation = None;
+        self.artifacts.pending = None;
+        while self.index < self.job.steps.len() {
+            let step = &self.job.steps[self.index];
+            let mutations = self.policy.step_mutations();
+            let observation_number = self.artifacts.observations.len();
+            let outcome = evaluate_step(
+                self.job,
+                self.redactor,
+                browser,
+                evaluator,
+                journal,
+                &self.values,
+                cancellation,
+                &mut self.policy,
+                self.index,
+                step,
+                &mut self.artifacts,
+                mutations,
+                observation_number,
+            );
+            if let Some(stop) = outcome {
+                self.artifacts.stop = Some(stop);
+                return;
+            }
+            if let Some(config) = config
+                && let Err(error) = publish_active_checkpoint(
+                    self.job,
+                    config,
+                    self.redactor,
+                    &mut self.artifacts,
+                    self.index,
+                    control,
+                )
+            {
+                self.artifacts.stop = Some(Stop::blocked(
+                    "evidence_unavailable",
+                    BTreeMap::from([(
+                        "message".into(),
+                        json!(self.redactor.redact_external_text(&error)),
+                    )]),
+                ));
+                return;
+            }
+            self.index += 1;
+            if self.index < self.job.steps.len() {
+                self.policy.begin_step();
+            }
+        }
+    }
+
+    fn apply(
+        &mut self,
+        request: DispositionRequest,
+        browser: &impl DriveBrowser,
+        evaluator: &impl manuvra_jev::Evaluator,
+        journal: &mut impl actions::ActionJournal,
+        cancellation: &manuvra_chrome::InputCancellation,
+    ) -> Option<HostedTermination> {
+        let name = format!("request_{:04}", self.artifacts.dispositions.len() + 1);
+        self.artifacts
+            .dispositions
+            .push((name, redacted_value(&request, self.redactor)));
+        match request.disposition {
+            Disposition::Abort(_) => {
+                self.artifacts.caller_assisted = true;
+                Some(HostedTermination::Aborted)
+            }
+            Disposition::RetryObservation(_) => {
+                self.artifacts.caller_assisted = true;
+                self.clear_pause();
+                None
+            }
+            Disposition::Advance(advance) => {
+                self.apply_advance(&advance.rationale, browser);
+                None
+            }
+            Disposition::Execute(execute) => {
+                self.apply_execute(
+                    &execute.candidate_id,
+                    browser,
+                    evaluator,
+                    journal,
+                    cancellation,
+                );
+                None
+            }
+        }
+    }
+
+    fn clear_pause(&mut self) {
+        self.artifacts.stop = None;
+        self.artifacts.escalation = None;
+        self.artifacts.pending = None;
+    }
+
+    fn apply_advance(&mut self, rationale: &str, browser: &impl DriveBrowser) {
+        let Some(pending) = self.artifacts.pending.clone() else {
+            self.reissue("stale_escalation", None);
+            return;
+        };
+        let step = &self.job.steps[self.index];
+        let permitted = advance_permitted(step, &pending, rationale);
+        let prior_hash = relevant_state_hash(&pending.observation);
+        let fresh = browser.observe_page().ok();
+        let current_hash = fresh.as_ref().map(relevant_state_hash);
+        let unchanged = current_hash.as_deref() == Some(prior_hash.as_str());
+        self.artifacts.trace.push(json!({
+            "event":"disposition_check",
+            "kind":"advance",
+            "permitted":permitted,
+            "relevant_state_unchanged":unchanged,
+            "prior_state_hash":prior_hash,
+            "current_state_hash":current_hash,
+            "numeric_checks_satisfied":natural_condition_numeric_checks_satisfied(step, &pending),
+            "pending_ambiguous_mutation":pending.ambiguous_mutation,
+            "pending_candidate":pending.candidate.is_some(),
+        }));
+        if !permitted || !unchanged {
+            self.reissue(
+                if !unchanged {
+                    "relevant_state_changed"
+                } else {
+                    "advance_not_permitted"
+                },
+                Some(pending),
+            );
+            return;
+        }
+        self.artifacts.caller_assisted = true;
+        self.artifacts.verdicts[self.index] = StepVerdict {
+            id: self.redactor.redact_export_text(&step.id),
+            result: VerdictResult::Satisfied,
+            basis: Some("caller_attestation".into()),
+        };
+        record_step(
+            &mut self.artifacts,
+            self.redactor,
+            self.index,
+            step,
+            DoneResult::Satisfied,
+            self.policy.step_mutations(),
+            true,
+            self.policy.active_ms(),
+            "caller_attestation",
+        );
+        self.index += 1;
+        if self.index < self.job.steps.len() {
+            self.policy.begin_step();
+        }
+        self.clear_pause();
+    }
+
+    fn apply_execute(
+        &mut self,
+        candidate_id: &str,
+        browser: &impl DriveBrowser,
+        evaluator: &impl manuvra_jev::Evaluator,
+        journal: &mut impl actions::ActionJournal,
+        cancellation: &manuvra_chrome::InputCancellation,
+    ) {
+        let (pending, candidate) = match self.offered_candidate(candidate_id) {
+            Ok(value) => value,
+            Err(reason) => {
+                self.reissue(reason, self.artifacts.pending.clone());
+                return;
+            }
+        };
+        let ResumeObservation {
+            captured,
+            done,
+            noul,
+        } = match self.resume_observation(browser, evaluator) {
+            Ok(value) => value,
+            Err(stop) => {
+                self.artifacts.stop = Some(stop);
+                return;
+            }
+        };
+        let step = &self.job.steps[self.index];
+        record_capture(
+            &mut self.artifacts,
+            self.redactor,
+            step,
+            &captured,
+            "resume_observation",
+            done,
+        );
+        if done == DoneResult::Satisfied {
+            self.complete_resumed_step(captured.redaction_verified);
+            return;
+        }
+        if done == DoneResult::Unknown {
+            self.reissue_unknown_done(pending, captured.raw, noul);
+            return;
+        }
+        self.perform_caller_candidate(
+            pending,
+            candidate,
+            captured,
+            done,
+            browser,
+            journal,
+            cancellation,
+        );
+    }
+
+    fn reissue_unknown_done(
+        &mut self,
+        mut pending: PendingEscalation,
+        observation: Observation,
+        noul: Option<f64>,
+    ) {
+        pending.done = DoneResult::Unknown;
+        pending.noul = noul;
+        pending.candidate = None;
+        pending.ambiguous_mutation = false;
+        pending.observation = observation;
+        let reason = match self.job.steps[self.index].done_when {
+            DoneCondition::NaturalLanguage(_) => "done_uncertain",
+            DoneCondition::Structured(_) => "done_unknown",
+        };
+        self.reissue(reason, Some(pending));
+    }
+
+    fn offered_candidate(
+        &self,
+        candidate_id: &str,
+    ) -> Result<(PendingEscalation, policy::Candidate), &'static str> {
+        let pending = self.artifacts.pending.clone().ok_or("stale_escalation")?;
+        let candidate = pending
+            .candidate
+            .clone()
+            .filter(|candidate| candidate.id == candidate_id)
+            .ok_or("candidate_not_offered")?;
+        Ok((pending, candidate))
+    }
+
+    fn resume_observation(
+        &mut self,
+        browser: &impl DriveBrowser,
+        evaluator: &impl manuvra_jev::Evaluator,
+    ) -> Result<ResumeObservation, Stop> {
+        let captured = capture_step(
+            browser,
+            self.redactor,
+            self.index + 1,
+            self.artifacts.observations.len() + 1,
+        )
+        .map_err(control_stop)?;
+        let step = &self.job.steps[self.index];
+        let (done, noul) = match &step.done_when {
+            DoneCondition::Structured(assertions) => (
+                check_done(assertions, &captured.raw, &self.job.values),
+                None,
+            ),
+            DoneCondition::NaturalLanguage(condition) => {
+                self.judge_resume_done(condition, &captured, evaluator)?
+            }
+        };
+        Ok(ResumeObservation {
+            captured,
+            done,
+            noul,
+        })
+    }
+
+    fn judge_resume_done(
+        &mut self,
+        condition: &str,
+        captured: &Captured,
+        evaluator: &impl manuvra_jev::Evaluator,
+    ) -> Result<(DoneResult, Option<f64>), Stop> {
+        let step = &self.job.steps[self.index];
+        let deadline = self
+            .policy
+            .record_model_call()
+            .map_err(|stop| policy_stop(stop, self.redactor, step))?;
+        let judgments = judgment::judge(
+            evaluator,
+            step,
+            &captured.raw,
+            &self.artifacts.trace,
+            &self.values,
+            deadline,
+        )
+        .map_err(|error| provider_stop(&error, self.redactor, step))?;
+        self.artifacts.decisions.push((
+            format!("d_{:04}", self.artifacts.decisions.len() + 1),
+            redacted_value(&judgments, self.redactor),
+        ));
+        Ok((
+            check_natural_done(condition, &captured.raw, judgments.step_done),
+            Some(judgments.step_done),
+        ))
+    }
+
+    fn complete_resumed_step(&mut self, redaction_verified: bool) {
+        let step = &self.job.steps[self.index];
+        self.artifacts.caller_assisted = true;
+        let basis = match step.done_when {
+            DoneCondition::Structured(_) => "structured",
+            DoneCondition::NaturalLanguage(_) => "natural_language",
+        };
+        self.artifacts.verdicts[self.index] = StepVerdict {
+            id: self.redactor.redact_export_text(&step.id),
+            result: VerdictResult::Satisfied,
+            basis: Some(basis.into()),
+        };
+        record_step(
+            &mut self.artifacts,
+            self.redactor,
+            self.index,
+            step,
+            DoneResult::Satisfied,
+            self.policy.step_mutations(),
+            redaction_verified,
+            self.policy.active_ms(),
+            basis,
+        );
+        self.index += 1;
+        if self.index < self.job.steps.len() {
+            self.policy.begin_step();
+        }
+        self.clear_pause();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn perform_caller_candidate(
+        &mut self,
+        pending: PendingEscalation,
+        candidate: policy::Candidate,
+        captured: Captured,
+        done: DoneResult,
+        browser: &impl DriveBrowser,
+        journal: &mut impl actions::ActionJournal,
+        cancellation: &manuvra_chrome::InputCancellation,
+    ) {
+        let step = &self.job.steps[self.index];
+        let permit = match self
+            .policy
+            .authorize_caller(step, &captured.raw, &candidate)
+        {
+            Ok(permit) => permit,
+            Err(policy::PolicyStop::Uncertain(reason)) => {
+                let mut stale = pending;
+                stale.candidate = None;
+                stale.observation = captured.raw;
+                self.reissue(reason, Some(stale));
+                return;
+            }
+            Err(stop) => {
+                self.artifacts.stop = Some(policy_stop(stop, self.redactor, step));
+                return;
+            }
+        };
+        let journal_start = journal.entries().len();
+        let performed = actions::perform_with_basis(
+            permit,
+            browser,
+            &captured.raw,
+            &self.values,
+            journal,
+            cancellation,
+            "caller_authority",
+        );
+        self.artifacts
+            .trace
+            .extend(journal.entries()[journal_start..].iter().cloned());
+        self.artifacts.caller_assisted = true;
+        self.clear_pause();
+        if let Err(stop) = performed {
+            self.record_resumed_action_stop(stop, done, captured.raw);
+        }
+    }
+
+    fn record_resumed_action_stop(
+        &mut self,
+        stop: actions::ActionStop,
+        done: DoneResult,
+        observation: Observation,
+    ) {
+        let step = &self.job.steps[self.index];
+        let mapped = resumed_action_stop(stop, self.redactor, step);
+        if mapped.state != RunState::Uncertain {
+            self.artifacts.stop = Some(mapped);
+            return;
+        }
+        self.artifacts.pending = Some(PendingEscalation {
+            done,
+            noul: None,
+            candidate: None,
+            observation,
+            ambiguous_mutation: true,
+        });
+        self.reissue(mapped.code, self.artifacts.pending.clone());
+    }
+
+    fn reissue(&mut self, reason: &'static str, pending: Option<PendingEscalation>) {
+        let step = &self.job.steps[self.index];
+        self.artifacts.pending = pending;
+        self.artifacts.stop = Some(reissue_escalation(
+            &mut self.artifacts,
+            self.redactor,
+            self.index,
+            step,
+            reason,
+        ));
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+struct ResumeObservation {
+    captured: Captured,
+    done: DoneResult,
+    noul: Option<f64>,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn resumed_action_stop(
+    stop: actions::ActionStop,
+    redactor: &Redactor,
+    step: &manuvra_contract::Step,
+) -> Stop {
+    match stop {
+        actions::ActionStop::EvidenceUnavailable => {
+            Stop::blocked("evidence_unavailable", step_detail(redactor, step))
+        }
+        actions::ActionStop::ReadbackMismatch => {
+            Stop::failed("write_readback_mismatch", step_detail(redactor, step))
+        }
+        actions::ActionStop::IncompleteEvidence => Stop::uncertain(
+            "evidence_incomplete_after_dispatch",
+            step_detail(redactor, step),
+        ),
+        _ => Stop::uncertain("action_outcome_uncertain", step_detail(redactor, step)),
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn advance_permitted(
+    step: &manuvra_contract::Step,
+    pending: &PendingEscalation,
+    rationale: &str,
+) -> bool {
+    let DoneCondition::NaturalLanguage(condition) = &step.done_when else {
+        return false;
+    };
+    if pending.done != DoneResult::Unknown || pending.noul.is_none_or(|noul| noul <= 0.20) {
+        return false;
+    }
+    natural_numeric_literals_satisfied(condition, &pending.observation)
+        && !pending.ambiguous_mutation
+        && pending.candidate.is_none()
+        && !rationale.trim().is_empty()
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn natural_condition_numeric_checks_satisfied(
+    step: &manuvra_contract::Step,
+    pending: &PendingEscalation,
+) -> bool {
+    let DoneCondition::NaturalLanguage(condition) = &step.done_when else {
+        return false;
+    };
+    natural_numeric_literals_satisfied(condition, &pending.observation)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn relevant_state_hash(observation: &Observation) -> String {
+    use sha2::{Digest, Sha256};
+
+    hex::encode(Sha256::digest(relevant_state(observation).to_string()))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn relevant_state(observation: &Observation) -> Value {
+    json!({
+        "url": observation.url,
+        "route": observation.route,
+        "dialogs": observation.dialogs,
+        "visible_text": observation.visible_text,
+        "covered_text": observation.covered_text,
+        "elements": observation.elements,
+        "coverage": observation.coverage,
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 fn publish_active_hosted_stop(
     job: &Job,
     config: FlowConfig,
     redactor: &Redactor,
-    browser: &mut OwnedBrowser,
+    browser: &mut impl HostedBrowser,
     provenance: Value,
     artifacts: RunArtifacts,
     journal: &mut actions::DurableJournal,
     termination: HostedTermination,
 ) -> Result<FlowOutcome, String> {
-    let cleanup = cleanup_started_browser(browser);
+    let cleanup = browser.cleanup_hosted();
     let (state, code, exit_code) = hosted_termination_fields(termination);
-    let result = run_result(
+    let result = run_result_with_assistance(
         job,
         &config,
         redactor,
@@ -305,6 +1038,7 @@ fn publish_active_hosted_stop(
         artifacts.verdicts,
         artifacts.escalation,
         cleanup.clone(),
+        artifacts.caller_assisted,
     )?;
     publish_bundle(
         job,
@@ -315,6 +1049,7 @@ fn publish_active_hosted_stop(
         artifacts.decisions,
         artifacts.steps,
         artifacts.escalations,
+        artifacts.dispositions,
         artifacts.trace,
         cleanup,
         result,
@@ -323,45 +1058,6 @@ fn publish_active_hosted_stop(
     .inspect(|_| {
         let _ = journal.clear();
     })
-}
-
-#[cfg(target_os = "linux")]
-#[allow(clippy::too_many_arguments)]
-fn pause_hosted_run(
-    job: &Job,
-    config: FlowConfig,
-    redactor: &Redactor,
-    browser: &mut OwnedBrowser,
-    provenance: Value,
-    mut artifacts: RunArtifacts,
-    journal: &mut actions::DurableJournal,
-    control: &dyn HostedControl,
-) -> Result<FlowOutcome, String> {
-    set_hosted_escalation_deadline(&mut artifacts, control.pause_deadline_unix_ms());
-    publish_pause_checkpoint(job, &config, redactor, provenance, &artifacts).and_then(|published| {
-        continue_paused_run(
-            job, &config, redactor, browser, artifacts, journal, control, published,
-        )
-    })
-}
-
-#[cfg(target_os = "linux")]
-#[allow(clippy::too_many_arguments)]
-fn continue_paused_run(
-    job: &Job,
-    config: &FlowConfig,
-    redactor: &Redactor,
-    browser: &mut OwnedBrowser,
-    artifacts: RunArtifacts,
-    journal: &mut actions::DurableJournal,
-    control: &dyn HostedControl,
-    published: FlowOutcome,
-) -> Result<FlowOutcome, String> {
-    control.publish_checkpoint(&published.result)?;
-    let termination = control.wait_while_paused();
-    let cleanup = cleanup_started_browser(browser);
-    finalize_hosted_stop(job, config, redactor, artifacts, cleanup, termination)
-        .and_then(|outcome| publish_terminal_checkpoint(control, journal, outcome))
 }
 
 #[cfg(target_os = "linux")]
@@ -397,7 +1093,7 @@ fn publish_pause_checkpoint(
         profile: "retained".into(),
         application_state: "caller_owned".into(),
     };
-    let mut checkpoint = run_result(
+    let mut checkpoint = run_result_with_assistance(
         job,
         config,
         redactor,
@@ -407,6 +1103,7 @@ fn publish_pause_checkpoint(
         artifacts.verdicts.clone(),
         artifacts.escalation.clone(),
         retained.clone(),
+        artifacts.caller_assisted,
     )?;
     checkpoint["terminal"] = json!(false);
     publish_bundle(
@@ -418,25 +1115,11 @@ fn publish_pause_checkpoint(
         artifacts.decisions.clone(),
         artifacts.steps.clone(),
         artifacts.escalations.clone(),
+        artifacts.dispositions.clone(),
         artifacts.trace.clone(),
         retained,
         checkpoint,
         exit_code,
-    )
-}
-
-#[cfg(target_os = "linux")]
-fn finalize_hosted_stop(
-    job: &Job,
-    config: &FlowConfig,
-    redactor: &Redactor,
-    artifacts: RunArtifacts,
-    cleanup: Cleanup,
-    termination: HostedTermination,
-) -> Result<FlowOutcome, String> {
-    let (state, code, final_exit) = hosted_termination_fields(termination);
-    hosted_terminal_result(
-        job, config, redactor, artifacts, cleanup, state, code, final_exit,
     )
 }
 
@@ -450,54 +1133,6 @@ fn hosted_termination_fields(termination: HostedTermination) -> (RunState, &'sta
         HostedTermination::LifetimeElapsed => (RunState::Expired, "lifetime_elapsed", 5),
         HostedTermination::WatchdogLost => (RunState::Blocked, "watchdog_lost", 3),
     }
-}
-
-#[cfg(target_os = "linux")]
-#[allow(clippy::too_many_arguments)]
-fn hosted_terminal_result(
-    job: &Job,
-    config: &FlowConfig,
-    redactor: &Redactor,
-    artifacts: RunArtifacts,
-    cleanup: Cleanup,
-    state: RunState,
-    code: &str,
-    final_exit: u8,
-) -> Result<FlowOutcome, String> {
-    let final_result = run_result(
-        job,
-        config,
-        redactor,
-        state,
-        Some(Reason {
-            code: code.into(),
-            details: BTreeMap::new(),
-        }),
-        VerdictResult::Unresolved,
-        artifacts.verdicts,
-        artifacts.escalation,
-        cleanup.clone(),
-    )?;
-    replace_hosted_tail(config, &cleanup, &final_result, redactor).map(|()| FlowOutcome {
-        result: final_result,
-        exit_code: final_exit,
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn replace_hosted_tail(
-    config: &FlowConfig,
-    cleanup: &Cleanup,
-    final_result: &Value,
-    redactor: &Redactor,
-) -> Result<(), String> {
-    evidence::replace_result_cleanup(
-        &config.evidence_root,
-        &config.run_id,
-        cleanup,
-        final_result,
-        redactor,
-    )
 }
 
 #[cfg(target_os = "linux")]
@@ -574,6 +1209,18 @@ trait DriveBrowser: BrowserPage + actions::Performer {}
 impl<T: BrowserPage + actions::Performer> DriveBrowser for T {}
 
 #[cfg(target_os = "linux")]
+trait HostedBrowser: DriveBrowser {
+    fn cleanup_hosted(&mut self) -> Cleanup;
+}
+
+#[cfg(target_os = "linux")]
+impl HostedBrowser for OwnedBrowser {
+    fn cleanup_hosted(&mut self) -> Cleanup {
+        cleanup_started_browser(self)
+    }
+}
+
+#[cfg(target_os = "linux")]
 struct LazyEvaluator {
     client: OnceLock<Result<manuvra_jev::Client, manuvra_jev::JevError>>,
     provider_key: Option<String>,
@@ -628,10 +1275,23 @@ struct RunArtifacts {
     decisions: Vec<(String, Value)>,
     steps: Vec<(String, Value)>,
     escalations: Vec<(String, Value)>,
+    dispositions: Vec<(String, Value)>,
     trace: Vec<Value>,
     verdicts: Vec<StepVerdict>,
     stop: Option<Stop>,
     escalation: Option<Escalation>,
+    pending: Option<PendingEscalation>,
+    caller_assisted: bool,
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone)]
+struct PendingEscalation {
+    done: DoneResult,
+    noul: Option<f64>,
+    candidate: Option<policy::Candidate>,
+    observation: Observation,
+    ambiguous_mutation: bool,
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -642,6 +1302,7 @@ impl RunArtifacts {
             decisions: Vec::new(),
             steps: Vec::new(),
             escalations: Vec::new(),
+            dispositions: Vec::new(),
             trace: Vec::new(),
             verdicts: job
                 .steps
@@ -654,6 +1315,8 @@ impl RunArtifacts {
                 .collect(),
             stop: None,
             escalation: None,
+            pending: None,
+            caller_assisted: false,
         }
     }
 }
@@ -740,6 +1403,8 @@ fn drive_steps(
             index,
             step,
             &mut artifacts,
+            0,
+            0,
         );
         if let Some(stop) = outcome {
             artifacts.stop = Some(stop);
@@ -790,7 +1455,7 @@ fn publish_active_checkpoint(
             "overall":VerdictResult::Unresolved,
             "steps":artifacts.verdicts,
             "expectations":job.expectations.iter().map(|expectation| json!({"id":redactor.redact_export_text(&expectation.id),"result":"not_run","numeric_checks":[]})).collect::<Vec<_>>(),
-            "caller_assisted":false
+            "caller_assisted":artifacts.caller_assisted
         },
         "evidence":{"manifest":manifest,"complete":false},
         "escalation":null,
@@ -812,6 +1477,8 @@ fn evaluate_step(
     index: usize,
     step: &manuvra_contract::Step,
     artifacts: &mut RunArtifacts,
+    initial_mutations: u8,
+    initial_observation_number: usize,
 ) -> Option<Stop> {
     StepDriver {
         job,
@@ -825,10 +1492,10 @@ fn evaluate_step(
         index,
         step,
         artifacts,
-        observation_number: 0,
+        observation_number: initial_observation_number,
         done_unknown_reobserved: false,
         operation_gate_reobserved: false,
-        mutations: 0,
+        mutations: initial_mutations,
         awaiting_final_done_reobservation: false,
     }
     .drive()
@@ -980,7 +1647,7 @@ impl StepDriver<'_> {
                 self.complete_step(done);
                 StepProgress::Complete
             }
-            DoneResult::Unknown => self.unknown_done(done),
+            DoneResult::Unknown => self.unknown_done(done, captured),
             DoneResult::NotSatisfied => self.not_done(done, captured),
         }
     }
@@ -994,7 +1661,7 @@ impl StepDriver<'_> {
         self.record_step(done, true);
     }
 
-    fn unknown_done(&mut self, done: DoneResult) -> StepProgress {
+    fn unknown_done(&mut self, done: DoneResult, captured: &Captured) -> StepProgress {
         if !self.done_unknown_reobserved {
             self.done_unknown_reobserved = true;
             self.pause_before_reobservation(Duration::from_millis(300));
@@ -1007,6 +1674,13 @@ impl StepDriver<'_> {
             self.step,
             done,
             None,
+            PendingEscalation {
+                done,
+                noul: None,
+                candidate: None,
+                observation: captured.raw.clone(),
+                ambiguous_mutation: false,
+            },
             "done_unknown",
         ))
     }
@@ -1135,7 +1809,7 @@ impl StepDriver<'_> {
     ) -> StepProgress {
         match next {
             policy::Next::Mutate(permit) if self.force_stop_before_first_mutation() => {
-                drop(permit);
+                let candidate = self.policy.release_unused(permit);
                 StepProgress::Stop(escalate(
                     self.artifacts,
                     self.redactor,
@@ -1143,10 +1817,17 @@ impl StepDriver<'_> {
                     self.step,
                     done,
                     Some(judgments),
+                    PendingEscalation {
+                        done,
+                        noul: natural_noul(self.step, judgments),
+                        candidate: Some(candidate),
+                        observation: captured.raw.clone(),
+                        ambiguous_mutation: true,
+                    },
                     "debug_forced_stop",
                 ))
             }
-            policy::Next::Mutate(permit) => self.mutate(done, captured, judgments, permit),
+            policy::Next::Mutate(permit) => self.mutate(done, captured, judgments, *permit),
             policy::Next::Stop(stop) => {
                 StepProgress::Stop(self.policy_stop(done, captured, judgments, stop))
             }
@@ -1203,12 +1884,15 @@ impl StepDriver<'_> {
                 );
                 StepProgress::Continue
             })
-            .unwrap_or_else(|stop| StepProgress::Stop(self.action_stop(done, judgments, stop)))
+            .unwrap_or_else(|stop| {
+                StepProgress::Stop(self.action_stop(done, captured, judgments, stop))
+            })
     }
 
     fn action_stop(
         &mut self,
         done: DoneResult,
+        captured: &Captured,
         judgments: &judgment::Judgments,
         stop: actions::ActionStop,
     ) -> Stop {
@@ -1220,6 +1904,13 @@ impl StepDriver<'_> {
                 self.step,
                 done,
                 Some(judgments),
+                PendingEscalation {
+                    done,
+                    noul: natural_noul(self.step, judgments),
+                    candidate: None,
+                    observation: captured.raw.clone(),
+                    ambiguous_mutation: true,
+                },
                 "action_outcome_uncertain",
             ),
             other => self.simple_action_stop(other),
@@ -1269,15 +1960,27 @@ impl StepDriver<'_> {
         stop: policy::PolicyStop,
     ) -> Stop {
         match stop {
-            policy::PolicyStop::Uncertain(reason) => escalate(
-                self.artifacts,
-                self.redactor,
-                self.index,
-                self.step,
-                done,
-                Some(judgments),
-                reason,
-            ),
+            policy::PolicyStop::Uncertain(reason) => {
+                let candidate = (reason == "operation_below_gate")
+                    .then(|| self.policy.caller_candidate(&captured.raw, judgments).ok())
+                    .flatten();
+                escalate(
+                    self.artifacts,
+                    self.redactor,
+                    self.index,
+                    self.step,
+                    done,
+                    Some(judgments),
+                    PendingEscalation {
+                        done,
+                        noul: natural_noul(self.step, judgments),
+                        candidate,
+                        observation: captured.raw.clone(),
+                        ambiguous_mutation: false,
+                    },
+                    reason,
+                )
+            }
             policy::PolicyStop::Blocked("value_not_provided") => {
                 value_not_provided(self.redactor, self.step, captured, judgments, self.values)
             }
@@ -1414,6 +2117,7 @@ fn policy_stop(
 }
 
 #[cfg(any(target_os = "linux", test))]
+#[allow(clippy::too_many_arguments)]
 fn escalate(
     artifacts: &mut RunArtifacts,
     redactor: &Redactor,
@@ -1421,15 +2125,20 @@ fn escalate(
     step: &manuvra_contract::Step,
     done: DoneResult,
     judgments: Option<&judgment::Judgments>,
+    pending: PendingEscalation,
     reason: &'static str,
 ) -> Stop {
-    let id = "e_1".to_owned();
+    let id = format!("e_{}", artifacts.escalations.len() + 1);
     let stopped = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
         .to_string();
-    let candidates=judgments.map(|value|json!({"operation":value.operation,"click_target":value.click_target,"type_target":value.type_target,"type_value":value.type_value})).unwrap_or_else(||json!({}));
+    let offered_candidate = pending.candidate.as_ref().map(policy::Candidate::offered);
+    let candidates = offered_candidate.as_ref().map_or_else(
+        || judgments.map(|value|json!({"operation":value.operation,"click_target":value.click_target,"type_target":value.type_target,"type_value":value.type_value})).unwrap_or_else(||json!({})),
+        |candidate| json!([candidate]),
+    );
     let latest=artifacts.observations.last().map(|(name,_,png)|json!({"snapshot":format!("observations/{name}.json"),"screenshot":png.as_ref().map(|_|format!("observations/{name}.png"))})).unwrap_or(Value::Null);
     let decision = judgments.and_then(|_| {
         artifacts
@@ -1438,24 +2147,107 @@ fn escalate(
             .map(|(name, _)| format!("decisions/{name}.json"))
     });
     let payload = redacted_value(
-        &json!({"id":id,"phase":"step","step_id":step.id,"step":{"goal":step.goal,"done_when":step.done_when},"done":done,"observation":latest,"decision":decision,"gate_reason":reason,"candidates":candidates,"permitted_mutations":["CLICK","TYPE_TEXT"],"recent_actions":artifacts.trace.iter().rev().filter(|event|event.get("event").and_then(Value::as_str).is_some_and(|event|event.starts_with("action_"))).take(8).collect::<Vec<_>>(),"stopped_at":stopped}),
+        &json!({"id":id,"phase":"step","step_id":step.id,"step":{"goal":step.goal,"done_when":step.done_when},"done":done,"observation":latest,"decision":decision,"gate_reason":reason,"candidates":candidates,"offered_candidate":offered_candidate,"permitted_mutations":["CLICK","TYPE_TEXT"],"recent_actions":artifacts.trace.iter().rev().filter(|event|event.get("event").and_then(Value::as_str).is_some_and(|event|event.starts_with("action_"))).take(8).collect::<Vec<_>>(),"stopped_at":stopped}),
         redactor,
     );
     artifacts.escalations.push((id.clone(), payload));
+    let dispositions = allowed_dispositions(step, &pending);
     artifacts.escalation = Some(Escalation {
-        id,
+        id: id.clone(),
         phase: "step".into(),
         step_id: Some(redactor.redact_export_text(&step.id)),
         expires_at: stopped,
-        payload: "escalations/e_1.json".into(),
-        dispositions: Vec::<DispositionKind>::new(),
+        payload: format!("escalations/{id}.json"),
+        dispositions,
     });
+    artifacts.pending = Some(pending);
     artifacts.verdicts[index] = StepVerdict {
         id: redactor.redact_export_text(&step.id),
         result: VerdictResult::Unresolved,
         basis: None,
     };
     Stop::uncertain(reason, step_detail(redactor, step))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn allowed_dispositions(
+    step: &manuvra_contract::Step,
+    pending: &PendingEscalation,
+) -> Vec<DispositionKind> {
+    let mut dispositions = Vec::new();
+    if pending.candidate.is_some() {
+        dispositions.push(DispositionKind::Execute);
+    }
+    if matches!(step.done_when, DoneCondition::NaturalLanguage(_))
+        && pending.done == DoneResult::Unknown
+        && pending.noul.is_some_and(|noul| noul > 0.20)
+        && !pending.ambiguous_mutation
+        && pending.candidate.is_none()
+        && natural_condition_numeric_checks_satisfied(step, pending)
+    {
+        dispositions.push(DispositionKind::Advance);
+    }
+    dispositions.extend([DispositionKind::RetryObservation, DispositionKind::Abort]);
+    dispositions
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn natural_noul(step: &manuvra_contract::Step, judgments: &judgment::Judgments) -> Option<f64> {
+    matches!(step.done_when, DoneCondition::NaturalLanguage(_)).then_some(judgments.step_done)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn reissue_escalation(
+    artifacts: &mut RunArtifacts,
+    redactor: &Redactor,
+    index: usize,
+    step: &manuvra_contract::Step,
+    reason: &'static str,
+) -> Stop {
+    let pending = artifacts
+        .pending
+        .clone()
+        .unwrap_or_else(|| PendingEscalation {
+            done: DoneResult::Unknown,
+            noul: None,
+            candidate: None,
+            observation: empty_observation(),
+            ambiguous_mutation: true,
+        });
+    escalate(
+        artifacts,
+        redactor,
+        index,
+        step,
+        pending.done,
+        None,
+        pending,
+        reason,
+    )
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn empty_observation() -> Observation {
+    Observation {
+        document_id: String::new(),
+        url: String::new(),
+        route: String::new(),
+        title: String::new(),
+        dialogs: Vec::new(),
+        focused: None,
+        visible_text: String::new(),
+        covered_text: String::new(),
+        dialog_texts: BTreeMap::new(),
+        elements: Vec::new(),
+        viewport: manuvra_chrome::ViewportState {
+            width: 0,
+            height: 0,
+            scroll_x: 0.0,
+            scroll_y: 0.0,
+            document_height: 0.0,
+        },
+        coverage: manuvra_chrome::Coverage::default(),
+    }
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1545,38 +2337,41 @@ fn withheld_capture(
 
 #[cfg(any(target_os = "linux", test))]
 fn redacted_observation(raw: &Observation, redactor: &Redactor) -> Result<Value, String> {
-    let mut output = raw.clone();
-    for text in [
-        &mut output.document_id,
-        &mut output.url,
-        &mut output.route,
-        &mut output.title,
-        &mut output.visible_text,
-        &mut output.covered_text,
-    ] {
-        *text = redactor.redact_external_text(text);
-    }
-    output.dialogs.iter_mut().for_each(|text| {
-        *text = redactor.redact_external_text(text);
-    });
-    output.dialog_texts = output
-        .dialog_texts
-        .into_iter()
-        .map(|(name, text)| {
-            (
-                redactor.redact_external_text(&name),
-                redactor.redact_external_text(&text),
-            )
+    let redact = |text: &str| redactor.redact_external_text(text);
+    let elements = raw
+        .elements
+        .iter()
+        .map(|element| {
+            json!({
+                "index":element.index,
+                "context":element.context,
+                "role":element.role,
+                "name":redact(&element.name),
+                "input_type":element.input_type,
+                "value":redact(&element.value),
+                "checked":element.checked,
+                "selected":element.selected,
+                "expanded":element.expanded,
+                "disabled":element.disabled,
+                "in_dialog":element.in_dialog.as_ref().map(|dialog|redact(dialog)),
+                "operations":element.operations,
+                "rect":element.rect,
+            })
         })
-        .collect();
-    for element in &mut output.elements {
-        element.name = redactor.redact_external_text(&element.name);
-        element.value = redactor.redact_external_text(&element.value);
-        if let Some(dialog) = &mut element.in_dialog {
-            *dialog = redactor.redact_external_text(dialog);
-        }
-    }
-    serde_json::to_value(output).map_err(|error| error.to_string())
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "url":redact(&raw.url),
+        "route":redact(&raw.route),
+        "title":redact(&raw.title),
+        "dialogs":raw.dialogs.iter().map(|dialog|redact(dialog)).collect::<Vec<_>>(),
+        "focused":raw.focused,
+        "visible_text":redact(&raw.visible_text),
+        "covered_text":redact(&raw.covered_text),
+        "dialog_texts":raw.dialog_texts.iter().map(|(name,text)|(redact(name),redact(text))).collect::<BTreeMap<_,_>>(),
+        "elements":elements,
+        "viewport":raw.viewport,
+        "coverage":raw.coverage,
+    }))
 }
 
 #[cfg(target_os = "linux")]
@@ -1664,6 +2459,7 @@ fn publish_browser_error_with_provenance(
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Vec::new(),
         vec![json!({"event":"stop","reason":code})],
         cleanup,
         result,
@@ -1712,6 +2508,7 @@ fn publish_without_browser(
         config,
         redactor,
         json!({"browser_path":null,"browser_version":null,"viewport":null,"display_mode":null}),
+        Vec::new(),
         Vec::new(),
         Vec::new(),
         Vec::new(),
@@ -1783,6 +2580,29 @@ fn run_result(
     serde_json::to_value(result).map_err(|e| e.to_string())
 }
 
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn run_result_with_assistance(
+    job: &Job,
+    config: &FlowConfig,
+    redactor: &Redactor,
+    state: RunState,
+    reason: Option<Reason>,
+    overall: VerdictResult,
+    steps: Vec<StepVerdict>,
+    escalation: Option<Escalation>,
+    cleanup: Cleanup,
+    caller_assisted: bool,
+) -> Result<Value, String> {
+    run_result(
+        job, config, redactor, state, reason, overall, steps, escalation, cleanup,
+    )
+    .map(|mut result| {
+        result["verdict"]["caller_assisted"] = json!(caller_assisted);
+        result
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn publish_bundle(
     job: &Job,
@@ -1793,6 +2613,7 @@ fn publish_bundle(
     decisions: Vec<(String, Value)>,
     steps: Vec<(String, Value)>,
     escalations: Vec<(String, Value)>,
+    dispositions: Vec<(String, Value)>,
     trace: Vec<Value>,
     cleanup: Cleanup,
     result: Value,
@@ -1811,6 +2632,7 @@ fn publish_bundle(
         decisions,
         steps,
         escalations,
+        dispositions,
         trace,
         cleanup: serde_json::to_value(cleanup).map_err(|e| e.to_string())?,
         result,
@@ -1903,6 +2725,17 @@ mod tests {
                     "fake browser".into(),
                 ))
             })
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl HostedBrowser for FakeBrowser {
+        fn cleanup_hosted(&mut self) -> Cleanup {
+            Cleanup {
+                browser: "closed".into(),
+                profile: "removed".into(),
+                application_state: "caller_owned".into(),
+            }
         }
     }
 
@@ -2033,10 +2866,36 @@ mod tests {
             Ok(())
         }
 
-        fn wait_while_paused(&self) -> HostedTermination {
-            HostedTermination::Aborted
+        fn wait_while_paused(&self, _: &str) -> HostedEvent {
+            HostedEvent::Termination(HostedTermination::Aborted)
         }
 
+        fn termination(&self) -> Option<HostedTermination> {
+            None
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct DispositionHostedControl {
+        checkpoints: Mutex<Vec<Value>>,
+        request: Mutex<Option<DispositionRequest>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl HostedControl for DispositionHostedControl {
+        fn cancellation(&self) -> manuvra_chrome::InputCancellation {
+            manuvra_chrome::InputCancellation::default()
+        }
+        fn pause_deadline_unix_ms(&self) -> u64 {
+            u64::MAX
+        }
+        fn publish_checkpoint(&self, result: &Value) -> Result<(), String> {
+            self.checkpoints.lock().unwrap().push(result.clone());
+            Ok(())
+        }
+        fn wait_while_paused(&self, _: &str) -> HostedEvent {
+            HostedEvent::Disposition(self.request.lock().unwrap().take().unwrap())
+        }
         fn termination(&self) -> Option<HostedTermination> {
             None
         }
@@ -2185,6 +3044,32 @@ mod tests {
         })).unwrap().as_slice()).unwrap()
     }
 
+    fn text_field(value: &str) -> Observation {
+        let mut observation = observed("");
+        observation.elements.push(Element {
+            index: 1,
+            node_id: 7,
+            context: "main".into(),
+            role: "textbox".into(),
+            name: "Name".into(),
+            input_type: Some("text".into()),
+            value: value.into(),
+            checked: None,
+            selected: None,
+            expanded: None,
+            disabled: false,
+            in_dialog: None,
+            operations: vec!["TYPE_TEXT".into()],
+            rect: Rect {
+                x: 1.0,
+                y: 1.0,
+                width: 20.0,
+                height: 10.0,
+            },
+        });
+        observation
+    }
+
     #[test]
     fn debug_force_stop_publishes_uncertainty_before_first_dispatch() {
         let mut job = mutation_job();
@@ -2234,6 +3119,668 @@ mod tests {
         assert_eq!(artifacts.stop.unwrap().code, "debug_forced_stop");
         assert!(journal.0.is_empty());
         assert!(artifacts.escalation.is_some());
+        assert_eq!(artifacts.escalations[0].1["offered_candidate"]["id"], "c_1");
+        let exported = artifacts.escalations[0].1.to_string();
+        assert!(!exported.contains("document_id"));
+        assert!(!exported.contains("node_id"));
+        assert!(!exported.contains("target_index"));
+        assert_eq!(
+            artifacts.escalations[0].1["offered_candidate"]["target_name"],
+            "Name"
+        );
+    }
+
+    #[test]
+    fn exported_observation_keeps_public_indices_but_omits_browser_identity() {
+        let job = mutation_job();
+        let redactor = Redactor::for_job(&job).unwrap();
+        let mut observation = text_field("");
+        observation.document_id = "internal-document-token".into();
+        observation.elements[0].node_id = 981_723;
+        let exported = redacted_observation(&observation, &redactor).unwrap();
+        let text = exported.to_string();
+
+        assert_eq!(exported["elements"][0]["index"], 1);
+        assert_eq!(exported["elements"][0]["name"], "Name");
+        assert!(!text.contains("internal-document-token"));
+        assert!(!text.contains("981723"));
+        assert!(!text.contains("document_id"));
+        assert!(!text.contains("node_id"));
+    }
+
+    #[test]
+    fn caller_execute_reobserves_done_first_then_dispatches_once_without_operation_reask() {
+        let mut job = mutation_job();
+        job.options.debug = Some(manuvra_contract::DebugOptions {
+            force_stop_at_step: "fill".into(),
+        });
+        let redactor = Redactor::for_job(&job).unwrap();
+        let empty = text_field("");
+        let filled = text_field("Wanted");
+        let browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::from([
+                observation_page(empty.clone()),
+                observation_page(empty.clone()),
+                observation_page(filled),
+            ])),
+            fallback: empty,
+            dispatch_result: Some(Ok(manuvra_chrome::PerformFact {
+                readback: Some("Wanted".into()),
+            })),
+        };
+        let evaluator = TypeTextProvider(std::sync::atomic::AtomicUsize::new(0));
+        let control = RecordingHostedControl::default();
+        let cancellation = manuvra_chrome::InputCancellation::default();
+        let mut journal = MemoryJournal::default();
+        let mut machine = HostedMachine::new(&job, &redactor);
+        machine.drive(
+            &browser,
+            &evaluator,
+            &mut journal,
+            &cancellation,
+            None,
+            &control,
+        );
+        let candidate_id = machine
+            .artifacts
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.candidate.as_ref())
+            .unwrap()
+            .id
+            .clone();
+        machine.apply(
+            DispositionRequest {
+                schema_version: SchemaVersion,
+                escalation_id: "e_1".into(),
+                disposition: Disposition::Execute(manuvra_contract::ExecuteDisposition {
+                    kind: manuvra_contract::ExecuteKind::Execute,
+                    candidate_id,
+                }),
+            },
+            &browser,
+            &evaluator,
+            &mut journal,
+            &cancellation,
+        );
+        machine.drive(
+            &browser,
+            &evaluator,
+            &mut journal,
+            &cancellation,
+            None,
+            &control,
+        );
+
+        assert_eq!(machine.index, 1);
+        assert!(machine.artifacts.caller_assisted);
+        assert_eq!(
+            evaluator.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "resume execute must not re-ask the operation gate"
+        );
+        assert_eq!(
+            journal
+                .0
+                .iter()
+                .filter(|event| event["event"] == "action_prepared")
+                .count(),
+            1
+        );
+        assert!(journal.0.iter().all(|event| {
+            event["event"] != "action_prepared" || event["basis"] == "caller_authority"
+        }));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn hosted_flow_round_trip_publishes_assisted_terminal_evidence() {
+        let temporary = TempDir::new().unwrap();
+        let mut job = mutation_job();
+        job.options.debug = Some(manuvra_contract::DebugOptions {
+            force_stop_at_step: "fill".into(),
+        });
+        let redactor = Redactor::for_job(&job).unwrap();
+        let empty = text_field("");
+        let mut browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::from([
+                observation_page(empty.clone()),
+                observation_page(empty),
+                observation_page(text_field("Wanted")),
+            ])),
+            fallback: observed(""),
+            dispatch_result: Some(Ok(manuvra_chrome::PerformFact {
+                readback: Some("Wanted".into()),
+            })),
+        };
+        let control = DispositionHostedControl {
+            checkpoints: Mutex::new(Vec::new()),
+            request: Mutex::new(Some(DispositionRequest {
+                schema_version: SchemaVersion,
+                escalation_id: "e_1".into(),
+                disposition: Disposition::Execute(manuvra_contract::ExecuteDisposition {
+                    kind: manuvra_contract::ExecuteKind::Execute,
+                    candidate_id: "c_1".into(),
+                }),
+            })),
+        };
+        let config = FlowConfig {
+            request_id: "resume-round-trip".into(),
+            run_id: "r_roundtrip".into(),
+            evidence_root: temporary.path().join("evidence"),
+            browser: None,
+            headless: true,
+        };
+        std::fs::create_dir_all(&config.evidence_root).unwrap();
+        let mut journal =
+            actions::DurableJournal::open(&config.evidence_root, &config.run_id, &redactor)
+                .unwrap();
+        let outcome = finish_hosted_browser_run(
+            &job,
+            config.clone(),
+            &redactor,
+            &mut browser,
+            json!({"fixture":"resume"}),
+            &TypeTextProvider(std::sync::atomic::AtomicUsize::new(0)),
+            &mut journal,
+            &manuvra_chrome::InputCancellation::default(),
+            &control,
+        )
+        .unwrap();
+        assert_eq!(outcome.result["state"], "passed");
+        assert_eq!(outcome.result["verdict"]["caller_assisted"], true);
+        assert!(
+            config
+                .evidence_root
+                .join("r_roundtrip/dispositions/request_0001.json")
+                .is_file()
+        );
+        assert!(control.checkpoints.lock().unwrap().len() >= 2);
+        assert!(
+            control
+                .checkpoints
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|checkpoint| checkpoint["verdict"]["caller_assisted"] == true)
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn hosted_pause_termination_closes_the_browser_and_publishes_abort() {
+        let temporary = TempDir::new().unwrap();
+        let mut job = mutation_job();
+        job.options.debug = Some(manuvra_contract::DebugOptions {
+            force_stop_at_step: "fill".into(),
+        });
+        let redactor = Redactor::for_job(&job).unwrap();
+        let observation = text_field("");
+        let mut browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::from([observation_page(observation.clone())])),
+            fallback: observation,
+            dispatch_result: None,
+        };
+        let config = FlowConfig {
+            request_id: "pause-abort".into(),
+            run_id: "r_pause_abort".into(),
+            evidence_root: temporary.path().join("evidence"),
+            browser: None,
+            headless: true,
+        };
+        std::fs::create_dir_all(&config.evidence_root).unwrap();
+        let mut journal =
+            actions::DurableJournal::open(&config.evidence_root, &config.run_id, &redactor)
+                .unwrap();
+        let control = RecordingHostedControl::default();
+        let outcome = finish_hosted_browser_run(
+            &job,
+            config,
+            &redactor,
+            &mut browser,
+            json!({"fixture":"pause-abort"}),
+            &TypeTextProvider(std::sync::atomic::AtomicUsize::new(0)),
+            &mut journal,
+            &manuvra_chrome::InputCancellation::default(),
+            &control,
+        )
+        .unwrap();
+        assert_eq!(outcome.result["state"], "aborted");
+        assert_eq!(outcome.result["reason"]["code"], "caller_aborted");
+        assert_eq!(outcome.result["cleanup"]["browser"], "closed");
+    }
+
+    #[test]
+    fn retry_observation_preserves_model_budget_and_replay_ledger() {
+        let mut job = mutation_job();
+        job.options.max_model_calls = Some(1);
+        job.options.debug = Some(manuvra_contract::DebugOptions {
+            force_stop_at_step: "fill".into(),
+        });
+        let redactor = Redactor::for_job(&job).unwrap();
+        let observation = text_field("");
+        let browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::from([observation_page(observation.clone())])),
+            fallback: observation.clone(),
+            dispatch_result: None,
+        };
+        let control = RecordingHostedControl::default();
+        let mut machine = HostedMachine::new(&job, &redactor);
+        let mut journal = MemoryJournal::default();
+        machine.drive(
+            &browser,
+            &TypeTextProvider(std::sync::atomic::AtomicUsize::new(0)),
+            &mut journal,
+            &manuvra_chrome::InputCancellation::default(),
+            None,
+            &control,
+        );
+        let candidate = machine
+            .artifacts
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.candidate.clone())
+            .unwrap();
+        let _reserved = machine
+            .policy
+            .authorize_caller(&job.steps[0], &observation, &candidate)
+            .unwrap();
+
+        machine.apply(
+            DispositionRequest {
+                schema_version: SchemaVersion,
+                escalation_id: "e_1".into(),
+                disposition: Disposition::RetryObservation(
+                    manuvra_contract::RetryObservationDisposition {
+                        kind: manuvra_contract::RetryObservationKind::RetryObservation,
+                    },
+                ),
+            },
+            &browser,
+            &NoProvider,
+            &mut journal,
+            &manuvra_chrome::InputCancellation::default(),
+        );
+
+        assert!(machine.artifacts.stop.is_none());
+        assert!(matches!(
+            machine.policy.record_model_call(),
+            Err(policy::PolicyStop::Blocked("budget_exhausted"))
+        ));
+        assert!(matches!(
+            machine
+                .policy
+                .authorize_caller(&job.steps[0], &observation, &candidate),
+            Err(policy::PolicyStop::Uncertain("replay_forbidden"))
+        ));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn abort_persists_disposition_and_reports_actions_already_sent() {
+        let temporary = TempDir::new().unwrap();
+        let job = mutation_job();
+        let redactor = Redactor::for_job(&job).unwrap();
+        let config = FlowConfig {
+            request_id: "abort-resume".into(),
+            run_id: "r_abort_resume".into(),
+            evidence_root: temporary.path().join("evidence"),
+            browser: None,
+            headless: true,
+        };
+        std::fs::create_dir_all(&config.evidence_root).unwrap();
+        let mut machine = HostedMachine::new(&job, &redactor);
+        machine.artifacts.stop = Some(Stop::uncertain("caller_review", BTreeMap::new()));
+        machine.artifacts.trace.extend([
+            json!({"event":"action_prepared","action_sequence":1,"outcome":"not_performed"}),
+            json!({"event":"action_fact","action_sequence":1,"outcome":"confirmed"}),
+        ]);
+        publish_pause_checkpoint(
+            &job,
+            &config,
+            &redactor,
+            json!({"fixture":"abort"}),
+            &machine.artifacts,
+        )
+        .unwrap();
+        let browser_observation = text_field("");
+        let mut browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::new()),
+            fallback: browser_observation,
+            dispatch_result: None,
+        };
+        let control = RecordingHostedControl::default();
+        let mut journal =
+            actions::DurableJournal::open(&config.evidence_root, &config.run_id, &redactor)
+                .unwrap();
+        let termination = machine
+            .apply(
+                DispositionRequest {
+                    schema_version: SchemaVersion,
+                    escalation_id: "e_1".into(),
+                    disposition: Disposition::Abort(manuvra_contract::AbortDisposition {
+                        kind: manuvra_contract::AbortKind::Abort,
+                    }),
+                },
+                &browser,
+                &NoProvider,
+                &mut journal,
+                &manuvra_chrome::InputCancellation::default(),
+            )
+            .unwrap();
+        let outcome = finalize_paused_termination(
+            &job,
+            &config,
+            &redactor,
+            &mut browser,
+            json!({"fixture":"abort"}),
+            &mut journal,
+            &control,
+            &mut machine,
+            termination,
+        )
+        .unwrap();
+        assert_eq!(outcome.result["state"], "aborted");
+        assert_eq!(outcome.result["verdict"]["caller_assisted"], true);
+        let trace =
+            std::fs::read_to_string(config.evidence_root.join("r_abort_resume/trace.jsonl"))
+                .unwrap();
+        assert!(trace.contains("action_prepared"));
+        assert!(trace.contains("action_fact"));
+        assert!(
+            config
+                .evidence_root
+                .join("r_abort_resume/dispositions/request_0001.json")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn resume_done_judgment_records_the_natural_language_decision() {
+        let mut job = mutation_job();
+        job.steps[0].done_when = DoneCondition::NaturalLanguage("The form is complete".into());
+        let redactor = Redactor::for_job(&job).unwrap();
+        let mut machine = HostedMachine::new(&job, &redactor);
+        let captured = Captured {
+            raw: text_field(""),
+            artifact: ("o_resume".into(), json!({}), None),
+            redaction_verified: true,
+        };
+        let (done, noul) = match machine.judge_resume_done(
+            "The form is complete",
+            &captured,
+            &TypeTextProvider(std::sync::atomic::AtomicUsize::new(0)),
+        ) {
+            Ok(value) => value,
+            Err(_) => panic!("natural-language resume judgment should succeed"),
+        };
+        assert_eq!(done, DoneResult::NotSatisfied);
+        assert_eq!(noul, Some(0.01));
+        assert_eq!(machine.artifacts.decisions.len(), 1);
+    }
+
+    #[test]
+    fn resumed_unknown_done_reissues_the_condition_specific_reason() {
+        for (natural, reason) in [(true, "done_uncertain"), (false, "done_unknown")] {
+            let mut job = mutation_job();
+            if natural {
+                job.steps[0].done_when =
+                    DoneCondition::NaturalLanguage("The form is complete".into());
+            }
+            let redactor = Redactor::for_job(&job).unwrap();
+            let mut machine = HostedMachine::new(&job, &redactor);
+            let observation = text_field("");
+            machine.reissue_unknown_done(
+                PendingEscalation {
+                    done: DoneResult::NotSatisfied,
+                    noul: None,
+                    candidate: None,
+                    observation: observation.clone(),
+                    ambiguous_mutation: false,
+                },
+                observation,
+                natural.then_some(0.5),
+            );
+            assert_eq!(machine.artifacts.stop.as_ref().unwrap().code, reason);
+            assert!(
+                machine
+                    .artifacts
+                    .pending
+                    .as_ref()
+                    .unwrap()
+                    .candidate
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn resumed_action_failures_preserve_truthful_terminal_classification() {
+        let job = mutation_job();
+        let redactor = Redactor::for_job(&job).unwrap();
+        let step = &job.steps[0];
+        for (failure, state, code) in [
+            (
+                actions::ActionStop::EvidenceUnavailable,
+                RunState::Blocked,
+                "evidence_unavailable",
+            ),
+            (
+                actions::ActionStop::ReadbackMismatch,
+                RunState::Failed,
+                "write_readback_mismatch",
+            ),
+            (
+                actions::ActionStop::IncompleteEvidence,
+                RunState::Uncertain,
+                "evidence_incomplete_after_dispatch",
+            ),
+            (
+                actions::ActionStop::Uncertain,
+                RunState::Uncertain,
+                "action_outcome_uncertain",
+            ),
+            (
+                actions::ActionStop::InvalidPermit,
+                RunState::Uncertain,
+                "action_outcome_uncertain",
+            ),
+        ] {
+            let stop = resumed_action_stop(failure, &redactor, step);
+            assert_eq!(stop.state, state);
+            assert_eq!(stop.code, code);
+        }
+    }
+
+    #[test]
+    fn advance_requires_natural_uncertainty_without_pending_mutation_and_unchanged_state() {
+        let mut job = job("unused");
+        job.steps[0].done_when = DoneCondition::NaturalLanguage("The journey is complete".into());
+        let redactor = Redactor::for_job(&job).unwrap();
+        let observation = observed("unchanged");
+        let browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::new()),
+            fallback: observation.clone(),
+            dispatch_result: None,
+        };
+        let mut machine = HostedMachine::new(&job, &redactor);
+        machine.artifacts.pending = Some(PendingEscalation {
+            done: DoneResult::Unknown,
+            noul: Some(0.5),
+            candidate: None,
+            observation: observation.clone(),
+            ambiguous_mutation: false,
+        });
+        machine.apply_advance("caller verified the condition", &browser);
+        assert_eq!(machine.index, 1);
+        assert_eq!(
+            machine.artifacts.verdicts[0].basis.as_deref(),
+            Some("caller_attestation")
+        );
+        let advance_check = machine
+            .artifacts
+            .trace
+            .iter()
+            .find(|entry| entry["event"] == "disposition_check")
+            .unwrap();
+        assert_eq!(advance_check["relevant_state_unchanged"], true);
+        assert_eq!(advance_check["numeric_checks_satisfied"], true);
+        assert_eq!(
+            advance_check["prior_state_hash"],
+            advance_check["current_state_hash"]
+        );
+
+        let allowed = PendingEscalation {
+            done: DoneResult::Unknown,
+            noul: Some(0.5),
+            candidate: None,
+            observation: observed("unchanged"),
+            ambiguous_mutation: false,
+        };
+        let mut low_noul = allowed.clone();
+        low_noul.noul = Some(0.20);
+        assert!(!advance_permitted(&job.steps[0], &low_noul, "attested"));
+        let mut not_satisfied = allowed.clone();
+        not_satisfied.done = DoneResult::NotSatisfied;
+        assert!(!advance_permitted(
+            &job.steps[0],
+            &not_satisfied,
+            "attested"
+        ));
+        let mut ambiguous = allowed.clone();
+        ambiguous.ambiguous_mutation = true;
+        assert!(!advance_permitted(&job.steps[0], &ambiguous, "attested"));
+        assert!(!advance_permitted(&job.steps[0], &allowed, ""));
+
+        let mut numeric_job = job.clone();
+        numeric_job.steps[0].done_when =
+            DoneCondition::NaturalLanguage("The balance is 12.34".into());
+        assert!(!advance_permitted(
+            &numeric_job.steps[0],
+            &allowed,
+            "attested"
+        ));
+        assert!(
+            !allowed_dispositions(&numeric_job.steps[0], &allowed)
+                .contains(&DispositionKind::Advance)
+        );
+
+        let structured_job = mutation_job();
+        let structured_redactor = Redactor::for_job(&structured_job).unwrap();
+        let mut structured = HostedMachine::new(&structured_job, &structured_redactor);
+        structured.artifacts.pending = Some(PendingEscalation {
+            done: DoneResult::NotSatisfied,
+            noul: None,
+            candidate: None,
+            observation,
+            ambiguous_mutation: false,
+        });
+        structured.apply_advance("not allowed", &browser);
+        assert_eq!(structured.index, 0);
+        assert_eq!(
+            structured.artifacts.stop.as_ref().unwrap().code,
+            "advance_not_permitted"
+        );
+        assert!(!structured.artifacts.caller_assisted);
+        let mut structured_unknown = allowed;
+        structured_unknown.done = DoneResult::Unknown;
+        assert!(!advance_permitted(
+            &structured_job.steps[0],
+            &structured_unknown,
+            "attested"
+        ));
+    }
+
+    #[test]
+    fn execute_does_not_dispatch_when_done_or_when_the_target_is_stale() {
+        let job = mutation_job();
+        let redactor = Redactor::for_job(&job).unwrap();
+        let empty = text_field("");
+        let judgments = judgment::Judgments {
+            operation: judgment::ChoiceJudgment {
+                choice: "TYPE_TEXT".into(),
+                probabilities: BTreeMap::from([("TYPE_TEXT".into(), 1.0)]),
+                confidence: 0.5,
+            },
+            click_target: judgment::ChoiceJudgment {
+                choice: "NO_CLICK_TARGET".into(),
+                probabilities: BTreeMap::from([("NO_CLICK_TARGET".into(), 1.0)]),
+                confidence: 1.0,
+            },
+            type_target: judgment::ChoiceJudgment {
+                choice: "1".into(),
+                probabilities: BTreeMap::from([("1".into(), 1.0)]),
+                confidence: 1.0,
+            },
+            type_value: judgment::ChoiceJudgment {
+                choice: "name".into(),
+                probabilities: BTreeMap::from([("name".into(), 1.0)]),
+                confidence: 1.0,
+            },
+            step_done: 0.0,
+            usage: BTreeMap::new(),
+            request_id: None,
+            model: "fixture".into(),
+            request: Value::Null,
+        };
+        let mut machine = HostedMachine::new(&job, &redactor);
+        let candidate = machine.policy.caller_candidate(&empty, &judgments).unwrap();
+        machine.artifacts.pending = Some(PendingEscalation {
+            done: DoneResult::NotSatisfied,
+            noul: None,
+            candidate: Some(candidate.clone()),
+            observation: empty.clone(),
+            ambiguous_mutation: false,
+        });
+        let done_browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::from([observation_page(text_field("Wanted"))])),
+            fallback: empty.clone(),
+            dispatch_result: Some(Err(manuvra_chrome::PerformError::Uncertain(
+                "must not dispatch".into(),
+            ))),
+        };
+        let mut journal = MemoryJournal::default();
+        machine.apply_execute(
+            &candidate.id,
+            &done_browser,
+            &NoProvider,
+            &mut journal,
+            &manuvra_chrome::InputCancellation::default(),
+        );
+        assert_eq!(machine.index, 1);
+        assert!(journal.0.is_empty());
+        assert_eq!(machine.artifacts.steps.len(), 1);
+        assert_eq!(machine.artifacts.steps[0].1["done"], "satisfied");
+
+        let mut stale_machine = HostedMachine::new(&job, &redactor);
+        stale_machine.artifacts.pending = Some(PendingEscalation {
+            done: DoneResult::NotSatisfied,
+            noul: None,
+            candidate: Some(candidate.clone()),
+            observation: empty.clone(),
+            ambiguous_mutation: false,
+        });
+        let mut remounted = empty.clone();
+        remounted.elements[0].node_id = 99;
+        let stale_browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::from([observation_page(remounted)])),
+            fallback: empty,
+            dispatch_result: None,
+        };
+        stale_machine.apply_execute(
+            &candidate.id,
+            &stale_browser,
+            &NoProvider,
+            &mut journal,
+            &manuvra_chrome::InputCancellation::default(),
+        );
+        assert_eq!(stale_machine.index, 0);
+        assert_eq!(
+            stale_machine.artifacts.stop.as_ref().unwrap().code,
+            "candidate_revalidation_failed"
+        );
+        assert!(!stale_machine.artifacts.caller_assisted);
+        assert!(journal.0.is_empty());
     }
 
     fn mutation_judgments(operation: &str, confidence: f64) -> judgment::Judgments {
@@ -2442,7 +3989,7 @@ mod tests {
                 "candidate_revalidation_failed",
             ),
         ] {
-            assert_eq!(driver.action_stop(done, &typed, stop).code, code);
+            assert_eq!(driver.action_stop(done, &captured, &typed, stop).code, code);
         }
         assert_eq!(
             super::policy_stop(

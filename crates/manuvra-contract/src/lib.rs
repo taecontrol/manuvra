@@ -425,6 +425,7 @@ pub enum Disposition {
 #[serde(deny_unknown_fields)]
 pub struct AdvanceDisposition {
     pub kind: AdvanceKind,
+    pub rationale: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1064,7 +1065,7 @@ mod tests {
     #[test]
     fn disposition_input_is_closed_and_result_output_is_additive() {
         for disposition in [
-            json!({"kind": "advance"}),
+            json!({"kind": "advance", "rationale": "I verified the condition externally"}),
             json!({"kind": "execute", "candidate_id": "c_1"}),
             json!({"kind": "retry_observation"}),
             json!({"kind": "abort"}),

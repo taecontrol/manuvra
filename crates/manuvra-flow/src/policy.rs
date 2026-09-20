@@ -2,7 +2,8 @@ use crate::judgment::{Judgments, Operation, selected_operation};
 use crate::verification::DoneResult;
 use manuvra_chrome::{Element, Observation};
 use manuvra_contract::{DoneCondition, JobOptions, Step};
-use serde::{Deserialize, Serialize};
+#[cfg(any(target_os = "linux", test))]
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -10,13 +11,51 @@ use url::Url;
 
 const GATE: f64 = 0.70;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Candidate {
-    pub id: String,
-    pub operation: Operation,
-    pub target_index: Option<u64>,
-    pub target_name: Option<String>,
-    pub value_name: Option<String>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Candidate {
+    pub(crate) id: String,
+    pub(crate) operation: Operation,
+    pub(crate) target_index: Option<u64>,
+    pub(crate) target_name: Option<String>,
+    target_identity: TargetIdentity,
+    pub(crate) target_role: Option<String>,
+    pub(crate) target_dialog: Option<String>,
+    pub(crate) target_input_type: Option<String>,
+    pub(crate) value_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TargetIdentity {
+    node_id: Option<u64>,
+    document_id: String,
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Serialize)]
+struct OfferedCandidate<'a> {
+    id: &'a str,
+    operation: Operation,
+    target_name: Option<&'a str>,
+    target_role: Option<&'a str>,
+    target_dialog: Option<&'a str>,
+    target_input_type: Option<&'a str>,
+    value_name: Option<&'a str>,
+}
+
+impl Candidate {
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn offered(&self) -> serde_json::Value {
+        serde_json::to_value(OfferedCandidate {
+            id: &self.id,
+            operation: self.operation,
+            target_name: self.target_name.as_deref(),
+            target_role: self.target_role.as_deref(),
+            target_dialog: self.target_dialog.as_deref(),
+            target_input_type: self.target_input_type.as_deref(),
+            value_name: self.value_name.as_deref(),
+        })
+        .expect("offered candidate is serializable")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,7 +70,7 @@ pub enum Next {
     ReobserveDone,
     ReobserveOperation,
     Wait,
-    Mutate(Permit),
+    Mutate(Box<Permit>),
     Stop(PolicyStop),
 }
 
@@ -64,6 +103,8 @@ pub struct Policy {
     step_mutations: u8,
     replay: HashSet<String>,
     allowed_origins: Vec<String>,
+    paused_at: Option<Instant>,
+    paused_total: Duration,
 }
 
 impl Policy {
@@ -87,6 +128,8 @@ impl Policy {
             step_mutations: 0,
             replay: HashSet::new(),
             allowed_origins,
+            paused_at: None,
+            paused_total: Duration::ZERO,
         }
     }
 
@@ -95,7 +138,7 @@ impl Policy {
     }
 
     pub fn check_active(&self) -> Result<(), PolicyStop> {
-        (self.started.elapsed() < self.active_timeout)
+        (self.active_elapsed() < self.active_timeout)
             .then_some(())
             .ok_or(PolicyStop::Blocked("budget_exhausted"))
     }
@@ -106,7 +149,7 @@ impl Policy {
             return Err(PolicyStop::Blocked("budget_exhausted"));
         }
         self.model_calls += 1;
-        Ok(self.started + self.active_timeout)
+        Ok(Instant::now() + self.active_timeout.saturating_sub(self.active_elapsed()))
     }
 
     pub fn decide(
@@ -149,28 +192,90 @@ impl Policy {
         if let Err(stop) = self.authorize_context(step, observation) {
             return Next::Stop(stop);
         }
-        let target = match selected_target(observation, judgments, operation) {
-            Ok(target) => target,
+        let candidate = match self.candidate(observation, judgments, operation) {
+            Ok(candidate) => candidate,
             Err(stop) => return Next::Stop(stop),
         };
-        let value_name = match selected_value(judgments, operation) {
-            Ok(value) => value,
-            Err(stop) => return Next::Stop(stop),
-        };
-        let candidate = Candidate {
-            id: format!("c_{}_{}", self.actions + 1, target.index),
+        self.mint(observation, candidate)
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn caller_candidate(
+        &self,
+        observation: &Observation,
+        judgments: &Judgments,
+    ) -> Result<Candidate, PolicyStop> {
+        let operation = selected_operation(judgments)
+            .map_err(|_| PolicyStop::Blocked("provider_invalid_response"))?;
+        match operation {
+            Operation::Click | Operation::TypeText => {
+                self.candidate(observation, judgments, operation)
+            }
+            _ => Err(PolicyStop::Blocked("provider_invalid_response")),
+        }
+    }
+
+    fn candidate(
+        &self,
+        observation: &Observation,
+        judgments: &Judgments,
+        operation: Operation,
+    ) -> Result<Candidate, PolicyStop> {
+        let target = selected_target(observation, judgments, operation)?;
+        let value_name = selected_value(judgments, operation)?;
+        Ok(Candidate {
+            id: format!("c_{}", self.actions + 1),
             operation,
             target_index: Some(target.index),
             target_name: Some(target.name.clone()),
+            target_identity: TargetIdentity {
+                node_id: Some(target.node_id),
+                document_id: observation.document_id.clone(),
+            },
+            target_role: Some(target.role.clone()),
+            target_dialog: target.in_dialog.clone(),
+            target_input_type: target.input_type.clone(),
             value_name,
-        };
-        self.mint(observation, target, candidate)
+        })
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn authorize_caller(
+        &mut self,
+        step: &Step,
+        observation: &Observation,
+        candidate: &Candidate,
+    ) -> Result<Permit, PolicyStop> {
+        self.authorize_context(step, observation)?;
+        let target = candidate
+            .target_index
+            .and_then(|index| observation.elements.iter().find(|item| item.index == index))
+            .filter(|target| candidate_matches(observation, target, candidate))
+            .ok_or(PolicyStop::Uncertain("candidate_revalidation_failed"))?;
+        let mut current = candidate.clone();
+        current.target_name = Some(target.name.clone());
+        match self.mint(observation, current) {
+            Next::Mutate(permit) => Ok(*permit),
+            Next::Stop(stop) => Err(stop),
+            _ => unreachable!("caller authorization only mints or stops"),
+        }
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn release_unused(&mut self, permit: Box<Permit>) -> Candidate {
+        let (candidate, _, replay_key, action_sequence) = permit.consume();
+        debug_assert_eq!(action_sequence, u64::from(self.actions));
+        let removed = self.replay.remove(&replay_key);
+        debug_assert!(removed);
+        self.actions = self.actions.saturating_sub(1);
+        self.step_mutations = self.step_mutations.saturating_sub(1);
+        candidate
     }
 
     fn authorize_context(&self, step: &Step, observation: &Observation) -> Result<(), PolicyStop> {
         if self.actions >= self.max_actions
             || self.step_mutations >= step.mutation_limit
-            || self.started.elapsed() >= self.active_timeout
+            || self.active_elapsed() >= self.active_timeout
         {
             return Err(PolicyStop::Blocked("budget_exhausted"));
         }
@@ -181,24 +286,88 @@ impl Policy {
             .ok_or(PolicyStop::Blocked("origin_not_allowed"))
     }
 
-    fn mint(&mut self, observation: &Observation, target: &Element, candidate: Candidate) -> Next {
+    fn mint(&mut self, observation: &Observation, candidate: Candidate) -> Next {
+        let Some(target) = candidate
+            .target_index
+            .and_then(|index| observation.elements.iter().find(|item| item.index == index))
+        else {
+            return Next::Stop(PolicyStop::Uncertain("candidate_revalidation_failed"));
+        };
         let replay_key = replay_key(observation, target, &candidate);
         if !self.replay.insert(replay_key.clone()) {
             return Next::Stop(PolicyStop::Uncertain("replay_forbidden"));
         }
         self.actions += 1;
         self.step_mutations += 1;
-        Next::Mutate(Permit {
+        Next::Mutate(Box::new(Permit {
             candidate,
             document_id: observation.document_id.clone(),
             replay_key,
             action_sequence: u64::from(self.actions),
-        })
+        }))
     }
 
     pub fn active_ms(&self) -> u128 {
-        self.started.elapsed().as_millis()
+        self.active_elapsed().as_millis()
     }
+
+    pub fn step_mutations(&self) -> u8 {
+        self.step_mutations
+    }
+
+    pub fn pause(&mut self) {
+        if self.paused_at.is_none() {
+            self.paused_at = Some(Instant::now());
+        }
+    }
+
+    pub fn resume(&mut self) {
+        if let Some(paused_at) = self.paused_at.take() {
+            self.paused_total = self.paused_total.saturating_add(paused_at.elapsed());
+        }
+    }
+
+    fn active_elapsed(&self) -> Duration {
+        let current_pause = self.paused_at.map_or(Duration::ZERO, |at| at.elapsed());
+        self.started
+            .elapsed()
+            .saturating_sub(self.paused_total.saturating_add(current_pause))
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn candidate_matches(observation: &Observation, target: &Element, candidate: &Candidate) -> bool {
+    candidate_identity_matches(observation, target, candidate)
+        && candidate_semantics_match(target, candidate)
+        && candidate_operation_supported(target, candidate.operation)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn candidate_identity_matches(
+    observation: &Observation,
+    target: &Element,
+    candidate: &Candidate,
+) -> bool {
+    observation.document_id == candidate.target_identity.document_id
+        && Some(target.node_id) == candidate.target_identity.node_id
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn candidate_semantics_match(target: &Element, candidate: &Candidate) -> bool {
+    Some(target.name.as_str()) == candidate.target_name.as_deref()
+        && Some(target.role.as_str()) == candidate.target_role.as_deref()
+        && target.in_dialog == candidate.target_dialog
+        && target.input_type == candidate.target_input_type
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn candidate_operation_supported(target: &Element, operation: Operation) -> bool {
+    let expected = match operation {
+        Operation::Click => "CLICK",
+        Operation::TypeText => "TYPE_TEXT",
+        _ => return false,
+    };
+    target.operations.iter().any(|item| item == expected)
 }
 
 fn operation_gate(judgments: &Judgments, already_reobserved: bool) -> Option<Next> {
@@ -494,6 +663,36 @@ mod tests {
                 false
             ),
             Next::Stop(PolicyStop::Uncertain("replay_forbidden"))
+        ));
+    }
+
+    #[test]
+    fn caller_authority_revalidates_identity_semantics_origin_budget_and_replay() {
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        let original = observation("CLICK", "button");
+        let candidate = policy
+            .caller_candidate(&original, &judgments("CLICK"))
+            .unwrap();
+
+        let mut remounted = original.clone();
+        remounted.elements[0].node_id = 10;
+        assert!(matches!(
+            policy.authorize_caller(&step(), &remounted, &candidate),
+            Err(PolicyStop::Uncertain("candidate_revalidation_failed"))
+        ));
+        let mut renamed = original.clone();
+        renamed.elements[0].name = "Delete".into();
+        assert!(matches!(
+            policy.authorize_caller(&step(), &renamed, &candidate),
+            Err(PolicyStop::Uncertain("candidate_revalidation_failed"))
+        ));
+        let permit = policy
+            .authorize_caller(&step(), &original, &candidate)
+            .expect("unchanged candidate receives caller authority");
+        drop(permit);
+        assert!(matches!(
+            policy.authorize_caller(&step(), &original, &candidate),
+            Err(PolicyStop::Uncertain("replay_forbidden"))
         ));
     }
 

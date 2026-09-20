@@ -31,6 +31,8 @@ pub struct RequestRecord {
     pub public_request_id: String,
     pub run_id: String,
     pub job_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_digest: Option<String>,
     pub exit_code: u8,
     pub result: Value,
 }
@@ -307,15 +309,86 @@ fn run_state_dir(root: &Path, run_id: &str) -> Result<PathBuf, String> {
     Ok(directory)
 }
 
-pub fn keyed_digest(root: &Path, input: &[u8]) -> Result<String, String> {
+pub const DOMAIN_RUN_JOB: &[u8] = b"run-job";
+#[cfg(target_os = "linux")]
+pub const DOMAIN_RESUME_REQUEST: &[u8] = b"resume-request";
+#[cfg(target_os = "linux")]
+pub const DOMAIN_RESUME_RESULT: &[u8] = b"resume-result";
+#[cfg(target_os = "linux")]
+pub const DOMAIN_ABORT_REQUEST: &[u8] = b"abort-request";
+
+pub fn keyed_digest(root: &Path, domain: &[u8], input: &[u8]) -> Result<String, String> {
+    if domain.is_empty() || domain.contains(&0) {
+        return Err("digest domain must be nonempty and contain no NUL bytes".into());
+    }
     create_private_dir(root)?;
     let _lock = lock_file(&root.join(".digest-key.lock"), "digest key")?;
     let key_path = root.join("digest.key");
     let key = load_or_create_digest_key(root, &key_path)?;
     let mut digest = <Hmac<Sha256> as Mac>::new_from_slice(&key)
         .map_err(|error| format!("cannot initialize request digest: {error}"))?;
+    digest.update(b"manuvra-hmac-v1\0");
+    digest.update(domain);
+    digest.update(&[0]);
     digest.update(input);
     Ok(hex::encode(digest.finalize().into_bytes()))
+}
+
+#[cfg(target_os = "linux")]
+pub fn sealed_control_record(
+    root: &Path,
+    request_id: &str,
+    run_id: &str,
+    request_digest: &str,
+    exit_code: u8,
+    result: Value,
+) -> Result<RequestRecord, String> {
+    let result_digest =
+        control_result_digest(root, request_id, run_id, request_digest, exit_code, &result)?;
+    Ok(RequestRecord {
+        schema_version: SchemaVersion,
+        public_request_id: request_id.to_owned(),
+        run_id: run_id.to_owned(),
+        job_digest: request_digest.to_owned(),
+        result_digest: Some(result_digest),
+        exit_code,
+        result,
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub fn validate_control_record(root: &Path, record: &RequestRecord) -> Result<(), String> {
+    let expected = control_result_digest(
+        root,
+        &record.public_request_id,
+        &record.run_id,
+        &record.job_digest,
+        record.exit_code,
+        &record.result,
+    )?;
+    (record.result_digest.as_deref() == Some(expected.as_str()))
+        .then_some(())
+        .ok_or_else(|| "completed control result digest does not match".into())
+}
+
+#[cfg(target_os = "linux")]
+fn control_result_digest(
+    root: &Path,
+    request_id: &str,
+    run_id: &str,
+    request_digest: &str,
+    exit_code: u8,
+    result: &Value,
+) -> Result<String, String> {
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "request_id":request_id,
+        "run_id":run_id,
+        "request_digest":request_digest,
+        "exit_code":exit_code,
+        "result":result,
+    }))
+    .map_err(|error| error.to_string())?;
+    keyed_digest(root, DOMAIN_RESUME_RESULT, &bytes)
 }
 
 fn load_or_create_digest_key(root: &Path, key_path: &Path) -> Result<Vec<u8>, String> {
@@ -414,6 +487,18 @@ pub fn record_intent(
     create_private_dir(&requests_dir)?;
     atomic_write_private(&request_index_path(root, lookup_request_id), &bytes)?;
     write_run_entry(root, &intent.run_id, &bytes)
+}
+
+#[cfg(target_os = "linux")]
+pub fn record_control_intent(
+    root: &Path,
+    lookup_request_id: &str,
+    intent: &RequestIntent,
+) -> Result<(), String> {
+    let bytes = tagged_bytes(&RequestEntry::Intent(intent.clone()))?;
+    let requests_dir = root.join("requests");
+    create_private_dir(&requests_dir)?;
+    atomic_write_private(&request_index_path(root, lookup_request_id), &bytes)
 }
 
 pub fn finalize_request(
@@ -701,4 +786,43 @@ fn sync_directory(path: &Path) -> Result<(), String> {
     File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| format!("cannot sync directory {}: {error}", path.display()))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn keyed_digests_are_explicitly_domain_separated() {
+        let temporary = TempDir::new().unwrap();
+        let payload = b"same canonical bytes";
+        let run = keyed_digest(temporary.path(), DOMAIN_RUN_JOB, payload).unwrap();
+        let resume = keyed_digest(temporary.path(), DOMAIN_RESUME_REQUEST, payload).unwrap();
+        let result = keyed_digest(temporary.path(), DOMAIN_RESUME_RESULT, payload).unwrap();
+        let abort = keyed_digest(temporary.path(), DOMAIN_ABORT_REQUEST, payload).unwrap();
+        let unique = std::collections::BTreeSet::from([run, resume, result, abort]);
+        assert_eq!(unique.len(), 4);
+        assert!(keyed_digest(temporary.path(), b"", payload).is_err());
+        assert!(keyed_digest(temporary.path(), b"bad\0domain", payload).is_err());
+    }
+
+    #[test]
+    fn control_intent_indexes_request_without_replacing_run_owner_record() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path();
+        let intent = RequestIntent {
+            schema_version: SchemaVersion,
+            public_request_id: "resume-request".into(),
+            run_id: "r_resume".into(),
+            job_digest: "digest".into(),
+            evidence_root: root.join("evidence"),
+        };
+        record_control_intent(root, "resume-request", &intent).unwrap();
+        assert!(matches!(
+            lookup_request(root, "resume-request").unwrap(),
+            Some(RequestEntry::Intent(found)) if found.run_id == "r_resume"
+        ));
+        assert!(!root.join("runs/r_resume/request.json").exists());
+    }
 }

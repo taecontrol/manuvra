@@ -831,6 +831,7 @@ name = "manuvra-flow"
 version = "0.2.3"
 dependencies = [
  "hex",
+ "libc",
  "manuvra-chrome",
  "manuvra-contract",
  "manuvra-jev",

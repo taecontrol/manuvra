@@ -262,7 +262,7 @@ fn malformed_input_and_unimplemented_commands_return_one_error_object() {
         ],
     );
     assert_eq!(resume.status.code(), Some(64));
-    assert_eq!(one_object(&resume)["error"]["code"], "not_implemented");
+    assert_eq!(one_object(&resume)["error"]["code"], "invalid_disposition");
 
     for args in [
         vec!["status", "r_0000000000000001"],

@@ -27,6 +27,7 @@ pub struct ActionFact {
     pub outcome: Outcome,
     pub readback_matches: Option<bool>,
     pub replay_key: String,
+    pub basis: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,7 +161,27 @@ pub fn perform(
     journal: &mut (impl ActionJournal + ?Sized),
     cancellation: &InputCancellation,
 ) -> Result<ActionFact, ActionStop> {
-    let prepared = prepare(permit, observation, values)?;
+    perform_with_basis(
+        permit,
+        browser,
+        observation,
+        values,
+        journal,
+        cancellation,
+        "autonomous",
+    )
+}
+
+pub fn perform_with_basis(
+    permit: Permit,
+    browser: &(impl Performer + ?Sized),
+    observation: &Observation,
+    values: &Values<'_>,
+    journal: &mut (impl ActionJournal + ?Sized),
+    cancellation: &InputCancellation,
+    basis: &str,
+) -> Result<ActionFact, ActionStop> {
+    let prepared = prepare(permit, observation, values, basis)?;
     journal
         .append(&prepared.evidence)
         .map_err(|_| ActionStop::EvidenceUnavailable)?;
@@ -178,12 +199,14 @@ struct PreparedAction {
     replay_key: String,
     expected_text: Option<String>,
     evidence: Value,
+    basis: String,
 }
 
 fn prepare(
     permit: Permit,
     observation: &Observation,
     values: &Values<'_>,
+    basis: &str,
 ) -> Result<PreparedAction, ActionStop> {
     let (candidate, document_id, replay_key, action_sequence) = permit.consume();
     let target = candidate
@@ -200,7 +223,7 @@ fn prepare(
         .as_deref()
         .map(|name| values.resolve(name).ok_or(ActionStop::InvalidPermit))
         .transpose()?;
-    let evidence = json!({"event":"action_prepared","action_sequence":action_sequence,"candidate_id":candidate.id,"operation":candidate.operation,"target":{"role":target.role,"name":target.name,"dialog":target.in_dialog},"value_name":candidate.value_name,"replay_key":replay_key,"outcome":"not_performed"});
+    let evidence = json!({"event":"action_prepared","action_sequence":action_sequence,"candidate_id":candidate.id,"operation":candidate.operation,"target":{"role":target.role,"name":target.name,"dialog":target.in_dialog},"value_name":candidate.value_name,"replay_key":replay_key,"outcome":"not_performed","basis":basis});
     let input = PreparedInput {
         document_id,
         node_id: target.node_id,
@@ -218,6 +241,7 @@ fn prepare(
         replay_key,
         expected_text: text.map(str::to_owned),
         evidence,
+        basis: basis.to_owned(),
     })
 }
 
@@ -247,6 +271,7 @@ fn action_fact(
         outcome,
         readback_matches,
         replay_key: prepared.replay_key,
+        basis: prepared.basis,
     };
     (fact, stop)
 }
@@ -391,7 +416,7 @@ mod tests {
             false,
             false,
         ) {
-            Next::Mutate(p) => p,
+            Next::Mutate(p) => *p,
             _ => panic!(),
         }
     }

@@ -84,6 +84,7 @@ enum SchemaArg {
     Manifest,
 }
 
+#[derive(Debug)]
 pub struct Invocation {
     pub output: Value,
     pub exit_code: u8,
@@ -165,8 +166,10 @@ impl Command {
                 "version": env!("CARGO_PKG_VERSION")
             })),
             Self::Resume {
-                run_id, request_id, ..
-            } => validate_resume_identifiers(&run_id, &request_id),
+                run_id,
+                request_id,
+                input,
+            } => client::resume(&run_id, &request_id, &input),
             Self::Status {
                 run_id,
                 request_id,
@@ -175,16 +178,6 @@ impl Command {
             Self::Abort { run_id, request_id } => client::abort(&run_id, &request_id),
         }
     }
-}
-
-fn validate_resume_identifiers(run_id: &str, request_id: &str) -> Invocation {
-    if let Err(message) = validate_run_id(run_id) {
-        return Invocation::error("invalid_run_id", message, EXIT_INVALID);
-    }
-    if let Err(message) = validate_request_id(request_id) {
-        return Invocation::error("invalid_request_id", message, EXIT_INVALID);
-    }
-    not_implemented("resume")
 }
 
 impl From<SchemaArg> for SchemaKind {
@@ -196,14 +189,6 @@ impl From<SchemaArg> for SchemaKind {
             SchemaArg::Manifest => Self::Manifest,
         }
     }
-}
-
-fn not_implemented(command: &str) -> Invocation {
-    Invocation::error(
-        "not_implemented",
-        format!("{command} is not implemented in this build"),
-        EXIT_INVALID,
-    )
 }
 
 fn run(
@@ -986,6 +971,16 @@ fn validate_published_evidence(
     request_id: &str,
     recorded_result: Option<&Value>,
 ) -> Result<Value, String> {
+    validate_published_result(manifest_path, run_id, request_id, recorded_result, true)
+}
+
+pub(crate) fn validate_published_result(
+    manifest_path: &Path,
+    run_id: &str,
+    request_id: &str,
+    recorded_result: Option<&Value>,
+    require_terminal: bool,
+) -> Result<Value, String> {
     let manifest_path = canonical_regular_file(manifest_path)?;
     let run_dir = manifest_path
         .parent()
@@ -993,7 +988,7 @@ fn validate_published_evidence(
     let manifest = read_prior_manifest(&manifest_path, run_id)?;
     let artifacts = validate_manifest_artifacts(run_dir, &manifest)?;
     let result = read_published_result(&artifacts)?;
-    validate_evidence_shape(&manifest, &result)?;
+    validate_evidence_shape(&manifest, &result, require_terminal)?;
     validate_result_identity(&result, run_id, request_id, &manifest_path)?;
     recorded_result
         .is_none_or(|recorded| recorded == &result)
@@ -1001,8 +996,12 @@ fn validate_published_evidence(
         .ok_or_else(|| "completed request record does not match published result".into())
 }
 
-fn validate_evidence_shape(manifest: &Manifest, result: &Value) -> Result<(), String> {
-    if result.get("terminal").and_then(Value::as_bool) != Some(true) {
+fn validate_evidence_shape(
+    manifest: &Manifest,
+    result: &Value,
+    require_terminal: bool,
+) -> Result<(), String> {
+    if require_terminal && result.get("terminal").and_then(Value::as_bool) != Some(true) {
         return Err("complete evidence does not contain a terminal result".into());
     }
     let short = manifest.artifacts.len() == 2;
@@ -1221,6 +1220,7 @@ fn role_matches_path(role: &str, path: &Path) -> bool {
         ("decision", "decisions/", ".json"),
         ("step", "steps/", ".json"),
         ("escalation", "escalations/", ".json"),
+        ("disposition", "dispositions/", ".json"),
     ];
     NESTED
         .iter()
@@ -1324,6 +1324,7 @@ fn finalize(
         public_request_id: prepared.intent.public_request_id.clone(),
         run_id: prepared.intent.run_id.clone(),
         job_digest: prepared.intent.job_digest.clone(),
+        result_digest: None,
         exit_code,
         result: result.clone(),
     };
@@ -1415,6 +1416,7 @@ fn validate_request_id(request_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn validate_run_id(run_id: &str) -> Result<(), String> {
     let suffix = run_id.strip_prefix("r_").ok_or_else(|| {
         "run_id must use the generated r_ followed by 16 ASCII alphanumeric characters format"
@@ -1441,7 +1443,7 @@ fn canonical_digest(
         "headless": headless,
     }))
     .map_err(|error| internal_error(error.to_string()))?;
-    store::keyed_digest(state_root, &bytes)
+    store::keyed_digest(state_root, store::DOMAIN_RUN_JOB, &bytes)
         .map_err(|error| internal_error(redactor.redact_text(&error)))
 }
 
@@ -1451,7 +1453,9 @@ pub(crate) fn internal_error(message: String) -> Invocation {
 
 #[cfg(all(test, target_os = "linux"))]
 mod boundary_tests {
-    use super::remove_confirmed_dead_socket;
+    use super::{remove_confirmed_dead_socket, validate_evidence_shape};
+    use manuvra_contract::{Artifact, Manifest, SchemaVersion};
+    use serde_json::json;
     use std::os::unix::net::UnixListener;
     use tempfile::TempDir;
 
@@ -1471,5 +1475,28 @@ mod boundary_tests {
         std::fs::write(&ordinary, b"not a socket").unwrap();
         assert!(remove_confirmed_dead_socket(&ordinary).is_err());
         assert_eq!(std::fs::read(&ordinary).unwrap(), b"not a socket");
+    }
+
+    #[test]
+    fn completed_resume_checkpoint_may_be_nonterminal_but_product_may_not() {
+        let artifact = |role: &str| Artifact {
+            role: role.into(),
+            path: format!("/e/{role}.json"),
+            digest: "0".repeat(64),
+            complete: true,
+        };
+        let manifest = Manifest {
+            schema_version: SchemaVersion,
+            run_id: "r_checkpoint".into(),
+            complete: true,
+            artifacts: vec![
+                artifact("normalized_job"),
+                artifact("result"),
+                artifact("trace"),
+            ],
+        };
+        let checkpoint = json!({"terminal":false,"state":"uncertain"});
+        assert!(validate_evidence_shape(&manifest, &checkpoint, false).is_ok());
+        assert!(validate_evidence_shape(&manifest, &checkpoint, true).is_err());
     }
 }

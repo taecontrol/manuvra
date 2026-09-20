@@ -2,12 +2,11 @@
 
 use crate::process::{HostBootstrap, IPC_VERSION, now_unix_ms, process_identity};
 use crate::store::{self, RunControl};
-use manuvra_contract::{SchemaVersion, VerdictResult};
+use manuvra_contract::{DispositionRequest, SchemaVersion, VerdictResult};
 use manuvra_flow::InputCancellation;
-use manuvra_flow::run::{HostedControl, HostedTermination};
+use manuvra_flow::run::{HostedControl, HostedEvent, HostedTermination};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-#[cfg(debug_assertions)]
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
@@ -23,13 +22,33 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-#[derive(Clone, Copy, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
-    Ready { ipc_version: u16 },
-    Status { ipc_version: u16 },
-    Abort { ipc_version: u16 },
-    Deadline { ipc_version: u16 },
+    Ready {
+        ipc_version: u16,
+    },
+    Status {
+        ipc_version: u16,
+    },
+    Abort {
+        ipc_version: u16,
+        run_id: String,
+        job_digest: String,
+    },
+    Deadline {
+        ipc_version: u16,
+        run_id: String,
+        job_digest: String,
+    },
+    Resume {
+        ipc_version: u16,
+        run_id: String,
+        job_digest: String,
+        request_id: String,
+        request_digest: String,
+        request: DispositionRequest,
+    },
 }
 
 #[derive(Serialize)]
@@ -40,6 +59,8 @@ struct Response<'a> {
     accepted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<&'a Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<&'a str>,
 }
 
 struct Control {
@@ -49,7 +70,31 @@ struct Control {
     abort: AtomicBool,
     ready: AtomicBool,
     watchdog_lost: AtomicBool,
+    resume: Mutex<ResumeAdmission>,
     pause_timeout_ms: u64,
+}
+
+#[derive(Default)]
+struct ResumeAdmission {
+    pending: Option<PendingResume>,
+    awaiting_checkpoint: Option<ResumePublication>,
+    consumed: BTreeMap<String, ResumeReceipt>,
+}
+
+struct PendingResume {
+    request: DispositionRequest,
+    receipt: ResumeReceipt,
+}
+
+#[derive(Clone)]
+struct ResumeReceipt {
+    request_id: String,
+    request_digest: String,
+}
+
+struct ResumePublication {
+    receipt: ResumeReceipt,
+    response: Option<Value>,
 }
 
 impl HostedControl for Control {
@@ -79,31 +124,98 @@ impl HostedControl for Control {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         run.sequence = run.sequence.saturating_add(1);
         run.result = result.clone();
-        let paused = result.get("state").and_then(Value::as_str) == Some("uncertain")
-            && result.get("terminal").and_then(Value::as_bool) == Some(false);
-        if !paused {
-            run.pause_deadline_unix_ms = None;
-        } else if run.pause_deadline_unix_ms.is_none() {
-            run.pause_deadline_unix_ms = Some(
-                now_unix_ms()
-                    .saturating_add(self.pause_timeout_ms)
-                    .min(run.lifetime_deadline_unix_ms),
-            );
-        }
+        update_pause_deadline(&mut run, result, self.pause_timeout_ms);
+        publish_resume_response(self, &run, result)?;
         store::write_run_control(&self.state_root, &run)
     }
 
-    fn wait_while_paused(&self) -> HostedTermination {
+    fn wait_while_paused(&self, escalation_id: &str) -> HostedEvent {
         loop {
             if let Some(termination) = self.paused_termination() {
-                return termination;
+                return HostedEvent::Termination(termination);
             }
+            let mut admission = self
+                .resume
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if admission
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.request.escalation_id == escalation_id)
+            {
+                let pending = admission.pending.take().expect("checked pending resume");
+                admission.awaiting_checkpoint = Some(ResumePublication {
+                    receipt: pending.receipt,
+                    response: None,
+                });
+                return HostedEvent::Disposition(pending.request);
+            }
+            drop(admission);
             std::thread::sleep(Duration::from_millis(20));
         }
     }
 
     fn termination(&self) -> Option<HostedTermination> {
         self.paused_termination()
+    }
+}
+
+fn publish_resume_response(
+    control: &Control,
+    run: &RunControl,
+    result: &Value,
+) -> Result<(), String> {
+    publish_resume_response_with(
+        control,
+        result,
+        |receipt, result, exit_code| {
+            store::sealed_control_record(
+                &control.state_root,
+                &receipt.request_id,
+                &run.run_id,
+                &receipt.request_digest,
+                exit_code,
+                result,
+            )
+        },
+        |receipt, record| {
+            store::finalize_control_request(&control.state_root, &receipt.request_id, record)
+        },
+    )
+}
+
+fn publish_resume_response_with(
+    control: &Control,
+    result: &Value,
+    seal: impl FnOnce(&ResumeReceipt, Value, u8) -> Result<store::RequestRecord, String>,
+    finalize: impl FnOnce(&ResumeReceipt, &store::RequestRecord) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut admission = control
+        .resume
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(publication) = admission.awaiting_checkpoint.as_mut() else {
+        return Ok(());
+    };
+    let frozen = publication.response.get_or_insert_with(|| result.clone());
+    let exit_code = crate::result_exit_code(frozen)?;
+    let record = seal(&publication.receipt, frozen.clone(), exit_code)?;
+    finalize(&publication.receipt, &record)?;
+    admission.awaiting_checkpoint = None;
+    Ok(())
+}
+
+fn update_pause_deadline(run: &mut RunControl, result: &Value, pause_timeout_ms: u64) {
+    let paused = result.get("state").and_then(Value::as_str) == Some("uncertain")
+        && result.get("terminal").and_then(Value::as_bool) == Some(false);
+    if !paused {
+        run.pause_deadline_unix_ms = None;
+    } else if run.pause_deadline_unix_ms.is_none() {
+        run.pause_deadline_unix_ms = Some(
+            now_unix_ms()
+                .saturating_add(pause_timeout_ms)
+                .min(run.lifetime_deadline_unix_ms),
+        );
     }
 }
 
@@ -546,7 +658,7 @@ fn fault_permit(
         false,
         false,
     ) {
-        Ok(permit)
+        Ok(*permit)
     } else {
         Err("fault action policy did not mint a permit".into())
     }
@@ -669,6 +781,7 @@ fn publish_fault_pause(bootstrap: &HostBootstrap, control: &Control) -> Result<(
             decisions: Vec::new(),
             steps: Vec::new(),
             escalations: Vec::new(),
+            dispositions: Vec::new(),
             trace: Vec::new(),
             cleanup,
             result: result.clone(),
@@ -684,7 +797,10 @@ fn finish_watchdog_loss(
     control: &Control,
     browser: &mut Child,
 ) -> Result<bool, String> {
-    if control.wait_while_paused() != HostedTermination::WatchdogLost {
+    if !matches!(
+        control.wait_while_paused("e_fault"),
+        HostedEvent::Termination(HostedTermination::WatchdogLost)
+    ) {
         return Err("fault fixture ended without watchdog loss".into());
     }
     close_fake_browser(browser);
@@ -710,7 +826,10 @@ fn finish_pause_abort(
     browser: &mut Child,
 ) -> Result<bool, String> {
     publish_fault_pause(bootstrap, control)?;
-    if control.wait_while_paused() != HostedTermination::Aborted {
+    if !matches!(
+        control.wait_while_paused("e_fault"),
+        HostedEvent::Termination(HostedTermination::Aborted)
+    ) {
         return Err("fault fixture ended without caller abort".into());
     }
     close_fake_browser(browser);
@@ -761,6 +880,7 @@ fn finish_fault_evidence(bootstrap: &HostBootstrap, result: &mut Value) -> Resul
                 decisions: Vec::new(),
                 steps: Vec::new(),
                 escalations: Vec::new(),
+                dispositions: Vec::new(),
                 trace: Vec::new(),
                 cleanup,
                 result: result.clone(),
@@ -817,6 +937,7 @@ fn make_control(
         abort: AtomicBool::new(false),
         ready: AtomicBool::new(false),
         watchdog_lost: AtomicBool::new(false),
+        resume: Mutex::new(ResumeAdmission::default()),
         pause_timeout_ms: bootstrap.pause_timeout_ms,
     }))
 }
@@ -864,6 +985,7 @@ fn finalize_flow(
         public_request_id: bootstrap.intent.public_request_id,
         run_id: bootstrap.intent.run_id.clone(),
         job_digest: bootstrap.intent.job_digest,
+        result_digest: None,
         exit_code: outcome.exit_code,
         result: outcome.result,
     };
@@ -957,42 +1079,7 @@ fn handle(mut stream: UnixStream, control: &Control) {
     let mut bytes = Vec::new();
     let _ = stream.read_to_end(&mut bytes);
     let request: Result<Request, _> = serde_json::from_slice(&bytes);
-    let ordinary_request = matches!(
-        request,
-        Ok(Request::Ready {
-            ipc_version: IPC_VERSION
-        }) | Ok(Request::Status {
-            ipc_version: IPC_VERSION
-        }) | Ok(Request::Abort {
-            ipc_version: IPC_VERSION
-        })
-    );
-    let deadline_request = matches!(
-        request,
-        Ok(Request::Deadline {
-            ipc_version: IPC_VERSION
-        })
-    );
-    let readiness_request = matches!(
-        request,
-        Ok(Request::Ready {
-            ipc_version: IPC_VERSION
-        })
-    );
-    let deadline_accepted = deadline_request && control.deadline_termination().is_some();
-    let accepted = ordinary_request || deadline_accepted;
-    if matches!(
-        request,
-        Ok(Request::Abort {
-            ipc_version: IPC_VERSION
-        })
-    ) {
-        control.abort.store(true, Ordering::SeqCst);
-        control.cancellation.cancel();
-    }
-    if deadline_accepted {
-        control.cancellation.cancel();
-    }
+    let effect = apply_request(control, &request);
     let run = control
         .run
         .lock()
@@ -1001,12 +1088,149 @@ fn handle(mut stream: UnixStream, control: &Control) {
         ipc_version: IPC_VERSION,
         run_id: &run.run_id,
         job_digest: &run.job_digest,
-        accepted,
-        result: accepted.then_some(&run.result),
+        accepted: effect.accepted,
+        result: effect.accepted.then_some(&run.result),
+        error_code: effect.error_code,
     };
-    if send_response(&mut stream, &response) && readiness_request && accepted {
+    if send_response(&mut stream, &response) && effect.readiness && effect.accepted {
         control.ready.store(true, Ordering::SeqCst);
     }
+}
+
+struct RequestEffect {
+    accepted: bool,
+    readiness: bool,
+    error_code: Option<&'static str>,
+}
+
+fn apply_request(control: &Control, request: &Result<Request, serde_json::Error>) -> RequestEffect {
+    match request {
+        Ok(Request::Ready {
+            ipc_version: IPC_VERSION,
+        }) => RequestEffect {
+            accepted: true,
+            readiness: true,
+            error_code: None,
+        },
+        Ok(Request::Status {
+            ipc_version: IPC_VERSION,
+        }) => ordinary_effect(),
+        Ok(Request::Abort {
+            ipc_version: IPC_VERSION,
+            run_id,
+            job_digest,
+        }) if request_identity_matches(control, run_id, job_digest) => {
+            control.abort.store(true, Ordering::SeqCst);
+            control.cancellation.cancel();
+            ordinary_effect()
+        }
+        Ok(Request::Deadline {
+            ipc_version: IPC_VERSION,
+            run_id,
+            job_digest,
+        }) if request_identity_matches(control, run_id, job_digest)
+            && control.deadline_termination().is_some() =>
+        {
+            control.cancellation.cancel();
+            ordinary_effect()
+        }
+        Ok(Request::Resume {
+            ipc_version: IPC_VERSION,
+            run_id,
+            job_digest,
+            request_id,
+            request_digest,
+            request,
+        }) if request_identity_matches(control, run_id, job_digest) => resume_effect(
+            admit_disposition(control, request_id, request_digest, request.clone()),
+        ),
+        _ => RequestEffect {
+            accepted: false,
+            readiness: false,
+            error_code: None,
+        },
+    }
+}
+
+fn request_identity_matches(control: &Control, run_id: &str, job_digest: &str) -> bool {
+    let run = control
+        .run
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run.run_id == run_id && run.job_digest == job_digest
+}
+
+fn ordinary_effect() -> RequestEffect {
+    RequestEffect {
+        accepted: true,
+        readiness: false,
+        error_code: None,
+    }
+}
+
+fn resume_effect(result: Result<(), &'static str>) -> RequestEffect {
+    RequestEffect {
+        accepted: result.is_ok(),
+        readiness: false,
+        error_code: result.err(),
+    }
+}
+
+fn admit_disposition(
+    control: &Control,
+    request_id: &str,
+    request_digest: &str,
+    request: DispositionRequest,
+) -> Result<(), &'static str> {
+    let mut run = control
+        .run
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut admission = control
+        .resume
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(repeated) = repeated_resume(&admission, request_id, request_digest, &request) {
+        return repeated;
+    }
+    let current_id = run.result.pointer("/escalation/id").and_then(Value::as_str);
+    let paused = run.result.get("state").and_then(Value::as_str) == Some("uncertain")
+        && run.result.get("terminal").and_then(Value::as_bool) == Some(false);
+    if !paused || current_id != Some(request.escalation_id.as_str()) {
+        return Err("stale_escalation");
+    }
+    if admission.pending.is_some() {
+        return Err("stale_escalation");
+    }
+    run.pause_deadline_unix_ms = None;
+    if store::write_run_control(&control.state_root, &run).is_err() {
+        return Err("resume_state_unavailable");
+    }
+    let receipt = ResumeReceipt {
+        request_id: request_id.to_owned(),
+        request_digest: request_digest.to_owned(),
+    };
+    admission
+        .consumed
+        .insert(request.escalation_id.clone(), receipt.clone());
+    admission.pending = Some(PendingResume { request, receipt });
+    Ok(())
+}
+
+fn repeated_resume(
+    admission: &ResumeAdmission,
+    request_id: &str,
+    request_digest: &str,
+    request: &DispositionRequest,
+) -> Option<Result<(), &'static str>> {
+    admission
+        .consumed
+        .get(&request.escalation_id)
+        .map(|receipt| {
+            (receipt.request_id == request_id && receipt.request_digest == request_digest)
+                .then_some(())
+                .ok_or("stale_escalation")
+        })
 }
 
 fn send_response(stream: &mut UnixStream, response: &Response<'_>) -> bool {
@@ -1109,6 +1333,7 @@ mod tests {
             abort: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             watchdog_lost: AtomicBool::new(false),
+            resume: Mutex::new(ResumeAdmission::default()),
             pause_timeout_ms: 1_000,
         };
 
@@ -1133,7 +1358,19 @@ mod tests {
     }
 
     fn send_test_request(control: &Control, kind: &str) -> Value {
-        send_test_value(control, json!({"kind":kind,"ipc_version":IPC_VERSION}))
+        let run = control.run.lock().unwrap();
+        let request = if matches!(kind, "abort" | "deadline") {
+            json!({
+                "kind":kind,
+                "ipc_version":IPC_VERSION,
+                "run_id":run.run_id,
+                "job_digest":run.job_digest,
+            })
+        } else {
+            json!({"kind":kind,"ipc_version":IPC_VERSION})
+        };
+        drop(run);
+        send_test_value(control, request)
     }
 
     fn send_test_value(control: &Control, request: Value) -> Value {
@@ -1170,6 +1407,7 @@ mod tests {
             abort: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             watchdog_lost: AtomicBool::new(false),
+            resume: Mutex::new(ResumeAdmission::default()),
             pause_timeout_ms: 1_000,
         };
         let wrong = send_test_value(
@@ -1184,6 +1422,322 @@ mod tests {
         assert_eq!(ready["run_id"], "ready-run");
         assert_eq!(ready["job_digest"], "d");
         assert!(control.ready.load(Ordering::SeqCst));
+        assert_eq!(send_test_request(&control, "status")["accepted"], true);
+    }
+
+    #[test]
+    fn disposition_admission_consumes_an_escalation_exactly_once() {
+        let temporary = TempDir::new().unwrap();
+        let control = Arc::new(Control {
+            state_root: temporary.path().join("state"),
+            run: Mutex::new(RunControl {
+                schema_version: SchemaVersion,
+                ipc_version: IPC_VERSION,
+                sequence: 1,
+                run_id: "r_resume".into(),
+                request_id: "original".into(),
+                job_digest: "digest".into(),
+                evidence_root: temporary.path().join("evidence"),
+                started_unix_ms: 0,
+                lifetime_deadline_unix_ms: u64::MAX,
+                pause_deadline_unix_ms: Some(u64::MAX),
+                host: None,
+                watchdog: None,
+                socket: temporary.path().join("socket"),
+                result: json!({"state":"uncertain","terminal":false,"escalation":{"id":"e_1"}}),
+            }),
+            cancellation: InputCancellation::default(),
+            abort: AtomicBool::new(false),
+            ready: AtomicBool::new(true),
+            watchdog_lost: AtomicBool::new(false),
+            resume: Mutex::new(ResumeAdmission::default()),
+            pause_timeout_ms: 1_000,
+        });
+        let request = DispositionRequest {
+            schema_version: SchemaVersion,
+            escalation_id: "e_1".into(),
+            disposition: manuvra_contract::Disposition::RetryObservation(
+                manuvra_contract::RetryObservationDisposition {
+                    kind: manuvra_contract::RetryObservationKind::RetryObservation,
+                },
+            ),
+        };
+        let wrong_resume = send_test_value(
+            &control,
+            json!({
+                "kind":"resume",
+                "ipc_version":IPC_VERSION,
+                "run_id":"r_other",
+                "job_digest":"digest",
+                "request_id":"misdirected",
+                "request_digest":"misdirected-digest",
+                "request":request,
+            }),
+        );
+        assert_eq!(wrong_resume["accepted"], false);
+        assert!(control.resume.lock().unwrap().pending.is_none());
+        assert!(control.resume.lock().unwrap().consumed.is_empty());
+        let wrong_abort = send_test_value(
+            &control,
+            json!({
+                "kind":"abort",
+                "ipc_version":IPC_VERSION,
+                "run_id":"r_resume",
+                "job_digest":"wrong-digest",
+            }),
+        );
+        assert_eq!(wrong_abort["accepted"], false);
+        assert!(!control.abort.load(Ordering::SeqCst));
+        assert!(!control.cancellation.is_cancelled());
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let contenders = (0..8)
+            .map(|index| {
+                let control = Arc::clone(&control);
+                let barrier = Arc::clone(&barrier);
+                let request = request.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    admit_disposition(
+                        &control,
+                        &format!("resume-{index}"),
+                        &format!("digest-{index}"),
+                        request,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            contenders
+                .into_iter()
+                .map(|contender| contender.join().unwrap())
+                .filter(Result::is_ok)
+                .count(),
+            1
+        );
+        let (accepted_id, accepted_digest) = {
+            let admission = control.resume.lock().unwrap();
+            let receipt = admission.consumed.get("e_1").unwrap();
+            (receipt.request_id.clone(), receipt.request_digest.clone())
+        };
+        assert!(matches!(
+            control.wait_while_paused("e_1"),
+            HostedEvent::Disposition(_)
+        ));
+        let historical = json!({
+            "schema_version":1,
+            "request_id":"original",
+            "run_id":"r_resume",
+            "state":"running",
+            "terminal":false,
+            "evidence":{"complete":false,"manifest":"/tmp/history/manifest.json"},
+            "escalation":null,
+        });
+        control.publish_checkpoint(&historical).unwrap();
+        let immutable = match store::lookup_request(&control.state_root, &accepted_id).unwrap() {
+            Some(store::RequestEntry::Complete(record)) => record,
+            _ => panic!("accepted resume must publish an immutable response record"),
+        };
+        assert_eq!(immutable.result, historical);
+        store::validate_control_record(&control.state_root, &immutable).unwrap();
+        control
+            .publish_checkpoint(&json!({
+                "schema_version":1,
+                "request_id":"original",
+                "run_id":"r_resume",
+                "state":"passed",
+                "terminal":true,
+                "evidence":{"complete":true,"manifest":"/tmp/later/manifest.json"},
+                "escalation":null,
+            }))
+            .unwrap();
+        let still_immutable =
+            match store::lookup_request(&control.state_root, &accepted_id).unwrap() {
+                Some(store::RequestEntry::Complete(record)) => record,
+                _ => panic!("historical resume response disappeared"),
+            };
+        assert_eq!(still_immutable.result, historical);
+        assert!(
+            admit_disposition(&control, &accepted_id, &accepted_digest, request.clone()).is_ok()
+        );
+        let duplicate = send_test_value(
+            &control,
+            json!({
+                "kind":"resume",
+                "ipc_version":IPC_VERSION,
+                "run_id":"r_resume",
+                "job_digest":"digest",
+                "request_id":accepted_id,
+                "request_digest":accepted_digest,
+                "request":request,
+            }),
+        );
+        assert_eq!(duplicate["accepted"], true);
+        assert_eq!(
+            admit_disposition(&control, "late-resume", "late-digest", request.clone()),
+            Err("stale_escalation")
+        );
+        let stale = DispositionRequest {
+            schema_version: SchemaVersion,
+            escalation_id: "e_0".into(),
+            disposition: manuvra_contract::Disposition::Abort(manuvra_contract::AbortDisposition {
+                kind: manuvra_contract::AbortKind::Abort,
+            }),
+        };
+        assert_eq!(
+            admit_disposition(&control, "stale", "stale-digest", stale),
+            Err("stale_escalation")
+        );
+        assert_eq!(control.run.lock().unwrap().pause_deadline_unix_ms, None);
+    }
+
+    fn assert_resume_publication_recovers_first_response(fail_seal: bool) {
+        let temporary = TempDir::new().unwrap();
+        let receipt = ResumeReceipt {
+            request_id: "resume-publication".into(),
+            request_digest: "resume-digest".into(),
+        };
+        let mut consumed = BTreeMap::new();
+        consumed.insert("e_1".into(), receipt.clone());
+        let control = Control {
+            state_root: temporary.path().join("state"),
+            run: Mutex::new(RunControl {
+                schema_version: SchemaVersion,
+                ipc_version: IPC_VERSION,
+                sequence: 1,
+                run_id: "r_publication".into(),
+                request_id: "original".into(),
+                job_digest: "job-digest".into(),
+                evidence_root: temporary.path().join("evidence"),
+                started_unix_ms: 0,
+                lifetime_deadline_unix_ms: u64::MAX,
+                pause_deadline_unix_ms: None,
+                host: None,
+                watchdog: None,
+                socket: temporary.path().join("socket"),
+                result: json!({"state":"uncertain","terminal":false,"escalation":{"id":"e_1"}}),
+            }),
+            cancellation: InputCancellation::default(),
+            abort: AtomicBool::new(false),
+            ready: AtomicBool::new(true),
+            watchdog_lost: AtomicBool::new(false),
+            resume: Mutex::new(ResumeAdmission {
+                pending: None,
+                awaiting_checkpoint: Some(ResumePublication {
+                    receipt: receipt.clone(),
+                    response: None,
+                }),
+                consumed,
+            }),
+            pause_timeout_ms: 1_000,
+        };
+        let first = json!({
+            "schema_version":1,
+            "request_id":"original",
+            "run_id":"r_publication",
+            "state":"running",
+            "terminal":false,
+            "evidence":{"complete":false,"manifest":"/tmp/first/manifest.json"},
+            "escalation":null,
+        });
+        let later = json!({
+            "schema_version":1,
+            "request_id":"original",
+            "run_id":"r_publication",
+            "state":"passed",
+            "terminal":true,
+            "evidence":{"complete":true,"manifest":"/tmp/later/manifest.json"},
+            "escalation":null,
+        });
+        let failure = publish_resume_response_with(
+            &control,
+            &first,
+            |receipt, result, exit_code| {
+                if fail_seal {
+                    Err("injected seal failure".into())
+                } else {
+                    store::sealed_control_record(
+                        &control.state_root,
+                        &receipt.request_id,
+                        "r_publication",
+                        &receipt.request_digest,
+                        exit_code,
+                        result,
+                    )
+                }
+            },
+            |receipt, record| {
+                if fail_seal {
+                    unreachable!("finalization cannot follow a seal failure")
+                }
+                let _ = (receipt, record);
+                Err("injected finalize failure".into())
+            },
+        )
+        .unwrap_err();
+        assert!(failure.contains(if fail_seal { "seal" } else { "finalize" }));
+        assert!(
+            store::lookup_request(&control.state_root, &receipt.request_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            control
+                .resume
+                .lock()
+                .unwrap()
+                .awaiting_checkpoint
+                .as_ref()
+                .and_then(|publication| publication.response.as_ref()),
+            Some(&first)
+        );
+
+        control.publish_checkpoint(&later).unwrap();
+        let immutable =
+            match store::lookup_request(&control.state_root, &receipt.request_id).unwrap() {
+                Some(store::RequestEntry::Complete(record)) => record,
+                _ => panic!("the later checkpoint must finish the retained response"),
+            };
+        assert_eq!(immutable.result, first);
+        store::validate_control_record(&control.state_root, &immutable).unwrap();
+        assert!(control.resume.lock().unwrap().awaiting_checkpoint.is_none());
+
+        let final_later = json!({"state":"failed","terminal":true});
+        control.publish_checkpoint(&final_later).unwrap();
+        let unchanged =
+            match store::lookup_request(&control.state_root, &receipt.request_id).unwrap() {
+                Some(store::RequestEntry::Complete(record)) => record,
+                _ => panic!("the retained history must remain complete"),
+            };
+        assert_eq!(unchanged.result, first);
+        let repeated = DispositionRequest {
+            schema_version: SchemaVersion,
+            escalation_id: "e_1".into(),
+            disposition: manuvra_contract::Disposition::RetryObservation(
+                manuvra_contract::RetryObservationDisposition {
+                    kind: manuvra_contract::RetryObservationKind::RetryObservation,
+                },
+            ),
+        };
+        assert_eq!(
+            admit_disposition(
+                &control,
+                &receipt.request_id,
+                &receipt.request_digest,
+                repeated
+            ),
+            Ok(())
+        );
+        assert!(control.resume.lock().unwrap().pending.is_none());
+    }
+
+    #[test]
+    fn resume_publication_retains_first_response_when_sealing_fails() {
+        assert_resume_publication_recovers_first_response(true);
+    }
+
+    #[test]
+    fn resume_publication_retains_first_response_when_finalization_fails() {
+        assert_resume_publication_recovers_first_response(false);
     }
 
     #[cfg(debug_assertions)]
@@ -1234,6 +1788,7 @@ mod tests {
             abort: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             watchdog_lost: AtomicBool::new(false),
+            resume: Mutex::new(ResumeAdmission::default()),
             pause_timeout_ms: 1_000,
         });
         monitor_watchdog(Some(descriptors[0]), control.clone());
@@ -1250,7 +1805,10 @@ mod tests {
             control.paused_termination(),
             Some(HostedTermination::WatchdogLost)
         );
-        assert_eq!(control.wait_while_paused(), HostedTermination::WatchdogLost);
+        assert!(matches!(
+            control.wait_while_paused("e"),
+            HostedEvent::Termination(HostedTermination::WatchdogLost)
+        ));
 
         control.watchdog_lost.store(false, Ordering::SeqCst);
         control.abort.store(true, Ordering::SeqCst);

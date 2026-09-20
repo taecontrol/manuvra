@@ -43,8 +43,8 @@ impl<'a> Values<'a> {
             })
             .collect();
         json!({
-            "document_id":observation.document_id,"url":self.mask(&observation.url),
-            "route":self.mask(&observation.route),"title":self.mask(&observation.title),
+            "url":self.mask(&observation.url),"route":self.mask(&observation.route),
+            "title":self.mask(&observation.title),
             "dialogs":observation.dialogs.iter().map(|value|self.mask(value)).collect::<Vec<_>>(),
             "focused":observation.focused,"visible_text":self.mask(&observation.visible_text),
             "covered_text":self.mask(&observation.covered_text),"elements":elements,
@@ -105,7 +105,7 @@ mod tests {
     fn model_view_exposes_names_descriptions_and_equality_but_no_raw_values() {
         let job = Job::parse(serde_json::to_vec(&json!({"schema_version":1,"target":{"kind":"browser","url":"http://example.test"},"context":{"journey":"x","revision":"x","environment":"x","actor":"x","authority":"x"},"values":{"secret_name":{"value":"raw-secret-742","description":"Account name","secret":true,"formats":{"display":"RAW SECRET"}}},"steps":[{"id":"x","goal":"fill","done_when":[{"field":"Account","equals_value":"secret_name"}]}]})).unwrap().as_slice()).unwrap();
         let observation = Observation {
-            document_id: "d".into(),
+            document_id: "internal-document-token".into(),
             url: "http://example.test/raw-secret-742".into(),
             route: "/raw-secret-742".into(),
             title: "raw-secret-742".into(),
@@ -116,7 +116,7 @@ mod tests {
             dialog_texts: BTreeMap::new(),
             elements: vec![Element {
                 index: 1,
-                node_id: 1,
+                node_id: 981_723,
                 context: "main".into(),
                 role: "textbox".into(),
                 name: "raw-secret-742".into(),
@@ -147,6 +147,10 @@ mod tests {
         let serialized = Values::new(&job).model_view(&observation).to_string();
         assert!(!serialized.contains("raw-secret-742"));
         assert!(!serialized.contains("RAW SECRET"));
+        assert!(!serialized.contains("internal-document-token"));
+        assert!(!serialized.contains("981723"));
+        assert!(!serialized.contains("document_id"));
+        assert!(!serialized.contains("node_id"));
         assert!(serialized.contains("secret_name"));
         assert!(serialized.contains("equals_value_names"));
         let _ = ValueFormats {
