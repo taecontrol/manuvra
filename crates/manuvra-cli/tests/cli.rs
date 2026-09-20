@@ -778,6 +778,64 @@ fn incomplete_existing_evidence_is_not_reported_complete_or_replaced_by_a_new_ru
 }
 
 #[test]
+fn completed_requests_reject_every_evidence_corruption_without_relaunching() {
+    for corruption in [
+        "manifest_incomplete",
+        "artifact_incomplete",
+        "artifact_digest",
+        "artifact_role_path",
+        "missing_required_artifact",
+        "unmanifested_file",
+        "record_result_mismatch",
+    ] {
+        let temp = TempDir::new().unwrap();
+        let job_path = fixture(&temp, &valid_job());
+        let evidence = temp.path().join("evidence");
+        let request_id = format!("corrupt-{corruption}");
+        let args = [
+            "run",
+            "--request-id",
+            request_id.as_str(),
+            "--job",
+            job_path.to_str().unwrap(),
+            "--evidence",
+            evidence.to_str().unwrap(),
+        ];
+        let first = one_object(&invoke(&temp, &args));
+        let manifest_path = PathBuf::from(first["evidence"]["manifest"].as_str().unwrap());
+        let run_dir = manifest_path.parent().unwrap();
+        let index = request_index(&temp.path().join("state/manuvra"), &request_id);
+        if corruption == "unmanifested_file" {
+            fs::write(run_dir.join("unexpected.json"), b"{}\n").unwrap();
+        } else if corruption == "record_result_mismatch" {
+            let mut record: Value = serde_json::from_slice(&fs::read(&index).unwrap()).unwrap();
+            record["result"]["state"] = json!("passed");
+            write_private_json(&index, &record);
+        } else {
+            let mut manifest: Value =
+                serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+            match corruption {
+                "manifest_incomplete" => manifest["complete"] = json!(false),
+                "artifact_incomplete" => manifest["artifacts"][0]["complete"] = json!(false),
+                "artifact_digest" => manifest["artifacts"][0]["digest"] = json!("0".repeat(64)),
+                "artifact_role_path" => manifest["artifacts"][0]["role"] = json!("result"),
+                "missing_required_artifact" => {
+                    manifest["artifacts"].as_array_mut().unwrap().remove(0);
+                }
+                _ => unreachable!(),
+            }
+            write_private_json(&manifest_path, &manifest);
+        }
+
+        let output = invoke(&temp, &args);
+        assert_eq!(output.status.code(), Some(70), "{corruption}");
+        assert_eq!(one_object(&output)["error"]["code"], "internal");
+        assert_eq!(fs::read_dir(&evidence).unwrap().count(), 1);
+        assert!(run_dir.is_dir(), "corrupt evidence must be preserved");
+    }
+}
+
+#[test]
 fn missing_digest_key_with_request_history_reports_corruption() {
     let temp = TempDir::new().unwrap();
     let job_path = fixture(&temp, &valid_job());

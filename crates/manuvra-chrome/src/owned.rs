@@ -1,5 +1,6 @@
 #[cfg(target_os = "linux")]
 use crate::endpoint::Endpoint;
+use crate::input::{InputCancellation, PerformError, PerformFact, PreparedInput};
 use crate::observation::Observation;
 use crate::page::{self, Screenshot};
 use crate::transport::{CdpClient, CommandFailure};
@@ -127,6 +128,14 @@ impl OwnedBrowser {
         let value = evaluate(&self.client, SNAPSHOT)?;
         serde_json::from_value(value)
             .map_err(|error| BrowserError::InvalidObservation(error.to_string()))
+    }
+
+    pub fn perform(
+        &self,
+        input: PreparedInput,
+        cancellation: &InputCancellation,
+    ) -> Result<PerformFact, PerformError> {
+        crate::input::perform(&self.client, input, cancellation)
     }
 
     pub fn capture(&self) -> Result<CapturedPage, BrowserError> {

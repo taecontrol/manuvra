@@ -829,8 +829,10 @@ pub(crate) mod test_support {
 
     #[derive(Default)]
     struct Script {
-        replies: HashMap<String, Value>,
+        replies: HashMap<String, Vec<Value>>,
         reject: HashSet<String>,
+        cancel_after: HashMap<String, (usize, Arc<AtomicBool>)>,
+        method_counts: HashMap<String, usize>,
         pending_events: VecDeque<Value>,
         ping_once: bool,
         invalid_json_methods: HashSet<String>,
@@ -881,7 +883,9 @@ pub(crate) mod test_support {
                 .lock()
                 .expect("scripted Chrome")
                 .replies
-                .insert(method.to_owned(), result);
+                .entry(method.to_owned())
+                .or_default()
+                .push(result);
         }
 
         pub fn reject(&self, method: &str) {
@@ -890,6 +894,14 @@ pub(crate) mod test_support {
                 .expect("scripted Chrome")
                 .reject
                 .insert(method.to_owned());
+        }
+
+        pub fn cancel_after(&self, method: &str, occurrence: usize, cancellation: Arc<AtomicBool>) {
+            self.script
+                .lock()
+                .expect("scripted Chrome")
+                .cancel_after
+                .insert(method.to_owned(), (occurrence, cancellation));
         }
 
         pub fn push_event(&self, method: &str, params: Value) {
@@ -1114,21 +1126,44 @@ pub(crate) mod test_support {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
-        let (reply, invalid) = {
-            let script = script.lock().expect("scripted Chrome");
+        let (reply, invalid, cancel_after) = {
+            let mut script = script.lock().expect("scripted Chrome");
             let invalid = script.invalid_json_methods.contains(&method);
             let reply = if script.reject.contains(&method) {
                 json!({"id": id, "error": {"message": "rejected"}})
             } else {
-                let result = script.replies.get(&method).cloned().unwrap_or(json!({}));
+                let result = script
+                    .replies
+                    .get_mut(&method)
+                    .map(|replies| {
+                        if replies.len() > 1 {
+                            replies.remove(0)
+                        } else {
+                            replies[0].clone()
+                        }
+                    })
+                    .unwrap_or(json!({}));
                 json!({"id": id, "result": result})
             };
-            (reply, invalid)
+            let count = {
+                let count = script.method_counts.entry(method.clone()).or_default();
+                *count += 1;
+                *count
+            };
+            let cancel_after = script
+                .cancel_after
+                .get(&method)
+                .filter(|(occurrence, _)| *occurrence == count)
+                .map(|(_, cancellation)| cancellation.clone());
+            (reply, invalid, cancel_after)
         };
         if invalid {
             let _ = socket.send(Message::Text("not-json".into()));
             return;
         }
         let _ = socket.send(Message::Text(reply.to_string().into()));
+        if let Some(cancellation) = cancel_after {
+            cancellation.store(true, Ordering::SeqCst);
+        }
     }
 }

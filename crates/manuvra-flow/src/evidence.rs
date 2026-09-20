@@ -344,10 +344,13 @@ fn collect_characters(value: &mut Value, set: &mut HashSet<char>) {
 }
 
 pub struct EvidenceBundle {
+    pub complete: bool,
     pub job: Value,
     pub provenance: Value,
     pub observations: Vec<(String, Value, Option<Vec<u8>>)>,
+    pub decisions: Vec<(String, Value)>,
     pub steps: Vec<(String, Value)>,
+    pub escalations: Vec<(String, Value)>,
     pub trace: Vec<Value>,
     pub cleanup: Value,
     pub result: Value,
@@ -371,8 +374,9 @@ pub fn publish(
         final_dir,
         artifacts: Vec::new(),
     };
+    let complete = bundle.complete;
     publication.write_bundle(bundle)?;
-    publication.write_manifest(run_id)?;
+    publication.write_manifest(run_id, complete)?;
     publication.commit(root, redactor)?;
     Ok(result)
 }
@@ -393,7 +397,9 @@ impl Publication {
     fn write_bundle(&mut self, bundle: EvidenceBundle) -> Result<(), String> {
         self.write_headers(&bundle)?;
         self.write_observations(bundle.observations)?;
+        self.write_named("decisions", "decision", bundle.decisions)?;
         self.write_steps(bundle.steps)?;
+        self.write_named("escalations", "escalation", bundle.escalations)?;
         self.write_tail(bundle.trace, &bundle.cleanup, &bundle.result)
     }
 
@@ -457,6 +463,25 @@ impl Publication {
         Ok(())
     }
 
+    fn write_named(
+        &mut self,
+        directory: &str,
+        role: &str,
+        values: Vec<(String, Value)>,
+    ) -> Result<(), String> {
+        for (name, value) in values {
+            write_json(
+                &self.stage,
+                &self.final_dir,
+                &format!("{directory}/{name}.json"),
+                role,
+                &value,
+                &mut self.artifacts,
+            )?;
+        }
+        Ok(())
+    }
+
     fn write_tail(
         &mut self,
         trace: Vec<Value>,
@@ -490,11 +515,11 @@ impl Publication {
         )
     }
 
-    fn write_manifest(&self, run_id: &str) -> Result<(), String> {
+    fn write_manifest(&self, run_id: &str, complete: bool) -> Result<(), String> {
         let manifest = Manifest {
             schema_version: SchemaVersion,
             run_id: run_id.to_owned(),
-            complete: true,
+            complete,
             artifacts: self.artifacts.clone(),
         };
         write_atomic(&self.stage.join("manifest.json"), &pretty(&manifest)?)
@@ -706,10 +731,13 @@ mod tests {
 
     fn bundle(text: &str, screenshot: Vec<u8>) -> EvidenceBundle {
         EvidenceBundle {
+            complete: true,
             job: json!({"safe":text}),
             provenance: json!({"browser":text}),
             observations: vec![("o_1".into(), json!({"title":text}), Some(screenshot))],
+            decisions: Vec::new(),
             steps: vec![("s".into(), json!({"done":"satisfied"}))],
+            escalations: Vec::new(),
             trace: vec![json!({"event":text})],
             cleanup: json!({"browser":"closed"}),
             result: json!({"state":"passed"}),
@@ -752,6 +780,23 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn publisher_preserves_an_incomplete_after_dispatch_marker() {
+        let temporary = TempDir::new().unwrap();
+        let job = test_job(false);
+        let redactor = Redactor::for_job(&job).unwrap();
+        let mut incomplete = bundle("safe", b"png".to_vec());
+        incomplete.complete = false;
+        incomplete.result["evidence"] = json!({"complete":false});
+        let result = publish(temporary.path(), "r_incomplete", incomplete, &redactor).unwrap();
+        let manifest: Manifest = serde_json::from_slice(
+            &fs::read(temporary.path().join("r_incomplete/manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(!manifest.complete);
+        assert_eq!(result["evidence"]["complete"], false);
     }
 
     #[test]

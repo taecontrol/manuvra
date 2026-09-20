@@ -324,6 +324,15 @@ enum SecureReadError {
     Invalid(String),
 }
 
+impl SecureReadError {
+    fn message(self, path: &Path, purpose: &str) -> String {
+        if let Self::Invalid(message) = self {
+            return message;
+        }
+        format!("{purpose} {} does not exist", path.display())
+    }
+}
+
 fn read_private_file(path: &Path, purpose: &str) -> Result<Vec<u8>, SecureReadError> {
     let mut file = open_existing_private(path, purpose)?;
     let mut bytes = Vec::new();
@@ -334,13 +343,7 @@ fn read_private_file(path: &Path, purpose: &str) -> Result<Vec<u8>, SecureReadEr
 }
 
 pub fn read_private(path: &Path, purpose: &str) -> Result<Vec<u8>, String> {
-    match read_private_file(path, purpose) {
-        Ok(bytes) => Ok(bytes),
-        Err(SecureReadError::NotFound) => {
-            Err(format!("{purpose} {} does not exist", path.display()))
-        }
-        Err(SecureReadError::Invalid(message)) => Err(message),
-    }
+    read_private_file(path, purpose).map_err(|error| error.message(path, purpose))
 }
 
 fn open_existing_private(path: &Path, purpose: &str) -> Result<File, SecureReadError> {

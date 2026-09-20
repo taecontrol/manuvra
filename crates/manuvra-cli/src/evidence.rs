@@ -179,21 +179,20 @@ fn expected_evidence(
 }
 
 fn validate_existing(paths: &EvidencePaths, expected: &ExpectedEvidence) -> Result<(), String> {
-    store::create_private_dir(&paths.directory)?;
-    for (path, wanted) in [
-        (&paths.job, &expected.job_bytes),
-        (&paths.result, &expected.result_bytes),
-        (&paths.manifest, &expected.manifest_bytes),
-    ] {
-        let actual = store::read_private(path, "evidence artifact")?;
-        if actual != *wanted {
-            return Err(format!(
-                "existing evidence artifact {} does not match its request intent",
-                path.display()
-            ));
-        }
-    }
-    Ok(())
+    store::create_private_dir(&paths.directory)
+        .and_then(|()| validate_artifact(&paths.job, &expected.job_bytes))
+        .and_then(|()| validate_artifact(&paths.result, &expected.result_bytes))
+        .and_then(|()| validate_artifact(&paths.manifest, &expected.manifest_bytes))
+}
+
+fn validate_artifact(path: &Path, wanted: &[u8]) -> Result<(), String> {
+    let actual = store::read_private(path, "evidence artifact")?;
+    (actual == wanted).then_some(()).ok_or_else(|| {
+        format!(
+            "existing evidence artifact {} does not match its request intent",
+            path.display()
+        )
+    })
 }
 
 struct StageDirectory {

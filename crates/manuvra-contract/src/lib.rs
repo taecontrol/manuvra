@@ -615,14 +615,8 @@ impl JobOptions {
 
     fn first_unsupported_feature(&self) -> Option<&'static str> {
         [
-            (
-                self.active_timeout_ms.is_some(),
-                "options.active_timeout_ms",
-            ),
             (self.pause_timeout_ms.is_some(), "options.pause_timeout_ms"),
             (self.lifetime_ms.is_some(), "options.lifetime_ms"),
-            (self.max_actions.is_some(), "options.max_actions"),
-            (self.max_model_calls.is_some(), "options.max_model_calls"),
             (self.debug.is_some(), "options.debug"),
         ]
         .into_iter()
@@ -1119,7 +1113,7 @@ mod tests {
     }
 
     #[test]
-    fn names_the_first_feature_not_supported_by_slice_one() {
+    fn names_the_first_feature_not_supported_by_current_build() {
         let mut natural = valid_job();
         natural["steps"][0]["done_when"] = json!("The account exists");
         assert_eq!(
@@ -1135,10 +1129,10 @@ mod tests {
         );
 
         let mut option = valid_job();
-        option["options"]["active_timeout_ms"] = json!(100_000);
+        option["options"]["pause_timeout_ms"] = json!(100_000);
         assert_eq!(
             parse(&option).unwrap().first_unsupported_feature(),
-            Some("options.active_timeout_ms")
+            Some("options.pause_timeout_ms")
         );
     }
 

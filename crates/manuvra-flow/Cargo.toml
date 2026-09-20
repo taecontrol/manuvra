@@ -9,10 +9,12 @@ license.workspace = true
 hex.workspace = true
 manuvra-chrome = { path = "../manuvra-chrome" }
 manuvra-contract = { path = "../manuvra-contract" }
+manuvra-jev = { path = "../manuvra-jev" }
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
