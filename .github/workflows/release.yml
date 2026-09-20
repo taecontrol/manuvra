@@ -17,13 +17,13 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
+  validate:
     if: github.ref == 'refs/heads/main'
-    runs-on: macos-latest
-    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       actions: read
-      contents: write
+      contents: read
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -42,6 +42,63 @@ jobs:
           ! gh release view "v$VERSION" >/dev/null 2>&1
           conclusion=$(gh run list --workflow ci.yml --commit "$GITHUB_SHA" --status completed --limit 1 --json conclusion --jq '.[0].conclusion')
           test "$conclusion" = success
+
+  linux:
+    needs: validate
+    name: Linux binary (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x64
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup default 1.95.0
+      - name: Build the Linux binary archive
+        env:
+          ARCH: ${{ matrix.arch }}
+          VERSION: ${{ inputs.version }}
+        run: scripts/create-linux-binary-archive.sh --version "$VERSION" --arch "$ARCH" --output release-assets
+      - name: Upload the Linux binary archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linux-${{ matrix.arch }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    needs: [validate, linux]
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      attestations: write
+      contents: write
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Download Linux binary archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: linux-*
+          path: release-assets
+          merge-multiple: true
       - name: Build deterministic source assets
         env:
           VERSION: ${{ inputs.version }}
@@ -51,9 +108,14 @@ jobs:
           scripts/create-source-archive.sh --version "$VERSION" --output "$first"
           scripts/create-source-archive.sh --version "$VERSION" --output "$second"
           cmp "$first/manuvra-$VERSION.tar.gz" "$second/manuvra-$VERSION.tar.gz"
-          mkdir release-assets
           cp "$first/manuvra-$VERSION.tar.gz" "$first/manuvra-$VERSION.tar.gz.sha256" release-assets/
-      - name: Publish immutable source release
+          (cd release-assets && shasum -a 256 -c "manuvra-$VERSION-linux-x64.tar.gz.sha256")
+          (cd release-assets && shasum -a 256 -c "manuvra-$VERSION-linux-arm64.tar.gz.sha256")
+      - name: Attest Linux binary archives
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: release-assets/manuvra-*-linux-*.tar.gz
+      - name: Publish immutable release
         env:
           VERSION: ${{ inputs.version }}
         run: |
@@ -74,13 +136,64 @@ jobs:
           trap rollback EXIT
           gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/v$VERSION" -f "sha=$GITHUB_SHA"
           tag_created=true
-          gh release create "v$VERSION" release-assets/* --draft --verify-tag --title "Manuvra v$VERSION" --notes "MIT source release for the macOS Homebrew formula. No executable binary is attached."
+          gh release create "v$VERSION" release-assets/* --draft --verify-tag --title "Manuvra v$VERSION" --notes "MIT source release with attested Linux x64 and ARM64 binaries for mise. The macOS Homebrew formula builds from source."
           release_created=true
           gh release edit "v$VERSION" --draft=false
           trap - EXIT
 
-  homebrew:
+  mise:
     needs: release
+    name: mise install (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x64
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    permissions:
+      attestations: read
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GITHUB_TOKEN: ${{ github.token }}
+      MISE_MINIMUM_RELEASE_AGE: "0"
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db
+        env:
+          MISE_CACHE_DIR: ${{ runner.temp }}/mise-cache
+          MISE_CONFIG_DIR: ${{ runner.temp }}/mise-config
+          MISE_DATA_DIR: ${{ runner.temp }}/mise-data
+          MISE_STATE_DIR: ${{ runner.temp }}/mise-state
+        with:
+          version: 2026.9.12
+          install: false
+          cache: false
+      - name: Verify the published archive and attestation
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          archive="manuvra-$VERSION-linux-$ARCH.tar.gz"
+          gh release download "v$VERSION" --repo "$GITHUB_REPOSITORY" --pattern "$archive" --pattern "$archive.sha256"
+          sha256sum -c "$archive.sha256"
+          gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY"
+      - name: Install and run through mise
+        env:
+          MISE_CACHE_DIR: ${{ runner.temp }}/mise-cache
+          MISE_CONFIG_DIR: ${{ runner.temp }}/mise-config
+          MISE_DATA_DIR: ${{ runner.temp }}/mise-data
+          MISE_STATE_DIR: ${{ runner.temp }}/mise-state
+        run: |
+          version_json=$(mise x "github:$GITHUB_REPOSITORY@$VERSION" -- manuvra version)
+          test "$(printf '%s' "$version_json" | python3 -c 'import json, sys; print(json.load(sys.stdin)["version"])')" = "$VERSION"
+          mise x "github:$GITHUB_REPOSITORY@$VERSION" -- manuvra schema job | python3 -c 'import json, sys; assert json.load(sys.stdin)["title"] == "Job"'
+
+  homebrew:
+    needs: [release, mise]
     runs-on: macos-latest
     timeout-minutes: 45
     permissions:

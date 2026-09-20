@@ -6,13 +6,28 @@ Use Manuvra with a disposable application fixture and synthetic data. The caller
 
 ## Requirements
 
-Manuvra runs on Linux and requires Chromium or Google Chrome. Building it requires Rust 1.95 or newer. Jobs that need Jev judgments also require `TYPESAFE_API_KEY`.
+Manuvra runs on Linux and requires Chromium or Google Chrome. Building it from source requires Rust 1.95 or newer. Jobs that need Jev judgments also require `TYPESAFE_API_KEY`.
 
 The workspace keeps the macOS fallback compiling, but macOS is not a supported runtime platform.
 
 ## Install
 
-On Linux, build or install the CLI with Cargo:
+On Omarchy, install the latest Linux release with the bundled `mise`:
+
+```bash
+MISE_MINIMUM_RELEASE_AGE=0 mise use -g github:taecontrol/manuvra@latest
+manuvra version
+```
+
+The same command works on other Linux systems with `mise`. Releases contain native x64 and ARM64 archives, and `mise` selects the matching one. Run `omarchy update mise` to update Manuvra along with other mise-managed tools.
+
+If Chromium is not already installed on Omarchy, add it with:
+
+```bash
+omarchy pkg add chromium
+```
+
+To build from source instead:
 
 ```bash
 cargo build --release --locked
@@ -191,7 +206,15 @@ Contributors and coding agents should follow [docs/CODING_STANDARDS.md](docs/COD
 
 ## Release
 
-Releases are source-only and start from the `release` workflow on `main`. Enter the workspace version from `Cargo.toml` without the leading `v`. The workflow requires a successful CI run for that exact commit, creates a deterministic source archive and GitHub release, installs the rendered formula on macOS, and opens an auto-merge pull request in [`taecontrol/homebrew-tap`](https://github.com/taecontrol/homebrew-tap). Repository secret `HOMEBREW_TAP_TOKEN` provides write access to the tap.
+Releases start from the `release` workflow on `main`. Enter the workspace version from `Cargo.toml` without the leading `v`. The workflow requires a successful CI run for that exact commit, then:
+
+1. Builds deterministic Linux x64 and ARM64 archives and publishes their SHA-256 checksums.
+2. Creates GitHub build-provenance attestations for both Linux archives.
+3. Publishes those binaries with the deterministic source archive.
+4. Installs the published binaries through `mise` on native x64 and ARM64 runners.
+5. Installs the rendered formula on macOS and opens an auto-merge pull request in [`taecontrol/homebrew-tap`](https://github.com/taecontrol/homebrew-tap).
+
+Repository secret `HOMEBREW_TAP_TOKEN` provides write access to the tap. The release workflow does not modify Omarchy; Omarchy consumes the ordinary GitHub release through `mise`.
 
 ## License
 

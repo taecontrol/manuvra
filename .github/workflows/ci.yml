@@ -85,3 +85,44 @@ jobs:
               summary.write(f"- Above threshold: {offenders}\n")
               summary.write(f"- Maximum: {maximum}\n")
           PY
+
+  linux-distribution:
+    name: Linux package (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x64
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup default 1.95.0
+      - name: Build and verify the Linux release archive
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          version=$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)
+          first=$(mktemp -d)
+          second=$(mktemp -d)
+          scripts/create-linux-binary-archive.sh --version "$version" --arch "$ARCH" --output "$first"
+          scripts/create-linux-binary-archive.sh --version "$version" --arch "$ARCH" --output "$second"
+
+          archive="manuvra-$version-linux-$ARCH.tar.gz"
+          cmp "$first/$archive" "$second/$archive"
+          (cd "$first" && sha256sum -c "$archive.sha256")
+          test "$(tar -tzf "$first/$archive")" = manuvra
+
+          extracted=$(mktemp -d)
+          tar -xzf "$first/$archive" -C "$extracted"
+          test -x "$extracted/manuvra"
+          test "$("$extracted/manuvra" version | python3 -c 'import json, sys; print(json.load(sys.stdin)["version"])')" = "$version"
+          "$extracted/manuvra" schema job | python3 -c 'import json, sys; assert json.load(sys.stdin)["title"] == "Job"'
