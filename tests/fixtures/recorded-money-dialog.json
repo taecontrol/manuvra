@@ -1,0 +1,32 @@
+{
+  "source": "jev-spike/evidence-2/create-unit/run-1/step-02.json",
+  "document_id": "recorded-money-create-unit-run-1",
+  "url": "http://127.0.0.1:4351/",
+  "route": "/",
+  "title": "Money · Accounts",
+  "dialogs": ["Create account"],
+  "focused": 1,
+  "visible_text": "Create account\nAccount name\nCurrency or asset\nOpening balance\nCancel\nCreate account\nClose",
+  "covered_text": "Money\nAccounts\n+ Create account\nNo accounts yet",
+  "dialog_texts": {
+    "Create account": "Create account\nAccount name\nCurrency or asset\nOpening balance\nCancel\nCreate account\nClose"
+  },
+  "elements": [{
+    "index": 1,
+    "node_id": 4,
+    "context": "main",
+    "role": "textbox",
+    "name": "Account name",
+    "input_type": "text",
+    "value": "Unit seed wallet",
+    "checked": false,
+    "selected": null,
+    "expanded": null,
+    "disabled": false,
+    "in_dialog": "Create account",
+    "operations": ["TYPE_TEXT"],
+    "rect": {"x": 301.0, "y": 249.0, "width": 518.0, "height": 36.0}
+  }],
+  "viewport": {"width": 1120, "height": 780, "scroll_x": 0.0, "scroll_y": 0.0, "document_height": 780.0},
+  "coverage": {"viewport_complete": true, "open_shadow_roots": true, "slots": true, "same_origin_frames": true, "gaps": []}
+}

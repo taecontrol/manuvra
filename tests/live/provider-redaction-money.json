@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "target": {"kind": "browser", "url": "http://127.0.0.1:4351/"},
+  "context": {
+    "journey": "Observe live-provider-export-marker safely",
+    "revision": "live-provider-export-marker",
+    "environment": "fresh local Money fixture live-provider-export-marker",
+    "actor": "synthetic live-provider-export-marker",
+    "authority": "observe live-provider-export-marker only"
+  },
+  "values": {
+    "live-provider-export-marker-value": {
+      "value": "live-provider-export-marker",
+      "description": "live-provider-export-marker caller value"
+    }
+  },
+  "steps": [
+    {
+      "id": "live-provider-export-marker-step",
+      "goal": "Observe the live-provider-export-marker account creation control.",
+      "done_when": [{"text_visible": "+ Create account", "scope": "viewport"}]
+    }
+  ],
+  "options": {"allowed_origins": ["http://127.0.0.1:4351"]}
+}

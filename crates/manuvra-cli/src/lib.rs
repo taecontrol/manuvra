@@ -30,6 +30,10 @@ enum Command {
         job: PathBuf,
         #[arg(long)]
         evidence: PathBuf,
+        #[arg(long)]
+        browser: Option<PathBuf>,
+        #[arg(long)]
+        headless: bool,
     },
     Resume {
         run_id: String,
@@ -84,14 +88,25 @@ impl Invocation {
     }
 
     fn error(code: &str, message: impl Into<String>, exit_code: u8) -> Self {
+        let message = scrub_provider_key(&message.into());
         Self {
             output: json!({
                 "schema_version": 1,
-                "error": {"code": code, "message": message.into()}
+                "error": {"code": code, "message": message}
             }),
             exit_code,
         }
     }
+}
+
+fn scrub_provider_key(message: &str) -> String {
+    std::env::var("TYPESAFE_API_KEY")
+        .ok()
+        .filter(|key| !key.is_empty())
+        .map_or_else(
+            || message.to_owned(),
+            |key| message.replace(&key, "<masked-key>"),
+        )
 }
 
 pub fn invoke(args: impl IntoIterator<Item = OsString>) -> Invocation {
@@ -111,7 +126,9 @@ impl Command {
                 request_id,
                 job,
                 evidence,
-            } => run(&request_id, &job, &evidence),
+                browser,
+                headless,
+            } => run(&request_id, &job, &evidence, browser.as_deref(), headless),
             Self::Schema { kind } => Invocation::success(schema(kind.into())),
             Self::Version => Invocation::success(json!({
                 "schema_version": 1,
@@ -143,14 +160,22 @@ fn not_implemented(command: &str) -> Invocation {
     )
 }
 
-fn run(request_id: &str, job_path: &Path, evidence_root: &Path) -> Invocation {
-    try_run(request_id, job_path, evidence_root).unwrap_or_else(|error| error)
+fn run(
+    request_id: &str,
+    job_path: &Path,
+    evidence_root: &Path,
+    browser: Option<&Path>,
+    headless: bool,
+) -> Invocation {
+    try_run(request_id, job_path, evidence_root, browser, headless).unwrap_or_else(|error| error)
 }
 
 fn try_run(
     request_id: &str,
     job_path: &Path,
     evidence_root: &Path,
+    browser: Option<&Path>,
+    headless: bool,
 ) -> Result<Invocation, Invocation> {
     if evidence_root.to_str().is_none() {
         return Err(Invocation::error(
@@ -159,7 +184,7 @@ fn try_run(
             EXIT_INVALID,
         ));
     }
-    match prepare_run(request_id, job_path, evidence_root)? {
+    match prepare_run(request_id, job_path, evidence_root, browser, headless)? {
         PreparedRun::Existing(invocation) => Ok(invocation),
         PreparedRun::New(prepared) => publish_new_run(prepared),
     }
@@ -173,15 +198,20 @@ enum PreparedRun {
 struct Prepared {
     job: Job,
     intent: store::RequestIntent,
+    lookup_request_id: String,
     redactor: evidence::Redactor,
     state_root: PathBuf,
     _request_lock: store::RequestLock,
+    browser: Option<PathBuf>,
+    headless: bool,
 }
 
 fn prepare_run(
     request_id: &str,
     job_path: &Path,
     evidence_root: &Path,
+    browser: Option<&Path>,
+    headless: bool,
 ) -> Result<PreparedRun, Invocation> {
     validate_request_id(request_id)
         .map_err(|message| Invocation::error("invalid_request_id", message, EXIT_INVALID))?;
@@ -191,7 +221,8 @@ fn prepare_run(
         store::state_root().map_err(|error| internal_error(redactor.redact_text(&error)))?;
     let request_lock = store::lock_request(&state_root, request_id)
         .map_err(|error| internal_error(redactor.redact_text(&error)))?;
-    let digest = canonical_digest(&state_root, &job, &redactor)?;
+    let browser = effective_browser_selection(browser);
+    let digest = canonical_digest(&state_root, &job, browser.as_deref(), headless, &redactor)?;
     let existing = lookup_request(&state_root, request_id, &digest, &redactor)?;
     finish_preparation(
         request_id,
@@ -204,7 +235,15 @@ fn prepare_run(
             digest,
         },
         existing,
+        browser.as_deref(),
+        headless,
     )
+}
+
+fn effective_browser_selection(explicit: Option<&Path>) -> Option<PathBuf> {
+    explicit
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("MANUVRA_BROWSER").map(PathBuf::from))
 }
 
 struct Admission {
@@ -220,6 +259,8 @@ fn finish_preparation(
     evidence_root: &Path,
     admission: Admission,
     existing: RequestLookup,
+    browser: Option<&Path>,
+    headless: bool,
 ) -> Result<PreparedRun, Invocation> {
     let intent = match existing {
         RequestLookup::Complete(invocation) => return Ok(PreparedRun::Existing(invocation)),
@@ -235,9 +276,12 @@ fn finish_preparation(
     Ok(PreparedRun::New(Box::new(Prepared {
         job: admission.job,
         intent,
+        lookup_request_id: request_id.to_owned(),
         redactor: admission.redactor,
         state_root: admission.state_root,
         _request_lock: admission.request_lock,
+        browser: browser.map(Path::to_path_buf),
+        headless,
     })))
 }
 
@@ -253,12 +297,12 @@ fn create_intent(
         .map_err(|error| internal_error(redactor.redact_text(&error)))?;
     let intent = store::RequestIntent {
         schema_version: SchemaVersion,
-        request_id: request_id.to_owned(),
+        public_request_id: redactor.redact_export_text(request_id),
         run_id: evidence::new_run_id(),
         job_digest: digest,
         evidence_root: absolute_evidence,
     };
-    store::record_intent(state_root, &intent)
+    store::record_intent(state_root, request_id, &intent)
         .map_err(|error| internal_error(redactor.redact_text(&error)))?;
     Ok(intent)
 }
@@ -279,33 +323,64 @@ fn reject_sensitive_evidence_path(
 }
 
 fn publish_new_run(prepared: Box<Prepared>) -> Result<Invocation, Invocation> {
-    let stop = if let Some(missing) = prepared.job.first_missing_value() {
-        evidence::BlockedStop::missing_value(missing.value_name, missing.step_id)
-    } else {
-        evidence::BlockedStop::unsupported(prepared.job.first_unsupported_feature())
-    };
+    if let Some(missing) = prepared.job.first_missing_value() {
+        return publish_blocked(
+            prepared,
+            evidence::BlockedStop::missing_value(missing.value_name, missing.step_id),
+        );
+    }
+    if let Some(feature) = prepared.job.first_unsupported_feature() {
+        return publish_blocked(prepared, evidence::BlockedStop::unsupported(feature));
+    }
+    let outcome = manuvra_flow::run(
+        &prepared.job,
+        manuvra_flow::FlowConfig {
+            request_id: prepared.intent.public_request_id.clone(),
+            run_id: prepared.intent.run_id.clone(),
+            evidence_root: prepared.intent.evidence_root.clone(),
+            browser: prepared.browser.clone(),
+            headless: prepared.headless,
+        },
+        &prepared.redactor,
+    )
+    .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))?;
+    finalize(prepared, outcome.result, outcome.exit_code)
+}
+
+fn publish_blocked(
+    prepared: Box<Prepared>,
+    stop: evidence::BlockedStop,
+) -> Result<Invocation, Invocation> {
     let published = evidence::publish(
         &prepared.intent.evidence_root,
-        &prepared.intent.request_id,
+        &prepared.intent.public_request_id,
         &prepared.intent.run_id,
         &prepared.job,
         stop,
         &prepared.redactor,
     )
     .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))?;
+    finalize(prepared, published.result, EXIT_BLOCKED)
+}
+
+fn finalize(
+    prepared: Box<Prepared>,
+    result: Value,
+    exit_code: u8,
+) -> Result<Invocation, Invocation> {
     let record = store::RequestRecord {
         schema_version: SchemaVersion,
-        request_id: prepared.intent.request_id.clone(),
+        public_request_id: prepared.intent.public_request_id.clone(),
         run_id: prepared.intent.run_id.clone(),
         job_digest: prepared.intent.job_digest.clone(),
-        exit_code: EXIT_BLOCKED,
-        result: published.result.clone(),
+        exit_code,
+        result: result.clone(),
     };
-    store::finalize_request(&prepared.state_root, &record)
+    store::finalize_request(&prepared.state_root, &prepared.lookup_request_id, &record)
         .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))?;
     Ok(Invocation {
-        output: published.result,
-        exit_code: EXIT_BLOCKED,
+        output: result,
+        exit_code,
     })
 }
 
@@ -341,7 +416,8 @@ fn lookup_request(
                 output: record.result,
             }))
         }
-        Some(store::RequestEntry::Intent(intent)) if intent.job_digest == digest => {
+        Some(store::RequestEntry::Intent(mut intent)) if intent.job_digest == digest => {
+            intent.public_request_id = redactor.redact_export_text(&intent.public_request_id);
             Ok(RequestLookup::Intent(intent))
         }
         Some(_) => Err(Invocation::error(
@@ -366,9 +442,16 @@ fn validate_request_id(request_id: &str) -> Result<(), String> {
 fn canonical_digest(
     state_root: &Path,
     job: &Job,
+    browser: Option<&Path>,
+    headless: bool,
     redactor: &evidence::Redactor,
 ) -> Result<String, Invocation> {
-    let bytes = serde_json::to_vec(job).map_err(|error| internal_error(error.to_string()))?;
+    let bytes = serde_json::to_vec(&json!({
+        "job": job,
+        "browser": browser,
+        "headless": headless,
+    }))
+    .map_err(|error| internal_error(error.to_string()))?;
     store::keyed_digest(state_root, &bytes)
         .map_err(|error| internal_error(redactor.redact_text(&error)))
 }

@@ -1,0 +1,18 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Adversarial browser evidence fixture</title>
+<style>
+  body { background: white; color: black; font: 16px sans-serif; margin: 12px; }
+  #split { color: red; font-size: 28px; }
+  #covered { position: fixed; inset: 80px 0 auto 0; background: white; }
+  [role="dialog"] { position: fixed; inset: 130px 20px auto 20px; max-height: 180px; overflow: hidden; background: white; }
+</style>
+<div id="split"><span>split-</span><strong>secret</strong></div>
+<div id="long"></div>
+<div id="covered" aria-hidden="true"></div>
+<section role="dialog" aria-label="Long dialog"><div id="dialog-long"></div></section>
+<script>
+  document.querySelector('#long').textContent = `visible-prefix ${'v'.repeat(8100)} visible-tail`;
+  document.querySelector('#covered').textContent = `covered-prefix ${'c'.repeat(8100)} covered-tail`;
+  document.querySelector('#dialog-long').textContent = `dialog-prefix ${'d'.repeat(8100)} dialog-tail`;
+</script>

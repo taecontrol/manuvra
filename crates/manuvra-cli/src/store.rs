@@ -14,7 +14,8 @@ use sha2::{Digest, Sha256};
 #[serde(deny_unknown_fields)]
 pub struct RequestIntent {
     pub schema_version: SchemaVersion,
-    pub request_id: String,
+    #[serde(rename = "request_id")]
+    pub public_request_id: String,
     pub run_id: String,
     pub job_digest: String,
     pub evidence_root: PathBuf,
@@ -24,7 +25,8 @@ pub struct RequestIntent {
 #[serde(deny_unknown_fields)]
 pub struct RequestRecord {
     pub schema_version: SchemaVersion,
-    pub request_id: String,
+    #[serde(rename = "request_id")]
+    pub public_request_id: String,
     pub run_id: String,
     pub job_digest: String,
     pub exit_code: u8,
@@ -181,20 +183,28 @@ fn lock_file(path: &Path, purpose: &str) -> Result<RequestLock, String> {
     Ok(RequestLock { _file: file })
 }
 
-pub fn record_intent(root: &Path, intent: &RequestIntent) -> Result<(), String> {
+pub fn record_intent(
+    root: &Path,
+    lookup_request_id: &str,
+    intent: &RequestIntent,
+) -> Result<(), String> {
     let bytes = tagged_bytes(&RequestEntry::Intent(intent.clone()))?;
     let requests_dir = root.join("requests");
     create_private_dir(&requests_dir)?;
-    atomic_write_private(&request_index_path(root, &intent.request_id), &bytes)?;
+    atomic_write_private(&request_index_path(root, lookup_request_id), &bytes)?;
     write_run_entry(root, &intent.run_id, &bytes)
 }
 
-pub fn finalize_request(root: &Path, record: &RequestRecord) -> Result<(), String> {
+pub fn finalize_request(
+    root: &Path,
+    lookup_request_id: &str,
+    record: &RequestRecord,
+) -> Result<(), String> {
     let bytes = tagged_bytes(&RequestEntry::Complete(record.clone()))?;
     write_run_entry(root, &record.run_id, &bytes)?;
     let requests_dir = root.join("requests");
     create_private_dir(&requests_dir)?;
-    atomic_write_private(&request_index_path(root, &record.request_id), &bytes)
+    atomic_write_private(&request_index_path(root, lookup_request_id), &bytes)
 }
 
 fn tagged_bytes(entry: &RequestEntry) -> Result<Vec<u8>, String> {

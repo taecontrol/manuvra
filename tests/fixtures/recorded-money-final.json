@@ -1,0 +1,15 @@
+{
+  "source": "jev-spike/evidence-2/create-account/run-2/step-09.json",
+  "document_id": "recorded-money-create-account-run-2",
+  "url": "http://127.0.0.1:4351/",
+  "route": "/",
+  "title": "Money · Accounts",
+  "dialogs": [],
+  "focused": null,
+  "visible_text": "Money\nAccounts\n+ Create account\nReview wallet\n12.34\nUSD",
+  "covered_text": "",
+  "dialog_texts": {},
+  "elements": [],
+  "viewport": {"width": 1120, "height": 780, "scroll_x": 0.0, "scroll_y": 0.0, "document_height": 780.0},
+  "coverage": {"viewport_complete": true, "open_shadow_roots": true, "slots": true, "same_origin_frames": true, "gaps": []}
+}

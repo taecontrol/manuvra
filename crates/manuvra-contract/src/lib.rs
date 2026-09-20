@@ -543,20 +543,18 @@ impl Job {
             .find_map(|step| step.first_missing_value(&self.values))
     }
 
-    pub fn first_unsupported_feature(&self) -> &'static str {
+    pub fn first_unsupported_feature(&self) -> Option<&'static str> {
         if self
             .steps
             .iter()
             .any(|step| matches!(step.done_when, DoneCondition::NaturalLanguage(_)))
         {
-            return "natural_language_done_condition";
+            return Some("natural_language_done_condition");
         }
         if !self.expectations.is_empty() {
-            return "expectations";
+            return Some("expectations");
         }
-        self.options
-            .first_unsupported_feature()
-            .unwrap_or("browser_execution")
+        self.options.first_unsupported_feature()
     }
 
     fn expectation_ids(&self) -> impl Iterator<Item = &str> {
@@ -625,7 +623,6 @@ impl JobOptions {
             (self.lifetime_ms.is_some(), "options.lifetime_ms"),
             (self.max_actions.is_some(), "options.max_actions"),
             (self.max_model_calls.is_some(), "options.max_model_calls"),
-            (self.viewport.is_some(), "options.viewport"),
             (self.debug.is_some(), "options.debug"),
         ]
         .into_iter()
@@ -1127,21 +1124,21 @@ mod tests {
         natural["steps"][0]["done_when"] = json!("The account exists");
         assert_eq!(
             parse(&natural).unwrap().first_unsupported_feature(),
-            "natural_language_done_condition"
+            Some("natural_language_done_condition")
         );
 
         let mut expectation = valid_job();
         expectation["expectations"] = json!([{"id": "account", "claim": "Account exists"}]);
         assert_eq!(
             parse(&expectation).unwrap().first_unsupported_feature(),
-            "expectations"
+            Some("expectations")
         );
 
         let mut option = valid_job();
         option["options"]["active_timeout_ms"] = json!(100_000);
         assert_eq!(
             parse(&option).unwrap().first_unsupported_feature(),
-            "options.active_timeout_ms"
+            Some("options.active_timeout_ms")
         );
     }
 

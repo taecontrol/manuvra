@@ -383,9 +383,15 @@ fn execute(
     let id = take_next_id(next_id);
     let message = json!({"id": id, "method": method, "params": params});
     if let Err(error) = socket.send(Message::Text(message.to_string().into())) {
-        return CommandOutcome::NotSent(format!("WebSocket send failed: {error}"));
+        return classify_send_error(error);
     }
     await_command_response(socket, id, deadline, cancellation, journal, action_sequence)
+}
+
+fn classify_send_error(error: tungstenite::Error) -> CommandOutcome {
+    // tungstenite may have written a prefix before reporting an error. Once send is
+    // attempted, replay is unsafe unless the transport can prove zero bytes left it.
+    CommandOutcome::Unknown(format!("WebSocket send failed: {error}"))
 }
 
 fn command_should_not_send(cancellation: &Arc<AtomicBool>, deadline: Instant) -> bool {
@@ -572,6 +578,15 @@ mod tests {
         );
         assert!(matches!(outcome, CommandOutcome::Unknown(_)));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn a_send_attempt_is_classified_unknown() {
+        let outcome = classify_send_error(tungstenite::Error::Io(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "scripted partial write",
+        )));
+        assert!(matches!(outcome.result(), Err(CommandFailure::Unknown(_))));
     }
 
     #[test]

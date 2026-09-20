@@ -424,6 +424,8 @@ name = "manuvra-chrome"
 version = "0.2.3"
 dependencies = [
  "base64",
+ "libc",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",
@@ -439,6 +441,7 @@ dependencies = [
  "hmac",
  "libc",
  "manuvra-contract",
+ "manuvra-flow",
  "rand",
  "serde",
  "serde_json",
@@ -455,6 +458,20 @@ dependencies = [
  "serde_json",
  "thiserror",
  "url",
+]
+
+[[package]]
+name = "manuvra-flow"
+version = "0.2.3"
+dependencies = [
+ "hex",
+ "manuvra-chrome",
+ "manuvra-contract",
+ "rand",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/manuvra-chrome", "crates/manuvra-contract", "crates/manuvra-cli"]
+members = ["crates/manuvra-chrome", "crates/manuvra-contract", "crates/manuvra-flow", "crates/manuvra-cli"]
 exclude = ["tools/crap-gate"]
 resolver = "2"
 

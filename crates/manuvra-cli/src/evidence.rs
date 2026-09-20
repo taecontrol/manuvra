@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -7,8 +7,11 @@ use manuvra_contract::{
     SchemaVersion, StepVerdict, Verdict, VerdictResult,
 };
 use rand::{Rng, RngCore, distr::Alphanumeric};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+
+pub use manuvra_flow::evidence::Redactor;
+use manuvra_flow::evidence::redacted_job;
 
 use crate::store;
 
@@ -37,10 +40,13 @@ impl BlockedStop {
             } => Reason {
                 code: "missing_value".into(),
                 details: BTreeMap::from([
-                    ("step_id".into(), json!(redactor.redact_text(&step_id))),
+                    (
+                        "step_id".into(),
+                        json!(redactor.redact_export_text(&step_id)),
+                    ),
                     (
                         "value_name".into(),
-                        json!(redactor.redact_text(&value_name)),
+                        json!(redactor.redact_export_text(&value_name)),
                     ),
                 ]),
             },
@@ -54,129 +60,6 @@ impl BlockedStop {
 
 pub struct Published {
     pub result: Value,
-}
-
-#[derive(Clone)]
-pub struct Redactor {
-    replacements: Vec<(String, String)>,
-}
-
-impl Redactor {
-    pub fn for_job(job: &Job) -> Result<Self, String> {
-        let explicit = job.options.redact_values.as_deref().unwrap_or_default();
-        let classified: Vec<_> = job
-            .values
-            .iter()
-            .filter(|(name, value)| {
-                value.secret || explicit.iter().any(|redacted| redacted == *name)
-            })
-            .collect();
-        let mut seen = HashSet::new();
-        let renderings: Vec<_> = classified
-            .into_iter()
-            .flat_map(|(_, value)| value_renderings(value))
-            .filter(|rendering| !rendering.is_empty())
-            .filter(|rendering| seen.insert((*rendering).to_owned()))
-            .map(str::to_owned)
-            .collect();
-        let used_characters = job_characters(job);
-        let mut placeholders =
-            private_use_characters().filter(|candidate| !used_characters.contains(candidate));
-        let mut replacements = Vec::new();
-        for (index, rendering) in renderings.iter().enumerate() {
-            let boundary = placeholders.next().ok_or_else(|| {
-                "job has too many distinct classified value renderings".to_owned()
-            })?;
-            let readable = format!("{boundary}<masked:{}>{boundary}", index + 1);
-            let placeholder = if renderings
-                .iter()
-                .any(|sensitive| readable.contains(sensitive.as_str()))
-            {
-                boundary.to_string()
-            } else {
-                readable
-            };
-            replacements.push((rendering.clone(), placeholder));
-        }
-        replacements.sort_by(|left, right| {
-            right
-                .0
-                .len()
-                .cmp(&left.0.len())
-                .then_with(|| left.0.cmp(&right.0))
-        });
-        Ok(Self { replacements })
-    }
-
-    pub fn redact_text(&self, text: &str) -> String {
-        let mut output = String::with_capacity(text.len());
-        let mut offset = 0;
-        while offset < text.len() {
-            let remaining = &text[offset..];
-            if let Some((sensitive, placeholder)) = self
-                .replacements
-                .iter()
-                .find(|(sensitive, _)| remaining.starts_with(sensitive))
-            {
-                output.push_str(placeholder);
-                offset += sensitive.len();
-            } else {
-                let character = remaining
-                    .chars()
-                    .next()
-                    .expect("offset is before the end of the string");
-                output.push(character);
-                offset += character.len_utf8();
-            }
-        }
-        output
-    }
-
-    pub fn contains_sensitive(&self, text: &str) -> bool {
-        self.replacements
-            .iter()
-            .any(|(sensitive, _)| text.contains(sensitive))
-    }
-}
-
-fn job_characters(job: &Job) -> HashSet<char> {
-    let value = serde_json::to_value(job).expect("a validated job serializes");
-    let mut characters = HashSet::new();
-    collect_characters(&value, &mut characters);
-    characters
-}
-
-fn collect_characters(value: &Value, characters: &mut HashSet<char>) {
-    match value {
-        Value::String(text) => characters.extend(text.chars()),
-        Value::Array(items) => {
-            for item in items {
-                collect_characters(item, characters);
-            }
-        }
-        Value::Object(fields) => {
-            for (key, value) in fields {
-                characters.extend(key.chars());
-                collect_characters(value, characters);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn private_use_characters() -> impl Iterator<Item = char> {
-    (0xE000..=0xF8FF)
-        .chain(0xF0000..=0xFFFFD)
-        .chain(0x100000..=0x10FFFD)
-        .filter_map(char::from_u32)
-}
-
-fn value_renderings(value: &manuvra_contract::JobValue) -> impl Iterator<Item = &str> {
-    std::iter::once(value.value.as_str()).chain(value.formats.iter().flat_map(|formats| {
-        [formats.iso.as_deref(), formats.display.as_deref()]
-            .into_iter()
-            .flatten()
-    }))
 }
 
 pub fn prepare_root(root: &Path, redactor: &Redactor) -> Result<PathBuf, String> {
@@ -282,6 +165,11 @@ fn expected_evidence(
         ],
     };
     let manifest_bytes = pretty_json(&manifest)?;
+    for bytes in [&job_bytes, &result_bytes, &manifest_bytes] {
+        if redactor.contains_export_leak(bytes) {
+            return Err("evidence leak scan rejected blocked-run export".into());
+        }
+    }
     Ok(ExpectedEvidence {
         job_bytes,
         result,
@@ -373,60 +261,7 @@ fn canonicalize_root(root: &Path) -> Result<PathBuf, String> {
 }
 
 fn redacted_job_bytes(job: &Job, redactor: &Redactor) -> Result<Vec<u8>, String> {
-    let mut output = serde_json::to_value(job).map_err(|error| error.to_string())?;
-    redact_job(&mut output, redactor)?;
-    pretty_json(&output)
-}
-
-fn redact_job(output: &mut Value, redactor: &Redactor) -> Result<(), String> {
-    let root = output
-        .as_object_mut()
-        .ok_or_else(|| "serialized job must be an object".to_owned())?;
-    if let Some(Value::Object(values)) = root.get_mut("values") {
-        redact_caller_keys(values, redactor)?;
-    }
-    redact_job_strings(output, redactor);
-    Ok(())
-}
-
-fn redact_caller_keys(fields: &mut Map<String, Value>, redactor: &Redactor) -> Result<(), String> {
-    let original = std::mem::take(fields);
-    for (key, value) in original {
-        let redacted_key = redactor.redact_text(&key);
-        if fields.insert(redacted_key.clone(), value).is_some() {
-            return Err(format!(
-                "classified value replacement produced duplicate value name {redacted_key:?}"
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn redact_job_strings(value: &mut Value, redactor: &Redactor) {
-    match value {
-        Value::String(text) => *text = redactor.redact_text(text),
-        Value::Array(items) => redact_job_array(items, redactor),
-        Value::Object(fields) => redact_job_object(fields, redactor),
-        _ => {}
-    }
-}
-
-fn redact_job_array(items: &mut [Value], redactor: &Redactor) {
-    for item in items {
-        redact_job_strings(item, redactor);
-    }
-}
-
-fn redact_job_object(fields: &mut Map<String, Value>, redactor: &Redactor) {
-    for (key, value) in fields {
-        if !is_protocol_literal(key, value) {
-            redact_job_strings(value, redactor);
-        }
-    }
-}
-
-fn is_protocol_literal(key: &str, value: &Value) -> bool {
-    matches!(key, "kind" | "scope") && matches!(value, Value::String(_))
+    pretty_json(&redacted_job(job, redactor)?)
 }
 
 fn blocked_result(
@@ -439,7 +274,7 @@ fn blocked_result(
 ) -> Result<Value, String> {
     let result = RunResult {
         schema_version: SchemaVersion,
-        request_id: redactor.redact_text(request_id),
+        request_id: redactor.redact_export_text(request_id),
         run_id: run_id.to_owned(),
         state: RunState::Blocked,
         terminal: true,
@@ -450,7 +285,7 @@ fn blocked_result(
                 .steps
                 .iter()
                 .map(|step| StepVerdict {
-                    id: redactor.redact_text(&step.id),
+                    id: redactor.redact_export_text(&step.id),
                     result: VerdictResult::NotRun,
                     basis: None,
                 })
@@ -459,7 +294,7 @@ fn blocked_result(
                 .expectations
                 .iter()
                 .map(|expectation| ExpectationVerdict {
-                    id: redactor.redact_text(&expectation.id),
+                    id: redactor.redact_export_text(&expectation.id),
                     result: VerdictResult::NotRun,
                     noul: None,
                     numeric_checks: Vec::new(),
