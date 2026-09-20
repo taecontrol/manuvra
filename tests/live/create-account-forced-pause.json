@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "target": {"kind": "browser", "url": "http://127.0.0.1:4351/"},
-  "context": {"journey": "Create one account with opening balance (early fixture; final claims intentionally removed)", "revision": "doctor-confirmed live candidate", "environment": "fresh money fixture", "actor": "synthetic owner", "authority": "create validation state only in this fixture"},
+  "context": {"journey": "Create one account and force a pause before submit without final expectations", "revision": "doctor-confirmed live candidate", "environment": "fresh money fixture", "actor": "synthetic owner", "authority": "create validation state only in this fixture"},
   "values": {
     "account_name": {"value": "Review wallet", "description": "Name of the new account"},
     "unit_symbol": {"value": "USD", "description": "Symbol of the new currency"},
@@ -20,5 +20,5 @@
     {"id":"submit","goal":"Submit Create account.","done_when":[{"dialog_closed":"Create account"},{"text_visible":"Review wallet"},{"text_visible":"12.34"}]}
   ],
   "expectations": [],
-  "options": {"allowed_origins":["http://127.0.0.1:4351"]}
+  "options": {"allowed_origins":["http://127.0.0.1:4351"],"active_timeout_ms":30000,"pause_timeout_ms":3000,"lifetime_ms":30000,"debug":{"force_stop_at_step":"submit"}}
 }

@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 money_dir=${MONEY_DIR:-/home/guetteluis/Work/personal/money}
 stamp=$(date +%Y%m%d-%H%M%S)-$$
-evidence_root="$repo_root/.work/live/slice4/$stamp"
+evidence_root="$repo_root/.work/live/natural-done/$stamp"
 state_root="$evidence_root/state"
 report="$evidence_root/matrix.jsonl"
 mkdir -p "$evidence_root" "$state_root"
@@ -96,7 +96,7 @@ assert_complete_evidence() {
 run_case() {
   local iteration=$1 label="create-account-nl-$iteration"
   local launch candidate started finished status state classification output observe accounts units active_ms cleanup_status
-  active_run="manuvra-s4-$iteration-$stamp"
+  active_run="manuvra-natural-done-$iteration-$stamp"
   launch=$(cd "$money_dir" && pnpm verify:app launch --run-id "$active_run" --port 4351)
   candidate=$(jq -r '.result.candidate' <<<"$launch")
   (cd "$money_dir" && node scripts/app-driver.mjs doctor \
@@ -104,8 +104,8 @@ run_case() {
   started=$(date +%s%3N)
   set +e
   XDG_STATE_HOME="$state_root/$label" "$repo_root/target/debug/manuvra" run \
-    --request-id "slice4-$label-$stamp" \
-    --job "$repo_root/tests/live/create-account.nl.early.json" \
+    --request-id "natural-done-$label-$stamp" \
+    --job "$repo_root/tests/live/create-account-natural-done.json" \
     --evidence "$evidence_root/$label" \
     >"$evidence_root/$label-stdout.json" 2>"$evidence_root/$label-stderr.txt"
   status=$?

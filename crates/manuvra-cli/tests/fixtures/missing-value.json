@@ -3,20 +3,20 @@
   "target": {"kind": "browser", "url": "http://127.0.0.1:4351/"},
   "context": {
     "journey": "Block before filling a missing account name",
-    "revision": "slice-1",
+    "revision": "admission-contract",
     "environment": "contract fixture",
     "actor": "synthetic owner",
     "authority": "no application mutation"
   },
   "values": {
     "private_note": {
-      "value": "slice-one-secret",
+      "value": "classified-fixture-secret",
       "description": "Secret marker",
       "formats": {"iso": "secret-iso-form", "display": "secret-display-form"},
       "secret": true
     },
     "redacted_note": {
-      "value": "slice-one-redacted",
+      "value": "classified-fixture-redacted",
       "description": "Redacted marker",
       "formats": {"iso": "redacted-iso-form", "display": "redacted-display-form"}
     }

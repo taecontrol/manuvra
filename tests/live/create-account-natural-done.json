@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "target": {"kind": "browser", "url": "http://127.0.0.1:4351/"},
-  "context": {"journey": "Create one account from the spike natural-language job (early fixture; both final claims intentionally removed)", "revision": "doctor-confirmed live candidate", "environment": "fresh money fixture", "actor": "synthetic owner", "authority": "create validation state only in this fixture"},
+  "context": {"journey": "Create one account with natural-language completion conditions and no final expectations", "revision": "doctor-confirmed live candidate", "environment": "fresh money fixture", "actor": "synthetic owner", "authority": "create validation state only in this fixture"},
   "values": {
     "account_name": {"value": "Review wallet", "description": "Name of the new account"},
     "unit_symbol": {"value": "USD", "description": "Symbol of the new currency"},

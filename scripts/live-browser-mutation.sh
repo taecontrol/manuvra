@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 money_dir=${MONEY_DIR:-/home/guetteluis/Work/personal/money}
 stamp=$(date +%Y%m%d-%H%M%S)-$$
-evidence_root="$repo_root/.work/live/slice3/$stamp"
+evidence_root="$repo_root/.work/live/browser-mutation/$stamp"
 state_root="$evidence_root/state"
 report="$evidence_root/matrix.jsonl"
 mkdir -p "$evidence_root" "$state_root"
@@ -64,14 +64,14 @@ assert_correct_stop() {
 run_case() {
   local journey=$1 iteration=$2 fixture=$3 feature=accounts.create
   local label="$journey-$iteration" launch candidate started finished status state output observe accounts units active_ms cleanup_status
-  active_run="manuvra-s3-$label-$stamp"
+  active_run="manuvra-browser-mutation-$label-$stamp"
   launch=$(cd "$money_dir" && pnpm verify:app launch --run-id "$active_run" --port 4351)
   candidate=$(node -e 'const value=JSON.parse(process.argv[1]);process.stdout.write(value.result.candidate)' "$launch")
   (cd "$money_dir" && node scripts/app-driver.mjs doctor --run-id "$active_run" --candidate "$candidate") >"$evidence_root/$label-doctor.json"
   started=$(date +%s%3N)
   set +e
   XDG_STATE_HOME="$state_root/$label" "$repo_root/target/debug/manuvra" run \
-    --request-id "slice3-$label-$stamp" --job "$repo_root/tests/live/$fixture" \
+    --request-id "browser-mutation-$label-$stamp" --job "$repo_root/tests/live/$fixture" \
     --evidence "$evidence_root/$label" >"$evidence_root/$label-stdout.json" 2>"$evidence_root/$label-stderr.txt"
   status=$?
   set -e
@@ -100,9 +100,9 @@ run_case() {
     '{journey:$journey,run:$iteration,state:$state,exit_code:$exit_code,wall_ms:$wall_ms,active_ms:$active_ms,accounts:$accounts,units:$units,cleanup:$cleanup}' >>"$report"
 }
 
-for iteration in 1 2 3; do run_case create-unit "$iteration" create-unit.early.json; done
-for iteration in 1 2 3; do run_case create-account "$iteration" create-account.early.json; done
-run_case secret 1 create-account.early.secret.json
+for iteration in 1 2 3; do run_case create-unit "$iteration" create-unit.expectation-free.json; done
+for iteration in 1 2 3; do run_case create-account "$iteration" create-account.expectation-free.json; done
+run_case secret 1 create-account.expectation-free-secret.json
 
 if rg -a -F -- 'Secret review wallet 7491' \
   "$evidence_root/secret-1" "$evidence_root/secret-1-stdout.json" \

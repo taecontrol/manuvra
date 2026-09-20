@@ -4,13 +4,13 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 money_dir=${MONEY_DIR:-/home/guetteluis/Work/personal/money}
 stamp=$(date +%Y%m%d-%H%M%S)-$$
-evidence_root="$repo_root/.work/live/slice5/$stamp"
+evidence_root="$repo_root/.work/live/run-lifecycle/$stamp"
 state_root="$evidence_root/state"
 runtime_root=${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR is required for the headed Wayland run}
 mkdir -p "$evidence_root" "$state_root"
 
 cargo build --locked --manifest-path "$repo_root/Cargo.toml" --bin manuvra
-active_run="manuvra-s5-$stamp"
+active_run="manuvra-run-lifecycle-$stamp"
 cleanup() {
   (cd "$money_dir" && pnpm verify:app cleanup --run-id "$active_run") >/dev/null || true
 }
@@ -24,8 +24,8 @@ candidate=$(jq -r '.result.candidate' <<<"$launch")
 set +e
 XDG_STATE_HOME="$state_root" XDG_RUNTIME_DIR="$runtime_root" \
   "$repo_root/target/debug/manuvra" run \
-  --request-id "slice5-$stamp" \
-  --job "$repo_root/tests/live/create-account.pause.json" \
+  --request-id "run-lifecycle-$stamp" \
+  --job "$repo_root/tests/live/create-account-forced-pause.json" \
   --evidence "$evidence_root/run" >"$evidence_root/run.json"
 run_status=$?
 set -e
@@ -59,8 +59,8 @@ pgrep -P "$host_pid" chromium | grep -Fx "$initial_browser_pid" >/dev/null
 set +e
 XDG_STATE_HOME="$state_root" XDG_RUNTIME_DIR="$runtime_root" \
   "$repo_root/target/debug/manuvra" run \
-  --request-id "slice5-$stamp" \
-  --job "$repo_root/tests/live/create-account.pause.json" \
+  --request-id "run-lifecycle-$stamp" \
+  --job "$repo_root/tests/live/create-account-forced-pause.json" \
   --evidence "$evidence_root/run" \
   --wait-ms 0 >"$evidence_root/attach-identical.json"
 attach_status=$?
@@ -125,8 +125,8 @@ done < <(jq -r '.artifacts[] | [.path,.digest] | @tsv' "$manifest")
 set +e
 XDG_STATE_HOME="$state_root" XDG_RUNTIME_DIR="$runtime_root" \
   "$repo_root/target/debug/manuvra" run \
-  --request-id "slice5-$stamp" \
-  --job "$repo_root/tests/live/create-account.pause.json" \
+  --request-id "run-lifecycle-$stamp" \
+  --job "$repo_root/tests/live/create-account-forced-pause.json" \
   --evidence "$evidence_root/run" >"$evidence_root/retry-after-expiry.json"
 retry_status=$?
 set -e

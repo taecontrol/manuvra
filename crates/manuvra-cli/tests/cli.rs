@@ -138,8 +138,8 @@ fn missing_value_blocks_without_browser_and_publishes_private_complete_evidence(
     assert!(manifest_path.is_absolute());
     let run_dir = manifest_path.parent().unwrap();
     let job_copy = fs::read_to_string(run_dir.join("job.json")).unwrap();
-    assert!(!job_copy.contains("slice-one-secret"));
-    assert!(!job_copy.contains("slice-one-redacted"));
+    assert!(!job_copy.contains("classified-fixture-secret"));
+    assert!(!job_copy.contains("classified-fixture-redacted"));
     assert!(!job_copy.contains("secret-iso-form"));
     assert!(!job_copy.contains("secret-display-form"));
     assert!(!job_copy.contains("redacted-iso-form"));
@@ -147,11 +147,11 @@ fn missing_value_blocks_without_browser_and_publishes_private_complete_evidence(
     let exported_job: Value = serde_json::from_str(&job_copy).unwrap();
     assert_ne!(
         exported_job["values"]["private_note"]["value"],
-        "slice-one-secret"
+        "classified-fixture-secret"
     );
     assert_ne!(
         exported_job["values"]["redacted_note"]["value"],
-        "slice-one-redacted"
+        "classified-fixture-redacted"
     );
 
     let manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
@@ -1537,7 +1537,7 @@ fn fault_window_job() -> Value {
     json!({
         "schema_version": 1,
         "target": {"kind":"browser","url":"http://127.0.0.1:4351/"},
-        "context": {"journey":"host fault fixture","revision":"slice-5","environment":"fake","actor":"synthetic owner","authority":"fixture only"},
+        "context": {"journey":"host fault fixture","revision":"run-lifecycle","environment":"fake","actor":"synthetic owner","authority":"fixture only"},
         "values": {},
         "steps": [{"id":"submit","goal":"submit","done_when":[{"url_contains":"/done"}]}],
         "expectations": [],

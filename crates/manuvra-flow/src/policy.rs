@@ -476,10 +476,10 @@ fn needs_native_select(observation: &Observation, selected: Option<&Element>) ->
             .elements
             .iter()
             .any(|element| element.operations == ["SELECT"])
-            && !observation.elements.iter().any(supports_slice_three_input))
+            && !observation.elements.iter().any(supports_direct_input))
 }
 
-fn supports_slice_three_input(element: &Element) -> bool {
+fn supports_direct_input(element: &Element) -> bool {
     element
         .operations
         .iter()

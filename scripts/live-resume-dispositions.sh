@@ -5,7 +5,7 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 money_dir=${MONEY_DIR:-/home/guetteluis/Work/personal/money}
 runtime_root=${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR is required for the headed Wayland run}
 stamp=$(date +%Y%m%d-%H%M%S)-$$
-live_root="$repo_root/.work/live/slice6/$stamp"
+live_root="$repo_root/.work/live/resume-dispositions/$stamp"
 mkdir -p "$live_root"
 
 cargo build --locked --manifest-path "$repo_root/Cargo.toml" --bin manuvra
@@ -71,7 +71,7 @@ run_case() {
   local job="$fixture"
   mkdir -p "$case_root" "$state_root" "$evidence_root"
 
-  active_fixture="manuvra-s6-$label-$stamp"
+  active_fixture="manuvra-resume-dispositions-$label-$stamp"
   local launch candidate
   launch=$(cd "$money_dir" && pnpm verify:app launch --run-id "$active_fixture" --port 4351)
   candidate=$(jq -r '.result.candidate' <<<"$launch")
@@ -83,7 +83,7 @@ run_case() {
     jq '.options.pause_timeout_ms=120000 | .options.lifetime_ms=300000' "$fixture" >"$job"
   fi
 
-  local request="slice6-$label-$stamp"
+  local request="resume-dispositions-$label-$stamp"
   local result="$case_root/result.json"
   set +e
   XDG_STATE_HOME="$state_root" XDG_RUNTIME_DIR="$runtime_root" \
@@ -120,10 +120,10 @@ run_case() {
         '{schema_version:1,escalation_id:$escalation,disposition:{kind:"retry_observation"}}' \
         >"$disposition"
     fi
-    request_id="slice6-$label-resume-$assists-$stamp"
+    request_id="resume-dispositions-$label-resume-$assists-$stamp"
     resume_result="$case_root/resume-$assists.json"
     if [[ "$forced" == yes && $assists -eq 1 ]]; then
-      local contender_request="slice6-$label-contender-$stamp"
+      local contender_request="resume-dispositions-$label-contender-$stamp"
       local contender_result="$case_root/resume-contender.json"
       set +e
       (XDG_STATE_HOME="$state_root" XDG_RUNTIME_DIR="$runtime_root" \
@@ -197,18 +197,18 @@ run_case() {
       --input "$first_disposition" >"$case_root/resume-dedup.json"
     local dedup_code=$?
     XDG_STATE_HOME="$state_root" XDG_RUNTIME_DIR="$runtime_root" \
-      "$manuvra" resume "$run_id" --request-id "slice6-$label-stale-$stamp" \
+      "$manuvra" resume "$run_id" --request-id "resume-dispositions-$label-stale-$stamp" \
       --input "$first_disposition" >"$case_root/resume-stale.json"
     local stale_code=$?
     XDG_STATE_HOME="$state_root" XDG_RUNTIME_DIR="$runtime_root" \
-      "$manuvra" resume "$run_id" --request-id "slice6-$label-stale-$stamp" \
+      "$manuvra" resume "$run_id" --request-id "resume-dispositions-$label-stale-$stamp" \
       --input "$first_disposition" >"$case_root/resume-stale-dedup.json"
     local stale_dedup_code=$?
     jq -n --arg escalation "$escalation_id" \
       '{schema_version:1,escalation_id:$escalation,disposition:{kind:"abort"}}' \
       >"$case_root/disposition-stale-conflict.json"
     XDG_STATE_HOME="$state_root" XDG_RUNTIME_DIR="$runtime_root" \
-      "$manuvra" resume "$run_id" --request-id "slice6-$label-stale-$stamp" \
+      "$manuvra" resume "$run_id" --request-id "resume-dispositions-$label-stale-$stamp" \
       --input "$case_root/disposition-stale-conflict.json" \
       >"$case_root/resume-stale-conflict.json"
     local stale_conflict_code=$?
@@ -230,9 +230,9 @@ run_case() {
   active_fixture=
 }
 
-run_case forced-account "$repo_root/tests/live/create-account.pause.json" yes
+run_case forced-account "$repo_root/tests/live/create-account-forced-pause.json" yes
 for index in 1 2 3; do
-  run_case "create-unit-$index" "$repo_root/tests/live/create-unit.early.json" no
+  run_case "create-unit-$index" "$repo_root/tests/live/create-unit.expectation-free.json" no
 done
 
 if [[ -n ${TYPESAFE_API_KEY-} ]] && rg -a -l -F -- "$TYPESAFE_API_KEY" "$live_root"; then
