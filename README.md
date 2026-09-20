@@ -85,7 +85,7 @@ make crap
 
 `make live` runs the release-build money journey matrix against fresh fixtures. It requires Chromium, a headed desktop, `TYPESAFE_API_KEY`, `jq`, and the Money repository at `/home/guetteluis/Work/personal/money` (override with `MONEY_DIR`). The matrix runs create-unit, create-account, and record-transaction three times each, plus one forced escalation round-trip. Timestamped evidence and its report are written under `.work/live/money-journey/`.
 
-The maintained usage recipe for coding agents is [skills/manuvra/SKILL.md](skills/manuvra/SKILL.md). Design rationale is recorded in [docs/adrs](docs/adrs/).
+The maintained usage recipe for coding agents is [skills/manuvra/SKILL.md](skills/manuvra/SKILL.md). Contributors and coding agents should follow [docs/CODING_STANDARDS.md](docs/CODING_STANDARDS.md). Design rationale is recorded in [docs/adrs](docs/adrs/).
 
 ## License
 

@@ -1,4 +1,4 @@
-# ADR-0006: Resume authority preserves code verification
+# ADR-0004: Resume authority preserves code verification
 
 Date: 2026-09-20
 Status: Accepted

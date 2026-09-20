@@ -1,4 +1,4 @@
-# ADR-0003: Pin production CRAP at 8 and keep hosted CI advisory
+# ADR-0001: Pin production CRAP at 8 and keep hosted CI advisory
 
 Date: 2026-08-22
 Status: Accepted

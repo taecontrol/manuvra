@@ -1,4 +1,4 @@
-# ADR-0004: Own background lifetime per run
+# ADR-0002: Own background lifetime per run
 
 Date: 2026-09-20
 Status: Accepted

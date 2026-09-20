@@ -1,4 +1,4 @@
-# ADR-0005: Never recover a crashed run by replay
+# ADR-0003: Never recover a crashed run by replay
 
 Date: 2026-09-20
 Status: Accepted
