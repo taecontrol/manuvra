@@ -200,7 +200,7 @@ fn missing_value_blocks_without_browser_and_publishes_private_complete_evidence(
 }
 
 #[test]
-fn intermediate_build_rejects_natural_language_before_browser_execution() {
+fn natural_language_done_conditions_reach_browser_execution() {
     let temp = TempDir::new().unwrap();
     let mut job = valid_job();
     job["values"]["missing_name"] = json!({"value": "Wallet", "description": "Missing name"});
@@ -212,20 +212,18 @@ fn intermediate_build_rejects_natural_language_before_browser_execution() {
         &[
             "run",
             "--request-id",
-            "unsupported-1",
+            "natural-1",
             "--job",
             job_path.to_str().unwrap(),
             "--evidence",
             evidence.to_str().unwrap(),
+            "--browser",
+            "/definitely/not/a/browser",
         ],
     );
     assert_eq!(output.status.code(), Some(3));
     let result = one_object(&output);
-    assert_eq!(result["reason"]["code"], "unsupported_in_this_build");
-    assert_eq!(
-        result["reason"]["feature"],
-        "natural_language_done_condition"
-    );
+    assert_eq!(result["reason"]["code"], "browser_unavailable");
 }
 
 #[test]

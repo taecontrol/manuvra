@@ -11,6 +11,23 @@ pub enum DoneResult {
     Unknown,
 }
 
+pub fn check_natural_done(condition: &str, observation: &Observation, noul: f64) -> DoneResult {
+    if noul <= 0.20 {
+        return DoneResult::NotSatisfied;
+    }
+    if noul < 0.80 {
+        return DoneResult::Unknown;
+    }
+    if numeric_literals(condition)
+        .iter()
+        .all(|literal| observation_contains_numeric_literal(observation, literal))
+    {
+        DoneResult::Satisfied
+    } else {
+        DoneResult::NotSatisfied
+    }
+}
+
 pub fn check_done(
     assertions: &[Assertion],
     observation: &Observation,
@@ -208,6 +225,68 @@ fn truth(value: bool) -> DoneResult {
     }
 }
 
+fn numeric_literals(text: &str) -> Vec<&str> {
+    let mut literals = Vec::new();
+    let mut cursor = 0;
+    while let Some((literal, next)) = next_numeric_literal(text, cursor) {
+        literals.push(literal);
+        cursor = next;
+    }
+    literals
+}
+
+fn next_numeric_literal(text: &str, from: usize) -> Option<(&str, usize)> {
+    let bytes = text.as_bytes();
+    let start = (from..bytes.len()).find(|index| numeric_starts_at(bytes, *index))?;
+    let integer_start = start + usize::from(matches!(bytes[start], b'+' | b'-'));
+    let integer_end = digits_end(bytes, integer_start);
+    let end = if integer_end + 1 < bytes.len()
+        && bytes[integer_end] == b'.'
+        && bytes[integer_end + 1].is_ascii_digit()
+    {
+        digits_end(bytes, integer_end + 1)
+    } else {
+        integer_end
+    };
+    Some((&text[start..end], end))
+}
+
+fn numeric_starts_at(text: &[u8], index: usize) -> bool {
+    text[index].is_ascii_digit()
+        || (matches!(text[index], b'+' | b'-')
+            && text.get(index + 1).is_some_and(u8::is_ascii_digit))
+}
+
+fn digits_end(text: &[u8], mut index: usize) -> usize {
+    while text.get(index).is_some_and(u8::is_ascii_digit) {
+        index += 1;
+    }
+    index
+}
+
+fn observation_contains_numeric_literal(observation: &Observation, literal: &str) -> bool {
+    numeric_literal_present(&observation.visible_text, literal)
+        || observation
+            .elements
+            .iter()
+            .any(|element| numeric_literal_present(&element.value, literal))
+}
+
+fn numeric_literal_present(text: &str, literal: &str) -> bool {
+    text.match_indices(literal).any(|(start, _)| {
+        let end = start + literal.len();
+        numeric_start_boundary(text.as_bytes(), start) && numeric_end_boundary(text.as_bytes(), end)
+    })
+}
+
+fn numeric_start_boundary(text: &[u8], index: usize) -> bool {
+    index == 0 || !matches!(text[index - 1], b'0'..=b'9' | b'.' | b'+' | b'-')
+}
+
+fn numeric_end_boundary(text: &[u8], index: usize) -> bool {
+    index == text.len() || !matches!(text[index], b'0'..=b'9' | b'.' | b'+' | b'-')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,6 +350,58 @@ mod tests {
                 secret: false,
             },
         )])
+    }
+
+    #[test]
+    fn natural_done_bands_are_inclusive_at_the_accepted_boundaries() {
+        let observation = observation();
+        for (noul, expected) in [
+            (0.19, DoneResult::NotSatisfied),
+            (0.20, DoneResult::NotSatisfied),
+            (0.21, DoneResult::Unknown),
+            (0.79, DoneResult::Unknown),
+            (0.80, DoneResult::Satisfied),
+            (0.81, DoneResult::Satisfied),
+        ] {
+            assert_eq!(
+                check_natural_done("The saved account is visible", &observation, noul),
+                expected,
+                "Noul {noul}"
+            );
+        }
+    }
+
+    #[test]
+    fn natural_done_requires_exact_numeric_literals_before_advancing() {
+        let mut observation = observation();
+        observation.visible_text = "Balance 112.34".into();
+        assert_eq!(
+            check_natural_done("The balance is 12.34", &observation, 0.95),
+            DoneResult::NotSatisfied
+        );
+        observation.elements[0].value = "12.34".into();
+        assert_eq!(
+            check_natural_done("The balance is 12.34", &observation, 0.95),
+            DoneResult::Satisfied
+        );
+        assert_eq!(
+            check_natural_done("The range is +7 through -12.34", &observation, 0.95),
+            DoneResult::NotSatisfied
+        );
+        observation.visible_text = "Range +7 through -12.34".into();
+        assert_eq!(
+            check_natural_done("The range is +7 through -12.34", &observation, 0.95),
+            DoneResult::Satisfied
+        );
+    }
+
+    #[test]
+    fn numeric_literal_extraction_preserves_signs_decimals_and_integers() {
+        assert_eq!(
+            numeric_literals("No number; then -12.34, +7 and 0."),
+            ["-12.34", "+7", "0"]
+        );
+        assert!(numeric_literals("A sign + without digits").is_empty());
     }
 
     #[test]

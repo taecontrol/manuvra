@@ -1,0 +1,20 @@
+{
+  "source": "jev-spike/spikes/jev-browser-executor/evidence-2/create-account-es",
+  "records": [
+    {
+      "source": "evidence-2/create-account-es/run-1/result.json decisions step 2 calls 2-3",
+      "first": {"step": 2, "call": 2, "retry": false, "structured_done": null, "step_done": 0.67, "operation": "TYPE_TEXT", "confidence": 0.94},
+      "retry": {"step": 2, "call": 3, "retry": true, "structured_done": null, "step_done": 0.69, "operation": "TYPE_TEXT", "confidence": 0.92}
+    },
+    {
+      "source": "evidence-2/create-account-es/run-2/result.json decisions step 2 calls 2-3",
+      "first": {"step": 2, "call": 2, "retry": false, "structured_done": null, "step_done": 0.63, "operation": "TYPE_TEXT", "confidence": 0.94},
+      "retry": {"step": 2, "call": 3, "retry": true, "structured_done": null, "step_done": 0.71, "operation": "TYPE_TEXT", "confidence": 0.93}
+    },
+    {
+      "source": "evidence-2/create-account-es/run-3/result.json decisions step 2 calls 2-3",
+      "first": {"step": 2, "call": 2, "retry": false, "structured_done": null, "step_done": 0.59, "operation": "TYPE_TEXT", "confidence": 0.94},
+      "retry": {"step": 2, "call": 3, "retry": true, "structured_done": null, "step_done": 0.65, "operation": "TYPE_TEXT", "confidence": 0.94}
+    }
+  ]
+}

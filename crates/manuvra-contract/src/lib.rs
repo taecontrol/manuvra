@@ -544,13 +544,6 @@ impl Job {
     }
 
     pub fn first_unsupported_feature(&self) -> Option<&'static str> {
-        if self
-            .steps
-            .iter()
-            .any(|step| matches!(step.done_when, DoneCondition::NaturalLanguage(_)))
-        {
-            return Some("natural_language_done_condition");
-        }
         if !self.expectations.is_empty() {
             return Some("expectations");
         }
@@ -1116,10 +1109,7 @@ mod tests {
     fn names_the_first_feature_not_supported_by_current_build() {
         let mut natural = valid_job();
         natural["steps"][0]["done_when"] = json!("The account exists");
-        assert_eq!(
-            parse(&natural).unwrap().first_unsupported_feature(),
-            Some("natural_language_done_condition")
-        );
+        assert_eq!(parse(&natural).unwrap().first_unsupported_feature(), None);
 
         let mut expectation = valid_job();
         expectation["expectations"] = json!([{"id": "account", "claim": "Account exists"}]);

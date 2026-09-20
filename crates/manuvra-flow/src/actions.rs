@@ -367,7 +367,14 @@ mod tests {
             request: Value::Null,
         };
         let mut p = Policy::new(&job.options, "http://example.test");
-        match p.decide(&job.steps[0], obs, &j, false) {
+        match p.decide(
+            &job.steps[0],
+            obs,
+            &j,
+            crate::verification::DoneResult::NotSatisfied,
+            false,
+            false,
+        ) {
             Next::Mutate(p) => p,
             _ => panic!(),
         }

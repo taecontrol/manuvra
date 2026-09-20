@@ -1,6 +1,7 @@
 use crate::judgment::{Judgments, Operation, selected_operation};
+use crate::verification::DoneResult;
 use manuvra_chrome::{Element, Observation};
-use manuvra_contract::{JobOptions, Step};
+use manuvra_contract::{DoneCondition, JobOptions, Step};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -26,7 +27,9 @@ pub enum PolicyStop {
 
 #[derive(Debug)]
 pub enum Next {
-    Reobserve,
+    Complete,
+    ReobserveDone,
+    ReobserveOperation,
     Wait,
     Mutate(Permit),
     Stop(PolicyStop),
@@ -111,15 +114,20 @@ impl Policy {
         step: &Step,
         observation: &Observation,
         judgments: &Judgments,
-        already_reobserved: bool,
+        done: DoneResult,
+        done_reobserved: bool,
+        operation_reobserved: bool,
     ) -> Next {
+        if let Some(next) = done_first(step, done, done_reobserved) {
+            return next;
+        }
         if let Some(capability) = unsupported_capability(observation, judgments) {
             return Next::Stop(PolicyStop::Blocked(capability));
         }
         let Ok(operation) = selected_operation(judgments) else {
             return Next::Stop(PolicyStop::Blocked("provider_invalid_response"));
         };
-        if let Some(next) = operation_gate(judgments, already_reobserved) {
+        if let Some(next) = operation_gate(judgments, operation_reobserved) {
             return next;
         }
         match operation {
@@ -198,9 +206,24 @@ fn operation_gate(judgments: &Judgments, already_reobserved: bool) -> Option<Nex
         if already_reobserved {
             Next::Stop(PolicyStop::Uncertain("operation_below_gate"))
         } else {
-            Next::Reobserve
+            Next::ReobserveOperation
         }
     })
+}
+
+pub fn done_first(step: &Step, done: DoneResult, already_reobserved: bool) -> Option<Next> {
+    match done {
+        DoneResult::Satisfied => Some(Next::Complete),
+        DoneResult::Unknown if already_reobserved => {
+            let reason = match &step.done_when {
+                DoneCondition::NaturalLanguage(_) => "done_uncertain",
+                DoneCondition::Structured(_) => "done_unknown",
+            };
+            Some(Next::Stop(PolicyStop::Uncertain(reason)))
+        }
+        DoneResult::Unknown => Some(Next::ReobserveDone),
+        DoneResult::NotSatisfied => None,
+    }
 }
 
 fn selected_target<'a>(
@@ -389,10 +412,37 @@ mod tests {
         }
     }
 
+    fn natural_step() -> Step {
+        Step {
+            done_when: DoneCondition::NaturalLanguage(
+                "El campo Account name contiene el valor proporcionado".into(),
+            ),
+            ..step()
+        }
+    }
+
+    fn decide_not_done(
+        policy: &mut Policy,
+        step: &Step,
+        observation: &Observation,
+        judgments: &Judgments,
+        operation_reobserved: bool,
+    ) -> Next {
+        policy.decide(
+            step,
+            observation,
+            judgments,
+            DoneResult::NotSatisfied,
+            false,
+            operation_reobserved,
+        )
+    }
+
     #[test]
     fn permit_is_single_owner_and_replay_survives_wait_remount_shape() {
         let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
-        let first = policy.decide(
+        let first = decide_not_done(
+            &mut policy,
             &step(),
             &observation("CLICK", "button"),
             &judgments("CLICK"),
@@ -400,7 +450,8 @@ mod tests {
         );
         assert!(matches!(first, Next::Mutate(_)));
         assert!(matches!(
-            policy.decide(
+            decide_not_done(
+                &mut policy,
                 &step(),
                 &observation("CLICK", "button"),
                 &judgments("WAIT"),
@@ -411,7 +462,7 @@ mod tests {
         let mut remount = observation("CLICK", "button");
         remount.elements[0].node_id = 77;
         assert!(matches!(
-            policy.decide(&step(), &remount, &judgments("CLICK"), false),
+            decide_not_done(&mut policy, &step(), &remount, &judgments("CLICK"), false),
             Next::Stop(PolicyStop::Uncertain("replay_forbidden"))
         ));
     }
@@ -422,7 +473,8 @@ mod tests {
         let first_step = step();
         let mut later_step = step();
         later_step.id = "confirm-again".into();
-        let first = policy.decide(
+        let first = decide_not_done(
+            &mut policy,
             &first_step,
             &observation("CLICK", "button"),
             &judgments("CLICK"),
@@ -434,7 +486,13 @@ mod tests {
         remounted.document_id = "new-document-token".into();
         remounted.elements[0].node_id = 999;
         assert!(matches!(
-            policy.decide(&later_step, &remounted, &judgments("CLICK"), false),
+            decide_not_done(
+                &mut policy,
+                &later_step,
+                &remounted,
+                &judgments("CLICK"),
+                false
+            ),
             Next::Stop(PolicyStop::Uncertain("replay_forbidden"))
         ));
     }
@@ -445,20 +503,38 @@ mod tests {
         let mut click = judgments("CLICK");
         click.type_target.confidence = 0.01;
         assert!(matches!(
-            policy.decide(&step(), &observation("CLICK", "button"), &click, false),
+            decide_not_done(
+                &mut policy,
+                &step(),
+                &observation("CLICK", "button"),
+                &click,
+                false
+            ),
             Next::Mutate(_)
         ));
         let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
         click.click_target.confidence = 0.69;
         assert!(matches!(
-            policy.decide(&step(), &observation("CLICK", "button"), &click, false),
+            decide_not_done(
+                &mut policy,
+                &step(),
+                &observation("CLICK", "button"),
+                &click,
+                false
+            ),
             Next::Mutate(_)
         ));
         let mut typed = judgments("TYPE_TEXT");
         typed.type_value.confidence = 0.01;
         let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
         assert!(matches!(
-            policy.decide(&step(), &observation("TYPE_TEXT", "textbox"), &typed, false),
+            decide_not_done(
+                &mut policy,
+                &step(),
+                &observation("TYPE_TEXT", "textbox"),
+                &typed,
+                false
+            ),
             Next::Mutate(_)
         ));
     }
@@ -467,7 +543,8 @@ mod tests {
     fn native_select_stops_before_authorization() {
         let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
         assert!(matches!(
-            policy.decide(
+            decide_not_done(
+                &mut policy,
                 &step(),
                 &observation("SELECT", "combobox"),
                 &judgments("CLICK"),
@@ -483,14 +560,14 @@ mod tests {
         control.elements[0].name = "Currency or asset".into();
         let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
         assert!(matches!(
-            policy.decide(&step(), &control, &judgments("CLICK"), false),
+            decide_not_done(&mut policy, &step(), &control, &judgments("CLICK"), false),
             Next::Mutate(_)
         ));
         let mut option = observation("CLICK", "option");
         option.elements[0].name = "+ New currency or asset…".into();
         let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
         assert!(matches!(
-            policy.decide(&step(), &option, &judgments("CLICK"), false),
+            decide_not_done(&mut policy, &step(), &option, &judgments("CLICK"), false),
             Next::Mutate(_)
         ));
     }
@@ -501,20 +578,118 @@ mod tests {
         low.operation.confidence = 0.69;
         let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
         assert!(matches!(
-            policy.decide(&step(), &observation("CLICK", "button"), &low, false),
-            Next::Reobserve
+            decide_not_done(
+                &mut policy,
+                &step(),
+                &observation("CLICK", "button"),
+                &low,
+                false
+            ),
+            Next::ReobserveOperation
         ));
         assert!(matches!(
-            policy.decide(&step(), &observation("CLICK", "button"), &low, true),
+            decide_not_done(
+                &mut policy,
+                &step(),
+                &observation("CLICK", "button"),
+                &low,
+                true
+            ),
             Next::Stop(PolicyStop::Uncertain("operation_below_gate"))
         ));
         let mut none = judgments("TYPE_TEXT");
         none.type_value = choice("NONE_FITS");
         let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
         assert!(matches!(
-            policy.decide(&step(), &observation("TYPE_TEXT", "textbox"), &none, false),
+            decide_not_done(
+                &mut policy,
+                &step(),
+                &observation("TYPE_TEXT", "textbox"),
+                &none,
+                false
+            ),
             Next::Stop(PolicyStop::Blocked("value_not_provided"))
         ));
+    }
+
+    #[test]
+    fn done_first_prevents_a_confident_operation_from_dispatching() {
+        let mut judgment = judgments("CLICK");
+        judgment.operation.confidence = 0.95;
+        judgment.step_done = 0.50;
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        assert!(matches!(
+            policy.decide(
+                &natural_step(),
+                &observation("CLICK", "button"),
+                &judgment,
+                DoneResult::Unknown,
+                false,
+                false
+            ),
+            Next::ReobserveDone
+        ));
+        assert_eq!(policy.actions, 0);
+        assert!(matches!(
+            policy.decide(
+                &natural_step(),
+                &observation("CLICK", "button"),
+                &judgment,
+                DoneResult::Unknown,
+                true,
+                false
+            ),
+            Next::Stop(PolicyStop::Uncertain("done_uncertain"))
+        ));
+        assert_eq!(policy.actions, 0);
+    }
+
+    #[test]
+    fn recorded_iteration_two_spanish_done_judgments_stop_instead_of_advancing() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/iteration2-spanish-done-records.json"
+        ))
+        .unwrap();
+        for record in fixture["records"].as_array().unwrap() {
+            assert_eq!(record["first"]["step"], 2);
+            assert_eq!(record["first"]["call"], 2);
+            assert_eq!(record["first"]["retry"], false);
+            assert!(record["first"]["structured_done"].is_null());
+            assert_eq!(record["retry"]["step"], 2);
+            assert_eq!(record["retry"]["call"], 3);
+            assert_eq!(record["retry"]["retry"], true);
+            assert!(record["retry"]["structured_done"].is_null());
+            let replay = |decision: &Value| {
+                let mut judgment = judgments(decision["operation"].as_str().unwrap());
+                judgment.step_done = decision["step_done"].as_f64().unwrap();
+                judgment.operation.confidence = decision["confidence"].as_f64().unwrap();
+                judgment
+            };
+            let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+            assert!(matches!(
+                policy.decide(
+                    &natural_step(),
+                    &observation("TYPE_TEXT", "textbox"),
+                    &replay(&record["first"]),
+                    DoneResult::Unknown,
+                    false,
+                    false
+                ),
+                Next::ReobserveDone
+            ));
+            assert!(matches!(
+                policy.decide(
+                    &natural_step(),
+                    &observation("TYPE_TEXT", "textbox"),
+                    &replay(&record["retry"]),
+                    DoneResult::Unknown,
+                    true,
+                    false
+                ),
+                Next::Stop(PolicyStop::Uncertain("done_uncertain"))
+            ));
+            assert_eq!(policy.actions, 0, "record {}", record["source"]);
+        }
     }
 
     #[test]
@@ -543,16 +718,18 @@ mod tests {
         assert_eq!(policy.actions, 0);
 
         assert!(matches!(
-            policy.decide(
+            decide_not_done(
+                &mut policy,
                 &step(),
                 &observation("CLICK", "button"),
                 &from_record(&records[1]),
                 records[1]["retry"].as_bool().unwrap()
             ),
-            Next::Reobserve
+            Next::ReobserveOperation
         ));
         assert!(matches!(
-            policy.decide(
+            decide_not_done(
+                &mut policy,
                 &step(),
                 &observation("CLICK", "button"),
                 &from_record(&records[2]),
@@ -566,7 +743,13 @@ mod tests {
         recorded_page.elements[0].name = records[3]["target_name"].as_str().unwrap().into();
         let mut fresh_policy = Policy::new(&JobOptions::default(), "http://example.test/");
         assert!(matches!(
-            fresh_policy.decide(&step(), &recorded_page, &from_record(&records[3]), false),
+            decide_not_done(
+                &mut fresh_policy,
+                &step(),
+                &recorded_page,
+                &from_record(&records[3]),
+                false
+            ),
             Next::Mutate(_)
         ));
     }
@@ -585,7 +768,8 @@ mod tests {
             Err(PolicyStop::Blocked("budget_exhausted"))
         );
         assert!(matches!(
-            policy.decide(
+            decide_not_done(
+                &mut policy,
                 &step(),
                 &observation("CLICK", "button"),
                 &judgments("CLICK"),

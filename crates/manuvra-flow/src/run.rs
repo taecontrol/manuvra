@@ -1,6 +1,6 @@
 use crate::evidence::{self, EvidenceBundle, Redactor};
 #[cfg(any(target_os = "linux", test))]
-use crate::verification::{DoneResult, check_done};
+use crate::verification::{DoneResult, check_done, check_natural_done};
 #[cfg(any(target_os = "linux", test))]
 use crate::{actions, judgment, policy, values::Values};
 #[cfg(target_os = "linux")]
@@ -471,11 +471,8 @@ struct StepDriver<'a> {
 #[cfg(any(target_os = "linux", test))]
 impl StepDriver<'_> {
     fn drive(&mut self) -> Option<Stop> {
-        let DoneCondition::Structured(assertions) = &self.step.done_when else {
-            unreachable!("admission rejected natural language")
-        };
         loop {
-            match self.drive_iteration(assertions) {
+            match self.drive_iteration() {
                 StepProgress::Continue => {}
                 StepProgress::Complete => return None,
                 StepProgress::Stop(stop) => return Some(stop),
@@ -483,17 +480,71 @@ impl StepDriver<'_> {
         }
     }
 
-    fn drive_iteration(&mut self, assertions: &[manuvra_contract::Assertion]) -> StepProgress {
+    fn drive_iteration(&mut self) -> StepProgress {
         let captured = match self.capture() {
             Ok(value) => value,
             Err(stop) => return StepProgress::Stop(stop),
         };
-        let done = check_done(assertions, &captured.raw, &self.job.values);
-        self.record(&captured, done);
-        if let Err(stop) = self.policy.check_active() {
-            return StepProgress::Stop(policy_stop(stop, self.redactor, self.step));
+        match &self.step.done_when {
+            DoneCondition::Structured(assertions) => {
+                let done = check_done(assertions, &captured.raw, &self.job.values);
+                self.record(&captured, done);
+                if let Err(stop) = self.policy.check_active() {
+                    return StepProgress::Stop(policy_stop(stop, self.redactor, self.step));
+                }
+                self.done_progress(done, &captured)
+            }
+            DoneCondition::NaturalLanguage(condition) => {
+                self.natural_done_progress(condition, &captured)
+            }
         }
-        self.done_progress(done, &captured)
+    }
+
+    fn natural_done_progress(&mut self, condition: &str, captured: &Captured) -> StepProgress {
+        let judgments = match self.natural_judgments(captured) {
+            Ok(value) => value,
+            Err(stop) => return StepProgress::Stop(stop),
+        };
+        let done = check_natural_done(condition, &captured.raw, judgments.step_done);
+        self.record(captured, done);
+        self.record_decision(&judgments);
+        if done == DoneResult::NotSatisfied && self.mutations >= self.step.mutation_limit {
+            return self.after_mutation_limit(done);
+        }
+        let next = self.policy.decide(
+            self.step,
+            &captured.raw,
+            &judgments,
+            done,
+            self.done_unknown_reobserved,
+            self.operation_gate_reobserved,
+        );
+        self.apply_next(done, captured, &judgments, next)
+    }
+
+    fn natural_judgments(&mut self, captured: &Captured) -> Result<judgment::Judgments, Stop> {
+        if !captured.redaction_verified {
+            self.record(captured, DoneResult::Unknown);
+            return Err(Stop::blocked(
+                "redaction_unverifiable",
+                step_detail(self.redactor, self.step),
+            ));
+        }
+        let deadline = self
+            .policy
+            .record_model_call()
+            .map_err(|stop| policy_stop(stop, self.redactor, self.step))?;
+        self.judge(captured, deadline)
+    }
+
+    fn after_mutation_limit(&mut self, done: DoneResult) -> StepProgress {
+        if !self.awaiting_final_done_reobservation {
+            self.awaiting_final_done_reobservation = true;
+            self.pause_before_reobservation(Duration::from_millis(300));
+            StepProgress::Continue
+        } else {
+            StepProgress::Stop(self.done_condition_failed(done))
+        }
     }
 
     fn capture(&mut self) -> Result<Captured, Stop> {
@@ -546,7 +597,7 @@ impl StepDriver<'_> {
         self.artifacts.verdicts[self.index] = StepVerdict {
             id: self.redactor.redact_export_text(&self.step.id),
             result: VerdictResult::Satisfied,
-            basis: Some("structured".into()),
+            basis: Some(self.done_basis().into()),
         };
         self.record_step(done, true);
     }
@@ -570,12 +621,7 @@ impl StepDriver<'_> {
 
     fn not_done(&mut self, done: DoneResult, captured: &Captured) -> StepProgress {
         if self.mutations >= self.step.mutation_limit {
-            if !self.awaiting_final_done_reobservation {
-                self.awaiting_final_done_reobservation = true;
-                self.pause_before_reobservation(Duration::from_millis(300));
-                return StepProgress::Continue;
-            }
-            return StepProgress::Stop(self.done_condition_failed(done));
+            return self.after_mutation_limit(done);
         }
         let deadline = match self.policy.record_model_call() {
             Ok(deadline) => deadline,
@@ -593,7 +639,7 @@ impl StepDriver<'_> {
         self.artifacts.verdicts[self.index] = StepVerdict {
             id: self.redactor.redact_export_text(&self.step.id),
             result: VerdictResult::NotSatisfied,
-            basis: Some("structured".into()),
+            basis: Some(self.done_basis().into()),
         };
         self.record_step(done, true);
         Stop::failed(
@@ -637,6 +683,8 @@ impl StepDriver<'_> {
             self.step,
             &captured.raw,
             judgments,
+            done,
+            self.done_unknown_reobserved,
             self.operation_gate_reobserved,
         );
         self.apply_next(done, captured, judgments, next)
@@ -650,7 +698,16 @@ impl StepDriver<'_> {
         next: policy::Next,
     ) -> StepProgress {
         match next {
-            policy::Next::Reobserve => {
+            policy::Next::Complete => {
+                self.complete_step(done);
+                StepProgress::Complete
+            }
+            policy::Next::ReobserveDone => {
+                self.done_unknown_reobserved = true;
+                self.pause_before_reobservation(Duration::from_millis(300));
+                StepProgress::Continue
+            }
+            policy::Next::ReobserveOperation => {
                 self.operation_gate_reobserved = true;
                 self.pause_before_reobservation(Duration::from_millis(300));
                 StepProgress::Continue
@@ -689,7 +746,10 @@ impl StepDriver<'_> {
             policy::Next::Stop(stop) => {
                 StepProgress::Stop(self.policy_stop(done, captured, judgments, stop))
             }
-            policy::Next::Reobserve | policy::Next::Wait => {
+            policy::Next::Complete
+            | policy::Next::ReobserveDone
+            | policy::Next::ReobserveOperation
+            | policy::Next::Wait => {
                 unreachable!("earlier next variants were handled")
             }
         }
@@ -825,7 +885,15 @@ impl StepDriver<'_> {
             self.mutations,
             redaction_verified,
             self.policy.active_ms(),
+            self.done_basis(),
         );
+    }
+
+    fn done_basis(&self) -> &'static str {
+        match &self.step.done_when {
+            DoneCondition::Structured(_) => "structured",
+            DoneCondition::NaturalLanguage(_) => "natural_language",
+        }
     }
 }
 
@@ -905,9 +973,10 @@ fn record_step(
     mutations: u8,
     redaction_verified: bool,
     active_ms: u128,
+    basis: &str,
 ) {
     let id = redactor.redact_export_text(&step.id);
-    artifacts.steps.push((safe_name(index+1,&id),json!({"id":id,"done":done,"basis":"structured","mutation_limit_consumed":mutations,"redaction_verified":redaction_verified,"active_ms":active_ms})));
+    artifacts.steps.push((safe_name(index+1,&id),json!({"id":id,"done":done,"basis":basis,"mutation_limit_consumed":mutations,"redaction_verified":redaction_verified,"active_ms":active_ms})));
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1492,6 +1561,35 @@ mod tests {
         }
     }
 
+    struct NaturalDoneSequenceProvider(Mutex<VecDeque<f64>>);
+
+    impl manuvra_jev::Evaluator for NaturalDoneSequenceProvider {
+        fn evaluate(
+            &self,
+            _request: &Value,
+            _deadline: Instant,
+        ) -> Result<manuvra_jev::Evaluation, manuvra_jev::JevError> {
+            let noul = self.0.lock().unwrap().pop_front().expect("done Noul");
+            let choice = |selected: &str| manuvra_jev::Answer::Choice {
+                choice: selected.into(),
+                probabilities: BTreeMap::from([(selected.into(), 1.0)]),
+                confidence: 0.95,
+            };
+            Ok(manuvra_jev::Evaluation {
+                answers: BTreeMap::from([
+                    ("operation".into(), choice("TYPE_TEXT")),
+                    ("click_target".into(), choice("NO_CLICK_TARGET")),
+                    ("type_target".into(), choice("1")),
+                    ("type_value".into(), choice("name")),
+                    ("step_done".into(), manuvra_jev::Answer::Noul { noul }),
+                ]),
+                usage: BTreeMap::new(),
+                request_id: Some("recorded-natural-sequence".into()),
+                model: "jev-1.13.0".into(),
+            })
+        }
+    }
+
     #[derive(Default)]
     struct MemoryJournal(Vec<Value>);
     impl actions::ActionJournal for MemoryJournal {
@@ -1603,6 +1701,58 @@ mod tests {
     }
 
     #[test]
+    fn natural_done_uncertainty_reobserves_once_and_never_dispatches() {
+        let mut job = mutation_job();
+        job.steps[0].done_when =
+            DoneCondition::NaturalLanguage("El campo Name contiene el valor proporcionado".into());
+        let redactor = Redactor::for_job(&job).unwrap();
+        let mut observation = observed("");
+        observation.elements.push(Element {
+            index: 1,
+            node_id: 7,
+            context: "main".into(),
+            role: "textbox".into(),
+            name: "Name".into(),
+            input_type: Some("text".into()),
+            value: "Wanted".into(),
+            checked: None,
+            selected: None,
+            expanded: None,
+            disabled: false,
+            in_dialog: None,
+            operations: vec!["TYPE_TEXT".into()],
+            rect: Rect {
+                x: 1.0,
+                y: 1.0,
+                width: 20.0,
+                height: 10.0,
+            },
+        });
+        let browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::from([
+                observation_page(observation.clone()),
+                observation_page(observation.clone()),
+            ])),
+            fallback: observation,
+            dispatch_result: None,
+        };
+        let provider = NaturalDoneSequenceProvider(Mutex::new(VecDeque::from([0.50, 0.50])));
+        let mut journal = MemoryJournal::default();
+        let artifacts = drive_steps(&job, &redactor, &browser, &provider, &mut journal);
+        assert_eq!(artifacts.stop.as_ref().unwrap().code, "done_uncertain");
+        assert_eq!(artifacts.observations.len(), 2);
+        assert_eq!(artifacts.decisions.len(), 2);
+        assert_eq!(artifacts.verdicts[0].result, VerdictResult::Unresolved);
+        assert!(
+            artifacts
+                .trace
+                .iter()
+                .all(|event| event["event"] != "action_prepared")
+        );
+        assert!(provider.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn step_driver_routes_every_policy_and_action_stop_truthfully() {
         let job = mutation_job();
         let redactor = Redactor::for_job(&job).unwrap();
@@ -1665,7 +1815,7 @@ mod tests {
         let done = DoneResult::NotSatisfied;
         let typed = mutation_judgments("TYPE_TEXT", 1.0);
         assert!(matches!(
-            driver.apply_next(done, &captured, &typed, policy::Next::Reobserve),
+            driver.apply_next(done, &captured, &typed, policy::Next::ReobserveOperation),
             StepProgress::Continue
         ));
         assert!(matches!(
@@ -1674,7 +1824,7 @@ mod tests {
         ));
         let next = driver
             .policy
-            .decide(driver.step, &captured.raw, &typed, false);
+            .decide(driver.step, &captured.raw, &typed, done, false, false);
         assert!(matches!(
             driver.apply_terminal_next(done, &captured, &typed, next),
             StepProgress::Stop(_)
