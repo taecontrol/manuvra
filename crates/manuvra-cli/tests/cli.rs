@@ -11,6 +11,16 @@ fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_manuvra")
 }
 
+#[cfg(target_os = "linux")]
+const EXECUTION_STOP_REASON: &str = "browser_unavailable";
+#[cfg(not(target_os = "linux"))]
+const EXECUTION_STOP_REASON: &str = "unsupported_platform";
+
+#[cfg(target_os = "linux")]
+const VALID_BACKGROUND_COMMAND_RESULT: (i32, &str) = (64, "run_not_found");
+#[cfg(not(target_os = "linux"))]
+const VALID_BACKGROUND_COMMAND_RESULT: (i32, &str) = (3, "unsupported_platform");
+
 fn valid_job() -> Value {
     json!({
         "schema_version": 1,
@@ -224,7 +234,7 @@ fn natural_language_done_conditions_reach_browser_execution() {
     );
     assert_eq!(output.status.code(), Some(3));
     let result = one_object(&output);
-    assert_eq!(result["reason"]["code"], "browser_unavailable");
+    assert_eq!(result["reason"]["code"], EXECUTION_STOP_REASON);
 }
 
 #[test]
@@ -269,8 +279,14 @@ fn malformed_input_and_unimplemented_commands_return_one_error_object() {
         vec!["abort", "r_0000000000000001", "--request-id", "abort-1"],
     ] {
         let output = invoke(&temp, &args);
-        assert_eq!(output.status.code(), Some(64));
-        assert_eq!(one_object(&output)["error"]["code"], "run_not_found");
+        assert_eq!(
+            output.status.code(),
+            Some(VALID_BACKGROUND_COMMAND_RESULT.0)
+        );
+        assert_eq!(
+            one_object(&output)["error"]["code"],
+            VALID_BACKGROUND_COMMAND_RESULT.1
+        );
     }
 
     for args in [
@@ -2244,5 +2260,5 @@ fn browser_run_export_uses_the_same_caller_and_protocol_redaction_policy() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(3));
-    assert_export_boundary(&output, &evidence, provider, "browser_unavailable");
+    assert_export_boundary(&output, &evidence, provider, EXECUTION_STOP_REASON);
 }

@@ -4,14 +4,13 @@ use crate::process::{IPC_VERSION, now_unix_ms};
 #[cfg(target_os = "linux")]
 use crate::store::{self, RunControl};
 #[cfg(target_os = "linux")]
-use crate::{
-    EXIT_INTERNAL, internal_error, result_exit_code, validate_request_id, validate_run_id,
-};
+use crate::{EXIT_INTERNAL, internal_error, result_exit_code};
+use crate::{validate_request_id, validate_run_id};
+use manuvra_contract::DispositionRequest;
 #[cfg(target_os = "linux")]
-use manuvra_contract::{DispositionRequest, SchemaVersion};
+use manuvra_contract::SchemaVersion;
 #[cfg(target_os = "linux")]
 use serde_json::{Value, json};
-#[cfg(target_os = "linux")]
 use std::fs;
 #[cfg(target_os = "linux")]
 use std::io::Read;
@@ -30,9 +29,10 @@ fn try_status(
     request_id: Option<&str>,
     wait_ms: Option<u64>,
 ) -> Result<Invocation, Invocation> {
+    validate_status_selectors(run_id, request_id)?;
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (run_id, request_id, wait_ms);
+        let _ = wait_ms;
         Err(Invocation::error(
             "unsupported_platform",
             "background runs are supported only on Linux",
@@ -51,7 +51,6 @@ fn try_status_linux(
     request_id: Option<&str>,
     wait_ms: Option<u64>,
 ) -> Result<Invocation, Invocation> {
-    validate_status_selectors(run_id, request_id)?;
     let root = store::state_root().map_err(internal_error)?;
     let run_id = resolve_run_id(&root, run_id, request_id).map_err(internal_error)?;
     validate_run_id(&run_id).map_err(internal_error)?;
@@ -60,7 +59,6 @@ fn try_status_linux(
     Ok(run_invocation(control))
 }
 
-#[cfg(target_os = "linux")]
 fn validate_status_selectors(
     run_id: Option<&str>,
     request_id: Option<&str>,
@@ -103,9 +101,11 @@ pub fn wait_for_run(run_id: &str, wait_ms: Option<u64>) -> Invocation {
 }
 
 pub fn abort(run_id: &str, request_id: &str) -> Invocation {
+    if let Err(error) = validate_control_ids(run_id, request_id) {
+        return error;
+    }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (run_id, request_id);
         Invocation::error(
             "unsupported_platform",
             "background runs are supported only on Linux",
@@ -119,9 +119,13 @@ pub fn abort(run_id: &str, request_id: &str) -> Invocation {
 }
 
 pub fn resume(run_id: &str, request_id: &str, input: &Path) -> Invocation {
+    let disposition = match load_disposition(run_id, request_id, input) {
+        Ok(disposition) => disposition,
+        Err(error) => return error,
+    };
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (run_id, request_id, input);
+        let _ = disposition;
         Invocation::error(
             "unsupported_platform",
             "background runs are supported only on Linux",
@@ -130,17 +134,21 @@ pub fn resume(run_id: &str, request_id: &str, input: &Path) -> Invocation {
     }
     #[cfg(target_os = "linux")]
     {
-        resume_linux(run_id, request_id, input).unwrap_or_else(|error| error)
+        resume_linux(run_id, request_id, disposition).unwrap_or_else(|error| error)
     }
 }
 
 #[cfg(target_os = "linux")]
-fn resume_linux(run_id: &str, request_id: &str, input: &Path) -> Result<Invocation, Invocation> {
+fn resume_linux(
+    run_id: &str,
+    request_id: &str,
+    disposition: DispositionRequest,
+) -> Result<Invocation, Invocation> {
     resume_at_root(
         store::state_root().map_err(internal_error),
         run_id,
         request_id,
-        input,
+        disposition,
     )
 }
 
@@ -149,9 +157,8 @@ fn resume_at_root(
     root: Result<PathBuf, Invocation>,
     run_id: &str,
     request_id: &str,
-    input: &Path,
+    disposition: DispositionRequest,
 ) -> Result<Invocation, Invocation> {
-    let disposition = load_disposition(run_id, request_id, input)?;
     let root = root?;
     let _lock = store::lock_request(&root, request_id).map_err(internal_error)?;
     let digest = resume_digest(&root, run_id, &disposition)?;
@@ -164,15 +171,12 @@ fn resume_at_root(
     )
 }
 
-#[cfg(target_os = "linux")]
 fn load_disposition(
     run_id: &str,
     request_id: &str,
     input: &Path,
 ) -> Result<DispositionRequest, Invocation> {
-    validate_run_id(run_id).map_err(|message| Invocation::error("invalid_run_id", message, 64))?;
-    validate_request_id(request_id)
-        .map_err(|message| Invocation::error("invalid_request_id", message, 64))?;
+    validate_control_ids(run_id, request_id)?;
     let bytes = fs::read(input).map_err(|error| {
         Invocation::error(
             "invalid_input",
@@ -182,6 +186,12 @@ fn load_disposition(
     })?;
     serde_json::from_slice(&bytes)
         .map_err(|_| Invocation::error("invalid_disposition", "disposition input is invalid", 64))
+}
+
+fn validate_control_ids(run_id: &str, request_id: &str) -> Result<(), Invocation> {
+    validate_run_id(run_id).map_err(|message| Invocation::error("invalid_run_id", message, 64))?;
+    validate_request_id(request_id)
+        .map_err(|message| Invocation::error("invalid_request_id", message, 64))
 }
 
 #[cfg(target_os = "linux")]
@@ -609,14 +619,7 @@ fn resume_record(
 
 #[cfg(target_os = "linux")]
 fn abort_linux(run_id: &str, request_id: &str) -> Invocation {
-    validate_run_id(run_id)
-        .map_err(|message| Invocation::error("invalid_run_id", message, 64))
-        .and_then(|()| {
-            validate_request_id(request_id)
-                .map_err(|message| Invocation::error("invalid_request_id", message, 64))
-        })
-        .and_then(|()| abort_in_state(run_id, request_id))
-        .unwrap_or_else(|invocation| invocation)
+    abort_in_state(run_id, request_id).unwrap_or_else(|invocation| invocation)
 }
 
 #[cfg(target_os = "linux")]
@@ -1346,8 +1349,6 @@ mod tests {
         assert_eq!(missing.output["error"]["code"], "run_not_found");
 
         let disposition = retry_disposition();
-        let input = temporary.path().join("resume.json");
-        std::fs::write(&input, serde_json::to_vec(&disposition).unwrap()).unwrap();
         let resume_root = temporary.path().join("resume-state");
         let valid_run = "r_1234567890abcdef";
         let digest = match resume_digest(&resume_root, valid_run, &disposition) {
@@ -1364,7 +1365,12 @@ mod tests {
         )
         .unwrap();
         store::finalize_control_request(&resume_root, "prior-root", &prior_record).unwrap();
-        let resumed = match resume_at_root(Ok(resume_root), valid_run, "prior-root", &input) {
+        let resumed = match resume_at_root(
+            Ok(resume_root),
+            valid_run,
+            "prior-root",
+            disposition.clone(),
+        ) {
             Ok(invocation) => invocation,
             Err(error) => panic!("resume from injected root failed: {}", error.output),
         };
@@ -1373,7 +1379,7 @@ mod tests {
             Err(Invocation::error("internal", "state unavailable", 3)),
             valid_run,
             "new-root",
-            &input,
+            disposition,
         ) {
             Err(error) => error,
             Ok(_) => panic!("missing state root must fail"),
