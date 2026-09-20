@@ -16,4 +16,4 @@ crap:
 	cargo run --locked --manifest-path tools/crap-gate/Cargo.toml -- --repo-root . --rust-manifest Cargo.toml --rust-root crates --report-json $(CRAP_REPORT)
 
 live:
-	bash scripts/live-final-verification.sh
+	bash scripts/live-money-journey-matrix.sh
