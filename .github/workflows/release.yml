@@ -117,8 +117,16 @@ jobs:
           subject-path: release-assets/manuvra-*-linux-*.tar.gz
       - name: Publish immutable release
         env:
+          RELEASE_TAG_DEPLOY_KEY: ${{ secrets.RELEASE_TAG_DEPLOY_KEY }}
           VERSION: ${{ inputs.version }}
         run: |
+          test -n "$RELEASE_TAG_DEPLOY_KEY"
+          install -d -m 0700 "$HOME/.ssh"
+          printf '%s\n' "$RELEASE_TAG_DEPLOY_KEY" > "$HOME/.ssh/manuvra-release"
+          chmod 0600 "$HOME/.ssh/manuvra-release"
+          ssh-keyscan github.com >> "$HOME/.ssh/known_hosts"
+          ssh_command="ssh -i $HOME/.ssh/manuvra-release -o IdentitiesOnly=yes"
+          release_remote="git@github.com:$GITHUB_REPOSITORY.git"
           tag_created=false
           release_created=false
           rollback() {
@@ -128,13 +136,14 @@ jobs:
                 gh release delete "v$VERSION" --yes || true
               fi
               if [[ "$tag_created" == true ]]; then
-                gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/v$VERSION" || true
+                git -c core.sshCommand="$ssh_command" push "$release_remote" ":refs/tags/v$VERSION" || true
               fi
             fi
             exit "$status"
           }
           trap rollback EXIT
-          gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/v$VERSION" -f "sha=$GITHUB_SHA"
+          git tag "v$VERSION" "$GITHUB_SHA"
+          git -c core.sshCommand="$ssh_command" push "$release_remote" "refs/tags/v$VERSION"
           tag_created=true
           gh release create "v$VERSION" release-assets/* --draft --verify-tag --title "Manuvra v$VERSION" --notes "MIT source release with attested Linux x64 and ARM64 binaries for mise. The macOS Homebrew formula builds from source."
           release_created=true
@@ -215,10 +224,14 @@ jobs:
       - name: Render and install the Homebrew formula
         run: |
           sha=$(awk '{print $1}' "release-assets/manuvra-$VERSION.tar.gz.sha256")
-          sed -e "s/@VERSION@/$VERSION/g" -e "s/@SHA256@/$sha/g" packaging/manuvra.rb.template > manuvra.rb
-          brew install --formula "$PWD/manuvra.rb"
-          brew test manuvra
-          brew uninstall manuvra
+          tap=taecontrol/manuvra-ci
+          brew tap-new --no-git "$tap"
+          formula="$(brew --repository "$tap")/Formula/manuvra.rb"
+          sed -e "s/@VERSION@/$VERSION/g" -e "s/@SHA256@/$sha/g" packaging/manuvra.rb.template > "$formula"
+          brew install --build-from-source "$tap/manuvra"
+          brew test "$tap/manuvra"
+          brew uninstall "$tap/manuvra"
+          brew untap "$tap"
       - name: Open the exact Homebrew tap update
         run: |
           test -n "$HOMEBREW_TAP_TOKEN"
