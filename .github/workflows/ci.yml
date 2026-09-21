@@ -54,7 +54,21 @@ jobs:
           cargo install --locked --path "$source_dir/manuvra-$version/crates/manuvra-cli" --root "$prefix"
           test "$("$prefix/bin/manuvra" version | python3 -c 'import json, sys; print(json.load(sys.stdin)["version"])')" = "$version"
           "$prefix/bin/manuvra" schema job | python3 -c 'import json, sys; assert json.load(sys.stdin)["title"] == "Job"'
-          ruby -c packaging/manuvra.rb.template
+
+          archive=$(cd "$first" && pwd -P)/manuvra-$version.tar.gz
+          sha=$(awk '{print $1}' "$archive.sha256")
+          tap=taecontrol/manuvra-ci
+          brew tap-new --no-git "$tap"
+          formula="$(brew --repository "$tap")/Formula/manuvra.rb"
+          sed \
+            -e "s/@VERSION@/$version/g" \
+            -e "s/@SHA256@/$sha/g" \
+            -e "s|^  url .*|  url \"file://$archive\"|" \
+            packaging/manuvra.rb.template > "$formula"
+          brew install --build-from-source "$tap/manuvra"
+          brew test "$tap/manuvra"
+          brew uninstall "$tap/manuvra"
+          brew untap "$tap"
       - name: Advisory CRAP inventory
         shell: bash
         run: |
