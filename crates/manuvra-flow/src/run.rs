@@ -65,7 +65,7 @@ pub trait HostedControl {
 }
 
 pub fn run(job: &Job, config: FlowConfig, redactor: &Redactor) -> Result<FlowOutcome, String> {
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         publish_without_browser(
             job,
@@ -75,8 +75,8 @@ pub fn run(job: &Job, config: FlowConfig, redactor: &Redactor) -> Result<FlowOut
             BTreeMap::new(),
         )
     }
-    #[cfg(target_os = "linux")]
-    run_linux(job, config, redactor)
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    run_supported(job, config, redactor)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -90,8 +90,12 @@ pub fn run_hosted(
     run_with_browser(job, config, redactor, provider_key, Some(control))
 }
 
-#[cfg(target_os = "linux")]
-fn run_linux(job: &Job, config: FlowConfig, redactor: &Redactor) -> Result<FlowOutcome, String> {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn run_supported(
+    job: &Job,
+    config: FlowConfig,
+    redactor: &Redactor,
+) -> Result<FlowOutcome, String> {
     run_with_browser(job, config, redactor, None, None)
 }
 
@@ -2938,7 +2942,7 @@ fn publish_browser_error_with_provenance(
     )
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn publish_without_browser(
     job: &Job,
     config: FlowConfig,
@@ -5496,9 +5500,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outcome.exit_code, 3);
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         assert_eq!(outcome.result["reason"]["code"], "browser_unavailable");
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         assert_eq!(outcome.result["reason"]["code"], "unsupported_platform");
         assert!(temp.path().join("r_fake/manifest.json").is_file());
     }

@@ -147,29 +147,10 @@ pub fn internal_main(command: &str) -> Option<u8> {
         "__host" => Some(host::main().map_or(EXIT_INTERNAL, |()| EXIT_PASSED)),
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         "__watchdog" => Some(watchdog::main().map_or(EXIT_INTERNAL, |()| EXIT_PASSED)),
-        #[cfg(all(target_os = "macos", debug_assertions))]
-        "__darwin_hosted" => Some(darwin_hosted_test_main()),
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         "__host" => Some(EXIT_BLOCKED),
         _ => None,
     }
-}
-
-#[cfg(all(target_os = "macos", debug_assertions))]
-fn darwin_hosted_test_main() -> u8 {
-    let args = std::iter::once(OsString::from("manuvra")).chain(std::env::args_os().skip(2));
-    let invocation = match Cli::try_parse_from(args) {
-        Ok(cli) => cli.command.execute_hosted_test(),
-        Err(error) => Invocation::error("invalid_arguments", error.to_string(), EXIT_INVALID),
-    };
-    let stdout = std::io::stdout();
-    let mut output = stdout.lock();
-    if serde_json::to_writer(&mut output, &invocation.output).is_err()
-        || std::io::Write::write_all(&mut output, b"\n").is_err()
-    {
-        return EXIT_INTERNAL;
-    }
-    invocation.exit_code
 }
 
 impl Command {
@@ -208,92 +189,6 @@ impl Command {
             Self::Abort { run_id, request_id } => client::abort(&run_id, &request_id),
         }
     }
-
-    #[cfg(all(target_os = "macos", debug_assertions))]
-    fn execute_hosted_test(self) -> Invocation {
-        match self {
-            Self::Run {
-                request_id,
-                job,
-                evidence,
-                browser,
-                headless,
-                wait_ms,
-            } => run_hosted_test(
-                &request_id,
-                &job,
-                &evidence,
-                browser.as_deref(),
-                headless,
-                wait_ms,
-            ),
-            Self::Resume {
-                run_id,
-                request_id,
-                input,
-            } => client::resume_hosted_test(&run_id, &request_id, &input),
-            Self::Status {
-                run_id,
-                request_id,
-                wait_ms,
-            } => client::status_hosted_test(run_id.as_deref(), request_id.as_deref(), wait_ms),
-            Self::Abort { run_id, request_id } => client::abort_hosted_test(&run_id, &request_id),
-            Self::Schema { .. } | Self::Version => Invocation::error(
-                "invalid_arguments",
-                "closed Darwin host gate accepts only Run lifecycle commands",
-                EXIT_INVALID,
-            ),
-        }
-    }
-}
-
-#[cfg(all(target_os = "macos", debug_assertions))]
-fn run_hosted_test(
-    request_id: &str,
-    job_path: &Path,
-    evidence_root: &Path,
-    browser: Option<&Path>,
-    headless: bool,
-    wait_ms: Option<u64>,
-) -> Invocation {
-    let prepared = try_run_hosted_test(request_id, job_path, evidence_root, browser, headless);
-    prepared
-        .and_then(|prepared| match prepared {
-            PreparedRun::Existing(invocation) => Ok(invocation),
-            PreparedRun::New(prepared) => {
-                if let Some(stop) = admission_stop(&prepared) {
-                    publish_admission_stop(prepared, stop)
-                } else {
-                    publish_hosted_run(prepared, wait_ms)
-                }
-            }
-        })
-        .unwrap_or_else(|error| error)
-}
-
-#[cfg(all(target_os = "macos", debug_assertions))]
-fn try_run_hosted_test(
-    request_id: &str,
-    job_path: &Path,
-    evidence_root: &Path,
-    browser: Option<&Path>,
-    headless: bool,
-) -> Result<PreparedRun, Invocation> {
-    runtime::runtime_root().map_err(|_| {
-        Invocation::error(
-            "runtime_directory_unavailable",
-            "neither XDG_RUNTIME_DIR nor TMPDIR is set",
-            EXIT_BLOCKED,
-        )
-    })?;
-    if evidence_root.to_str().is_none() {
-        return Err(Invocation::error(
-            "invalid_input",
-            "evidence path must be valid UTF-8",
-            EXIT_INVALID,
-        ));
-    }
-    prepare_run(request_id, job_path, evidence_root, browser, headless)
 }
 
 impl From<SchemaArg> for SchemaKind {
@@ -474,7 +369,7 @@ fn finish_preparation(
             false,
         ),
     };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let _ = existing_intent;
     Ok(PreparedRun::New(Box::new(Prepared {
         job: admission.job,
@@ -562,7 +457,7 @@ fn publish_admission_stop(
     publish_blocked(prepared, stop)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn publish_executable_run(
     prepared: Box<Prepared>,
     wait_ms: Option<u64>,
@@ -581,7 +476,7 @@ fn publish_hosted_run(
     start_background_run(prepared, wait_ms)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn publish_executable_run(
     prepared: Box<Prepared>,
     wait_ms: Option<u64>,

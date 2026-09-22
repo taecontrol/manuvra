@@ -33,23 +33,23 @@ fn try_status(
     wait_ms: Option<u64>,
 ) -> Result<Invocation, Invocation> {
     validate_status_selectors(run_id, request_id)?;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = wait_ms;
         Err(Invocation::error(
             "unsupported_platform",
-            "background runs are supported only on Linux",
+            "background runs are unsupported on this platform",
             3,
         ))
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        try_status_linux(run_id, request_id, wait_ms)
+        try_status_supported(run_id, request_id, wait_ms)
     }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn try_status_linux(
+fn try_status_supported(
     run_id: Option<&str>,
     request_id: Option<&str>,
     wait_ms: Option<u64>,
@@ -107,17 +107,17 @@ pub fn abort(run_id: &str, request_id: &str) -> Invocation {
     if let Err(error) = validate_control_ids(run_id, request_id) {
         return error;
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Invocation::error(
             "unsupported_platform",
-            "background runs are supported only on Linux",
+            "background runs are unsupported on this platform",
             3,
         )
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        abort_linux(run_id, request_id)
+        abort_supported(run_id, request_id)
     }
 }
 
@@ -126,47 +126,23 @@ pub fn resume(run_id: &str, request_id: &str, input: &Path) -> Invocation {
         Ok(disposition) => disposition,
         Err(error) => return error,
     };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = disposition;
         Invocation::error(
             "unsupported_platform",
-            "background runs are supported only on Linux",
+            "background runs are unsupported on this platform",
             3,
         )
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        resume_linux(run_id, request_id, disposition).unwrap_or_else(|error| error)
+        resume_supported(run_id, request_id, disposition).unwrap_or_else(|error| error)
     }
 }
 
-#[cfg(all(target_os = "macos", debug_assertions))]
-pub(crate) fn status_hosted_test(
-    run_id: Option<&str>,
-    request_id: Option<&str>,
-    wait_ms: Option<u64>,
-) -> Invocation {
-    validate_status_selectors(run_id, request_id)
-        .and_then(|()| try_status_linux(run_id, request_id, wait_ms))
-        .unwrap_or_else(|error| error)
-}
-
-#[cfg(all(target_os = "macos", debug_assertions))]
-pub(crate) fn abort_hosted_test(run_id: &str, request_id: &str) -> Invocation {
-    validate_control_ids(run_id, request_id)
-        .map_or_else(|error| error, |()| abort_linux(run_id, request_id))
-}
-
-#[cfg(all(target_os = "macos", debug_assertions))]
-pub(crate) fn resume_hosted_test(run_id: &str, request_id: &str, input: &Path) -> Invocation {
-    load_disposition(run_id, request_id, input)
-        .and_then(|request| resume_linux(run_id, request_id, request))
-        .unwrap_or_else(|error| error)
-}
-
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn resume_linux(
+fn resume_supported(
     run_id: &str,
     request_id: &str,
     disposition: DispositionRequest,
@@ -645,7 +621,7 @@ fn resume_record(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn abort_linux(run_id: &str, request_id: &str) -> Invocation {
+fn abort_supported(run_id: &str, request_id: &str) -> Invocation {
     abort_in_state(run_id, request_id).unwrap_or_else(|invocation| invocation)
 }
 
