@@ -66,13 +66,40 @@ impl RunLock {
     }
 }
 
-#[cfg(target_os = "linux")]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Serialize)]
 pub struct ProcessIdentity {
     pub pid: u32,
-    pub start_ticks: u64,
+    pub process_group: u32,
+    #[serde(rename = "start_ticks")]
+    pub start_marker: u64,
     pub session_id: u32,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl<'de> Deserialize<'de> for ProcessIdentity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct PersistedIdentity {
+            pid: u32,
+            #[serde(default)]
+            process_group: Option<u32>,
+            start_ticks: u64,
+            session_id: u32,
+        }
+
+        let persisted = PersistedIdentity::deserialize(deserializer)?;
+        Ok(Self {
+            pid: persisted.pid,
+            process_group: persisted.process_group.unwrap_or(persisted.pid),
+            start_marker: persisted.start_ticks,
+            session_id: persisted.session_id,
+        })
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -824,5 +851,18 @@ mod tests {
             Some(RequestEntry::Intent(found)) if found.run_id == "r_resume"
         ));
         assert!(!root.join("runs/r_resume/request.json").exists());
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod process_identity_tests {
+    use super::ProcessIdentity;
+
+    #[test]
+    fn legacy_identity_derives_the_owned_group_from_its_leader() {
+        let identity: ProcessIdentity =
+            serde_json::from_str(r#"{"pid":42,"start_ticks":700,"session_id":9}"#).unwrap();
+        assert_eq!(identity.process_group, 42);
+        assert_eq!(serde_json::to_value(identity).unwrap()["process_group"], 42);
     }
 }

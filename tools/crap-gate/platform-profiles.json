@@ -4,7 +4,9 @@
     {
       "platform": "linux",
       "target_os": "linux",
-      "exclude": []
+      "exclude": [
+        "manuvra-cli/src/process/darwin.rs"
+      ]
     },
     {
       "platform": "darwin",
@@ -12,6 +14,7 @@
       "exclude": [
         "manuvra-cli/src/host.rs",
         "manuvra-cli/src/process.rs",
+        "manuvra-cli/src/process/linux.rs",
         "manuvra-cli/src/watchdog.rs"
       ]
     }
@@ -26,8 +29,16 @@
       "platform": "linux"
     },
     {
+      "path": "manuvra-cli/src/process/linux.rs",
+      "platform": "linux"
+    },
+    {
       "path": "manuvra-cli/src/watchdog.rs",
       "platform": "linux"
+    },
+    {
+      "path": "manuvra-cli/src/process/darwin.rs",
+      "platform": "darwin"
     }
   ]
 }

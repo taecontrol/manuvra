@@ -4,6 +4,10 @@ mod evidence;
 mod host;
 #[cfg(target_os = "linux")]
 mod process;
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+#[path = "process/darwin.rs"]
+mod process;
 mod store;
 #[cfg(target_os = "linux")]
 mod watchdog;

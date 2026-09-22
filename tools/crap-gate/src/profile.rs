@@ -290,13 +290,14 @@ mod tests {
         let rust_root = manifest_dir.join("../../crates");
         assert_eq!(
             resolve(&document, &rust_root, "linux").unwrap().exclude,
-            Vec::<String>::new()
+            ["manuvra-cli/src/process/darwin.rs"]
         );
         assert_eq!(
             resolve(&document, &rust_root, "macos").unwrap().exclude,
             [
                 "manuvra-cli/src/host.rs",
                 "manuvra-cli/src/process.rs",
+                "manuvra-cli/src/process/linux.rs",
                 "manuvra-cli/src/watchdog.rs"
             ]
         );

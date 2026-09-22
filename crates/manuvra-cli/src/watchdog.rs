@@ -291,24 +291,7 @@ fn wait_for_publication_lock(bootstrap: &WatchdogBootstrap) -> Result<store::Run
 }
 
 fn child_exited_without_reaping(child: &Child) -> Result<bool, String> {
-    let pid: i32 = child
-        .id()
-        .try_into()
-        .map_err(|_| "host process id does not fit pid_t".to_owned())?;
-    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
-    let result = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            pid as libc::id_t,
-            info.as_mut_ptr(),
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
-    };
-    if result == -1 {
-        return Err(std::io::Error::last_os_error().to_string());
-    }
-    let info = unsafe { info.assume_init() };
-    Ok(unsafe { info.si_pid() } != 0)
+    process::child_exited_without_reaping(child.id())
 }
 
 fn lost_control(bootstrap: &WatchdogBootstrap) -> RunControl {

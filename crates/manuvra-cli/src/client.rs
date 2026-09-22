@@ -1540,7 +1540,8 @@ mod tests {
         let mut control = test_control(&root, false);
         control.host = Some(store::ProcessIdentity {
             pid: u32::MAX,
-            start_ticks: 1,
+            process_group: u32::MAX,
+            start_marker: 1,
             session_id: 1,
         });
         let lock = store::lock_run(&root, &control.run_id).unwrap();
