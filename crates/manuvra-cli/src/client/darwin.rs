@@ -1,6 +1,6 @@
 use crate::store::RunControl;
 use serde_json::{Value, json};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::Shutdown;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
@@ -33,8 +33,7 @@ fn request_value(socket: &std::path::Path, payload: &Value) -> Result<Value, Str
         .set_read_timeout(Some(Duration::from_millis(250)))
         .and_then(|()| stream.set_write_timeout(Some(Duration::from_millis(250))))
         .map_err(|error| error.to_string())?;
-    serde_json::to_writer(&mut stream, payload).map_err(|error| error.to_string())?;
-    stream.flush().map_err(|error| error.to_string())?;
+    crate::control_socket::write_frame(&mut stream, payload)?;
     stream
         .shutdown(Shutdown::Write)
         .map_err(|error| error.to_string())?;
@@ -84,9 +83,7 @@ mod tests {
         let listener = UnixListener::bind(&socket).unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            stream.read_to_end(&mut request).unwrap();
-            let request: Value = serde_json::from_slice(&request).unwrap();
+            let request: Value = crate::control_socket::read_frame(&mut stream).unwrap();
             assert_eq!(request["kind"], "deadline");
             serde_json::to_writer(
                 &mut stream,
