@@ -51,6 +51,11 @@ impl BrowserLifecycle {
                     .collect();
                 if observed.len() > 1 {
                     assert!(observed.iter().all(|(_, group, _)| group == process_group));
+                    eprintln!(
+                        "owned Chrome group observed: pgid={process_group} members={} profile={}",
+                        observed.len(),
+                        profile.display()
+                    );
                     return Self {
                         process_group: *process_group,
                         profile,
@@ -75,6 +80,11 @@ impl BrowserLifecycle {
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ESRCH),
             "owned Chrome group survived close"
+        );
+        eprintln!(
+            "owned Chrome cleanup observed: pgid={} removed profile={}",
+            self.process_group,
+            self.profile.display()
         );
     }
 }
@@ -228,6 +238,7 @@ fn production_snapshot_and_masking_cover_truncation_split_nodes_and_zero_masks()
     assert!(absent.redaction.verifies(1));
     assert_eq!(absent.redaction.matched_values, 0);
     assert_eq!(absent.redaction.mask_count, 0);
+    eprintln!("real Chrome CDP snapshot, screenshot, and masking fixture completed");
     browser.close().unwrap();
     #[cfg(target_os = "macos")]
     lifecycle.assert_cleaned();
@@ -520,6 +531,7 @@ fn production_input_strategies_cover_native_and_bounded_fallback_paths() {
         browser.perform(stale, &cancellation),
         Err(PerformError::Rejected(reason)) if reason == "document_changed" || reason == "target_missing"
     ));
+    eprintln!("real Chrome CDP input and readback fixture completed");
     browser.close().unwrap();
     #[cfg(target_os = "macos")]
     lifecycle.assert_cleaned();

@@ -101,6 +101,40 @@ jobs:
               summary.write(f"- Maximum: {maximum}\n")
           PY
 
+  darwin-real-chrome:
+    name: Apple Silicon real Chrome
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Assert Apple Silicon runner
+        run: |
+          architecture=$(uname -m)
+          echo "Runner architecture: $architecture"
+          test "$architecture" = arm64
+      - name: Identify Google Chrome
+        run: |
+          chrome="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+          test -x "$chrome"
+          echo "Chrome executable: $chrome"
+          "$chrome" --version
+          echo "MANUVRA_BROWSER=$chrome" >> "$GITHUB_ENV"
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup default 1.95.0
+      - name: Exercise the owned real-browser runtime
+        shell: bash
+        run: |
+          fixture_list=$(cargo test --locked -p manuvra-chrome --test local_fixture -- --ignored --list)
+          printf '%s\n' "$fixture_list"
+          fixture_count=$(printf '%s\n' "$fixture_list" | awk '/: test$/ { count += 1 } END { print count + 0 }')
+          echo "Ignored real-browser fixtures: $fixture_count"
+          test "$fixture_count" -gt 0
+          cargo test --locked -p manuvra-chrome --test local_fixture -- --ignored --nocapture --test-threads=1
+
   linux-distribution:
     name: Linux package (${{ matrix.arch }})
     strategy:
