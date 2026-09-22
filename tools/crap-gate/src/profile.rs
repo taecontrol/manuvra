@@ -290,15 +290,20 @@ mod tests {
         let rust_root = manifest_dir.join("../../crates");
         assert_eq!(
             resolve(&document, &rust_root, "linux").unwrap().exclude,
-            ["manuvra-cli/src/process/darwin.rs"]
+            [
+                "manuvra-cli/src/client/darwin.rs",
+                "manuvra-cli/src/process/darwin.rs",
+                "manuvra-cli/src/runtime/darwin.rs",
+                "manuvra-cli/src/socket_auth/darwin.rs"
+            ]
         );
         assert_eq!(
             resolve(&document, &rust_root, "macos").unwrap().exclude,
             [
                 "manuvra-cli/src/host.rs",
-                "manuvra-cli/src/process.rs",
                 "manuvra-cli/src/process/linux.rs",
-                "manuvra-cli/src/watchdog.rs"
+                "manuvra-cli/src/runtime/linux.rs",
+                "manuvra-cli/src/socket_auth/linux.rs"
             ]
         );
     }

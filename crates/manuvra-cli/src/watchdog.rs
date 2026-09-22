@@ -1,4 +1,4 @@
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use crate::process::{self, WatchdogBootstrap, now_unix_ms};
 use crate::store::{self, RunControl};
@@ -19,6 +19,12 @@ pub fn main() -> Result<(), String> {
 }
 
 fn read_inherited_bootstrap() -> Result<(WatchdogBootstrap, Vec<u8>, store::RunLock), String> {
+    duplicate_stdin().and_then(|input| {
+        inherited_run_lock_fd().and_then(|fd| read_inherited_bootstrap_from(input, fd))
+    })
+}
+
+fn duplicate_stdin() -> Result<fs::File, String> {
     let input_fd = unsafe { libc::dup(libc::STDIN_FILENO) };
     if input_fd == -1 {
         return Err(format!(
@@ -26,7 +32,13 @@ fn read_inherited_bootstrap() -> Result<(WatchdogBootstrap, Vec<u8>, store::RunL
             std::io::Error::last_os_error()
         ));
     }
-    let mut input = unsafe { fs::File::from_raw_fd(input_fd) };
+    Ok(unsafe { fs::File::from_raw_fd(input_fd) })
+}
+
+fn read_inherited_bootstrap_from(
+    mut input: fs::File,
+    run_lock_fd: RawFd,
+) -> Result<(WatchdogBootstrap, Vec<u8>, store::RunLock), String> {
     let watchdog_bytes = process::read_framed(&mut input)?;
     let bootstrap: WatchdogBootstrap = serde_json::from_slice(&watchdog_bytes)
         .map_err(|error| format!("invalid inherited watchdog bootstrap: {error}"))?;
@@ -35,7 +47,7 @@ fn read_inherited_bootstrap() -> Result<(WatchdogBootstrap, Vec<u8>, store::RunL
     let run_lock = store::adopt_inherited_run_lock(
         &bootstrap.state_root,
         &bootstrap.intent.run_id,
-        inherited_run_lock_fd()?,
+        run_lock_fd,
     )?;
     Ok((bootstrap, host_bytes, run_lock))
 }
@@ -45,8 +57,25 @@ fn run_watchdog(
     host_bytes: &mut [u8],
     run_lock: store::RunLock,
 ) -> Result<(), String> {
+    run_watchdog_with_spawn(bootstrap, host_bytes, run_lock, spawn_host)
+}
+
+fn run_watchdog_with_spawn(
+    bootstrap: &WatchdogBootstrap,
+    host_bytes: &mut [u8],
+    run_lock: store::RunLock,
+    spawn: impl FnOnce(RawFd, &store::RunLock) -> Result<Child, String>,
+) -> Result<(), String> {
     let (read_fd, write_fd) = liveness_pipe()?;
-    let mut child = spawn_host(read_fd, &run_lock)?;
+    let spawned = spawn(read_fd, &run_lock);
+    close_fd(read_fd);
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(error) => {
+            close_fd(write_fd);
+            return Err(error);
+        }
+    };
     drop(run_lock);
     let host = send_host_bootstrap(&mut child, host_bytes);
     host_bytes.fill(0);
@@ -63,17 +92,18 @@ fn inherited_run_lock_fd() -> Result<RawFd, String> {
 }
 
 fn spawn_host(read_fd: RawFd, run_lock: &store::RunLock) -> Result<Child, String> {
+    configured_host_command(read_fd, run_lock)
+        .and_then(|command| spawn_host_command(command, run_lock))
+}
+
+fn configured_host_command(read_fd: RawFd, run_lock: &store::RunLock) -> Result<Command, String> {
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    let mut command = Command::new(executable);
-    command
-        .arg("__host")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env("MANUVRA_LIVENESS_FD", read_fd.to_string())
-        .env_remove("TYPESAFE_API_KEY");
-    let run_lock_fd = run_lock.inherited_fd()?;
-    command.env("MANUVRA_RUN_LOCK_FD", run_lock_fd.to_string());
+    run_lock
+        .inherited_fd()
+        .map(|lock_fd| host_command(&executable, read_fd, lock_fd))
+}
+
+fn spawn_host_command(mut command: Command, run_lock: &store::RunLock) -> Result<Child, String> {
     unsafe {
         command.pre_exec(move || {
             if libc::setpgid(0, 0) == -1 {
@@ -86,8 +116,20 @@ fn spawn_host(read_fd: RawFd, run_lock: &store::RunLock) -> Result<Child, String
     let restored = run_lock.restore_cloexec();
     let child = spawned.map_err(|error| format!("cannot start run host: {error}"))?;
     restored?;
-    close_fd(read_fd);
     Ok(child)
+}
+
+fn host_command(executable: &std::path::Path, read_fd: RawFd, run_lock_fd: RawFd) -> Command {
+    let mut command = Command::new(executable);
+    command
+        .arg("__host")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env("MANUVRA_LIVENESS_FD", read_fd.to_string())
+        .env("MANUVRA_RUN_LOCK_FD", run_lock_fd.to_string())
+        .env_remove("TYPESAFE_API_KEY");
+    command
 }
 
 fn send_host_bootstrap(
@@ -116,22 +158,34 @@ fn supervise(
             return outcome;
         }
         let control = store::read_run_control(&bootstrap.state_root, &bootstrap.intent.run_id)?;
-        if control
-            .as_ref()
-            .is_some_and(|run| run.result.get("terminal").and_then(Value::as_bool) == Some(true))
-        {
+        if terminal_control(control.as_ref()) {
             return finish_terminal_host(child, host, bootstrap);
         }
         let now = now_unix_ms();
-        let deadline = control.as_ref().and_then(expired_deadline).or_else(|| {
-            (now >= bootstrap.lifetime_deadline_unix_ms)
-                .then_some(("lifetime_elapsed", bootstrap.lifetime_deadline_unix_ms))
-        });
+        let deadline = control_deadline(control.as_ref(), now, bootstrap);
         if let Some((reason, _)) = deadline {
             return expire_hung_host(child, host, bootstrap, reason);
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn terminal_control(control: Option<&RunControl>) -> bool {
+    control.is_some_and(|run| run.result.get("terminal").and_then(Value::as_bool) == Some(true))
+}
+
+fn control_deadline(
+    control: Option<&RunControl>,
+    now: u64,
+    bootstrap: &WatchdogBootstrap,
+) -> Option<(&'static str, u64)> {
+    control
+        .as_ref()
+        .and_then(|run| expired_deadline(run))
+        .or_else(|| {
+            (now >= bootstrap.lifetime_deadline_unix_ms)
+                .then_some(("lifetime_elapsed", bootstrap.lifetime_deadline_unix_ms))
+        })
 }
 
 fn expired_deadline(control: &RunControl) -> Option<(&'static str, u64)> {
@@ -151,11 +205,21 @@ fn expire_hung_host(
     bootstrap: &WatchdogBootstrap,
     reason: &'static str,
 ) -> Result<(), String> {
+    expire_hung_host_with_grace(child, host, bootstrap, reason, shutdown_grace())
+}
+
+fn expire_hung_host_with_grace(
+    child: &mut Child,
+    host: &store::ProcessIdentity,
+    bootstrap: &WatchdogBootstrap,
+    reason: &'static str,
+    grace: Duration,
+) -> Result<(), String> {
     if let Some(control) = store::read_run_control(&bootstrap.state_root, &bootstrap.intent.run_id)?
     {
         let _ = crate::client::request_host_deadline(&control);
     }
-    terminate_owned_group(child, host, shutdown_grace())?;
+    terminate_owned_group(child, host, grace)?;
     reconcile_dead_host(bootstrap, reason, Some("expired"), Some(host))
 }
 
@@ -359,7 +423,28 @@ fn close_fd(fd: RawFd) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Seek, SeekFrom};
     use tempfile::TempDir;
+
+    fn spawn_synthetic_host(_: RawFd, run_lock: &store::RunLock) -> Result<Child, String> {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "cat >/dev/null; exit 0"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        spawn_host_command(command, run_lock)
+    }
+
+    fn spawn_short_lived_host(_: RawFd, run_lock: &store::RunLock) -> Result<Child, String> {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "cat >/dev/null; sleep 0.2"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        spawn_host_command(command, run_lock)
+    }
 
     #[test]
     fn deadline_classification_prefers_absolute_lifetime() {
@@ -381,6 +466,36 @@ mod tests {
             result: json!({}),
         };
         assert_eq!(expired_deadline(&control).unwrap().0, "lifetime_elapsed");
+    }
+
+    #[test]
+    fn host_command_explicitly_removes_the_provider_secret() {
+        let command = host_command(std::path::Path::new("/bin/false"), 3, 4);
+        assert!(
+            command
+                .get_envs()
+                .any(|(name, value)| { name == "TYPESAFE_API_KEY" && value.is_none() })
+        );
+    }
+
+    #[test]
+    fn inherited_bootstrap_revalidates_lock_and_preserves_host_bytes() {
+        let temporary = TempDir::new().unwrap();
+        let bootstrap = bootstrap(&temporary);
+        let lock = store::lock_run(&bootstrap.state_root, &bootstrap.intent.run_id).unwrap();
+        let fd = lock.inherited_fd().unwrap();
+        let inherited = unsafe { libc::dup(fd) };
+        assert!(inherited >= 0);
+        lock.restore_cloexec().unwrap();
+        let mut input = tempfile::tempfile().unwrap();
+        process::write_framed(&mut input, &serde_json::to_vec(&bootstrap).unwrap()).unwrap();
+        process::write_framed(&mut input, b"sensitive host bytes").unwrap();
+        input.seek(SeekFrom::Start(0)).unwrap();
+        let (decoded, host_bytes, adopted) =
+            read_inherited_bootstrap_from(input, inherited).unwrap();
+        assert_eq!(decoded.intent.run_id, bootstrap.intent.run_id);
+        assert_eq!(host_bytes, b"sensitive host bytes");
+        drop(adopted);
     }
 
     #[test]
@@ -499,5 +614,104 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(after.result["reason"]["current_action"], "uncertain");
+    }
+
+    #[test]
+    fn synthetic_host_loss_reconciles_once_without_replay() {
+        let temporary = TempDir::new().unwrap();
+        let bootstrap = bootstrap(&temporary);
+        let lock = store::lock_run(&bootstrap.state_root, &bootstrap.intent.run_id).unwrap();
+        let mut bootstrap_bytes = b"synthetic bootstrap".to_vec();
+        run_watchdog_with_spawn(&bootstrap, &mut bootstrap_bytes, lock, spawn_synthetic_host)
+            .unwrap();
+        assert!(bootstrap_bytes.iter().all(|byte| *byte == 0));
+        let first = store::read_run_control(&bootstrap.state_root, &bootstrap.intent.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.result["state"], "blocked");
+        assert_eq!(first.result["reason"]["code"], "host_lost");
+        assert_eq!(first.result["reason"]["current_action"], "none");
+        let sequence = first.sequence;
+        reconcile_dead_host(&bootstrap, "host_lost", None, None).unwrap();
+        let repeated = store::read_run_control(&bootstrap.state_root, &bootstrap.intent.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(repeated.sequence, sequence);
+    }
+
+    #[test]
+    fn supervisor_honors_an_existing_terminal_checkpoint() {
+        let temporary = TempDir::new().unwrap();
+        let bootstrap = bootstrap(&temporary);
+        write_running_control(&bootstrap);
+        let mut control = store::read_run_control(&bootstrap.state_root, &bootstrap.intent.run_id)
+            .unwrap()
+            .unwrap();
+        control.result["terminal"] = json!(true);
+        control.result["state"] = json!("blocked");
+        store::write_run_control(&bootstrap.state_root, &control).unwrap();
+        let lock = store::lock_run(&bootstrap.state_root, &bootstrap.intent.run_id).unwrap();
+        let mut host_bytes = b"terminal checkpoint".to_vec();
+        run_watchdog_with_spawn(&bootstrap, &mut host_bytes, lock, spawn_short_lived_host).unwrap();
+        let preserved = store::read_run_control(&bootstrap.state_root, &bootstrap.intent.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(preserved.sequence, control.sequence);
+        assert_eq!(preserved.result["state"], "blocked");
+    }
+
+    #[test]
+    fn supervisor_enforces_the_absolute_lifetime_deadline() {
+        let temporary = TempDir::new().unwrap();
+        let mut bootstrap = bootstrap(&temporary);
+        bootstrap.lifetime_deadline_unix_ms = now_unix_ms().saturating_sub(1);
+        write_running_control(&bootstrap);
+        let lock = store::lock_run(&bootstrap.state_root, &bootstrap.intent.run_id).unwrap();
+        let mut host_bytes = b"expired bootstrap".to_vec();
+        run_watchdog_with_spawn(&bootstrap, &mut host_bytes, lock, spawn_short_lived_host).unwrap();
+        let expired = store::read_run_control(&bootstrap.state_root, &bootstrap.intent.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(expired.result["state"], "expired");
+        assert_eq!(expired.result["reason"]["code"], "lifetime_elapsed");
+    }
+
+    #[test]
+    fn deadline_cleanup_kills_a_resistant_synthetic_group_and_marks_expired() {
+        let temporary = TempDir::new().unwrap();
+        let bootstrap = bootstrap(&temporary);
+        write_running_control(&bootstrap);
+        let run_lock = store::lock_run(&bootstrap.state_root, &bootstrap.intent.run_id).unwrap();
+        drop(run_lock);
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "trap '' TERM HUP; while :; do sleep 1; done"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let identity = process::process_identity(child.id()).unwrap();
+        expire_hung_host_with_grace(
+            &mut child,
+            &identity,
+            &bootstrap,
+            "lifetime_elapsed",
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        let control = store::read_run_control(&bootstrap.state_root, &bootstrap.intent.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(control.result["state"], "expired");
+        assert_eq!(control.result["reason"]["code"], "lifetime_elapsed");
+        assert_eq!(control.result["reason"]["current_action"], "none");
     }
 }

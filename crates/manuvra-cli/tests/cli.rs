@@ -117,6 +117,35 @@ fn one_object(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn missing_runtime_variables_refuse_before_state_evidence_or_children() {
+    let temp = TempDir::new().unwrap();
+    let job_path = fixture(&temp, &valid_job());
+    let state = temp.path().join("state");
+    let evidence = temp.path().join("evidence");
+    let output = Command::new(binary())
+        .args([
+            "run",
+            "--request-id",
+            "no-runtime",
+            "--job",
+            job_path.to_str().unwrap(),
+            "--evidence",
+            evidence.to_str().unwrap(),
+        ])
+        .env("XDG_STATE_HOME", &state)
+        .env_remove("XDG_RUNTIME_DIR")
+        .env_remove("TMPDIR")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let result = one_object(&output);
+    assert_eq!(result["error"]["code"], "runtime_directory_unavailable");
+    assert!(!state.exists());
+    assert!(!evidence.exists());
+}
+
 #[test]
 fn missing_value_blocks_without_browser_and_publishes_private_complete_evidence() {
     let temp = TempDir::new().unwrap();

@@ -319,7 +319,7 @@ fn event(ident: libc::uintptr_t, filter: i16, fflags: u32) -> libc::kevent {
 mod tests {
     use super::*;
     use std::fs;
-    use std::os::unix::process::CommandExt;
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
     use std::path::Path;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
@@ -331,6 +331,8 @@ mod tests {
     const LOST_PATH: &str = "MANUVRA_TEST_PARENT_LOSS_LOST";
     const LIVENESS_FD: &str = "MANUVRA_TEST_PARENT_LOSS_FD";
     const PARENT_PID: &str = "MANUVRA_TEST_PARENT_LOSS_PID";
+    const WATCHDOG_LOSS_HOST: &str = "MANUVRA_TEST_WATCHDOG_LOSS_HOST";
+    const HELPER_PATH: &str = "MANUVRA_TEST_WATCHDOG_LOSS_HELPER";
 
     #[test]
     fn live_identity_revalidates_and_stale_start_is_refused() {
@@ -447,7 +449,7 @@ mod tests {
         let mut parent = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "process::tests::parent_loss_parent_fixture",
+                "process::platform::tests::parent_loss_parent_fixture",
                 "--nocapture",
             ])
             .env(PARENT_FIXTURE, "1")
@@ -477,7 +479,7 @@ mod tests {
         let mut watcher = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "process::tests::parent_loss_watcher_fixture",
+                "process::platform::tests::parent_loss_watcher_fixture",
                 "--nocapture",
             ])
             .env(WATCHER_FIXTURE, "1")
@@ -512,9 +514,90 @@ mod tests {
         fs::write(std::env::var_os(LOST_PATH).unwrap(), b"lost\n").unwrap();
     }
 
+    #[test]
+    fn watchdog_loss_terminates_the_owned_synthetic_group() {
+        if std::env::var_os(WATCHDOG_LOSS_HOST).is_some() {
+            return;
+        }
+        let temporary = TempDir::new().unwrap();
+        let ready = temporary.path().join("ready");
+        let helper = temporary.path().join("helper.pid");
+        let mut descriptors = [-1_i32; 2];
+        assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+        set_cloexec(descriptors[1]);
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "process::platform::tests::watchdog_loss_host_fixture",
+                "--nocapture",
+            ])
+            .env(WATCHDOG_LOSS_HOST, "1")
+            .env(READY_PATH, &ready)
+            .env(HELPER_PATH, &helper)
+            .env(LIVENESS_FD, descriptors[0].to_string())
+            .env(PARENT_PID, std::process::id().to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut host = command.spawn().unwrap();
+        unsafe { libc::close(descriptors[0]) };
+        wait_for_path(&ready);
+        wait_for_path(&helper);
+        let helper_pid: i32 = fs::read_to_string(&helper).unwrap().parse().unwrap();
+        unsafe { libc::close(descriptors[1]) };
+        let status = host.wait().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while unsafe { libc::kill(helper_pid, 0) } == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "synthetic helper escaped cleanup"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    #[allow(clippy::zombie_processes)] // The fixture deliberately SIGKILLs its complete group.
+    fn watchdog_loss_host_fixture() {
+        if std::env::var_os(WATCHDOG_LOSS_HOST).is_none() {
+            return;
+        }
+        let parent_pid = std::env::var(PARENT_PID).unwrap().parse().unwrap();
+        let liveness_fd = std::env::var(LIVENESS_FD).unwrap().parse().unwrap();
+        let monitor = ParentLossMonitor::register(parent_pid, liveness_fd).unwrap();
+        let helper = Command::new("sh")
+            .args(["-c", "trap '' TERM HUP; while :; do sleep 1; done"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        fs::write(
+            std::env::var_os(HELPER_PATH).unwrap(),
+            helper.id().to_string(),
+        )
+        .unwrap();
+        fs::write(std::env::var_os(READY_PATH).unwrap(), b"ready\n").unwrap();
+        monitor.wait().unwrap();
+        unsafe { libc::kill(0, libc::SIGKILL) };
+        loop {
+            std::thread::park();
+        }
+    }
+
     fn wait_for_path(path: &Path) {
         let deadline = Instant::now() + Duration::from_secs(3);
-        while !path.is_file() {
+        while fs::metadata(path).map_or(true, |metadata| metadata.len() == 0) {
             assert!(
                 Instant::now() < deadline,
                 "fixture path did not appear: {path:?}"

@@ -1,15 +1,22 @@
 mod client;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)]
+mod control_socket;
 mod evidence;
 #[cfg(target_os = "linux")]
 mod host;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 mod process;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(dead_code)]
-#[path = "process/darwin.rs"]
-mod process;
+mod runtime;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)]
+mod socket_auth;
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 mod store;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod watchdog;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -138,10 +145,10 @@ pub fn internal_main(command: &str) -> Option<u8> {
     match command {
         #[cfg(target_os = "linux")]
         "__host" => Some(host::main().map_or(EXIT_INTERNAL, |()| EXIT_PASSED)),
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         "__watchdog" => Some(watchdog::main().map_or(EXIT_INTERNAL, |()| EXIT_PASSED)),
         #[cfg(not(target_os = "linux"))]
-        "__host" | "__watchdog" => Some(EXIT_BLOCKED),
+        "__host" => Some(EXIT_BLOCKED),
         _ => None,
     }
 }
@@ -222,6 +229,14 @@ fn try_run(
     headless: bool,
     wait_ms: Option<u64>,
 ) -> Result<Invocation, Invocation> {
+    #[cfg(target_os = "macos")]
+    if runtime::runtime_root().is_err() {
+        return Err(Invocation::error(
+            "runtime_directory_unavailable",
+            "neither XDG_RUNTIME_DIR nor TMPDIR is set",
+            EXIT_BLOCKED,
+        ));
+    }
     if evidence_root.to_str().is_none() {
         return Err(Invocation::error(
             "invalid_input",

@@ -1,4 +1,7 @@
 use crate::Invocation;
+#[cfg(target_os = "macos")]
+#[path = "client/darwin.rs"]
+mod platform;
 #[cfg(target_os = "linux")]
 use crate::process::{IPC_VERSION, now_unix_ms};
 #[cfg(target_os = "linux")]
@@ -925,6 +928,11 @@ fn request_value(socket: &Path, payload: &Value) -> Result<Value, String> {
 #[cfg(target_os = "linux")]
 pub(crate) fn request_host_deadline(control: &RunControl) -> Result<(), String> {
     request_effect_for_control(control, "deadline").map(|_| ())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn request_host_deadline(control: &crate::store::RunControl) -> Result<(), String> {
+    platform::request_deadline(control, crate::process::IPC_VERSION)
 }
 
 #[cfg(target_os = "linux")]

@@ -5,7 +5,10 @@
       "platform": "linux",
       "target_os": "linux",
       "exclude": [
-        "manuvra-cli/src/process/darwin.rs"
+        "manuvra-cli/src/client/darwin.rs",
+        "manuvra-cli/src/process/darwin.rs",
+        "manuvra-cli/src/runtime/darwin.rs",
+        "manuvra-cli/src/socket_auth/darwin.rs"
       ]
     },
     {
@@ -13,9 +16,9 @@
       "target_os": "macos",
       "exclude": [
         "manuvra-cli/src/host.rs",
-        "manuvra-cli/src/process.rs",
         "manuvra-cli/src/process/linux.rs",
-        "manuvra-cli/src/watchdog.rs"
+        "manuvra-cli/src/runtime/linux.rs",
+        "manuvra-cli/src/socket_auth/linux.rs"
       ]
     }
   ],
@@ -25,19 +28,31 @@
       "platform": "linux"
     },
     {
-      "path": "manuvra-cli/src/process.rs",
-      "platform": "linux"
-    },
-    {
       "path": "manuvra-cli/src/process/linux.rs",
       "platform": "linux"
     },
     {
-      "path": "manuvra-cli/src/watchdog.rs",
+      "path": "manuvra-cli/src/runtime/linux.rs",
       "platform": "linux"
     },
     {
+      "path": "manuvra-cli/src/socket_auth/linux.rs",
+      "platform": "linux"
+    },
+    {
+      "path": "manuvra-cli/src/client/darwin.rs",
+      "platform": "darwin"
+    },
+    {
       "path": "manuvra-cli/src/process/darwin.rs",
+      "platform": "darwin"
+    },
+    {
+      "path": "manuvra-cli/src/runtime/darwin.rs",
+      "platform": "darwin"
+    },
+    {
+      "path": "manuvra-cli/src/socket_auth/darwin.rs",
       "platform": "darwin"
     }
   ]

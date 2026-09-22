@@ -1,7 +1,7 @@
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 
@@ -48,12 +48,12 @@ pub struct RequestLock {
     _file: File,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub struct RunLock {
     _file: File,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl RunLock {
     pub fn inherited_fd(&self) -> Result<RawFd, String> {
         let fd = self._file.as_raw_fd();
@@ -102,7 +102,7 @@ impl<'de> Deserialize<'de> for ProcessIdentity {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunControl {
@@ -164,7 +164,7 @@ pub fn lock_request(root: &Path, request_id: &str) -> Result<RequestLock, String
     lock_file(&path, "request")
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn lock_run(root: &Path, run_id: &str) -> Result<RunLock, String> {
     let directory = run_state_dir(root, run_id)?;
     let path = directory.join("run.lock");
@@ -179,7 +179,7 @@ pub fn lock_run(root: &Path, run_id: &str) -> Result<RunLock, String> {
     Ok(RunLock { _file: file })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn adopt_inherited_run_lock(root: &Path, run_id: &str, fd: RawFd) -> Result<RunLock, String> {
     if fd < 0 {
         return Err("inherited run lock descriptor is invalid".into());
@@ -198,7 +198,7 @@ pub fn adopt_inherited_run_lock(root: &Path, run_id: &str, fd: RawFd) -> Result<
     Ok(RunLock { _file: file })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn validate_inherited_lock_path(file: &File, path: &Path) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
 
@@ -214,7 +214,7 @@ fn validate_inherited_lock_path(file: &File, path: &Path) -> Result<(), String> 
     .ok_or_else(|| "inherited run lock does not match durable run state".into())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn set_fd_cloexec(fd: RawFd, enabled: bool) -> Result<(), String> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     if flags == -1 {
@@ -237,7 +237,7 @@ fn set_fd_cloexec(fd: RawFd, enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn try_lock_existing_run(root: &Path, run_id: &str) -> Result<Option<RunLock>, String> {
     let path = root.join("runs").join(run_id).join("run.lock");
     open_run_lock_for_inspection(&path)?
@@ -246,7 +246,7 @@ pub fn try_lock_existing_run(root: &Path, run_id: &str) -> Result<Option<RunLock
         .map(Option::flatten)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn run_lock_present(root: &Path, run_id: &str) -> Result<bool, String> {
     let path = root.join("runs").join(run_id).join("run.lock");
     open_run_lock_for_inspection(&path)?.map_or(Ok(false), |file| {
@@ -254,7 +254,7 @@ pub fn run_lock_present(root: &Path, run_id: &str) -> Result<bool, String> {
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn try_lock_inspected_run(file: File, path: &Path) -> Result<Option<RunLock>, String> {
     validate_private_file(&file, path, "run lock")?;
     match File::try_lock(&file) {
@@ -267,7 +267,7 @@ fn try_lock_inspected_run(file: File, path: &Path) -> Result<Option<RunLock>, St
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn open_run_lock_for_inspection(path: &Path) -> Result<Option<File>, String> {
     let mut options = OpenOptions::new();
     options.read(true).write(true);
@@ -279,14 +279,14 @@ fn open_run_lock_for_inspection(path: &Path) -> Result<Option<File>, String> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn write_run_control(root: &Path, control: &RunControl) -> Result<(), String> {
     let directory = run_state_dir(root, &control.run_id)?;
     let bytes = serde_json::to_vec_pretty(control).map_err(|error| error.to_string())?;
     atomic_write_private(&directory.join("control.json"), &bytes)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn read_run_control(root: &Path, run_id: &str) -> Result<Option<RunControl>, String> {
     let path = root.join("runs").join(run_id).join("control.json");
     match read_private_file(&path, "run control") {
@@ -298,7 +298,7 @@ pub fn read_run_control(root: &Path, run_id: &str) -> Result<Option<RunControl>,
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn unresolved_action(evidence_root: &Path, run_id: &str) -> Result<bool, String> {
     let journal = evidence_root.join(format!(".{run_id}.action-journal.jsonl"));
     let bytes = match read_private_file(&journal, "action journal") {
@@ -319,7 +319,7 @@ pub fn unresolved_action(evidence_root: &Path, run_id: &str) -> Result<bool, Str
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn request_run_id(root: &Path, request_id: &str) -> Result<Option<String>, String> {
     Ok(lookup_request(root, request_id)?.map(|entry| match entry {
         RequestEntry::Intent(intent) => intent.run_id,
@@ -327,7 +327,7 @@ pub fn request_run_id(root: &Path, request_id: &str) -> Result<Option<String>, S
     }))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_state_dir(root: &Path, run_id: &str) -> Result<PathBuf, String> {
     let runs = root.join("runs");
     create_private_dir(&runs)?;
@@ -337,11 +337,11 @@ fn run_state_dir(root: &Path, run_id: &str) -> Result<PathBuf, String> {
 }
 
 pub const DOMAIN_RUN_JOB: &[u8] = b"run-job";
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub const DOMAIN_RESUME_REQUEST: &[u8] = b"resume-request";
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub const DOMAIN_RESUME_RESULT: &[u8] = b"resume-result";
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub const DOMAIN_ABORT_REQUEST: &[u8] = b"abort-request";
 
 pub fn keyed_digest(root: &Path, domain: &[u8], input: &[u8]) -> Result<String, String> {
@@ -361,7 +361,7 @@ pub fn keyed_digest(root: &Path, domain: &[u8], input: &[u8]) -> Result<String, 
     Ok(hex::encode(digest.finalize().into_bytes()))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn sealed_control_record(
     root: &Path,
     request_id: &str,
@@ -383,7 +383,7 @@ pub fn sealed_control_record(
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn validate_control_record(root: &Path, record: &RequestRecord) -> Result<(), String> {
     let expected = control_result_digest(
         root,
@@ -398,7 +398,7 @@ pub fn validate_control_record(root: &Path, record: &RequestRecord) -> Result<()
         .ok_or_else(|| "completed control result digest does not match".into())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn control_result_digest(
     root: &Path,
     request_id: &str,
@@ -516,7 +516,7 @@ pub fn record_intent(
     write_run_entry(root, &intent.run_id, &bytes)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn record_control_intent(
     root: &Path,
     lookup_request_id: &str,
@@ -540,7 +540,7 @@ pub fn finalize_request(
     atomic_write_private(&request_index_path(root, lookup_request_id), &bytes)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn finalize_control_request(
     root: &Path,
     lookup_request_id: &str,
@@ -815,7 +815,7 @@ fn sync_directory(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("cannot sync directory {}: {error}", path.display()))
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
     use tempfile::TempDir;
@@ -851,6 +851,22 @@ mod tests {
             Some(RequestEntry::Intent(found)) if found.run_id == "r_resume"
         ));
         assert!(!root.join("runs/r_resume/request.json").exists());
+    }
+
+    #[test]
+    fn inherited_run_lock_revalidates_the_durable_inode_and_restores_cloexec() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path();
+        let run_id = "r_1234567890abcdef";
+        let lock = lock_run(root, run_id).unwrap();
+        let fd = lock.inherited_fd().unwrap();
+        let inherited = unsafe { libc::dup(fd) };
+        assert!(inherited >= 0);
+        lock.restore_cloexec().unwrap();
+        let adopted = adopt_inherited_run_lock(root, run_id, inherited).unwrap();
+        let flags = unsafe { libc::fcntl(adopted._file.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(flags, -1);
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
     }
 }
 
