@@ -59,8 +59,8 @@ pub struct Client {
     pinned_model: Mutex<Option<String>>,
 }
 
-enum Attempt {
-    Success(Response),
+enum Attempt<T> {
+    Success(T),
     Retry(Option<Duration>),
     Fail(JevError),
 }
@@ -91,15 +91,20 @@ impl Client {
         })
     }
 
-    fn send(&self, request: &Value, deadline: Instant) -> Result<Response, JevError> {
+    fn send(
+        &self,
+        request: &Value,
+        questions: &Map<String, Value>,
+        deadline: Instant,
+    ) -> Result<Evaluation, JevError> {
         let logical = deadline.min(Instant::now() + LOGICAL_TIMEOUT);
         let mut attempt = 0_u32;
         loop {
             let remaining = logical
                 .checked_duration_since(Instant::now())
                 .ok_or(JevError::Deadline)?;
-            match self.attempt(request, remaining, attempt < 2) {
-                Attempt::Success(response) => return Ok(response),
+            match self.evaluation_attempt(request, questions, remaining, attempt < 2) {
+                Attempt::Success(evaluation) => return Ok(evaluation),
                 Attempt::Retry(retry_after) => {
                     wait_before_retry(attempt, retry_after, logical)?;
                     attempt += 1;
@@ -109,7 +114,23 @@ impl Client {
         }
     }
 
-    fn attempt(&self, request: &Value, remaining: Duration, can_retry: bool) -> Attempt {
+    fn evaluation_attempt(
+        &self,
+        request: &Value,
+        questions: &Map<String, Value>,
+        remaining: Duration,
+        can_retry: bool,
+    ) -> Attempt<Evaluation> {
+        match self.attempt(request, remaining, can_retry) {
+            Attempt::Success(response) => {
+                classify_evaluation(self.parse_response(response, questions), can_retry)
+            }
+            Attempt::Retry(delay) => Attempt::Retry(delay),
+            Attempt::Fail(error) => Attempt::Fail(error),
+        }
+    }
+
+    fn attempt(&self, request: &Value, remaining: Duration, can_retry: bool) -> Attempt<Response> {
         let response = self
             .http
             .post(&self.endpoint)
@@ -121,6 +142,26 @@ impl Client {
             Ok(response) => classify_response(response, can_retry),
             Err(error) => classify_error(&error, can_retry),
         }
+    }
+
+    fn parse_response(
+        &self,
+        response: Response,
+        questions: &Map<String, Value>,
+    ) -> Result<Evaluation, JevError> {
+        let request_id = provider_request_id(&response)?;
+        let body: Value = response
+            .json()
+            .map_err(|_| JevError::InvalidResponse("response body was not valid JSON".into()))?;
+        let model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|model| !model.is_empty())
+            .ok_or_else(|| JevError::InvalidResponse("response model is missing".into()))?
+            .to_owned();
+        let evaluation = parse_evaluation(body, questions, Some(request_id), model.clone())?;
+        self.pin(&model)?;
+        Ok(evaluation)
     }
 
     fn pin(&self, model: &str) -> Result<(), JevError> {
@@ -156,7 +197,7 @@ impl Client {
     }
 }
 
-fn classify_response(response: Response, can_retry: bool) -> Attempt {
+fn classify_response(response: Response, can_retry: bool) -> Attempt<Response> {
     if response.status().is_success() {
         Attempt::Success(response)
     } else if can_retry && retryable(response.status()) {
@@ -166,7 +207,7 @@ fn classify_response(response: Response, can_retry: bool) -> Attempt {
     }
 }
 
-fn terminal_response(status: StatusCode) -> Attempt {
+fn terminal_response(status: StatusCode) -> Attempt<Response> {
     if [StatusCode::UNPROCESSABLE_ENTITY, StatusCode::BAD_REQUEST].contains(&status) {
         Attempt::Fail(JevError::InvalidResponse(
             "provider rejected the request shape".into(),
@@ -176,7 +217,7 @@ fn terminal_response(status: StatusCode) -> Attempt {
     }
 }
 
-fn classify_error(error: &reqwest::Error, can_retry: bool) -> Attempt {
+fn classify_error(error: &reqwest::Error, can_retry: bool) -> Attempt<Response> {
     if can_retry && (error.is_timeout() || error.is_connect()) {
         Attempt::Retry(None)
     } else {
@@ -184,23 +225,24 @@ fn classify_error(error: &reqwest::Error, can_retry: bool) -> Attempt {
     }
 }
 
+fn classify_evaluation(
+    evaluation: Result<Evaluation, JevError>,
+    can_retry: bool,
+) -> Attempt<Evaluation> {
+    match evaluation {
+        Ok(evaluation) => Attempt::Success(evaluation),
+        Err(JevError::InvalidResponse(_) | JevError::ModelChanged) if can_retry => {
+            Attempt::Retry(None)
+        }
+        Err(error) => Attempt::Fail(error),
+    }
+}
+
 impl Evaluator for Client {
     fn evaluate(&self, request: &Value, deadline: Instant) -> Result<Evaluation, JevError> {
         let request = self.request_for_run(request)?;
         let questions = validate_request(&request)?;
-        let response = self.send(&request, deadline)?;
-        let request_id = provider_request_id(&response)?;
-        let body: Value = response
-            .json()
-            .map_err(|_| JevError::InvalidResponse("response body was not valid JSON".into()))?;
-        let model = body
-            .get("model")
-            .and_then(Value::as_str)
-            .filter(|model| !model.is_empty())
-            .ok_or_else(|| JevError::InvalidResponse("response model is missing".into()))?
-            .to_owned();
-        self.pin(&model)?;
-        parse_evaluation(body, questions, Some(request_id), model)
+        self.send(&request, questions, deadline)
     }
 }
 
@@ -582,6 +624,55 @@ mod tests {
     }
 
     #[test]
+    fn retries_an_invalid_success_response_within_the_logical_call() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut first = listener.accept().unwrap().0;
+            read_request(&mut first);
+            let invalid = json!({"model":"jev-transient","usage":{}}).to_string();
+            write_response(&mut first, "request-invalid", &invalid);
+
+            let mut second = listener.accept().unwrap().0;
+            read_request(&mut second);
+            let valid = valid_response_body();
+            write_response(&mut second, "request-valid", &valid);
+        });
+
+        let client = Client::new("transport-test-key".into(), endpoint).unwrap();
+        let evaluation = client
+            .evaluate(&request(), Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(evaluation.request_id.as_deref(), Some("request-valid"));
+        assert_eq!(evaluation.model, "jev-1.13");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn does_not_retry_a_rejected_request_shape() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut stream = listener.accept().unwrap().0;
+            read_request(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 422 Unprocessable Entity\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+
+        let client = Client::new("transport-test-key".into(), endpoint).unwrap();
+        assert_eq!(
+            client.evaluate(&request(), Instant::now() + Duration::from_secs(2)),
+            Err(JevError::InvalidResponse(
+                "provider rejected the request shape".into()
+            ))
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
     fn rejects_missing_empty_oversized_and_unsafe_provider_request_ids_on_the_wire() {
         for header in [
             None,
@@ -592,23 +683,22 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let endpoint = format!("http://{}", listener.local_addr().unwrap());
             let server = thread::spawn(move || {
-                let mut stream = listener.accept().unwrap().0;
-                read_request(&mut stream);
-                let body = json!({"answers":{
-                    "operation":{"type":"choice","choice":"CLICK","probabilities":{"CLICK":0.7,"WAIT":0.3},"confidence":0.8},
-                    "step_done":{"type":"noul","noul":0.1}
-                },"model":"jev-1.13","usage":{}})
-                .to_string();
-                let request_id = header
-                    .map(|value| format!("X-TypeSafe-Request-Id: {value}\r\n"))
-                    .unwrap_or_default();
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\n{request_id}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                )
-                .unwrap();
+                for _ in 0..3 {
+                    let mut stream = listener.accept().unwrap().0;
+                    read_request(&mut stream);
+                    let body = valid_response_body();
+                    let request_id = header
+                        .as_ref()
+                        .map(|value| format!("X-TypeSafe-Request-Id: {value}\r\n"))
+                        .unwrap_or_default();
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\n{request_id}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .unwrap();
+                }
             });
             let client = Client::new("transport-test-key".into(), endpoint).unwrap();
             assert!(matches!(
@@ -646,5 +736,23 @@ mod tests {
     fn read_request(stream: &mut TcpStream) {
         let mut buffer = [0_u8; 8_192];
         let _ = stream.read(&mut buffer).unwrap();
+    }
+
+    fn valid_response_body() -> String {
+        json!({"answers":{
+            "operation":{"type":"choice","choice":"CLICK","probabilities":{"CLICK":0.7,"WAIT":0.3},"confidence":0.8},
+            "step_done":{"type":"noul","noul":0.1}
+        },"model":"jev-1.13","usage":{"input_tokens":12}})
+        .to_string()
+    }
+
+    fn write_response(stream: &mut TcpStream, request_id: &str, body: &str) {
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nX-TypeSafe-Request-Id: {request_id}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
     }
 }

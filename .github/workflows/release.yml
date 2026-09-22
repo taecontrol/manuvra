@@ -77,8 +77,52 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  darwin:
+    needs: validate
+    name: Darwin binary (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+            machine: arm64
+          - runner: macos-15-intel
+            arch: x64
+            machine: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Assert native runner architecture
+        env:
+          MACHINE: ${{ matrix.machine }}
+        run: |
+          architecture=$(uname -m)
+          echo "Runner architecture: $architecture"
+          test "$architecture" = "$MACHINE"
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup default 1.95.0
+      - name: Build the Darwin binary archive
+        env:
+          ARCH: ${{ matrix.arch }}
+          VERSION: ${{ inputs.version }}
+        shell: /bin/bash --noprofile --norc -eo pipefail {0}
+        run: scripts/create-darwin-binary-archive.sh --version "$VERSION" --arch "$ARCH" --output release-assets
+      - name: Upload the Darwin binary archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: darwin-${{ matrix.arch }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 1
+
   release:
-    needs: [validate, linux]
+    needs: [validate, linux, darwin]
     runs-on: macos-latest
     timeout-minutes: 30
     permissions:
@@ -99,6 +143,12 @@ jobs:
           pattern: linux-*
           path: release-assets
           merge-multiple: true
+      - name: Download Darwin binary archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: darwin-*
+          path: release-assets
+          merge-multiple: true
       - name: Build deterministic source assets
         env:
           VERSION: ${{ inputs.version }}
@@ -111,10 +161,16 @@ jobs:
           cp "$first/manuvra-$VERSION.tar.gz" "$first/manuvra-$VERSION.tar.gz.sha256" release-assets/
           (cd release-assets && shasum -a 256 -c "manuvra-$VERSION-linux-x64.tar.gz.sha256")
           (cd release-assets && shasum -a 256 -c "manuvra-$VERSION-linux-arm64.tar.gz.sha256")
+          (cd release-assets && shasum -a 256 -c "manuvra-$VERSION-darwin-x64.tar.gz.sha256")
+          (cd release-assets && shasum -a 256 -c "manuvra-$VERSION-darwin-arm64.tar.gz.sha256")
       - name: Attest Linux binary archives
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
           subject-path: release-assets/manuvra-*-linux-*.tar.gz
+      - name: Attest Darwin binary archives
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: release-assets/manuvra-*-darwin-*.tar.gz
       - name: Publish immutable release
         env:
           RELEASE_TAG_DEPLOY_KEY: ${{ secrets.RELEASE_TAG_DEPLOY_KEY }}
@@ -145,22 +201,34 @@ jobs:
           git tag "v$VERSION" "$GITHUB_SHA"
           git -c core.sshCommand="$ssh_command" push "$release_remote" "refs/tags/v$VERSION"
           tag_created=true
-          gh release create "v$VERSION" release-assets/* --draft --verify-tag --title "Manuvra v$VERSION" --notes "MIT source release with attested Linux x64 and ARM64 binaries for mise. The macOS Homebrew formula builds from source."
+          gh release create "v$VERSION" release-assets/* --draft --verify-tag --title "Manuvra v$VERSION" --notes "MIT source release with attested Linux and macOS x64 and ARM64 binaries for mise. The macOS Homebrew formula builds from source and does not use bottles."
           release_created=true
           gh release edit "v$VERSION" --draft=false
           trap - EXIT
 
   mise:
     needs: release
-    name: mise install (${{ matrix.arch }})
+    name: mise install (${{ matrix.platform }}-${{ matrix.arch }})
     strategy:
       fail-fast: false
       matrix:
         include:
           - runner: ubuntu-22.04
+            platform: linux
             arch: x64
+            machine: x86_64
           - runner: ubuntu-22.04-arm
+            platform: linux
             arch: arm64
+            machine: aarch64
+          - runner: macos-15
+            platform: darwin
+            arch: arm64
+            machine: arm64
+          - runner: macos-15-intel
+            platform: darwin
+            arch: x64
+            machine: x86_64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     permissions:
@@ -185,21 +253,37 @@ jobs:
       - name: Verify the published archive and attestation
         env:
           ARCH: ${{ matrix.arch }}
+          MACHINE: ${{ matrix.machine }}
+          PLATFORM: ${{ matrix.platform }}
         run: |
-          archive="manuvra-$VERSION-linux-$ARCH.tar.gz"
+          architecture=$(uname -m)
+          echo "Runner architecture: $architecture"
+          test "$architecture" = "$MACHINE"
+          archive="manuvra-$VERSION-$PLATFORM-$ARCH.tar.gz"
           gh release download "v$VERSION" --repo "$GITHUB_REPOSITORY" --pattern "$archive" --pattern "$archive.sha256"
-          sha256sum -c "$archive.sha256"
+          if [[ "$PLATFORM" == darwin ]]; then
+            shasum -a 256 -c "$archive.sha256"
+          else
+            sha256sum -c "$archive.sha256"
+          fi
           gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY"
       - name: Install and run through mise
         env:
+          ARCH: ${{ matrix.arch }}
           MISE_CACHE_DIR: ${{ runner.temp }}/mise-cache
           MISE_CONFIG_DIR: ${{ runner.temp }}/mise-config
           MISE_DATA_DIR: ${{ runner.temp }}/mise-data
           MISE_STATE_DIR: ${{ runner.temp }}/mise-state
+          PLATFORM: ${{ matrix.platform }}
         run: |
           version_json=$(mise x "github:$GITHUB_REPOSITORY@$VERSION" -- manuvra version)
           test "$(printf '%s' "$version_json" | python3 -c 'import json, sys; print(json.load(sys.stdin)["version"])')" = "$VERSION"
           mise x "github:$GITHUB_REPOSITORY@$VERSION" -- manuvra schema job | python3 -c 'import json, sys; assert json.load(sys.stdin)["title"] == "Job"'
+          archive="manuvra-$VERSION-$PLATFORM-$ARCH.tar.gz"
+          extracted=$(mktemp -d)
+          tar -xzf "$archive" -C "$extracted"
+          installed=$(mise x "github:$GITHUB_REPOSITORY@$VERSION" -- which manuvra)
+          cmp "$extracted/manuvra" "$installed"
 
   homebrew:
     needs: [release, mise]

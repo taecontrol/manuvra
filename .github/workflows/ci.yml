@@ -78,6 +78,7 @@ jobs:
             --repo-root . \
             --rust-manifest Cargo.toml \
             --rust-root crates \
+            --platform-profiles tools/crap-gate/platform-profiles.json \
             --report-json target/crap-report.json
           status=$?
           set -e
@@ -99,6 +100,40 @@ jobs:
               summary.write(f"- Above threshold: {offenders}\n")
               summary.write(f"- Maximum: {maximum}\n")
           PY
+
+  darwin-real-chrome:
+    name: Apple Silicon real Chrome
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Assert Apple Silicon runner
+        run: |
+          architecture=$(uname -m)
+          echo "Runner architecture: $architecture"
+          test "$architecture" = arm64
+      - name: Identify Google Chrome
+        run: |
+          chrome="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+          test -x "$chrome"
+          echo "Chrome executable: $chrome"
+          "$chrome" --version
+          echo "MANUVRA_BROWSER=$chrome" >> "$GITHUB_ENV"
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup default 1.95.0
+      - name: Exercise the owned real-browser runtime
+        shell: bash
+        run: |
+          fixture_list=$(cargo test --locked -p manuvra-chrome --test local_fixture -- --ignored --list)
+          printf '%s\n' "$fixture_list"
+          fixture_count=$(printf '%s\n' "$fixture_list" | awk '/: test$/ { count += 1 } END { print count + 0 }')
+          echo "Ignored real-browser fixtures: $fixture_count"
+          test "$fixture_count" -gt 0
+          cargo test --locked -p manuvra-chrome --test local_fixture -- --ignored --nocapture --test-threads=1
 
   linux-distribution:
     name: Linux package (${{ matrix.arch }})
@@ -140,3 +175,67 @@ jobs:
           test -x "$extracted/manuvra"
           test "$("$extracted/manuvra" version | python3 -c 'import json, sys; print(json.load(sys.stdin)["version"])')" = "$version"
           "$extracted/manuvra" schema job | python3 -c 'import json, sys; assert json.load(sys.stdin)["title"] == "Job"'
+
+  darwin-distribution:
+    name: Darwin package (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+            machine: arm64
+            macho: arm64
+          - runner: macos-15-intel
+            arch: x64
+            machine: x86_64
+            macho: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Assert native runner architecture
+        env:
+          MACHINE: ${{ matrix.machine }}
+        run: |
+          architecture=$(uname -m)
+          echo "Runner architecture: $architecture"
+          test "$architecture" = "$MACHINE"
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup default 1.95.0
+      - name: Build and verify the Darwin release archive
+        env:
+          ARCH: ${{ matrix.arch }}
+          MACHO_ARCH: ${{ matrix.macho }}
+        shell: /bin/bash --noprofile --norc -eo pipefail {0}
+        run: |
+          version=$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)
+          first="$PWD/release-assets"
+          second=$(mktemp -d)
+          scripts/create-darwin-binary-archive.sh --version "$version" --arch "$ARCH" --output "$first"
+          scripts/create-darwin-binary-archive.sh --version "$version" --arch "$ARCH" --output "$second"
+
+          archive="manuvra-$version-darwin-$ARCH.tar.gz"
+          cmp "$first/$archive" "$second/$archive"
+          cmp "$first/$archive.sha256" "$second/$archive.sha256"
+          (cd "$first" && shasum -a 256 -c "$archive.sha256")
+          test "$(tar -tzf "$first/$archive")" = manuvra
+
+          extracted=$(mktemp -d)
+          tar -xzf "$first/$archive" -C "$extracted"
+          test -x "$extracted/manuvra"
+          test "$(stat -f '%Lp' "$extracted/manuvra")" = 755
+          test "$(lipo -archs "$extracted/manuvra")" = "$MACHO_ARCH"
+          test "$("$extracted/manuvra" version | python3 -c 'import json, sys; print(json.load(sys.stdin)["version"])')" = "$version"
+          "$extracted/manuvra" schema job | python3 -c 'import json, sys; assert json.load(sys.stdin)["title"] == "Job"'
+      - name: Upload the Darwin binary archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: darwin-${{ matrix.arch }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 1

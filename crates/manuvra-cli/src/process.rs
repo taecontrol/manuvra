@@ -1,11 +1,21 @@
 use crate::store::{self, ProcessIdentity, RequestIntent};
 use manuvra_contract::Job;
 use serde::{Deserialize, Serialize};
-use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(target_os = "macos")]
+#[path = "process/darwin.rs"]
+mod platform;
+#[cfg(target_os = "linux")]
+#[path = "process/linux.rs"]
+mod platform;
+
+#[cfg(all(test, target_os = "linux"))]
+use platform::process_is_same;
+pub use platform::{child_exited_without_reaping, process_identity, signal_process_group};
 
 pub const IPC_VERSION: u16 = 1;
 
@@ -57,35 +67,30 @@ pub fn now_unix_ms() -> u64 {
 }
 
 pub fn runtime_run_dir(run_id: &str) -> Result<PathBuf, String> {
-    let root = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .ok_or_else(|| "XDG_RUNTIME_DIR is required for background runs".to_owned())?;
-    let manuvra = root.join("manuvra");
-    store::create_private_dir(&manuvra)?;
-    let root = manuvra.join("runs");
-    store::create_private_dir(&root)?;
-    let directory = root.join(run_id);
-    store::create_private_dir(&directory)?;
-    Ok(directory)
+    crate::runtime::run_dir(run_id)
 }
 
-#[cfg(target_os = "linux")]
 pub fn spawn_watchdog(
+    host: HostBootstrap,
+    watchdog: WatchdogBootstrap,
+    run_lock: &store::RunLock,
+) -> Result<ProcessIdentity, String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    spawn_watchdog_with_command(host, watchdog, run_lock, watchdog_command(&executable))
+}
+
+fn spawn_watchdog_with_command(
     mut host: HostBootstrap,
     mut watchdog: WatchdogBootstrap,
     run_lock: &store::RunLock,
+    mut command: Command,
 ) -> Result<ProcessIdentity, String> {
     use std::os::unix::process::CommandExt;
 
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    let mut command = Command::new(executable);
     command
-        .arg("__watchdog")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env_remove("TYPESAFE_API_KEY")
-        .env_remove("MANUVRA_TEST_CALLER_BOOTSTRAP_FAULT");
+        .stderr(Stdio::null());
     let run_lock_fd = run_lock.inherited_fd()?;
     command.env("MANUVRA_RUN_LOCK_FD", run_lock_fd.to_string());
     unsafe {
@@ -107,7 +112,15 @@ pub fn spawn_watchdog(
     Ok(identity)
 }
 
-#[cfg(target_os = "linux")]
+fn watchdog_command(executable: &Path) -> Command {
+    let mut command = Command::new(executable);
+    command
+        .arg("__watchdog")
+        .env_remove("TYPESAFE_API_KEY")
+        .env_remove("MANUVRA_TEST_CALLER_BOOTSTRAP_FAULT");
+    command
+}
+
 fn send_watchdog_bootstrap(
     child: &mut std::process::Child,
     watchdog: &WatchdogBootstrap,
@@ -122,129 +135,6 @@ fn send_watchdog_bootstrap(
     write_framed(&mut stdin, &watchdog_bytes)
         .and_then(|()| write_framed(&mut stdin, &host_bytes.0))
         .map_err(|error| format!("cannot write watchdog bootstrap: {error}"))
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn spawn_watchdog(
-    _host: HostBootstrap,
-    _watchdog: WatchdogBootstrap,
-) -> Result<ProcessIdentity, String> {
-    Err("unsupported_platform".into())
-}
-
-#[cfg(target_os = "linux")]
-pub fn process_identity(pid: u32) -> Result<ProcessIdentity, String> {
-    let fields = proc_identity_fields(pid)?;
-    Ok(ProcessIdentity {
-        pid,
-        start_ticks: fields.start_ticks,
-        session_id: fields.session_id,
-    })
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn process_identity(pid: u32) -> Result<ProcessIdentity, String> {
-    Ok(ProcessIdentity {
-        pid,
-        start_ticks: 0,
-        session_id: 0,
-    })
-}
-
-#[cfg(target_os = "linux")]
-pub fn process_is_same(identity: &ProcessIdentity) -> bool {
-    proc_identity_fields(identity.pid).is_ok_and(|fields| {
-        fields.start_ticks == identity.start_ticks && fields.session_id == identity.session_id
-    })
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn process_is_same(_identity: &ProcessIdentity) -> bool {
-    false
-}
-
-#[cfg(target_os = "linux")]
-pub fn signal_process_group(identity: &ProcessIdentity, signal: i32) -> Result<bool, String> {
-    if !process_is_same(identity) && !owned_group_has_member(identity)? {
-        return Ok(false);
-    }
-    let pid: i32 = identity
-        .pid
-        .try_into()
-        .map_err(|_| "process id does not fit pid_t".to_owned())?;
-    let result = unsafe { libc::kill(-pid, signal) };
-    if result == 0 {
-        Ok(true)
-    } else {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) {
-            Ok(false)
-        } else {
-            Err(format!("cannot signal owned process group: {error}"))
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ProcIdentityFields {
-    process_group: u32,
-    session_id: u32,
-    start_ticks: u64,
-}
-
-#[cfg(target_os = "linux")]
-fn proc_identity_fields(pid: u32) -> Result<ProcIdentityFields, String> {
-    let contents = fs::read_to_string(format!("/proc/{pid}/stat"))
-        .map_err(|error| format!("cannot inspect process {pid}: {error}"))?;
-    let after_name = contents
-        .rsplit_once(") ")
-        .map(|(_, fields)| fields)
-        .ok_or_else(|| format!("invalid /proc stat for process {pid}"))?;
-    let fields: Vec<_> = after_name.split_whitespace().collect();
-    let parse = |index: usize, name: &str| {
-        fields
-            .get(index)
-            .ok_or_else(|| format!("process {pid} stat has no {name}"))?
-            .parse::<u64>()
-            .map_err(|error| format!("invalid process {pid} {name}: {error}"))
-    };
-    Ok(ProcIdentityFields {
-        process_group: parse(2, "process group")?
-            .try_into()
-            .map_err(|_| format!("process {pid} process group does not fit u32"))?,
-        session_id: parse(3, "session id")?
-            .try_into()
-            .map_err(|_| format!("process {pid} session id does not fit u32"))?,
-        start_ticks: parse(19, "start identity")?,
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn owned_group_has_member(identity: &ProcessIdentity) -> Result<bool, String> {
-    if proc_identity_fields(identity.pid).is_ok() {
-        // The numeric leader PID exists but no longer has the recorded identity. Its process
-        // group may have been reused, so signalling the negative PID would be unsafe.
-        return Ok(false);
-    }
-    let entries =
-        fs::read_dir("/proc").map_err(|error| format!("cannot inspect /proc: {error}"))?;
-    for entry in entries {
-        let entry = entry.map_err(|error| format!("cannot inspect /proc entry: {error}"))?;
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse().ok())
-        else {
-            continue;
-        };
-        if proc_identity_fields(pid).is_ok_and(|fields| {
-            fields.process_group == identity.pid && fields.session_id == identity.session_id
-        }) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 pub fn write_framed(mut writer: impl Write, bytes: &[u8]) -> Result<(), std::io::Error> {
@@ -289,21 +179,49 @@ pub fn ensure_socket_parent(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store;
+    #[cfg(target_os = "linux")]
+    use std::fs;
+    use std::process::Command;
+    #[cfg(target_os = "linux")]
     use std::process::Stdio;
+    #[cfg(target_os = "linux")]
     use std::time::{Duration, Instant};
+    #[cfg(target_os = "linux")]
     use tempfile::TempDir;
 
     #[test]
     #[cfg(target_os = "linux")]
     fn process_identity_rejects_pid_reuse_shape() {
-        let current = process_identity(std::process::id()).unwrap();
+        use std::os::unix::process::CommandExt;
+
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "while :; do sleep 1; done"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let current = process_identity(child.id()).unwrap();
         assert!(process_is_same(&current));
         let reused = ProcessIdentity {
-            start_ticks: current.start_ticks.saturating_add(1),
-            ..current
+            start_marker: current.start_marker.saturating_add(1),
+            ..current.clone()
         };
         assert!(!process_is_same(&reused));
-        assert!(!signal_process_group(&reused, 0).unwrap());
+        assert!(!signal_process_group(&reused, libc::SIGTERM).unwrap());
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(signal_process_group(&current, libc::SIGKILL).unwrap());
+        child.wait().unwrap();
     }
 
     #[test]
@@ -349,12 +267,86 @@ mod tests {
         assert_eq!(unsafe { libc::kill(descendant as i32, 0) }, 0);
         assert!(signal_process_group(&identity, libc::SIGKILL).unwrap());
         let deadline = Instant::now() + Duration::from_secs(1);
-        while Path::new(&format!("/proc/{descendant}")).exists() {
+        while unsafe { libc::kill(descendant as i32, 0) } == 0 {
             assert!(
                 Instant::now() < deadline,
                 "descendant survived group cleanup"
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn inherited_frame_rejects_an_oversized_payload_before_allocation() {
+        let mut framed = Vec::new();
+        super::write_framed(&mut framed, b"bounded").unwrap();
+        assert_eq!(super::read_framed(framed.as_slice()).unwrap(), b"bounded");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(32_u64 * 1024 * 1024 + 1).to_le_bytes());
+        assert!(super::read_framed(bytes.as_slice()).is_err());
+    }
+
+    #[test]
+    fn watchdog_command_explicitly_removes_provider_and_test_secrets() {
+        let command = super::watchdog_command(std::path::Path::new("/bin/false"));
+        let removals = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(removals.contains(&"TYPESAFE_API_KEY".into()));
+        assert!(removals.contains(&"MANUVRA_TEST_CALLER_BOOTSTRAP_FAULT".into()));
+    }
+
+    #[test]
+    fn watchdog_spawn_frames_bootstrap_and_owns_a_new_session() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let state_root = temporary.path().join("state");
+        let intent = store::RequestIntent {
+            schema_version: manuvra_contract::SchemaVersion,
+            public_request_id: "request".into(),
+            run_id: "r_1234567890abcdef".into(),
+            job_digest: "digest".into(),
+            evidence_root: temporary.path().join("evidence"),
+        };
+        let job = manuvra_contract::Job::parse(
+            br#"{"schema_version":1,"target":{"kind":"browser","url":"http://example.test"},"context":{"journey":"j","revision":"r","environment":"e","actor":"a","authority":"fixture"},"steps":[{"id":"s","goal":"g","done_when":[{"url_contains":"/"}]}]}"#,
+        )
+        .unwrap();
+        let host = HostBootstrap {
+            job,
+            intent: intent.clone(),
+            lookup_request_id: "request".into(),
+            state_root: state_root.clone(),
+            browser: None,
+            headless: true,
+            provider_key: Some("must-be-framed".into()),
+            runtime_dir: temporary.path().join("runtime"),
+            started_unix_ms: 1,
+            lifetime_deadline_unix_ms: 2,
+            pause_timeout_ms: 1,
+            watchdog: None,
+            liveness_fd: None,
+        };
+        let watchdog = WatchdogBootstrap {
+            intent,
+            state_root: state_root.clone(),
+            runtime_dir: temporary.path().join("runtime"),
+            started_unix_ms: 1,
+            lifetime_deadline_unix_ms: 2,
+            initial_result: serde_json::json!({"state":"running"}),
+            watchdog: None,
+        };
+        let lock = store::lock_run(&state_root, "r_1234567890abcdef").unwrap();
+        let mut command = Command::new("sh");
+        command.args(["-c", "cat >/dev/null; sleep 60"]);
+        let identity = spawn_watchdog_with_command(host, watchdog, &lock, command).unwrap();
+        assert_eq!(identity.pid, identity.process_group);
+        assert!(signal_process_group(&identity, libc::SIGKILL).unwrap());
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(identity.pid as i32, &mut status, 0) },
+            identity.pid as i32
+        );
     }
 }

@@ -6,9 +6,9 @@ Use Manuvra with a disposable application fixture and synthetic data. The caller
 
 ## Requirements
 
-Manuvra runs on Linux and requires Chromium or Google Chrome. Building it from source requires Rust 1.95 or newer. Jobs that need Jev judgments also require `TYPESAFE_API_KEY`.
+Manuvra runs on Linux and macOS and requires Chromium or Google Chrome. Building it from source requires Rust 1.95 or newer. Jobs that need Jev judgments also require `TYPESAFE_API_KEY`.
 
-The workspace keeps the macOS fallback compiling, but macOS is not a supported runtime platform.
+The macOS runtime and real-Chrome lifecycle are proven on Apple Silicon. Intel macOS uses the same native implementation, but does not yet have an equivalent real-Chrome runtime gate.
 
 ## Install
 
@@ -19,7 +19,7 @@ MISE_MINIMUM_RELEASE_AGE=0 mise use -g github:taecontrol/manuvra@latest
 manuvra version
 ```
 
-The same command works on other Linux systems with `mise`. Releases contain native x64 and ARM64 archives, and `mise` selects the matching one. Run `omarchy update mise` to update Manuvra along with other mise-managed tools.
+The same command works on other Linux systems and macOS with `mise`. Releases contain native x64 and ARM64 archives for both platforms, and `mise` selects the matching archive. The release workflow verifies installation on native Linux and macOS runners. On Intel macOS this is an installation smoke check; the real-Chrome runtime gate covers Apple Silicon. Run `omarchy update mise` to update Manuvra along with other mise-managed tools on Omarchy.
 
 If Chromium is not already installed on Omarchy, add it with:
 
@@ -42,11 +42,11 @@ brew install taecontrol/tap/manuvra
 manuvra version
 ```
 
-The macOS package currently exposes `version` and the four `schema` contracts. Browser-journey execution remains unsupported on macOS; `run`, `status`, `resume`, and `abort` return `unsupported_platform`. The Homebrew release check builds and tests the formula on macOS so the install channel stays ready while runtime support is restored separately.
+Homebrew builds Manuvra from source and does not use a bottle. That installation and a source build both provide the complete `run`, `status`, `resume`, and `abort` lifecycle on macOS.
 
-At runtime, Manuvra looks for the browser specified by `--browser`, then `MANUVRA_BROWSER`, then known Chromium and Chrome locations. It uses the current Wayland or X11 desktop unless you pass `--headless`.
+At runtime, Manuvra looks for the browser specified by `--browser`, then `MANUVRA_BROWSER`, then known Chromium and Chrome locations. On macOS it checks the directly executable Google Chrome and Chromium binaries inside `/Applications` and `~/Applications` app bundles before searching `PATH`; an explicit path must name the inner executable, such as `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`. It uses the current macOS desktop, Wayland, or X11 display unless you pass `--headless`.
 
-Manuvra stores durable run records under `XDG_STATE_HOME`, or the user's standard XDG state directory when that variable is unset. It requires `XDG_RUNTIME_DIR` for private control sockets and other short-lived state. The caller chooses a separate evidence root for each `run` command.
+Manuvra stores durable run records under `XDG_STATE_HOME`, or the user's standard XDG state directory when that variable is unset. It uses `XDG_RUNTIME_DIR` for private control sockets and other short-lived state. On macOS, if `XDG_RUNTIME_DIR` is unset, it creates a private mode-`0700` runtime directory beneath the explicit `TMPDIR`; if both are unavailable, `run` stops with `runtime_directory_unavailable` before creating state or children. The caller chooses a separate evidence root for each `run` command.
 
 ## Write a job
 
@@ -180,6 +180,8 @@ Request ids are idempotency keys. Reusing an id with the same input recovers the
 
 Each run has a private directory beneath the requested evidence root. Its `manifest.json` lists every artifact by role, absolute path, SHA-256 digest, and completeness. Depending on the run, evidence includes the redacted job, provenance, checkpoints, observations, screenshots, decisions, step facts, action trace, escalations, dispositions, final verification, and cleanup state.
 
+Linux replaces a previously published Evidence directory with an atomic directory exchange. macOS uses a portable backup-then-rename replacement, so an abrupt machine or process failure can temporarily leave the final Evidence path absent. Treat Evidence as complete only when the returned result and manifest both say it is complete and every listed Artifact verifies; recover the durable Run with `status` after an interrupted caller.
+
 A `passed` result means Manuvra completed the browser steps and final expectations with complete evidence. It does not prove that the application persisted the intended effect. Before treating the run as product proof:
 
 1. Verify the manifest and artifact digests.
@@ -200,7 +202,7 @@ make test
 make crap
 ```
 
-`make live` builds a release binary and runs the Money journey matrix against fresh fixtures. It requires Chromium, a headed desktop, `TYPESAFE_API_KEY`, `jq`, and the Money repository at `/home/guetteluis/Work/personal/money`. Set `MONEY_DIR` to use another checkout. The matrix runs the create-unit, create-account, and record-transaction journeys three times each, followed by one forced escalation round trip. It writes timestamped evidence and a report under `.work/live/money-journey/`.
+`make live` uses `/bin/bash`, builds a release binary, and runs the Money journey matrix against fresh fixtures. Set `MONEY_DIR` explicitly to a disposable Money checkout and provide `TYPESAFE_API_KEY` in the environment. The checkout must have its documented Node and pnpm application-driver dependencies ready. The command also requires `jq`, `rg`, native `date`, `shasum`, and `nc`, Rust build tools, Google Chrome, and a headed desktop. On macOS the matrix leaves `XDG_RUNTIME_DIR` unset so Manuvra exercises its private `TMPDIR` runtime fallback. It runs the create-unit, create-account, and record-transaction journeys three times each, followed by one forced escalation round trip. It retains timestamped, redacted Evidence and a `report.json` under `.work/live/money-journey/`; the report records the source revision, release-binary digest, Bash version, Run classifications, application persistence checks, and cleanup results.
 
 Contributors and coding agents should follow [docs/CODING_STANDARDS.md](docs/CODING_STANDARDS.md). The [architecture decision records](docs/adrs/) explain the project's design choices.
 
@@ -208,11 +210,11 @@ Contributors and coding agents should follow [docs/CODING_STANDARDS.md](docs/COD
 
 Releases start from the `release` workflow on `main`. Enter the workspace version from `Cargo.toml` without the leading `v`. The workflow requires a successful CI run for that exact commit, then:
 
-1. Builds deterministic Linux x64 and ARM64 archives and publishes their SHA-256 checksums.
-2. Creates GitHub build-provenance attestations for both Linux archives.
+1. Builds deterministic Linux and macOS x64 and ARM64 archives and publishes their SHA-256 checksums.
+2. Creates GitHub build-provenance attestations for all four native binary archives.
 3. Publishes those binaries with the deterministic source archive.
-4. Installs the published binaries through `mise` on native x64 and ARM64 runners.
-5. Installs the rendered formula on macOS and opens an auto-merge pull request in [`taecontrol/homebrew-tap`](https://github.com/taecontrol/homebrew-tap).
+4. Verifies each published archive and attestation, then installs it through `mise` on the matching native Linux or macOS runner and checks `version` and `schema job`.
+5. Builds the rendered Homebrew formula from the source archive on macOS and opens an auto-merge pull request in [`taecontrol/homebrew-tap`](https://github.com/taecontrol/homebrew-tap). The formula remains source-only and does not use bottles.
 
 Repository secret `HOMEBREW_TAP_TOKEN` provides write access to the tap. The release workflow does not modify Omarchy; Omarchy consumes the ordinary GitHub release through `mise`.
 

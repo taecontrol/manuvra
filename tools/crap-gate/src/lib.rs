@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+mod profile;
 mod runner;
 
 pub use runner::{GateConfig, run};

@@ -23,7 +23,7 @@ manuvra schema disposition > /tmp/manuvra-disposition-schema.json
 manuvra schema manifest > /tmp/manuvra-manifest-schema.json
 ```
 
-If `manuvra` is missing while working in its source checkout, install it with `cargo install --path crates/manuvra-cli --locked`. Otherwise report that the CLI is unavailable. Confirm `TYPESAFE_API_KEY` is present without printing it. Locate Chromium with `command -v chromium || command -v chromium-browser || command -v google-chrome`. You can later pass an explicit executable with `--browser`.
+If `manuvra` is missing while working in its source checkout, install it with `cargo install --path crates/manuvra-cli --locked`. Otherwise report that the CLI is unavailable. Confirm `TYPESAFE_API_KEY` is present without printing it. On Linux, locate Chromium with `command -v chromium || command -v chromium-browser || command -v google-chrome`. On macOS, Manuvra also discovers the directly executable Google Chrome or Chromium binary inside `/Applications` and `~/Applications` app bundles. You can later pass an explicit executable with `--browser`; on macOS name the inner binary, such as `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`, rather than the `.app` directory.
 
 Launch or reset a disposable application fixture and record:
 
@@ -125,7 +125,7 @@ jq . "$result"
 run_id=$(jq -r '.run_id' "$result")
 ```
 
-Add `--headless` only when a visible browser is unnecessary. Add `--browser /absolute/path/to/chromium` when discovery cannot find the intended executable.
+Add `--headless` only when a visible browser is unnecessary. Add `--browser /absolute/path/to/chromium` when discovery cannot find the intended executable. On macOS, pass the executable inside the app bundle, not the `.app` directory and not an `open` command.
 
 The JSON result is authoritative. The exit code only classifies it. Starting is complete when the result is valid JSON and contains `request_id`, `run_id`, `state`, and `terminal`.
 

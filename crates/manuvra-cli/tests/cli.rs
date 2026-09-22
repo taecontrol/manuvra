@@ -7,18 +7,83 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
+#[cfg(target_os = "macos")]
+struct DarwinHttpFixture {
+    address: std::net::SocketAddr,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(target_os = "macos")]
+impl DarwinHttpFixture {
+    fn start() -> Self {
+        use std::io::{Read, Write};
+        use std::sync::atomic::Ordering;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let worker = std::thread::spawn(move || {
+            while !worker_stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(1)));
+                        let mut request = [0_u8; 4096];
+                        let _ = stream.read(&mut request);
+                        let body = b"<!doctype html><title>Darwin hosted fixture</title><main>Ready <button id=activate onclick=\"document.querySelector('output').textContent='Activated'\">Activate</button> <output>Idle</output></main>";
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.write_all(body);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            address,
+            stop,
+            worker: Some(worker),
+        }
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}/ready", self.address)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for DarwinHttpFixture {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(self.address);
+        if let Some(worker) = self.worker.take() {
+            worker.join().unwrap();
+        }
+    }
+}
+
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_manuvra")
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const EXECUTION_STOP_REASON: &str = "browser_unavailable";
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 const EXECUTION_STOP_REASON: &str = "unsupported_platform";
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const VALID_BACKGROUND_COMMAND_RESULT: (i32, &str) = (64, "run_not_found");
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 const VALID_BACKGROUND_COMMAND_RESULT: (i32, &str) = (3, "unsupported_platform");
 
 fn valid_job() -> Value {
@@ -117,6 +182,35 @@ fn one_object(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn missing_runtime_variables_refuse_before_state_evidence_or_children() {
+    let temp = TempDir::new().unwrap();
+    let job_path = fixture(&temp, &valid_job());
+    let state = temp.path().join("state");
+    let evidence = temp.path().join("evidence");
+    let output = Command::new(binary())
+        .args([
+            "run",
+            "--request-id",
+            "no-runtime",
+            "--job",
+            job_path.to_str().unwrap(),
+            "--evidence",
+            evidence.to_str().unwrap(),
+        ])
+        .env("XDG_STATE_HOME", &state)
+        .env_remove("XDG_RUNTIME_DIR")
+        .env_remove("TMPDIR")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let result = one_object(&output);
+    assert_eq!(result["error"]["code"], "runtime_directory_unavailable");
+    assert!(!state.exists());
+    assert!(!evidence.exists());
+}
+
 #[test]
 fn missing_value_blocks_without_browser_and_publishes_private_complete_evidence() {
     let temp = TempDir::new().unwrap();
@@ -212,6 +306,9 @@ fn missing_value_blocks_without_browser_and_publishes_private_complete_evidence(
 
 #[test]
 fn natural_language_done_conditions_reach_browser_execution() {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let temp = hosted_temp();
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let temp = TempDir::new().unwrap();
     let mut job = valid_job();
     job["values"]["missing_name"] = json!({"value": "Wallet", "description": "Missing name"});
@@ -1427,10 +1524,10 @@ fn caller_loss_does_not_kill_host_and_active_request_ids_attach_without_restart(
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn identical_active_paused_request_attaches_before_terminal_evidence_recovery() {
-    let temp = TempDir::new().unwrap();
+    let temp = hosted_temp();
     let mut job = fault_window_job();
     job["options"]["pause_timeout_ms"] = json!(5_000);
     let job_path = fixture(&temp, &job);
@@ -1500,7 +1597,7 @@ fn identical_active_paused_request_attaches_before_terminal_evidence_recovery() 
         let (mut stream, _) = listener.accept().unwrap();
         let mut request = Vec::new();
         stream.read_to_end(&mut request).unwrap();
-        serde_json::to_writer(
+        let _ = serde_json::to_writer(
             &mut stream,
             &json!({
                 "ipc_version":1,
@@ -1509,8 +1606,7 @@ fn identical_active_paused_request_attaches_before_terminal_evidence_recovery() 
                 "accepted":true,
                 "result":{"state":"uncertain","terminal":false}
             }),
-        )
-        .unwrap();
+        );
     });
     let mut stale_control = original_control.clone();
     stale_control["socket"] = json!(stale_socket);
@@ -1548,7 +1644,7 @@ fn identical_active_paused_request_attaches_before_terminal_evidence_recovery() 
     assert_eq!(one_object(&aborted)["state"], "aborted");
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn fault_window_job() -> Value {
     json!({
         "schema_version": 1,
@@ -1561,13 +1657,20 @@ fn fault_window_job() -> Value {
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn start_fault_window(temp: &TempDir, scenario: &str) -> (Value, PathBuf, PathBuf) {
-    let job_path = fixture(temp, &fault_window_job());
+    let mut job = fault_window_job();
+    if scenario == "pause_abort" {
+        job["options"]["pause_timeout_ms"] = json!(30_000);
+        job["options"]["lifetime_ms"] = json!(30_000);
+    }
+    let job_path = fixture(temp, &job);
     let evidence = temp.path().join("evidence");
     let state = temp.path().join("state");
     let runtime = temp.path().join("runtime");
-    let output = Command::new(binary())
+    let mut command = hosted_command();
+    isolate_abrupt_exit_coverage(&mut command, temp);
+    let output = command
         .args([
             "run",
             "--request-id",
@@ -1604,7 +1707,592 @@ fn start_fault_window(temp: &TempDir, scenario: &str) -> (Value, PathBuf, PathBu
     (initial, control, runtime_run)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn hosted_command() -> Command {
+    Command::new(binary())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn isolate_abrupt_exit_coverage(command: &mut Command, temp: &TempDir) {
+    if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
+        // These fixtures intentionally SIGKILL descendants. Their production boundaries have
+        // direct coverage; keep necessarily truncated profiles out of the strict merge set.
+        command.env(
+            "LLVM_PROFILE_FILE",
+            temp.path().join("abrupt-exit-%p.profraw"),
+        );
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn hosted_invoke(temp: &TempDir, args: &[&str]) -> Output {
+    hosted_command()
+        .args(args)
+        .env("XDG_STATE_HOME", temp.path().join("state"))
+        .env("XDG_RUNTIME_DIR", temp.path().join("runtime"))
+        .output()
+        .unwrap()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn hosted_temp() -> TempDir {
+    tempfile::Builder::new()
+        .prefix("m4")
+        .tempdir_in("/tmp")
+        .unwrap()
+}
+
+#[cfg(target_os = "macos")]
+fn public_darwin_forced_job(http: &DarwinHttpFixture, pause_timeout_ms: u64) -> Value {
+    json!({
+        "schema_version":1,
+        "target":{"kind":"browser","url":http.url()},
+        "context":{
+            "journey":"Exercise a public Darwin disposition",
+            "revision":"slice-5",
+            "environment":"disposable HTTP fixture",
+            "actor":"synthetic owner",
+            "authority":"click Activate once"
+        },
+        "values":{
+            "classified_marker":{
+                "value":"public-darwin-redaction-marker",
+                "description":"Evidence redaction probe",
+                "secret":true
+            }
+        },
+        "steps":[{
+            "id":"activate",
+            "goal":"Click Activate.",
+            "done_when":[{"text_visible":"Activated"}]
+        }],
+        "expectations":[],
+        "options":{
+            "allowed_origins":[format!("http://{}", http.address)],
+            "active_timeout_ms":30_000,
+            "pause_timeout_ms":pause_timeout_ms,
+            "lifetime_ms":60_000,
+            "debug":{"force_stop_at_step":"activate"}
+        }
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn start_public_darwin_forced_run(
+    temporary: &TempDir,
+    http: &DarwinHttpFixture,
+    request_id: &str,
+    pause_timeout_ms: u64,
+) -> Value {
+    let job = public_darwin_forced_job(http, pause_timeout_ms);
+    let job_path = fixture(temporary, &job);
+    let chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+    assert!(Path::new(chrome).is_file(), "Google Chrome is unavailable");
+    let output = Command::new(binary())
+        .args([
+            "run",
+            "--request-id",
+            request_id,
+            "--job",
+            job_path.to_str().unwrap(),
+            "--evidence",
+            temporary.path().join("evidence").to_str().unwrap(),
+            "--browser",
+            chrome,
+            "--headless",
+            "--wait-ms",
+            "45000",
+        ])
+        .env("XDG_STATE_HOME", temporary.path().join("state"))
+        .env("XDG_RUNTIME_DIR", temporary.path().join("runtime"))
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result = one_object(&output);
+    assert_eq!(result["state"], "uncertain");
+    assert_ne!(result["reason"]["code"], "unsupported_platform");
+    assert!(
+        result["escalation"]["dispositions"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("execute"))
+    );
+    result
+}
+
+#[cfg(target_os = "macos")]
+fn assert_complete_artifacts(result: &Value) {
+    assert_eq!(result["evidence"]["complete"], true);
+    let manifest_path = PathBuf::from(result["evidence"]["manifest"].as_str().unwrap());
+    let manifest: Value = serde_json::from_slice(&fs::read(manifest_path).unwrap()).unwrap();
+    assert_eq!(manifest["complete"], true);
+    for artifact in manifest["artifacts"].as_array().unwrap() {
+        assert_eq!(artifact["complete"], true);
+        let bytes = fs::read(artifact["path"].as_str().unwrap()).unwrap();
+        assert_eq!(artifact["digest"], hex::encode(Sha256::digest(bytes)));
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn public_darwin_run_recovers_by_run_and_request_id_with_owned_chrome() {
+    let temporary = hosted_temp();
+    let http = DarwinHttpFixture::start();
+    let url = http.url();
+    let job = json!({
+        "schema_version":1,
+        "target":{"kind":"browser","url":url},
+        "context":{
+            "journey":"Darwin hosted runtime fixture",
+            "revision":"slice-5",
+            "environment":"disposable HTTP fixture",
+            "actor":"synthetic owner",
+            "authority":"fixture only"
+        },
+        "values":{},
+        "steps":[{"id":"ready","goal":"Observe the fixture","done_when":[{"url_contains":"/ready"}]}],
+        "expectations":[],
+        "options":{
+            "allowed_origins":[format!("http://{}", http.address)],
+            "active_timeout_ms":10_000,
+            "pause_timeout_ms":5_000,
+            "lifetime_ms":30_000
+        }
+    });
+    let job_path = fixture(&temporary, &job);
+    let chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+    assert!(
+        Path::new(chrome).is_file(),
+        "Google Chrome fixture is unavailable"
+    );
+    let output = hosted_command()
+        .args([
+            "run",
+            "--request-id",
+            "darwin-hosted-http",
+            "--job",
+            job_path.to_str().unwrap(),
+            "--evidence",
+            temporary.path().join("evidence").to_str().unwrap(),
+            "--browser",
+            chrome,
+            "--headless",
+            "--wait-ms",
+            "45000",
+        ])
+        .env("XDG_STATE_HOME", temporary.path().join("state"))
+        .env("XDG_RUNTIME_DIR", temporary.path().join("runtime"))
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(6),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let initial = one_object(&output);
+    let run_id = initial["run_id"].as_str().unwrap();
+    let control_path = temporary
+        .path()
+        .join("state/manuvra/runs")
+        .join(run_id)
+        .join("control.json");
+    let running = wait_for_control_value(&control_path, |control| {
+        control["host"]["pid"].is_u64() && control["watchdog"]["pid"].is_u64()
+    });
+    let host_pid = running["host"]["pid"].as_u64().unwrap() as u32;
+    let watchdog_pid = running["watchdog"]["pid"].as_u64().unwrap() as u32;
+    let status_by_run = hosted_command()
+        .args(["status", run_id, "--wait-ms", "45000"])
+        .env("XDG_STATE_HOME", temporary.path().join("state"))
+        .env("XDG_RUNTIME_DIR", temporary.path().join("runtime"))
+        .output()
+        .unwrap();
+    assert_eq!(
+        status_by_run.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&status_by_run.stdout),
+        String::from_utf8_lossy(&status_by_run.stderr)
+    );
+    let result = one_object(&status_by_run);
+    assert_eq!(result["run_id"], initial["run_id"]);
+    assert_eq!(result["state"], "passed");
+    assert_eq!(result["terminal"], true);
+    assert_eq!(result["verdict"]["steps"][0]["result"], "satisfied");
+    assert_eq!(result["cleanup"]["browser"], "closed");
+    assert_eq!(result["cleanup"]["profile"], "removed");
+    assert_eq!(result["evidence"]["complete"], true);
+    let manifest = PathBuf::from(result["evidence"]["manifest"].as_str().unwrap());
+    assert!(manifest.is_file());
+    let status_by_request = hosted_command()
+        .args([
+            "status",
+            "--request-id",
+            "darwin-hosted-http",
+            "--wait-ms",
+            "0",
+        ])
+        .env("XDG_STATE_HOME", temporary.path().join("state"))
+        .env("XDG_RUNTIME_DIR", temporary.path().join("runtime"))
+        .output()
+        .unwrap();
+    assert_eq!(status_by_request.status.code(), Some(0));
+    assert_eq!(one_object(&status_by_request), result);
+    let repeated = hosted_command()
+        .args([
+            "run",
+            "--request-id",
+            "darwin-hosted-http",
+            "--job",
+            job_path.to_str().unwrap(),
+            "--evidence",
+            temporary.path().join("evidence").to_str().unwrap(),
+            "--browser",
+            chrome,
+            "--headless",
+            "--wait-ms",
+            "0",
+        ])
+        .env("XDG_STATE_HOME", temporary.path().join("state"))
+        .env("XDG_RUNTIME_DIR", temporary.path().join("runtime"))
+        .output()
+        .unwrap();
+    assert_eq!(repeated.status.code(), Some(0));
+    assert_eq!(repeated.stdout, status_by_run.stdout);
+    assert_process_gone(host_pid);
+    assert_process_gone(watchdog_pid);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires Google Chrome and TYPESAFE_API_KEY"]
+fn public_darwin_forced_disposition_revalidates_and_finishes_same_run() {
+    let provider_key = std::env::var("TYPESAFE_API_KEY")
+        .ok()
+        .filter(|key| !key.is_empty())
+        .expect("TYPESAFE_API_KEY is required");
+    let temporary = hosted_temp();
+    let http = DarwinHttpFixture::start();
+    let state = temporary.path().join("state");
+    let runtime = temporary.path().join("runtime");
+    let evidence = temporary.path().join("evidence");
+    let initial = start_public_darwin_forced_run(&temporary, &http, "darwin-public-resume", 30_000);
+    let run_id = initial["run_id"].as_str().unwrap();
+    let control_path = state.join("manuvra/runs").join(run_id).join("control.json");
+    let paused = wait_for_control_value(&control_path, |control| {
+        control["result"]["state"] == "uncertain" && control["host"]["pid"].is_u64()
+    });
+    let host_pid = paused["host"]["pid"].as_u64().unwrap();
+
+    let by_run = Command::new(binary())
+        .args(["status", run_id, "--wait-ms", "0"])
+        .env("XDG_STATE_HOME", &state)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .output()
+        .unwrap();
+    let by_request = Command::new(binary())
+        .args([
+            "status",
+            "--request-id",
+            "darwin-public-resume",
+            "--wait-ms",
+            "0",
+        ])
+        .env("XDG_STATE_HOME", &state)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .output()
+        .unwrap();
+    assert_eq!(by_run.status.code(), Some(2));
+    assert_eq!(by_request.status.code(), Some(2));
+    assert_eq!(one_object(&by_run)["run_id"], run_id);
+    assert_eq!(one_object(&by_request)["run_id"], run_id);
+    let attached_control: Value =
+        serde_json::from_slice(&fs::read(&control_path).unwrap()).unwrap();
+    assert_eq!(attached_control["host"]["pid"], host_pid);
+
+    let payload_path = PathBuf::from(initial["escalation"]["payload"].as_str().unwrap());
+    let payload: Value = serde_json::from_slice(&fs::read(payload_path).unwrap()).unwrap();
+    let disposition_path = temporary.path().join("execute.json");
+    fs::write(
+        &disposition_path,
+        serde_json::to_vec(&json!({
+            "schema_version":1,
+            "escalation_id":initial["escalation"]["id"],
+            "disposition":{
+                "kind":"execute",
+                "candidate_id":payload["offered_candidate"]["id"]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let resume_args = [
+        "resume",
+        run_id,
+        "--request-id",
+        "darwin-public-resume-execute",
+        "--input",
+        disposition_path.to_str().unwrap(),
+    ];
+    let resumed = Command::new(binary())
+        .args(resume_args)
+        .env("XDG_STATE_HOME", &state)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .output()
+        .unwrap();
+    assert_eq!(resumed.status.code(), Some(6));
+    let resumed_checkpoint = one_object(&resumed);
+    assert_eq!(resumed_checkpoint["run_id"], run_id);
+    assert_eq!(resumed_checkpoint["state"], "running");
+    assert_eq!(resumed_checkpoint["terminal"], false);
+    assert_eq!(resumed_checkpoint["verdict"]["caller_assisted"], true);
+
+    let repeated_resume = Command::new(binary())
+        .args(resume_args)
+        .env("XDG_STATE_HOME", &state)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .output()
+        .unwrap();
+    assert_eq!(repeated_resume.status.code(), Some(6));
+    assert_eq!(repeated_resume.stdout, resumed.stdout);
+    let terminal_output = Command::new(binary())
+        .args(["status", run_id, "--wait-ms", "45000"])
+        .env("XDG_STATE_HOME", &state)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .output()
+        .unwrap();
+    assert_eq!(terminal_output.status.code(), Some(0));
+    let terminal = one_object(&terminal_output);
+    assert_eq!(terminal["run_id"], run_id);
+    assert_eq!(terminal["state"], "passed");
+    assert_eq!(terminal["terminal"], true);
+    assert_eq!(terminal["verdict"]["caller_assisted"], true);
+    assert_eq!(terminal["cleanup"]["browser"], "closed");
+    assert_eq!(terminal["cleanup"]["profile"], "removed");
+    assert_complete_artifacts(&terminal);
+    let manifest_path = PathBuf::from(terminal["evidence"]["manifest"].as_str().unwrap());
+    let trace = fs::read_to_string(manifest_path.parent().unwrap().join("trace.jsonl")).unwrap();
+    assert!(trace.lines().any(|line| {
+        serde_json::from_str::<Value>(line).is_ok_and(|entry| {
+            entry["event"] == "action_prepared" && entry["basis"] == "caller_authority"
+        })
+    }));
+    for marker in [provider_key.as_bytes(), b"public-darwin-redaction-marker"] {
+        let evidence_bytes = all_file_bytes(&evidence);
+        assert!(
+            !evidence_bytes
+                .windows(marker.len())
+                .any(|part| part == marker)
+        );
+    }
+    assert_process_gone(host_pid as u32);
+    assert_path_gone(
+        &runtime
+            .join("manuvra/runs")
+            .join(run_id)
+            .join("control.sock"),
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires Google Chrome and TYPESAFE_API_KEY"]
+fn public_darwin_abort_and_expiry_close_owned_chrome() {
+    let provider_key = std::env::var("TYPESAFE_API_KEY")
+        .ok()
+        .filter(|key| !key.is_empty())
+        .expect("TYPESAFE_API_KEY is required");
+    let abort_temp = hosted_temp();
+    let abort_http = DarwinHttpFixture::start();
+    let abort_state = abort_temp.path().join("state");
+    let abort_runtime = abort_temp.path().join("runtime");
+    let abort_initial =
+        start_public_darwin_forced_run(&abort_temp, &abort_http, "darwin-public-abort", 30_000);
+    let abort_run_id = abort_initial["run_id"].as_str().unwrap();
+    let abort_control_path = abort_state
+        .join("manuvra/runs")
+        .join(abort_run_id)
+        .join("control.json");
+    let abort_control = wait_for_control_value(&abort_control_path, |control| {
+        control["result"]["state"] == "uncertain" && control["host"]["pid"].is_u64()
+    });
+    let abort_host_pid = abort_control["host"]["pid"].as_u64().unwrap() as u32;
+    let aborted = Command::new(binary())
+        .args([
+            "abort",
+            abort_run_id,
+            "--request-id",
+            "darwin-public-abort-control",
+        ])
+        .env("XDG_STATE_HOME", &abort_state)
+        .env("XDG_RUNTIME_DIR", &abort_runtime)
+        .output()
+        .unwrap();
+    assert_eq!(aborted.status.code(), Some(5));
+    let aborted_result = one_object(&aborted);
+    assert_eq!(aborted_result["run_id"], abort_run_id);
+    assert_eq!(aborted_result["state"], "aborted");
+    assert_eq!(aborted_result["reason"]["code"], "caller_aborted");
+    assert_eq!(aborted_result["cleanup"]["browser"], "closed");
+    assert_eq!(aborted_result["cleanup"]["profile"], "removed");
+    assert_complete_artifacts(&aborted_result);
+    for marker in [provider_key.as_bytes(), b"public-darwin-redaction-marker"] {
+        let evidence_bytes = all_file_bytes(&abort_temp.path().join("evidence"));
+        assert!(
+            !evidence_bytes
+                .windows(marker.len())
+                .any(|part| part == marker)
+        );
+    }
+    let repeated_abort = Command::new(binary())
+        .args([
+            "abort",
+            abort_run_id,
+            "--request-id",
+            "darwin-public-abort-control",
+        ])
+        .env("XDG_STATE_HOME", &abort_state)
+        .env("XDG_RUNTIME_DIR", &abort_runtime)
+        .output()
+        .unwrap();
+    assert_eq!(repeated_abort.status.code(), Some(5));
+    assert_eq!(repeated_abort.stdout, aborted.stdout);
+    assert_process_gone(abort_host_pid);
+    assert_path_gone(
+        &abort_runtime
+            .join("manuvra/runs")
+            .join(abort_run_id)
+            .join("control.sock"),
+    );
+
+    let expiry_temp = hosted_temp();
+    let expiry_http = DarwinHttpFixture::start();
+    let expiry_state = expiry_temp.path().join("state");
+    let expiry_runtime = expiry_temp.path().join("runtime");
+    let expiry_initial =
+        start_public_darwin_forced_run(&expiry_temp, &expiry_http, "darwin-public-expiry", 500);
+    let expiry_run_id = expiry_initial["run_id"].as_str().unwrap();
+    let expiry_control_path = expiry_state
+        .join("manuvra/runs")
+        .join(expiry_run_id)
+        .join("control.json");
+    let expiry_control = wait_for_control_value(&expiry_control_path, |control| {
+        control["result"]["state"] == "uncertain" && control["host"]["pid"].is_u64()
+    });
+    let expiry_host_pid = expiry_control["host"]["pid"].as_u64().unwrap() as u32;
+    let _ = wait_for_control_value(&expiry_control_path, |control| {
+        control["result"]["state"] == "expired" && control["result"]["terminal"] == true
+    });
+    let expired = Command::new(binary())
+        .args(["status", expiry_run_id, "--wait-ms", "0"])
+        .env("XDG_STATE_HOME", &expiry_state)
+        .env("XDG_RUNTIME_DIR", &expiry_runtime)
+        .output()
+        .unwrap();
+    assert_eq!(expired.status.code(), Some(5));
+    let expired_result = one_object(&expired);
+    assert_eq!(expired_result["run_id"], expiry_run_id);
+    assert_eq!(expired_result["state"], "expired");
+    assert_eq!(expired_result["reason"]["code"], "resume_deadline_elapsed");
+    assert_eq!(expired_result["cleanup"]["browser"], "closed");
+    assert_eq!(expired_result["cleanup"]["profile"], "removed");
+    assert_complete_artifacts(&expired_result);
+    for marker in [provider_key.as_bytes(), b"public-darwin-redaction-marker"] {
+        let evidence_bytes = all_file_bytes(&expiry_temp.path().join("evidence"));
+        assert!(
+            !evidence_bytes
+                .windows(marker.len())
+                .any(|part| part == marker)
+        );
+    }
+    assert_process_gone(expiry_host_pid);
+    assert_path_gone(
+        &expiry_runtime
+            .join("manuvra/runs")
+            .join(expiry_run_id)
+            .join("control.sock"),
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn public_darwin_commands_use_hosted_errors_instead_of_unsupported_platform() {
+    let host = Command::new(binary())
+        .arg("__host")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(host.status.code(), Some(70));
+
+    let temporary = hosted_temp();
+    let job_path = fixture(&temporary, &fault_window_job());
+    let public = Command::new(binary())
+        .args([
+            "run",
+            "--request-id",
+            "public-darwin-missing-browser",
+            "--job",
+            job_path.to_str().unwrap(),
+            "--evidence",
+            temporary.path().join("public-evidence").to_str().unwrap(),
+            "--browser",
+            "/missing/public-darwin-browser",
+        ])
+        .env("XDG_STATE_HOME", temporary.path().join("public-state"))
+        .env("XDG_RUNTIME_DIR", temporary.path().join("public-runtime"))
+        .output()
+        .unwrap();
+    assert_eq!(public.status.code(), Some(3));
+    assert_eq!(one_object(&public)["reason"]["code"], "browser_unavailable");
+
+    for args in [
+        vec!["status", "r_1234567890abcdef"],
+        vec![
+            "abort",
+            "r_1234567890abcdef",
+            "--request-id",
+            "closed-abort",
+        ],
+    ] {
+        let output = Command::new(binary()).args(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(64));
+        assert_eq!(one_object(&output)["error"]["code"], "run_not_found");
+    }
+
+    let disposition = temporary.path().join("disposition.json");
+    fs::write(
+        &disposition,
+        serde_json::to_vec(&json!({
+            "schema_version":1,
+            "escalation_id":"e_closed",
+            "disposition":{"kind":"abort"}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let resume = Command::new(binary())
+        .args([
+            "resume",
+            "r_1234567890abcdef",
+            "--request-id",
+            "closed-resume",
+            "--input",
+            disposition.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(resume.status.code(), Some(64));
+    assert_eq!(one_object(&resume)["error"]["code"], "run_not_found");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn wait_for_control_value(control: &Path, predicate: impl Fn(&Value) -> bool) -> Value {
     use std::time::{Duration, Instant};
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -1629,7 +2317,7 @@ fn wait_for_control_value(control: &Path, predicate: impl Fn(&Value) -> bool) ->
 
 #[cfg(target_os = "linux")]
 fn wait_for_ready_host_control(control_path: &Path) -> Value {
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::net::Shutdown;
     use std::os::unix::net::UnixStream;
     use std::time::{Duration, Instant};
@@ -1643,6 +2331,7 @@ fn wait_for_ready_host_control(control_path: &Path) -> Value {
                 stream.set_read_timeout(Some(Duration::from_millis(250)))?;
                 stream.set_write_timeout(Some(Duration::from_millis(250)))?;
                 serde_json::to_writer(&mut stream, &json!({"kind":"ready","ipc_version":1}))?;
+                stream.write_all(b"\n")?;
                 stream.shutdown(Shutdown::Write)?;
                 let mut response = Vec::new();
                 stream.read_to_end(&mut response)?;
@@ -1689,13 +2378,26 @@ fn ready_handshake_matches_control(
         && response["result"]["terminal"] == false
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn wait_for_pid_file(path: &Path) -> u32 {
-    let value = wait_for_file(path);
-    String::from_utf8(value).unwrap().parse().unwrap()
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Ok(value) = fs::read_to_string(path)
+            && let Ok(pid) = value.parse()
+        {
+            return pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fixture PID was not published at {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn wait_for_file(path: &Path) -> Vec<u8> {
     use std::time::{Duration, Instant};
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -1712,7 +2414,7 @@ fn wait_for_file(path: &Path) -> Vec<u8> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn assert_process_gone(pid: u32) {
     use std::time::{Duration, Instant};
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -1722,7 +2424,22 @@ fn assert_process_gone(pid: u32) {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(target_os = "macos")]
+fn assert_path_gone(path: &Path) {
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "owned runtime path remained: {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn host_crash_windows_hang_and_watchdog_loss_publish_without_another_cli_call() {
     for (scenario, prepared, dispatched) in [
@@ -1730,7 +2447,7 @@ fn host_crash_windows_hang_and_watchdog_loss_publish_without_another_cli_call() 
         ("after_action_prepared", true, false),
         ("after_dispatch_before_receipt", true, true),
     ] {
-        let temp = TempDir::new().unwrap();
+        let temp = hosted_temp();
         let (initial, control_path, runtime_run) = start_fault_window(&temp, scenario);
         let browser_pid = wait_for_pid_file(&runtime_run.join("fake-browser.pid"));
         let browser_child_pid = wait_for_pid_file(&runtime_run.join("fake-browser-child.pid"));
@@ -1767,7 +2484,7 @@ fn host_crash_windows_hang_and_watchdog_loss_publish_without_another_cli_call() 
         assert_process_gone(browser_child_pid);
     }
 
-    let temp = TempDir::new().unwrap();
+    let temp = hosted_temp();
     let (_, control_path, runtime_run) = start_fault_window(&temp, "pause_hang");
     let browser_pid = wait_for_pid_file(&runtime_run.join("fake-browser.pid"));
     let browser_child_pid = wait_for_pid_file(&runtime_run.join("fake-browser-child.pid"));
@@ -1788,7 +2505,7 @@ fn host_crash_windows_hang_and_watchdog_loss_publish_without_another_cli_call() 
     .unwrap();
     assert_eq!(persisted["terminal"], true);
     assert_eq!(persisted["state"], "expired");
-    let retry = Command::new(binary())
+    let retry = hosted_command()
         .args([
             "run",
             "--request-id",
@@ -1817,7 +2534,7 @@ fn host_crash_windows_hang_and_watchdog_loss_publish_without_another_cli_call() 
     assert_process_gone(browser_pid);
     assert_process_gone(browser_child_pid);
 
-    let temp = TempDir::new().unwrap();
+    let temp = hosted_temp();
     let (_, control_path, runtime_run) = start_fault_window(&temp, "watchdog_lost");
     let browser_pid = wait_for_pid_file(&runtime_run.join("fake-browser.pid"));
     let browser_child_pid = wait_for_pid_file(&runtime_run.join("fake-browser-child.pid"));
@@ -1833,16 +2550,18 @@ fn host_crash_windows_hang_and_watchdog_loss_publish_without_another_cli_call() 
     assert_process_gone(browser_child_pid);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn watchdog_reconciles_host_loss_at_every_bootstrap_checkpoint() {
     use std::time::{Duration, Instant};
 
     for point in ["before_lock", "after_lock", "after_socket", "after_control"] {
-        let temp = TempDir::new().unwrap();
+        let temp = hosted_temp();
         let job_path = fixture(&temp, &fault_window_job());
         let started = Instant::now();
-        let output = Command::new(binary())
+        let mut command = hosted_command();
+        isolate_abrupt_exit_coverage(&mut command, &temp);
+        let output = command
             .args([
                 "run",
                 "--request-id",
@@ -1873,7 +2592,7 @@ fn watchdog_reconciles_host_loss_at_every_bootstrap_checkpoint() {
         assert!(state_run.join("run.lock").is_file());
         assert!(state_run.join("control.json").is_file());
 
-        let retry = invoke(
+        let retry = hosted_invoke(
             &temp,
             &[
                 "run",
@@ -1894,13 +2613,13 @@ fn watchdog_reconciles_host_loss_at_every_bootstrap_checkpoint() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn retry_reconciles_caller_death_before_watchdog_without_relaunch() {
     use std::os::unix::process::ExitStatusExt;
     use std::time::{Duration, Instant};
 
-    let temp = TempDir::new().unwrap();
+    let temp = hosted_temp();
     let job_path = fixture(&temp, &fault_window_job());
     let evidence = temp.path().join("evidence");
     let state = temp.path().join("state");
@@ -1918,7 +2637,9 @@ fn retry_reconciles_caller_death_before_watchdog_without_relaunch() {
         "--wait-ms",
         "0",
     ];
-    let mut caller = Command::new(binary())
+    let mut caller_command = hosted_command();
+    isolate_abrupt_exit_coverage(&mut caller_command, &temp);
+    let mut caller = caller_command
         .args(args)
         .env("XDG_STATE_HOME", &state)
         .env("XDG_RUNTIME_DIR", &runtime)
@@ -1963,7 +2684,7 @@ fn retry_reconciles_caller_death_before_watchdog_without_relaunch() {
     assert_eq!(caller.wait().unwrap().signal(), Some(libc::SIGKILL));
 
     let retry = |state: &Path, runtime: &Path| {
-        Command::new(binary())
+        hosted_command()
             .args(args)
             .env("XDG_STATE_HOME", state)
             .env("XDG_RUNTIME_DIR", runtime)
@@ -1998,10 +2719,10 @@ fn retry_reconciles_caller_death_before_watchdog_without_relaunch() {
     assert_eq!(fs::read_dir(&evidence).unwrap().count(), 0);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn watchdog_bounds_terminal_checkpoint_hang_and_sweeps_the_process_group() {
-    let temp = TempDir::new().unwrap();
+    let temp = hosted_temp();
     let (_, control_path, runtime_run) = start_fault_window(&temp, "terminal_hang");
     let browser_pid = wait_for_pid_file(&runtime_run.join("fake-browser.pid"));
     let browser_child_pid = wait_for_pid_file(&runtime_run.join("fake-browser-child.pid"));
@@ -2017,10 +2738,10 @@ fn watchdog_bounds_terminal_checkpoint_hang_and_sweeps_the_process_group() {
     assert_process_gone(watchdog_pid);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn paused_abort_is_deduplicated_and_conflicting_control_request_is_rejected() {
-    let temp = TempDir::new().unwrap();
+    let temp = hosted_temp();
     let (initial, _, runtime_run) = start_fault_window(&temp, "pause_abort");
     let run_id = initial["run_id"].as_str().unwrap();
     let browser_pid = wait_for_pid_file(&runtime_run.join("fake-browser.pid"));
@@ -2031,8 +2752,10 @@ fn paused_abort_is_deduplicated_and_conflicting_control_request_is_rejected() {
         .join("control.json");
     let control = wait_for_control_value(&control_path, |value| value["watchdog"]["pid"].is_u64());
     let watchdog_pid = control["watchdog"]["pid"].as_u64().unwrap() as u32;
+    let process_group = control["host"]["process_group"].as_u64().unwrap() as i32;
+    assert_eq!(unsafe { libc::getpgid(browser_pid as i32) }, process_group);
     let args = ["abort", run_id, "--request-id", "abort-once"];
-    let first = invoke(&temp, &args);
+    let first = hosted_invoke(&temp, &args);
     assert_eq!(first.status.code(), Some(5));
     let first_value = one_object(&first);
     assert_eq!(first_value["state"], "aborted");
@@ -2040,11 +2763,11 @@ fn paused_abort_is_deduplicated_and_conflicting_control_request_is_rejected() {
     assert_process_gone(browser_pid);
     assert_process_gone(watchdog_pid);
 
-    let repeated = invoke(&temp, &args);
+    let repeated = hosted_invoke(&temp, &args);
     assert_eq!(repeated.status.code(), Some(5));
     assert_eq!(repeated.stdout, first.stdout);
 
-    let conflict = invoke(
+    let conflict = hosted_invoke(
         &temp,
         &["abort", "r_0000000000000002", "--request-id", "abort-once"],
     );
