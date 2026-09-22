@@ -19,7 +19,7 @@ MISE_MINIMUM_RELEASE_AGE=0 mise use -g github:taecontrol/manuvra@latest
 manuvra version
 ```
 
-The same command works on other Linux systems with `mise`. Releases contain native x64 and ARM64 archives, and `mise` selects the matching one. Run `omarchy update mise` to update Manuvra along with other mise-managed tools.
+The same command works on other Linux systems and macOS with `mise`. Releases contain native x64 and ARM64 archives for both platforms, and `mise` selects the matching archive. The release workflow verifies installation on native Linux and macOS runners. On Intel macOS this is an installation smoke check; the real-Chrome runtime gate covers Apple Silicon. Run `omarchy update mise` to update Manuvra along with other mise-managed tools on Omarchy.
 
 If Chromium is not already installed on Omarchy, add it with:
 
@@ -42,7 +42,7 @@ brew install taecontrol/tap/manuvra
 manuvra version
 ```
 
-Homebrew builds Manuvra from source. That installation and a source build both provide the complete `run`, `status`, `resume`, and `abort` lifecycle on macOS.
+Homebrew builds Manuvra from source and does not use a bottle. That installation and a source build both provide the complete `run`, `status`, `resume`, and `abort` lifecycle on macOS.
 
 At runtime, Manuvra looks for the browser specified by `--browser`, then `MANUVRA_BROWSER`, then known Chromium and Chrome locations. On macOS it checks the directly executable Google Chrome and Chromium binaries inside `/Applications` and `~/Applications` app bundles before searching `PATH`; an explicit path must name the inner executable, such as `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`. It uses the current macOS desktop, Wayland, or X11 display unless you pass `--headless`.
 
@@ -210,11 +210,11 @@ Contributors and coding agents should follow [docs/CODING_STANDARDS.md](docs/COD
 
 Releases start from the `release` workflow on `main`. Enter the workspace version from `Cargo.toml` without the leading `v`. The workflow requires a successful CI run for that exact commit, then:
 
-1. Builds deterministic Linux x64 and ARM64 archives and publishes their SHA-256 checksums.
-2. Creates GitHub build-provenance attestations for both Linux archives.
+1. Builds deterministic Linux and macOS x64 and ARM64 archives and publishes their SHA-256 checksums.
+2. Creates GitHub build-provenance attestations for all four native binary archives.
 3. Publishes those binaries with the deterministic source archive.
-4. Installs the published binaries through `mise` on native x64 and ARM64 runners.
-5. Installs the rendered formula on macOS and opens an auto-merge pull request in [`taecontrol/homebrew-tap`](https://github.com/taecontrol/homebrew-tap).
+4. Verifies each published archive and attestation, then installs it through `mise` on the matching native Linux or macOS runner and checks `version` and `schema job`.
+5. Builds the rendered Homebrew formula from the source archive on macOS and opens an auto-merge pull request in [`taecontrol/homebrew-tap`](https://github.com/taecontrol/homebrew-tap). The formula remains source-only and does not use bottles.
 
 Repository secret `HOMEBREW_TAP_TOKEN` provides write access to the tap. The release workflow does not modify Omarchy; Omarchy consumes the ordinary GitHub release through `mise`.
 
