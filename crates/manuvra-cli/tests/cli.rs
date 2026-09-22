@@ -2317,7 +2317,7 @@ fn wait_for_control_value(control: &Path, predicate: impl Fn(&Value) -> bool) ->
 
 #[cfg(target_os = "linux")]
 fn wait_for_ready_host_control(control_path: &Path) -> Value {
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::net::Shutdown;
     use std::os::unix::net::UnixStream;
     use std::time::{Duration, Instant};
