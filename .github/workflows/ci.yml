@@ -78,6 +78,7 @@ jobs:
             --repo-root . \
             --rust-manifest Cargo.toml \
             --rust-root crates \
+            --platform-profiles tools/crap-gate/platform-profiles.json \
             --report-json target/crap-report.json
           status=$?
           set -e

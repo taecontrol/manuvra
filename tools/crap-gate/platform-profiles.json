@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "profiles": [
+    {
+      "platform": "linux",
+      "target_os": "linux",
+      "exclude": []
+    },
+    {
+      "platform": "darwin",
+      "target_os": "macos",
+      "exclude": [
+        "manuvra-cli/src/host.rs",
+        "manuvra-cli/src/process.rs",
+        "manuvra-cli/src/watchdog.rs"
+      ]
+    }
+  ],
+  "platform_sources": [
+    {
+      "path": "manuvra-cli/src/host.rs",
+      "platform": "linux"
+    },
+    {
+      "path": "manuvra-cli/src/process.rs",
+      "platform": "linux"
+    },
+    {
+      "path": "manuvra-cli/src/watchdog.rs",
+      "platform": "linux"
+    }
+  ]
+}

@@ -13,7 +13,7 @@ test:
 
 crap:
 	mkdir -p $(dir $(CRAP_REPORT))
-	cargo run --locked --manifest-path tools/crap-gate/Cargo.toml -- --repo-root . --rust-manifest Cargo.toml --rust-root crates --report-json $(CRAP_REPORT)
+	cargo run --locked --manifest-path tools/crap-gate/Cargo.toml -- --repo-root . --rust-manifest Cargo.toml --rust-root crates --platform-profiles tools/crap-gate/platform-profiles.json --report-json $(CRAP_REPORT)
 
 live:
 	bash scripts/live-money-journey-matrix.sh

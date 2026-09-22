@@ -1523,14 +1523,19 @@ pub(crate) fn internal_error(message: String) -> Invocation {
     Invocation::error("internal", message, EXIT_INTERNAL)
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod boundary_tests {
-    use super::{remove_confirmed_dead_socket, role_matches_path, validate_evidence_shape};
+    #[cfg(target_os = "linux")]
+    use super::remove_confirmed_dead_socket;
+    use super::{role_matches_path, validate_evidence_shape};
     use manuvra_contract::{Artifact, Manifest, SchemaVersion};
     use serde_json::json;
+    #[cfg(target_os = "linux")]
     use std::os::unix::net::UnixListener;
+    #[cfg(target_os = "linux")]
     use tempfile::TempDir;
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn confirmed_dead_socket_removal_is_bounded_to_sockets() {
         let temporary = TempDir::new().unwrap();
@@ -1624,8 +1629,16 @@ mod boundary_tests {
         assert!(validate_evidence_shape(&manifest, &passed, true).is_err());
 
         manifest.artifacts.pop();
-        let mut unresolved = passed;
+        let mut unresolved = passed.clone();
         unresolved["verdict"]["expectations"][0]["result"] = json!("unresolved");
         assert!(validate_evidence_shape(&manifest, &unresolved, true).is_err());
+
+        let mut incomplete_step = passed.clone();
+        incomplete_step["verdict"]["steps"][0]["result"] = json!("not_satisfied");
+        assert!(validate_evidence_shape(&manifest, &incomplete_step, true).is_err());
+
+        let mut incomplete_overall = passed;
+        incomplete_overall["verdict"]["overall"] = json!("unresolved");
+        assert!(validate_evidence_shape(&manifest, &incomplete_overall, true).is_err());
     }
 }

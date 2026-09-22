@@ -827,14 +827,19 @@ fn safe_error(message: &str) -> String {
     )
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
     use crate::transport::test_support::ScriptedChrome;
+    #[cfg(target_os = "linux")]
     use std::io::{BufRead, BufReader, Write};
+    #[cfg(target_os = "linux")]
     use std::net::TcpListener;
+    #[cfg(target_os = "linux")]
     use std::os::unix::process::CommandExt;
+    use std::process::Command;
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn discovery_prefers_explicit_then_environment_then_path() {
         let temporary = tempfile::tempdir().unwrap();
@@ -872,6 +877,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn discovery_rejects_a_non_executable_file() {
         let temporary = tempfile::tempdir().unwrap();
@@ -893,6 +899,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn prepared_spawn_cleans_its_profile_on_success_and_failure() {
         let config = BrowserConfig {
@@ -927,6 +934,7 @@ mod tests {
         assert!(!failed_profile.exists());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn starting_browser_installs_probe_and_viewport_before_ownership_transfer() {
         let chrome = ScriptedChrome::start();
@@ -959,6 +967,7 @@ mod tests {
         assert!(!profile.exists());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn owned_browser_command_scrubs_the_provider_key_and_uses_an_ephemeral_port() {
         let temporary = tempfile::tempdir().unwrap();
@@ -990,7 +999,7 @@ mod tests {
     }
 
     #[test]
-    fn cdp_observation_capture_navigation_and_viewport_helpers_are_scriptable() {
+    fn cdp_observation_capture_and_navigation_helpers_are_scriptable() {
         let chrome = ScriptedChrome::start();
         chrome.reply(
             "Runtime.evaluate",
@@ -1005,7 +1014,6 @@ mod tests {
             json!({"data":base64::Engine::encode(&base64::engine::general_purpose::STANDARD,&png)}),
         );
         let client = chrome.connect_raw();
-        set_viewport(&client, 800, 600).unwrap();
         let browser = browser_with_client(client);
         assert_eq!(browser.observe().unwrap().title, "Fixture");
         assert_eq!(browser.capture().unwrap().screenshot.width, 1);
@@ -1101,6 +1109,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn endpoint_and_page_discovery_helpers_use_owned_loopback_files_and_http() {
         let temporary = tempfile::tempdir().unwrap();
@@ -1148,6 +1157,7 @@ mod tests {
         assert_eq!(page.0, "ws://127.0.0.1/devtools/page/1");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_profile_and_close_remove_only_owned_process_and_directory() {
         let profile = private_profile().unwrap();
@@ -1178,6 +1188,7 @@ mod tests {
         browser.close().unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn close_terminates_only_the_browser_when_it_inherits_the_host_group() {
         let profile = private_profile().unwrap();
@@ -1205,6 +1216,7 @@ mod tests {
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn close_terminates_the_entire_owned_process_group() {
         let profile = private_profile().unwrap();
@@ -1257,10 +1269,8 @@ mod tests {
     }
 
     fn browser_with_client(client: Arc<CdpClient>) -> OwnedBrowser {
-        let profile = private_profile().unwrap();
-        let mut command = Command::new("sleep");
-        command.arg("30").process_group(0);
-        let child = command.spawn().unwrap();
+        let profile = tempfile::tempdir().unwrap().keep();
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
         OwnedBrowser {
             child,
             profile,
@@ -1274,7 +1284,7 @@ mod tests {
                 },
                 display_mode: "headless".into(),
             },
-            owns_process_group: true,
+            owns_process_group: false,
             closed: false,
         }
     }

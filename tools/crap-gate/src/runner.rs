@@ -1,3 +1,4 @@
+use crate::profile;
 use crate::{
     ACCEPTED_THRESHOLD, EXIT_ANALYSIS_FAILED, EXIT_GATE_FAILED, Report, compact_report,
     exceeds_threshold, rust_entries,
@@ -14,14 +15,23 @@ use walkdir::WalkDir;
 const EXPECTED_CARGO_CRAP: &str = "0.4.3";
 const EXPECTED_CARGO_LLVM_COV: &str = "0.9.0";
 
+struct SourceExclusion {
+    source_glob: &'static str,
+    coverage_regex: &'static str,
+}
+
+const NON_PRODUCTION_EXCLUSIONS: &[SourceExclusion] = &[SourceExclusion {
+    source_glob: "**/tests/**",
+    coverage_regex: r"[/\\]tests[/\\]",
+}];
+
 #[derive(Debug, Clone)]
 pub struct GateConfig {
     pub top: usize,
     pub repo_root: PathBuf,
     pub rust_manifest: PathBuf,
     pub rust_root: PathBuf,
-    pub exclude: Vec<String>,
-    pub rust_coverage_ignore_regex: Option<String>,
+    pub platform_profiles: PathBuf,
     pub report_json: Option<PathBuf>,
     pub cargo_crap: String,
     pub cargo_llvm_cov: String,
@@ -49,7 +59,12 @@ pub fn run(config: GateConfig) -> i32 {
 
 fn execute(config: &GateConfig) -> Result<bool> {
     validate_config(config)?;
-    execute_valid(config)
+    let runtime = Runtime::new(config)?;
+    let rust_root = runtime.repo_root.join(&config.rust_root);
+    let profile_path = runtime.repo_root.join(&config.platform_profiles);
+    let selection = profile::resolve(&profile_path, &rust_root, std::env::consts::OS)?;
+    println!("CRAP platform profile: {}", selection.name);
+    execute_valid(config, &runtime, &selection.exclude)
 }
 
 fn validate_config(config: &GateConfig) -> Result<()> {
@@ -59,10 +74,8 @@ fn validate_config(config: &GateConfig) -> Result<()> {
     Ok(())
 }
 
-fn execute_valid(config: &GateConfig) -> Result<bool> {
-    Runtime::new(config).and_then(|runtime| {
-        measurement_entries(config, &runtime).and_then(|entries| conclude(config, entries))
-    })
+fn execute_valid(config: &GateConfig, runtime: &Runtime, exclude: &[String]) -> Result<bool> {
+    measurement_entries(config, runtime, exclude).and_then(|entries| conclude(config, entries))
 }
 
 impl Runtime {
@@ -89,13 +102,21 @@ fn resolve_tool(explicit: Option<PathBuf>, tool: &str) -> Result<PathBuf> {
     explicit.map(Ok).unwrap_or_else(|| rust_tool_path(tool))
 }
 
-fn measurement_entries(config: &GateConfig, runtime: &Runtime) -> Result<Vec<crate::Entry>> {
-    rust_measurements(config, runtime)
+fn measurement_entries(
+    config: &GateConfig,
+    runtime: &Runtime,
+    exclude: &[String],
+) -> Result<Vec<crate::Entry>> {
+    rust_measurements(config, runtime, exclude)
 }
 
-fn rust_measurements(config: &GateConfig, runtime: &Runtime) -> Result<Vec<crate::Entry>> {
+fn rust_measurements(
+    config: &GateConfig,
+    runtime: &Runtime,
+    exclude: &[String],
+) -> Result<Vec<crate::Entry>> {
     generate_rust_lcov(config, runtime).and_then(|lcov| {
-        generate_cargo_crap_report(config, &lcov, runtime)
+        generate_cargo_crap_report(config, &lcov, runtime, exclude)
             .and_then(|report| rust_entries(&report, &config.rust_root, &runtime.repo_root))
     })
 }
@@ -210,7 +231,7 @@ fn generate_rust_lcov(config: &GateConfig, runtime: &Runtime) -> Result<PathBuf>
     let mut merge = rust_profile_merge_command(runtime, &profiles, &merged);
     checked_status(&mut merge, "llvm-profdata merge")?;
     let objects = rust_coverage_objects(runtime)?;
-    let mut export = rust_coverage_export_command(config, runtime, &merged, &objects);
+    let mut export = rust_coverage_export_command(runtime, &merged, &objects);
     let output = checked_output(&mut export, "llvm-cov export")?;
     fs::write(&lcov, output.stdout)?;
     Ok(lcov)
@@ -276,12 +297,7 @@ fn rust_profile_merge_command(runtime: &Runtime, profiles: &[PathBuf], output: &
     command
 }
 
-fn rust_coverage_export_command(
-    config: &GateConfig,
-    runtime: &Runtime,
-    profile: &Path,
-    objects: &[PathBuf],
-) -> Command {
+fn rust_coverage_export_command(runtime: &Runtime, profile: &Path, objects: &[PathBuf]) -> Command {
     let mut command = Command::new(&runtime.llvm_cov);
     command
         .args(["export", "-format=lcov", "-instr-profile"])
@@ -291,7 +307,12 @@ fn rust_coverage_export_command(
     for object in &objects[1..] {
         command.arg("--object").arg(object);
     }
-    add_coverage_ignore(&mut command, config.rust_coverage_ignore_regex.as_deref());
+    let ignored = NON_PRODUCTION_EXCLUSIONS
+        .iter()
+        .map(|exclusion| exclusion.coverage_regex)
+        .collect::<Vec<_>>()
+        .join("|");
+    command.args(["--ignore-filename-regex", &ignored]);
     command
 }
 
@@ -354,16 +375,11 @@ fn parse_shell_exports(output: &str) -> Result<Vec<(String, String)>> {
     Ok(exports)
 }
 
-fn add_coverage_ignore(command: &mut Command, pattern: Option<&str>) {
-    if let Some(pattern) = pattern {
-        command.args(["--ignore-filename-regex", pattern]);
-    }
-}
-
 fn generate_cargo_crap_report(
     config: &GateConfig,
     lcov: &Path,
     runtime: &Runtime,
+    exclude: &[String],
 ) -> Result<PathBuf> {
     require_version(
         &config.cargo_crap,
@@ -371,12 +387,17 @@ fn generate_cargo_crap_report(
         EXPECTED_CARGO_CRAP,
     )?;
     let report = runtime.temporary.path().join("rust.json");
-    let mut command = cargo_crap_command(config, lcov, &report);
+    let mut command = cargo_crap_command(config, lcov, &report, exclude);
     checked_status(&mut command, "cargo-crap")?;
     Ok(report)
 }
 
-fn cargo_crap_command(config: &GateConfig, lcov: &Path, report: &Path) -> Command {
+fn cargo_crap_command(
+    config: &GateConfig,
+    lcov: &Path,
+    report: &Path,
+    exclude: &[String],
+) -> Command {
     let mut command = Command::new(&config.cargo_crap);
     command
         .args(["crap", "--path"])
@@ -393,7 +414,10 @@ fn cargo_crap_command(config: &GateConfig, lcov: &Path, report: &Path) -> Comman
             "--output",
         ])
         .arg(report);
-    add_excludes(&mut command, &config.exclude);
+    for exclusion in NON_PRODUCTION_EXCLUSIONS {
+        command.args(["--exclude", exclusion.source_glob]);
+    }
+    add_excludes(&mut command, exclude);
     command
 }
 
@@ -413,8 +437,7 @@ mod tests {
             repo_root: repo_root.to_path_buf(),
             rust_manifest: repo_root.join("Cargo.toml"),
             rust_root: repo_root.to_path_buf(),
-            exclude: vec!["generated/**".into()],
-            rust_coverage_ignore_regex: Some("generated".into()),
+            platform_profiles: repo_root.join("platform-profiles.json"),
             report_json: None,
             cargo_crap: "cargo-crap".into(),
             cargo_llvm_cov: "cargo-llvm-cov".into(),
@@ -465,23 +488,25 @@ mod tests {
             [("A".into(), "one".into()), ("B".into(), "two".into())]
         );
         let coverage = rust_coverage_export_command(
-            &config,
             &runtime,
             Path::new("coverage.profdata"),
             &[PathBuf::from("covered-binary")],
         );
         let coverage_debug = format!("{coverage:?}");
         assert!(coverage_debug.contains("--ignore-filename-regex"));
-        assert!(coverage_debug.contains("generated"));
+        assert!(coverage_debug.contains("tests"));
         let report = cargo_crap_command(
             &config,
             Path::new("coverage.lcov"),
             Path::new("report.json"),
+            &["generated/**".into()],
         );
         let report_debug = format!("{report:?}");
         assert!(report_debug.contains("--missing"));
         assert!(report_debug.contains("pessimistic"));
         assert!(report_debug.contains("--exclude"));
+        assert!(report_debug.contains("**/tests/**"));
+        assert!(report_debug.contains("generated/**"));
     }
 
     #[test]
