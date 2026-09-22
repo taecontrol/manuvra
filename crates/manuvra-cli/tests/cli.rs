@@ -7,6 +7,71 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
+#[cfg(target_os = "macos")]
+struct DarwinHttpFixture {
+    address: std::net::SocketAddr,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(target_os = "macos")]
+impl DarwinHttpFixture {
+    fn start() -> Self {
+        use std::io::{Read, Write};
+        use std::sync::atomic::Ordering;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let worker = std::thread::spawn(move || {
+            while !worker_stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(1)));
+                        let mut request = [0_u8; 4096];
+                        let _ = stream.read(&mut request);
+                        let body = b"<!doctype html><title>Darwin hosted fixture</title><main>Ready</main>";
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.write_all(body);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            address,
+            stop,
+            worker: Some(worker),
+        }
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}/ready", self.address)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for DarwinHttpFixture {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(self.address);
+        if let Some(worker) = self.worker.take() {
+            worker.join().unwrap();
+        }
+    }
+}
+
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_manuvra")
 }
@@ -1577,7 +1642,7 @@ fn identical_active_paused_request_attaches_before_terminal_evidence_recovery() 
     assert_eq!(one_object(&aborted)["state"], "aborted");
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn fault_window_job() -> Value {
     json!({
         "schema_version": 1,
@@ -1590,13 +1655,20 @@ fn fault_window_job() -> Value {
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn start_fault_window(temp: &TempDir, scenario: &str) -> (Value, PathBuf, PathBuf) {
-    let job_path = fixture(temp, &fault_window_job());
+    let mut job = fault_window_job();
+    if scenario == "pause_abort" {
+        job["options"]["pause_timeout_ms"] = json!(30_000);
+        job["options"]["lifetime_ms"] = json!(30_000);
+    }
+    let job_path = fixture(temp, &job);
     let evidence = temp.path().join("evidence");
     let state = temp.path().join("state");
     let runtime = temp.path().join("runtime");
-    let output = Command::new(binary())
+    let mut command = hosted_command();
+    isolate_abrupt_exit_coverage(&mut command, temp);
+    let output = command
         .args([
             "run",
             "--request-id",
@@ -1633,7 +1705,213 @@ fn start_fault_window(temp: &TempDir, scenario: &str) -> (Value, PathBuf, PathBu
     (initial, control, runtime_run)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn hosted_command() -> Command {
+    let mut command = Command::new(binary());
+    #[cfg(target_os = "macos")]
+    command.arg("__darwin_hosted");
+    command
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn isolate_abrupt_exit_coverage(command: &mut Command, temp: &TempDir) {
+    if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
+        // These fixtures intentionally SIGKILL descendants. Their production boundaries have
+        // direct coverage; keep necessarily truncated profiles out of the strict merge set.
+        command.env(
+            "LLVM_PROFILE_FILE",
+            temp.path().join("abrupt-exit-%p.profraw"),
+        );
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn hosted_invoke(temp: &TempDir, args: &[&str]) -> Output {
+    hosted_command()
+        .args(args)
+        .env("XDG_STATE_HOME", temp.path().join("state"))
+        .env("XDG_RUNTIME_DIR", temp.path().join("runtime"))
+        .output()
+        .unwrap()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn hosted_temp() -> TempDir {
+    tempfile::Builder::new()
+        .prefix("m4")
+        .tempdir_in("/tmp")
+        .unwrap()
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn closed_gate_runs_production_hosted_flow_with_owned_chrome() {
+    let temporary = hosted_temp();
+    let http = DarwinHttpFixture::start();
+    let url = http.url();
+    let job = json!({
+        "schema_version":1,
+        "target":{"kind":"browser","url":url},
+        "context":{
+            "journey":"Darwin hosted runtime fixture",
+            "revision":"slice-4",
+            "environment":"disposable HTTP fixture",
+            "actor":"synthetic owner",
+            "authority":"fixture only"
+        },
+        "values":{},
+        "steps":[{"id":"ready","goal":"Observe the fixture","done_when":[{"url_contains":"/ready"}]}],
+        "expectations":[],
+        "options":{
+            "allowed_origins":[format!("http://{}", http.address)],
+            "active_timeout_ms":10_000,
+            "pause_timeout_ms":5_000,
+            "lifetime_ms":30_000
+        }
+    });
+    let job_path = fixture(&temporary, &job);
+    let chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+    assert!(
+        Path::new(chrome).is_file(),
+        "Google Chrome fixture is unavailable"
+    );
+    let output = hosted_command()
+        .args([
+            "run",
+            "--request-id",
+            "darwin-hosted-http",
+            "--job",
+            job_path.to_str().unwrap(),
+            "--evidence",
+            temporary.path().join("evidence").to_str().unwrap(),
+            "--browser",
+            chrome,
+            "--headless",
+            "--wait-ms",
+            "45000",
+        ])
+        .env("XDG_STATE_HOME", temporary.path().join("state"))
+        .env("XDG_RUNTIME_DIR", temporary.path().join("runtime"))
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(6),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let initial = one_object(&output);
+    let run_id = initial["run_id"].as_str().unwrap();
+    let control_path = temporary
+        .path()
+        .join("state/manuvra/runs")
+        .join(run_id)
+        .join("control.json");
+    let running = wait_for_control_value(&control_path, |control| {
+        control["host"]["pid"].is_u64() && control["watchdog"]["pid"].is_u64()
+    });
+    let host_pid = running["host"]["pid"].as_u64().unwrap() as u32;
+    let watchdog_pid = running["watchdog"]["pid"].as_u64().unwrap() as u32;
+    let status = hosted_command()
+        .args(["status", run_id, "--wait-ms", "45000"])
+        .env("XDG_STATE_HOME", temporary.path().join("state"))
+        .env("XDG_RUNTIME_DIR", temporary.path().join("runtime"))
+        .output()
+        .unwrap();
+    assert_eq!(
+        status.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let result = one_object(&status);
+    assert_eq!(result["run_id"], initial["run_id"]);
+    assert_eq!(result["state"], "passed");
+    assert_eq!(result["terminal"], true);
+    assert_eq!(result["verdict"]["steps"][0]["result"], "satisfied");
+    assert_eq!(result["cleanup"]["browser"], "closed");
+    assert_eq!(result["cleanup"]["profile"], "removed");
+    assert_eq!(result["evidence"]["complete"], true);
+    let manifest = PathBuf::from(result["evidence"]["manifest"].as_str().unwrap());
+    assert!(manifest.is_file());
+    assert_process_gone(host_pid);
+    assert_process_gone(watchdog_pid);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn production_host_dispatch_exists_while_public_darwin_commands_stay_closed() {
+    let host = Command::new(binary())
+        .arg("__host")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(host.status.code(), Some(70));
+
+    let temporary = hosted_temp();
+    let job_path = fixture(&temporary, &fault_window_job());
+    let public = Command::new(binary())
+        .args([
+            "run",
+            "--request-id",
+            "public-darwin-stays-closed",
+            "--job",
+            job_path.to_str().unwrap(),
+            "--evidence",
+            temporary.path().join("public-evidence").to_str().unwrap(),
+        ])
+        .env("XDG_STATE_HOME", temporary.path().join("public-state"))
+        .env("XDG_RUNTIME_DIR", temporary.path().join("public-runtime"))
+        .output()
+        .unwrap();
+    assert_eq!(public.status.code(), Some(3));
+    assert_eq!(
+        one_object(&public)["reason"]["code"],
+        "unsupported_platform"
+    );
+
+    for args in [
+        vec!["status", "r_1234567890abcdef"],
+        vec![
+            "abort",
+            "r_1234567890abcdef",
+            "--request-id",
+            "closed-abort",
+        ],
+    ] {
+        let output = Command::new(binary()).args(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(one_object(&output)["error"]["code"], "unsupported_platform");
+    }
+
+    let disposition = temporary.path().join("disposition.json");
+    fs::write(
+        &disposition,
+        serde_json::to_vec(&json!({
+            "schema_version":1,
+            "escalation_id":"e_closed",
+            "disposition":{"kind":"abort"}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let resume = Command::new(binary())
+        .args([
+            "resume",
+            "r_1234567890abcdef",
+            "--request-id",
+            "closed-resume",
+            "--input",
+            disposition.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(resume.status.code(), Some(3));
+    assert_eq!(one_object(&resume)["error"]["code"], "unsupported_platform");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn wait_for_control_value(control: &Path, predicate: impl Fn(&Value) -> bool) -> Value {
     use std::time::{Duration, Instant};
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -1672,6 +1950,7 @@ fn wait_for_ready_host_control(control_path: &Path) -> Value {
                 stream.set_read_timeout(Some(Duration::from_millis(250)))?;
                 stream.set_write_timeout(Some(Duration::from_millis(250)))?;
                 serde_json::to_writer(&mut stream, &json!({"kind":"ready","ipc_version":1}))?;
+                stream.write_all(b"\n")?;
                 stream.shutdown(Shutdown::Write)?;
                 let mut response = Vec::new();
                 stream.read_to_end(&mut response)?;
@@ -1718,13 +1997,26 @@ fn ready_handshake_matches_control(
         && response["result"]["terminal"] == false
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn wait_for_pid_file(path: &Path) -> u32 {
-    let value = wait_for_file(path);
-    String::from_utf8(value).unwrap().parse().unwrap()
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Ok(value) = fs::read_to_string(path)
+            && let Ok(pid) = value.parse()
+        {
+            return pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fixture PID was not published at {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn wait_for_file(path: &Path) -> Vec<u8> {
     use std::time::{Duration, Instant};
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -1741,7 +2033,7 @@ fn wait_for_file(path: &Path) -> Vec<u8> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn assert_process_gone(pid: u32) {
     use std::time::{Duration, Instant};
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -1751,7 +2043,7 @@ fn assert_process_gone(pid: u32) {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn host_crash_windows_hang_and_watchdog_loss_publish_without_another_cli_call() {
     for (scenario, prepared, dispatched) in [
@@ -1759,7 +2051,7 @@ fn host_crash_windows_hang_and_watchdog_loss_publish_without_another_cli_call() 
         ("after_action_prepared", true, false),
         ("after_dispatch_before_receipt", true, true),
     ] {
-        let temp = TempDir::new().unwrap();
+        let temp = hosted_temp();
         let (initial, control_path, runtime_run) = start_fault_window(&temp, scenario);
         let browser_pid = wait_for_pid_file(&runtime_run.join("fake-browser.pid"));
         let browser_child_pid = wait_for_pid_file(&runtime_run.join("fake-browser-child.pid"));
@@ -1796,7 +2088,7 @@ fn host_crash_windows_hang_and_watchdog_loss_publish_without_another_cli_call() 
         assert_process_gone(browser_child_pid);
     }
 
-    let temp = TempDir::new().unwrap();
+    let temp = hosted_temp();
     let (_, control_path, runtime_run) = start_fault_window(&temp, "pause_hang");
     let browser_pid = wait_for_pid_file(&runtime_run.join("fake-browser.pid"));
     let browser_child_pid = wait_for_pid_file(&runtime_run.join("fake-browser-child.pid"));
@@ -1817,7 +2109,7 @@ fn host_crash_windows_hang_and_watchdog_loss_publish_without_another_cli_call() 
     .unwrap();
     assert_eq!(persisted["terminal"], true);
     assert_eq!(persisted["state"], "expired");
-    let retry = Command::new(binary())
+    let retry = hosted_command()
         .args([
             "run",
             "--request-id",
@@ -1846,7 +2138,7 @@ fn host_crash_windows_hang_and_watchdog_loss_publish_without_another_cli_call() 
     assert_process_gone(browser_pid);
     assert_process_gone(browser_child_pid);
 
-    let temp = TempDir::new().unwrap();
+    let temp = hosted_temp();
     let (_, control_path, runtime_run) = start_fault_window(&temp, "watchdog_lost");
     let browser_pid = wait_for_pid_file(&runtime_run.join("fake-browser.pid"));
     let browser_child_pid = wait_for_pid_file(&runtime_run.join("fake-browser-child.pid"));
@@ -1862,16 +2154,18 @@ fn host_crash_windows_hang_and_watchdog_loss_publish_without_another_cli_call() 
     assert_process_gone(browser_child_pid);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn watchdog_reconciles_host_loss_at_every_bootstrap_checkpoint() {
     use std::time::{Duration, Instant};
 
     for point in ["before_lock", "after_lock", "after_socket", "after_control"] {
-        let temp = TempDir::new().unwrap();
+        let temp = hosted_temp();
         let job_path = fixture(&temp, &fault_window_job());
         let started = Instant::now();
-        let output = Command::new(binary())
+        let mut command = hosted_command();
+        isolate_abrupt_exit_coverage(&mut command, &temp);
+        let output = command
             .args([
                 "run",
                 "--request-id",
@@ -1902,7 +2196,7 @@ fn watchdog_reconciles_host_loss_at_every_bootstrap_checkpoint() {
         assert!(state_run.join("run.lock").is_file());
         assert!(state_run.join("control.json").is_file());
 
-        let retry = invoke(
+        let retry = hosted_invoke(
             &temp,
             &[
                 "run",
@@ -1923,13 +2217,13 @@ fn watchdog_reconciles_host_loss_at_every_bootstrap_checkpoint() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn retry_reconciles_caller_death_before_watchdog_without_relaunch() {
     use std::os::unix::process::ExitStatusExt;
     use std::time::{Duration, Instant};
 
-    let temp = TempDir::new().unwrap();
+    let temp = hosted_temp();
     let job_path = fixture(&temp, &fault_window_job());
     let evidence = temp.path().join("evidence");
     let state = temp.path().join("state");
@@ -1947,7 +2241,9 @@ fn retry_reconciles_caller_death_before_watchdog_without_relaunch() {
         "--wait-ms",
         "0",
     ];
-    let mut caller = Command::new(binary())
+    let mut caller_command = hosted_command();
+    isolate_abrupt_exit_coverage(&mut caller_command, &temp);
+    let mut caller = caller_command
         .args(args)
         .env("XDG_STATE_HOME", &state)
         .env("XDG_RUNTIME_DIR", &runtime)
@@ -1992,7 +2288,7 @@ fn retry_reconciles_caller_death_before_watchdog_without_relaunch() {
     assert_eq!(caller.wait().unwrap().signal(), Some(libc::SIGKILL));
 
     let retry = |state: &Path, runtime: &Path| {
-        Command::new(binary())
+        hosted_command()
             .args(args)
             .env("XDG_STATE_HOME", state)
             .env("XDG_RUNTIME_DIR", runtime)
@@ -2027,10 +2323,10 @@ fn retry_reconciles_caller_death_before_watchdog_without_relaunch() {
     assert_eq!(fs::read_dir(&evidence).unwrap().count(), 0);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn watchdog_bounds_terminal_checkpoint_hang_and_sweeps_the_process_group() {
-    let temp = TempDir::new().unwrap();
+    let temp = hosted_temp();
     let (_, control_path, runtime_run) = start_fault_window(&temp, "terminal_hang");
     let browser_pid = wait_for_pid_file(&runtime_run.join("fake-browser.pid"));
     let browser_child_pid = wait_for_pid_file(&runtime_run.join("fake-browser-child.pid"));
@@ -2046,10 +2342,10 @@ fn watchdog_bounds_terminal_checkpoint_hang_and_sweeps_the_process_group() {
     assert_process_gone(watchdog_pid);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn paused_abort_is_deduplicated_and_conflicting_control_request_is_rejected() {
-    let temp = TempDir::new().unwrap();
+    let temp = hosted_temp();
     let (initial, _, runtime_run) = start_fault_window(&temp, "pause_abort");
     let run_id = initial["run_id"].as_str().unwrap();
     let browser_pid = wait_for_pid_file(&runtime_run.join("fake-browser.pid"));
@@ -2060,8 +2356,10 @@ fn paused_abort_is_deduplicated_and_conflicting_control_request_is_rejected() {
         .join("control.json");
     let control = wait_for_control_value(&control_path, |value| value["watchdog"]["pid"].is_u64());
     let watchdog_pid = control["watchdog"]["pid"].as_u64().unwrap() as u32;
+    let process_group = control["host"]["process_group"].as_u64().unwrap() as i32;
+    assert_eq!(unsafe { libc::getpgid(browser_pid as i32) }, process_group);
     let args = ["abort", run_id, "--request-id", "abort-once"];
-    let first = invoke(&temp, &args);
+    let first = hosted_invoke(&temp, &args);
     assert_eq!(first.status.code(), Some(5));
     let first_value = one_object(&first);
     assert_eq!(first_value["state"], "aborted");
@@ -2069,11 +2367,11 @@ fn paused_abort_is_deduplicated_and_conflicting_control_request_is_rejected() {
     assert_process_gone(browser_pid);
     assert_process_gone(watchdog_pid);
 
-    let repeated = invoke(&temp, &args);
+    let repeated = hosted_invoke(&temp, &args);
     assert_eq!(repeated.status.code(), Some(5));
     assert_eq!(repeated.stdout, first.stdout);
 
-    let conflict = invoke(
+    let conflict = hosted_invoke(
         &temp,
         &["abort", "r_0000000000000002", "--request-id", "abort-once"],
     );

@@ -1,28 +1,28 @@
 use crate::evidence::{self, EvidenceBundle, Redactor};
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 use crate::verification::{
     DoneResult, check_done, check_natural_done, natural_numeric_literals_satisfied, verify,
 };
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 use crate::{actions, judgment, policy, values::Values};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use manuvra_chrome::{BrowserConfig, OwnedBrowser};
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 use manuvra_chrome::{BrowserError, CapturedPage, Observation};
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 use manuvra_contract::DoneCondition;
 use manuvra_contract::{
     Cleanup, Escalation, EvidenceRef, ExpectationVerdict, Job, Reason, RunResult, RunState,
     SchemaVersion, StepVerdict, Verdict, VerdictResult,
 };
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 use manuvra_contract::{Disposition, DispositionKind, DispositionRequest};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::sync::OnceLock;
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone)]
@@ -39,7 +39,7 @@ pub struct FlowOutcome {
     pub exit_code: u8,
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostedTermination {
     Aborted,
@@ -48,14 +48,14 @@ pub enum HostedTermination {
     WatchdogLost,
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 #[derive(Debug, Clone)]
 pub enum HostedEvent {
     Disposition(DispositionRequest),
     Termination(HostedTermination),
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 pub trait HostedControl {
     fn cancellation(&self) -> manuvra_chrome::InputCancellation;
     fn pause_deadline_unix_ms(&self) -> u64;
@@ -79,7 +79,7 @@ pub fn run(job: &Job, config: FlowConfig, redactor: &Redactor) -> Result<FlowOut
     run_linux(job, config, redactor)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn run_hosted(
     job: &Job,
     config: FlowConfig,
@@ -87,16 +87,16 @@ pub fn run_hosted(
     provider_key: Option<String>,
     control: &dyn HostedControl,
 ) -> Result<FlowOutcome, String> {
-    run_linux_with(job, config, redactor, provider_key, Some(control))
+    run_with_browser(job, config, redactor, provider_key, Some(control))
 }
 
 #[cfg(target_os = "linux")]
 fn run_linux(job: &Job, config: FlowConfig, redactor: &Redactor) -> Result<FlowOutcome, String> {
-    run_linux_with(job, config, redactor, None, None)
+    run_with_browser(job, config, redactor, None, None)
 }
 
-#[cfg(target_os = "linux")]
-fn run_linux_with(
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn run_with_browser(
     job: &Job,
     config: FlowConfig,
     redactor: &Redactor,
@@ -130,27 +130,27 @@ fn run_linux_with(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct StartedBrowser {
     browser: OwnedBrowser,
     target_url: String,
     provenance: Value,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 enum StartupFailure {
     Launch(BrowserError),
     AfterLaunch(Box<AfterLaunchFailure>),
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct AfterLaunchFailure {
     error: BrowserError,
     provenance: Value,
     cleanup: Cleanup,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl StartedBrowser {
     fn launch(config: BrowserConfig, target_url: &str) -> Result<Self, StartupFailure> {
         OwnedBrowser::launch(config)
@@ -181,7 +181,7 @@ impl StartedBrowser {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn cleanup_started_browser(browser: &mut OwnedBrowser) -> Cleanup {
     if browser.close().is_ok() {
         Cleanup {
@@ -198,7 +198,7 @@ fn cleanup_started_browser(browser: &mut OwnedBrowser) -> Cleanup {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn finish_browser_run(
     job: &Job,
     config: FlowConfig,
@@ -274,7 +274,7 @@ fn finish_browser_run(
     )
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(clippy::too_many_arguments)]
 fn finish_hosted_browser_run(
     job: &Job,
@@ -334,7 +334,7 @@ fn finish_hosted_browser_run(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(clippy::too_many_arguments)]
 fn handle_hosted_pause(
     job: &Job,
@@ -394,7 +394,7 @@ fn handle_hosted_pause(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(clippy::too_many_arguments)]
 fn finalize_paused_termination(
     job: &Job,
@@ -421,7 +421,7 @@ fn finalize_paused_termination(
     .and_then(|outcome| publish_terminal_checkpoint(control, journal, outcome))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(clippy::too_many_arguments)]
 fn finish_hosted_terminal(
     job: &Job,
@@ -470,7 +470,7 @@ fn finish_hosted_terminal(
     Ok(outcome)
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 struct HostedMachine<'a> {
     job: &'a Job,
     redactor: &'a Redactor,
@@ -481,7 +481,7 @@ struct HostedMachine<'a> {
     artifacts: RunArtifacts,
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 impl<'a> HostedMachine<'a> {
     fn new(job: &'a Job, redactor: &'a Redactor) -> Self {
         let mut policy = policy::Policy::new(&job.options, target_url_for_policy(job));
@@ -497,7 +497,7 @@ impl<'a> HostedMachine<'a> {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn is_uncertain(&self) -> bool {
         self.artifacts
             .stop
@@ -505,12 +505,12 @@ impl<'a> HostedMachine<'a> {
             .is_some_and(|stop| stop.state == RunState::Uncertain)
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn is_paused(&self) -> bool {
         self.is_uncertain() && self.artifacts.escalation.is_some()
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn escalation_id(&self) -> Result<String, String> {
         self.artifacts
             .escalation
@@ -1086,14 +1086,14 @@ impl<'a> HostedMachine<'a> {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 struct ResumeObservation {
     captured: Captured,
     done: DoneResult,
     noul: Option<f64>,
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn resumed_action_stop(
     stop: actions::ActionStop,
     redactor: &Redactor,
@@ -1114,7 +1114,7 @@ fn resumed_action_stop(
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn advance_permitted(
     step: &manuvra_contract::Step,
     pending: &PendingEscalation,
@@ -1132,7 +1132,7 @@ fn advance_permitted(
         && !rationale.trim().is_empty()
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn natural_condition_numeric_checks_satisfied(
     step: &manuvra_contract::Step,
     pending: &PendingEscalation,
@@ -1143,14 +1143,14 @@ fn natural_condition_numeric_checks_satisfied(
     natural_numeric_literals_satisfied(condition, &pending.observation)
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn relevant_state_hash(observation: &Observation) -> String {
     use sha2::{Digest, Sha256};
 
     hex::encode(Sha256::digest(relevant_state(observation).to_string()))
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn relevant_state(observation: &Observation) -> Value {
     json!({
         "url": observation.url,
@@ -1166,7 +1166,7 @@ fn relevant_state(observation: &Observation) -> Value {
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(clippy::too_many_arguments)]
 fn publish_active_hosted_stop(
     job: &Job,
@@ -1218,7 +1218,7 @@ fn publish_active_hosted_stop(
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn publish_terminal_checkpoint(
     control: &dyn HostedControl,
     journal: &mut actions::DurableJournal,
@@ -1230,14 +1230,14 @@ fn publish_terminal_checkpoint(
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn set_hosted_escalation_deadline(artifacts: &mut RunArtifacts, deadline: u64) {
     if let Some(escalation) = &mut artifacts.escalation {
         escalation.expires_at = deadline.to_string();
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn publish_pause_checkpoint(
     job: &Job,
     config: &FlowConfig,
@@ -1283,7 +1283,7 @@ fn publish_pause_checkpoint(
     )
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn hosted_termination_fields(termination: HostedTermination) -> (RunState, &'static str, u8) {
     match termination {
         HostedTermination::Aborted => (RunState::Aborted, "caller_aborted", 5),
@@ -1295,7 +1295,7 @@ fn hosted_termination_fields(termination: HostedTermination) -> (RunState, &'sta
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn browser_config(job: &Job, config: &FlowConfig, hosted: bool) -> BrowserConfig {
     let (width, height) = viewport(job);
     BrowserConfig {
@@ -1307,7 +1307,7 @@ fn browser_config(job: &Job, config: &FlowConfig, hosted: bool) -> BrowserConfig
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn viewport(job: &Job) -> (u16, u16) {
     job.options
         .viewport
@@ -1315,14 +1315,14 @@ fn viewport(job: &Job) -> (u16, u16) {
         .map_or((1120, 780), |value| (value.width, value.height))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn target_url(job: &Job) -> &str {
     match &job.target {
         manuvra_contract::Target::Browser { url } => url,
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn cleanup_browser(
     browser: &mut OwnedBrowser,
     redactor: &Redactor,
@@ -1349,7 +1349,7 @@ fn cleanup_browser(
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn terminal_fields(stop: Option<Stop>) -> (RunState, Option<Reason>, u8, VerdictResult) {
     stop.map_or(
         (RunState::Passed, None, 0, VerdictResult::Satisfied),
@@ -1357,36 +1357,36 @@ fn terminal_fields(stop: Option<Stop>) -> (RunState, Option<Reason>, u8, Verdict
     )
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 trait BrowserPage {
     fn capture_redacted_page(&self, sensitive: &[String]) -> Result<CapturedPage, BrowserError>;
     fn observe_page(&self) -> Result<Observation, BrowserError>;
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 trait DriveBrowser: BrowserPage + actions::Performer {}
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 impl<T: BrowserPage + actions::Performer> DriveBrowser for T {}
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 trait HostedBrowser: DriveBrowser {
     fn cleanup_hosted(&mut self) -> Cleanup;
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl HostedBrowser for OwnedBrowser {
     fn cleanup_hosted(&mut self) -> Cleanup {
         cleanup_started_browser(self)
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct LazyEvaluator {
     client: OnceLock<Result<manuvra_jev::Client, manuvra_jev::JevError>>,
     provider_key: Option<String>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl LazyEvaluator {
     fn new(provider_key: Option<String>) -> Self {
         Self {
@@ -1396,7 +1396,7 @@ impl LazyEvaluator {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl manuvra_jev::Evaluator for LazyEvaluator {
     fn evaluate(
         &self,
@@ -1417,7 +1417,7 @@ impl manuvra_jev::Evaluator for LazyEvaluator {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl BrowserPage for OwnedBrowser {
     fn capture_redacted_page(&self, sensitive: &[String]) -> Result<CapturedPage, BrowserError> {
         self.capture_redacted(sensitive)
@@ -1428,7 +1428,7 @@ impl BrowserPage for OwnedBrowser {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 #[derive(Clone)]
 struct RunArtifacts {
     observations: Vec<(String, Value, Option<Vec<u8>>)>,
@@ -1447,7 +1447,7 @@ struct RunArtifacts {
     caller_assisted: bool,
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 #[derive(Clone)]
 struct PendingEscalation {
     done: DoneResult,
@@ -1457,14 +1457,14 @@ struct PendingEscalation {
     ambiguous_mutation: bool,
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 #[derive(Clone)]
 struct PendingVerification {
     verdicts: Vec<ExpectationVerdict>,
     observation: Observation,
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 impl PendingVerification {
     fn attestable(&self) -> bool {
         self.verdicts
@@ -1481,7 +1481,7 @@ impl PendingVerification {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 impl RunArtifacts {
     fn new(job: &Job, redactor: &Redactor) -> Self {
         Self {
@@ -1520,7 +1520,7 @@ impl RunArtifacts {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 #[derive(Clone)]
 struct Stop {
     state: RunState,
@@ -1529,7 +1529,7 @@ struct Stop {
     details: BTreeMap<String, Value>,
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 impl Stop {
     fn blocked(code: &'static str, details: BTreeMap<String, Value>) -> Self {
         Self {
@@ -1573,7 +1573,7 @@ impl Stop {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 #[allow(clippy::too_many_arguments)]
 fn drive_steps(
     job: &Job,
@@ -1639,13 +1639,13 @@ fn drive_steps(
     artifacts
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 enum VerificationProgress {
     Complete,
     Stop(Stop),
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 #[allow(clippy::too_many_arguments)]
 fn verify_final(
     job: &Job,
@@ -1679,7 +1679,7 @@ fn verify_final(
     )
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn capture_final(
     job: &Job,
     redactor: &Redactor,
@@ -1701,7 +1701,7 @@ fn capture_final(
     Ok(captured)
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn capture_verification_advance(
     job: &Job,
     redactor: &Redactor,
@@ -1716,7 +1716,7 @@ fn capture_verification_advance(
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn evaluate_final(
     job: &Job,
     observation: &Observation,
@@ -1735,7 +1735,7 @@ fn evaluate_final(
         .map_err(|error| verification_provider_stop(&error))
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn record_verification(
     report: crate::verification::VerificationReport,
     observation: Observation,
@@ -1764,7 +1764,7 @@ fn record_verification(
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn redacted_expectation_verdicts(
     verdicts: &[ExpectationVerdict],
     redactor: &Redactor,
@@ -1793,7 +1793,7 @@ fn redacted_expectation_verdicts(
     })
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn verification_policy_stop(stop: policy::PolicyStop) -> Stop {
     match stop {
         policy::PolicyStop::Blocked(code) => Stop::blocked(code, BTreeMap::new()),
@@ -1805,7 +1805,7 @@ fn verification_policy_stop(stop: policy::PolicyStop) -> Stop {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn verification_provider_stop(error: &manuvra_jev::JevError) -> Stop {
     match error {
         manuvra_jev::JevError::InvalidResponse(_) | manuvra_jev::JevError::ModelChanged => {
@@ -1816,7 +1816,7 @@ fn verification_provider_stop(error: &manuvra_jev::JevError) -> Stop {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn publish_active_checkpoint(
     job: &Job,
     config: &FlowConfig,
@@ -1852,7 +1852,7 @@ fn publish_active_checkpoint(
     }))
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 #[allow(clippy::too_many_arguments)]
 fn evaluate_step(
     job: &Job,
@@ -1890,7 +1890,7 @@ fn evaluate_step(
     .drive()
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 struct StepDriver<'a> {
     job: &'a Job,
     redactor: &'a Redactor,
@@ -1910,7 +1910,7 @@ struct StepDriver<'a> {
     awaiting_final_done_reobservation: bool,
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 impl StepDriver<'_> {
     fn drive(&mut self) -> Option<Stop> {
         loop {
@@ -2424,14 +2424,14 @@ impl StepDriver<'_> {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 enum StepProgress {
     Continue,
     Complete,
     Stop(Stop),
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn provider_stop(
     error: &manuvra_jev::JevError,
     redactor: &Redactor,
@@ -2448,7 +2448,7 @@ fn provider_stop(
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn value_not_provided(
     redactor: &Redactor,
     step: &manuvra_contract::Step,
@@ -2482,14 +2482,14 @@ fn value_not_provided(
     )
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn target_url_for_policy(job: &Job) -> &str {
     match &job.target {
         manuvra_contract::Target::Browser { url } => url,
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 #[allow(clippy::too_many_arguments)]
 fn record_step(
     artifacts: &mut RunArtifacts,
@@ -2506,7 +2506,7 @@ fn record_step(
     artifacts.steps.push((safe_name(index+1,&id),json!({"id":id,"done":done,"basis":basis,"mutation_limit_consumed":mutations,"redaction_verified":redaction_verified,"active_ms":active_ms})));
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn step_detail(redactor: &Redactor, step: &manuvra_contract::Step) -> BTreeMap<String, Value> {
     BTreeMap::from([(
         "step_id".into(),
@@ -2514,7 +2514,7 @@ fn step_detail(redactor: &Redactor, step: &manuvra_contract::Step) -> BTreeMap<S
     )])
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn policy_stop(
     stop: policy::PolicyStop,
     redactor: &Redactor,
@@ -2531,7 +2531,7 @@ fn policy_stop(
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 #[allow(clippy::too_many_arguments)]
 fn escalate(
     artifacts: &mut RunArtifacts,
@@ -2584,7 +2584,7 @@ fn escalate(
     Stop::uncertain(reason, step_detail(redactor, step))
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn allowed_dispositions(
     step: &manuvra_contract::Step,
     pending: &PendingEscalation,
@@ -2606,7 +2606,7 @@ fn allowed_dispositions(
     dispositions
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn escalate_verification(
     artifacts: &mut RunArtifacts,
     redactor: &Redactor,
@@ -2656,12 +2656,12 @@ fn escalate_verification(
     Stop::uncertain(reason, BTreeMap::new())
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn natural_noul(step: &manuvra_contract::Step, judgments: &judgment::Judgments) -> Option<f64> {
     matches!(step.done_when, DoneCondition::NaturalLanguage(_)).then_some(judgments.step_done)
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn reissue_escalation(
     artifacts: &mut RunArtifacts,
     redactor: &Redactor,
@@ -2691,7 +2691,7 @@ fn reissue_escalation(
     )
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn empty_observation() -> Observation {
     Observation {
         document_id: String::new(),
@@ -2715,13 +2715,13 @@ fn empty_observation() -> Observation {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn redacted_value(value: &impl serde::Serialize, redactor: &Redactor) -> Value {
     let text = serde_json::to_string(value).unwrap_or_else(|_| "null".into());
     serde_json::from_str(&redactor.redact_export_text(&text)).unwrap_or(Value::Null)
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn record_capture(
     artifacts: &mut RunArtifacts,
     redactor: &Redactor,
@@ -2736,7 +2736,7 @@ fn record_capture(
         .push(json!({"event":event,"step_id":redactor.redact_export_text(&step.id),"done":done}));
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn control_stop(message: String) -> Stop {
     Stop::blocked(
         "browser_control_failed",
@@ -2744,14 +2744,14 @@ fn control_stop(message: String) -> Stop {
     )
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 struct Captured {
     raw: Observation,
     artifact: (String, Value, Option<Vec<u8>>),
     redaction_verified: bool,
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn capture_step(
     browser: &(impl BrowserPage + ?Sized),
     redactor: &Redactor,
@@ -2777,7 +2777,7 @@ fn capture_step(
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn withheld_capture(
     browser: &(impl BrowserPage + ?Sized),
     redactor: &Redactor,
@@ -2800,7 +2800,7 @@ fn withheld_capture(
     })
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn redacted_observation(raw: &Observation, redactor: &Redactor) -> Result<Value, String> {
     let redact = |text: &str| redactor.redact_external_text(text);
     let elements = raw
@@ -2844,7 +2844,7 @@ fn redacted_observation(raw: &Observation, redactor: &Redactor) -> Result<Value,
     }))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn publish_browser_error(
     job: &Job,
     config: FlowConfig,
@@ -2878,7 +2878,7 @@ fn publish_browser_error(
     )
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn publish_browser_error_with_provenance(
     job: &Job,
     config: FlowConfig,
@@ -3052,7 +3052,7 @@ fn run_result(
     serde_json::to_value(result).map_err(|e| e.to_string())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(clippy::too_many_arguments)]
 fn run_result_with_assistance(
     job: &Job,
@@ -3075,7 +3075,7 @@ fn run_result_with_assistance(
     })
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn apply_artifact_verdict(result: &mut Value, artifacts: &RunArtifacts) -> Result<(), String> {
     result["verdict"]["expectations"] =
         serde_json::to_value(&artifacts.expectation_verdicts).unwrap_or(Value::Null);
@@ -3155,7 +3155,7 @@ fn redact_provenance(provenance: &mut Value, redactor: &Redactor) {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn safe_name(index: usize, id: &str) -> String {
     let clean: String = id
         .chars()
@@ -3188,20 +3188,20 @@ mod tests {
     use manuvra_chrome::{Coverage, Element, Rect, RedactionProof, Screenshot, ViewportState};
     use serde_json::json;
     use std::collections::{BTreeMap, VecDeque};
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::io::{Read, Write};
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::net::{TcpListener, TcpStream};
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::sync::Arc;
     use std::sync::Mutex;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::thread;
     use tempfile::TempDir;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     struct OriginFixture {
         start_port: u16,
         foreign_port: u16,
@@ -3209,7 +3209,7 @@ mod tests {
         workers: Vec<thread::JoinHandle<()>>,
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     impl OriginFixture {
         fn start() -> Self {
             let start = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3259,7 +3259,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     impl Drop for OriginFixture {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Relaxed);
@@ -3271,7 +3271,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn serve_origin_fixture(stream: &mut TcpStream, body: &str) {
         let mut request = Vec::new();
         let mut buffer = [0_u8; 1024];
@@ -3330,7 +3330,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     impl HostedBrowser for FakeBrowser {
         fn cleanup_hosted(&mut self) -> Cleanup {
             Cleanup {
@@ -3382,10 +3382,10 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     struct ClickProvider(AtomicUsize);
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     impl manuvra_jev::Evaluator for ClickProvider {
         fn evaluate(
             &self,
@@ -3549,13 +3549,13 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     struct DispositionHostedControl {
         checkpoints: Mutex<Vec<Value>>,
         request: Mutex<Option<DispositionRequest>>,
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     impl HostedControl for DispositionHostedControl {
         fn cancellation(&self) -> manuvra_chrome::InputCancellation {
             manuvra_chrome::InputCancellation::default()
@@ -3588,7 +3588,7 @@ mod tests {
         )
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     #[ignore = "requires the local Chromium executable"]
     fn production_driver_stops_after_committed_navigation_to_a_foreign_origin() {
@@ -4425,7 +4425,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn hosted_flow_round_trip_publishes_assisted_terminal_evidence() {
         let temporary = TempDir::new().unwrap();
         let mut job = mutation_job();
@@ -4501,7 +4501,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn hosted_pause_termination_closes_the_browser_and_publishes_abort() {
         let temporary = TempDir::new().unwrap();
         let mut job = mutation_job();
@@ -4610,7 +4610,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn abort_persists_disposition_and_reports_actions_already_sent() {
         let temporary = TempDir::new().unwrap();
         let job = mutation_job();
@@ -5503,7 +5503,37 @@ mod tests {
         assert!(temp.path().join("r_fake/manifest.json").is_file());
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn hosted_missing_browser_uses_the_production_browser_error_publisher() {
+        let job = job("Ready");
+        let redactor = Redactor::for_job(&job).unwrap();
+        let temp = TempDir::new().unwrap();
+        let control = RecordingHostedControl::default();
+        let outcome = run_hosted(
+            &job,
+            FlowConfig {
+                request_id: "hosted-unavailable".into(),
+                run_id: "r_hosted_unavailable".into(),
+                evidence_root: temp.path().to_path_buf(),
+                browser: Some(temp.path().join("missing-browser")),
+                headless: true,
+            },
+            &redactor,
+            None,
+            &control,
+        )
+        .unwrap();
+        assert_eq!(outcome.exit_code, 3);
+        assert_eq!(outcome.result["reason"]["code"], "browser_unavailable");
+        assert!(
+            temp.path()
+                .join("r_hosted_unavailable/manifest.json")
+                .is_file()
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn hosted_termination_has_closed_truthful_result_fields() {
         assert_eq!(

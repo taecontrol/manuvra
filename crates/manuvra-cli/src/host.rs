@@ -1,5 +1,6 @@
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
+use crate::control_socket::{AuthenticatedListener, read_frame};
 use crate::process::{HostBootstrap, IPC_VERSION, now_unix_ms, process_identity};
 use crate::store::{self, RunControl};
 use manuvra_contract::{DispositionRequest, SchemaVersion, VerdictResult};
@@ -10,9 +11,8 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::fd::FromRawFd;
+use std::os::unix::net::UnixStream;
 #[cfg(debug_assertions)]
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -485,6 +485,7 @@ fn spawn_fake_browser(runtime_dir: &Path) -> Result<Child, String> {
         .stderr(Stdio::null());
     unsafe {
         command.pre_exec(|| {
+            #[cfg(target_os = "linux")]
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -514,7 +515,10 @@ fn dispatch_fake_browser(browser: &mut Child, runtime_dir: &Path) -> Result<(), 
         .map_err(|error| error.to_string())?;
     let log = runtime_dir.join("fake-browser.dispatch.log");
     let deadline = std::time::Instant::now() + Duration::from_secs(1);
-    while !log.is_file() {
+    while fs::read_to_string(&log)
+        .map(|contents| !contents.contains("dispatch click submit"))
+        .unwrap_or(true)
+    {
         if std::time::Instant::now() >= deadline {
             return Err("fake browser did not persist dispatch".into());
         }
@@ -1038,43 +1042,18 @@ fn running_result(
     }))
 }
 
-fn bind_private_socket(path: &Path) -> Result<UnixListener, String> {
-    crate::process::ensure_socket_parent(path)?;
-    remove_prior_socket(path)?;
-    create_socket(path)
-}
-
-fn remove_prior_socket(path: &Path) -> Result<(), String> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_socket() => {
-            fs::remove_file(path).map_err(|error| error.to_string())
-        }
-        Ok(_) => Err("control socket path is occupied by an unsafe entry".into()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.to_string()),
-    }
-}
-
-fn create_socket(path: &Path) -> Result<UnixListener, String> {
-    let listener = UnixListener::bind(path).map_err(|error| error.to_string())?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .map_err(|error| error.to_string())?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|error| error.to_string())?;
+fn bind_private_socket(path: &Path) -> Result<AuthenticatedListener, String> {
+    let listener = AuthenticatedListener::bind(path)?;
+    listener.set_nonblocking()?;
     Ok(listener)
 }
 
-fn serve(listener: UnixListener, control: Arc<Control>, stop: Arc<AtomicBool>) {
+fn serve(listener: AuthenticatedListener, control: Arc<Control>, stop: Arc<AtomicBool>) {
     std::thread::spawn(move || {
         while !stop.load(Ordering::SeqCst) {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    if peer_is_current_user(&stream) {
-                        handle(stream, &control);
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            match listener.try_accept() {
+                Ok(Some(stream)) => handle(stream, &control),
+                Ok(None) => {
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(_) => break,
@@ -1084,9 +1063,7 @@ fn serve(listener: UnixListener, control: Arc<Control>, stop: Arc<AtomicBool>) {
 }
 
 fn handle(mut stream: UnixStream, control: &Control) {
-    let mut bytes = Vec::new();
-    let _ = stream.read_to_end(&mut bytes);
-    let request: Result<Request, _> = serde_json::from_slice(&bytes);
+    let request = read_frame(&mut stream);
     let effect = apply_request(control, &request);
     let run = control
         .run
@@ -1111,7 +1088,7 @@ struct RequestEffect {
     error_code: Option<&'static str>,
 }
 
-fn apply_request(control: &Control, request: &Result<Request, serde_json::Error>) -> RequestEffect {
+fn apply_request(control: &Control, request: &Result<Request, String>) -> RequestEffect {
     match request {
         Ok(Request::Ready {
             ipc_version: IPC_VERSION,
@@ -1245,25 +1222,6 @@ fn send_response(stream: &mut UnixStream, response: &Response<'_>) -> bool {
     serde_json::to_writer(&mut *stream, response).is_ok() && stream.flush().is_ok()
 }
 
-fn peer_is_current_user(stream: &UnixStream) -> bool {
-    let mut credentials = libc::ucred {
-        pid: 0,
-        uid: 0,
-        gid: 0,
-    };
-    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    let result = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            std::ptr::addr_of_mut!(credentials).cast(),
-            &mut length,
-        )
-    };
-    result == 0 && credentials.uid == unsafe { libc::geteuid() }
-}
-
 fn monitor_watchdog(fd: Option<i32>, control: Arc<Control>) {
     let Some(fd) = fd else { return };
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
@@ -1286,7 +1244,7 @@ fn monitor_watchdog(fd: Option<i32>, control: Arc<Control>) {
 mod tests {
     use super::*;
     use crate::process::IPC_VERSION;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use tempfile::TempDir;
 
     #[test]
@@ -1310,8 +1268,7 @@ mod tests {
             0o600
         );
         let client = UnixStream::connect(&socket).unwrap();
-        let (server, _) = listener.accept().unwrap();
-        assert!(peer_is_current_user(&server));
+        assert!(listener.accept().is_ok());
         drop(client);
     }
 
@@ -1363,6 +1320,8 @@ mod tests {
             control.termination(),
             Some(HostedTermination::PauseDeadlineElapsed)
         );
+        assert_eq!(send_test_request(&control, "abort")["accepted"], true);
+        assert!(control.abort.load(Ordering::SeqCst));
     }
 
     fn send_test_request(control: &Control, kind: &str) -> Value {
@@ -1383,8 +1342,7 @@ mod tests {
 
     fn send_test_value(control: &Control, request: Value) -> Value {
         let (mut client, server) = UnixStream::pair().unwrap();
-        serde_json::to_writer(&mut client, &request).unwrap();
-        client.shutdown(std::net::Shutdown::Write).unwrap();
+        crate::control_socket::write_frame(&mut client, &request).unwrap();
         handle(server, control);
         serde_json::from_reader(client).unwrap()
     }
@@ -1430,7 +1388,32 @@ mod tests {
         assert_eq!(ready["run_id"], "ready-run");
         assert_eq!(ready["job_digest"], "d");
         assert!(control.ready.load(Ordering::SeqCst));
-        assert_eq!(send_test_request(&control, "status")["accepted"], true);
+        for _ in 0..100 {
+            assert_eq!(send_test_request(&control, "status")["accepted"], true);
+        }
+
+        let abort = serde_json::to_vec(&json!({
+            "kind":"abort",
+            "ipc_version":IPC_VERSION,
+            "run_id":"ready-run",
+            "job_digest":"d",
+        }))
+        .unwrap();
+        let status = serde_json::to_vec(&json!({
+            "kind":"status",
+            "ipc_version":IPC_VERSION,
+        }))
+        .unwrap();
+        let mut joined = abort;
+        joined.push(b'\n');
+        joined.extend(status);
+        joined.push(b'\n');
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(&joined).unwrap();
+        handle(server, &control);
+        let rejected: Value = serde_json::from_reader(client).unwrap();
+        assert_eq!(rejected["accepted"], false);
+        assert!(!control.abort.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -1765,14 +1748,101 @@ mod tests {
         browser.wait().unwrap();
     }
 
+    #[cfg(debug_assertions)]
+    fn debug_fault_runtime() -> (TempDir, HostBootstrap, Arc<Control>) {
+        let temporary = tempfile::Builder::new()
+            .prefix("host-pause-abort")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let evidence_root = temporary.path().join("evidence");
+        let state_root = temporary.path().join("state");
+        let runtime_dir = temporary.path().join("runtime");
+        for directory in [&evidence_root, &state_root, &runtime_dir] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        let evidence_root = evidence_root.canonicalize().unwrap();
+        let job = manuvra_contract::Job::parse(
+            serde_json::to_vec(&json!({
+                "schema_version":1,
+                "target":{"kind":"browser","url":"http://127.0.0.1:4351/"},
+                "context":{"journey":"pause abort","revision":"fixture","environment":"fixture","actor":"fixture","authority":"fixture"},
+                "steps":[{"id":"submit","goal":"submit","done_when":[{"url_contains":"/done"}]}]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap();
+        let bootstrap = HostBootstrap {
+            job,
+            intent: store::RequestIntent {
+                schema_version: SchemaVersion,
+                public_request_id: "pause-abort".into(),
+                run_id: "r_pause_abort_test".into(),
+                job_digest: "digest".into(),
+                evidence_root,
+            },
+            lookup_request_id: "pause-abort".into(),
+            state_root,
+            browser: None,
+            headless: true,
+            provider_key: None,
+            runtime_dir,
+            started_unix_ms: now_unix_ms(),
+            lifetime_deadline_unix_ms: u64::MAX,
+            pause_timeout_ms: 30_000,
+            watchdog: None,
+            liveness_fd: None,
+        };
+        let redactor = manuvra_flow::evidence::Redactor::for_job(&bootstrap.job).unwrap();
+        let control = make_control(
+            &bootstrap,
+            &bootstrap.runtime_dir.join("control.sock"),
+            &redactor,
+        )
+        .unwrap();
+        (temporary, bootstrap, control)
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn pause_abort_fixture_publishes_and_replaces_complete_evidence() {
+        let (_temporary, bootstrap, control) = debug_fault_runtime();
+        control.abort.store(true, Ordering::SeqCst);
+        let mut browser = spawn_fake_browser(&bootstrap.runtime_dir).unwrap();
+
+        assert!(finish_pause_abort(&bootstrap, &control, &mut browser).unwrap());
+        let result = &control.run.lock().unwrap().result;
+        assert_eq!(result["state"], "aborted");
+        assert_eq!(result["evidence"]["complete"], true);
+        assert!(
+            bootstrap
+                .intent
+                .evidence_root
+                .join("r_pause_abort_test/manifest.json")
+                .is_file()
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn watchdog_loss_fixture_closes_browser_and_replaces_complete_evidence() {
+        let (_temporary, bootstrap, control) = debug_fault_runtime();
+        control.watchdog_lost.store(true, Ordering::SeqCst);
+        let mut browser = spawn_fake_browser(&bootstrap.runtime_dir).unwrap();
+
+        assert!(finish_watchdog_loss(&bootstrap, &control, &mut browser).unwrap());
+        let result = &control.run.lock().unwrap().result;
+        assert_eq!(result["state"], "blocked");
+        assert_eq!(result["reason"]["code"], "watchdog_lost");
+        assert_eq!(result["cleanup"]["browser"], "closed");
+        assert_eq!(result["evidence"]["complete"], true);
+    }
+
     #[test]
     fn watchdog_pipe_loss_cancels_input_and_marks_the_host() {
         let temporary = TempDir::new().unwrap();
         let mut descriptors = [-1_i32; 2];
-        assert_eq!(
-            unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) },
-            0
-        );
+        assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
         let cancellation = InputCancellation::default();
         let control = Arc::new(Control {
             state_root: temporary.path().join("state"),

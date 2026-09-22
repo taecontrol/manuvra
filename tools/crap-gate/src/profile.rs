@@ -294,16 +294,17 @@ mod tests {
                 "manuvra-cli/src/client/darwin.rs",
                 "manuvra-cli/src/process/darwin.rs",
                 "manuvra-cli/src/runtime/darwin.rs",
-                "manuvra-cli/src/socket_auth/darwin.rs"
+                "manuvra-cli/src/socket_auth/darwin.rs",
+                "manuvra-chrome/src/owned/darwin.rs"
             ]
         );
         assert_eq!(
             resolve(&document, &rust_root, "macos").unwrap().exclude,
             [
-                "manuvra-cli/src/host.rs",
                 "manuvra-cli/src/process/linux.rs",
                 "manuvra-cli/src/runtime/linux.rs",
-                "manuvra-cli/src/socket_auth/linux.rs"
+                "manuvra-cli/src/socket_auth/linux.rs",
+                "manuvra-chrome/src/owned/linux.rs"
             ]
         );
     }

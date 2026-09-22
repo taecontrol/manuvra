@@ -16,7 +16,6 @@
       "platform": "darwin",
       "target_os": "macos",
       "exclude": [
-        "manuvra-cli/src/host.rs",
         "manuvra-cli/src/process/linux.rs",
         "manuvra-cli/src/runtime/linux.rs",
         "manuvra-cli/src/socket_auth/linux.rs",
@@ -25,10 +24,6 @@
     }
   ],
   "platform_sources": [
-    {
-      "path": "manuvra-cli/src/host.rs",
-      "platform": "linux"
-    },
     {
       "path": "manuvra-cli/src/process/linux.rs",
       "platform": "linux"

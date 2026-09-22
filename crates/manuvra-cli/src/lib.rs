@@ -3,7 +3,7 @@ mod client;
 #[allow(dead_code)]
 mod control_socket;
 mod evidence;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod host;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[cfg_attr(target_os = "macos", allow(dead_code))]
@@ -143,14 +143,33 @@ pub fn invoke(args: impl IntoIterator<Item = OsString>) -> Invocation {
 
 pub fn internal_main(command: &str) -> Option<u8> {
     match command {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         "__host" => Some(host::main().map_or(EXIT_INTERNAL, |()| EXIT_PASSED)),
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         "__watchdog" => Some(watchdog::main().map_or(EXIT_INTERNAL, |()| EXIT_PASSED)),
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(all(target_os = "macos", debug_assertions))]
+        "__darwin_hosted" => Some(darwin_hosted_test_main()),
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         "__host" => Some(EXIT_BLOCKED),
         _ => None,
     }
+}
+
+#[cfg(all(target_os = "macos", debug_assertions))]
+fn darwin_hosted_test_main() -> u8 {
+    let args = std::iter::once(OsString::from("manuvra")).chain(std::env::args_os().skip(2));
+    let invocation = match Cli::try_parse_from(args) {
+        Ok(cli) => cli.command.execute_hosted_test(),
+        Err(error) => Invocation::error("invalid_arguments", error.to_string(), EXIT_INVALID),
+    };
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    if serde_json::to_writer(&mut output, &invocation.output).is_err()
+        || std::io::Write::write_all(&mut output, b"\n").is_err()
+    {
+        return EXIT_INTERNAL;
+    }
+    invocation.exit_code
 }
 
 impl Command {
@@ -189,6 +208,92 @@ impl Command {
             Self::Abort { run_id, request_id } => client::abort(&run_id, &request_id),
         }
     }
+
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    fn execute_hosted_test(self) -> Invocation {
+        match self {
+            Self::Run {
+                request_id,
+                job,
+                evidence,
+                browser,
+                headless,
+                wait_ms,
+            } => run_hosted_test(
+                &request_id,
+                &job,
+                &evidence,
+                browser.as_deref(),
+                headless,
+                wait_ms,
+            ),
+            Self::Resume {
+                run_id,
+                request_id,
+                input,
+            } => client::resume_hosted_test(&run_id, &request_id, &input),
+            Self::Status {
+                run_id,
+                request_id,
+                wait_ms,
+            } => client::status_hosted_test(run_id.as_deref(), request_id.as_deref(), wait_ms),
+            Self::Abort { run_id, request_id } => client::abort_hosted_test(&run_id, &request_id),
+            Self::Schema { .. } | Self::Version => Invocation::error(
+                "invalid_arguments",
+                "closed Darwin host gate accepts only Run lifecycle commands",
+                EXIT_INVALID,
+            ),
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", debug_assertions))]
+fn run_hosted_test(
+    request_id: &str,
+    job_path: &Path,
+    evidence_root: &Path,
+    browser: Option<&Path>,
+    headless: bool,
+    wait_ms: Option<u64>,
+) -> Invocation {
+    let prepared = try_run_hosted_test(request_id, job_path, evidence_root, browser, headless);
+    prepared
+        .and_then(|prepared| match prepared {
+            PreparedRun::Existing(invocation) => Ok(invocation),
+            PreparedRun::New(prepared) => {
+                if let Some(stop) = admission_stop(&prepared) {
+                    publish_admission_stop(prepared, stop)
+                } else {
+                    publish_hosted_run(prepared, wait_ms)
+                }
+            }
+        })
+        .unwrap_or_else(|error| error)
+}
+
+#[cfg(all(target_os = "macos", debug_assertions))]
+fn try_run_hosted_test(
+    request_id: &str,
+    job_path: &Path,
+    evidence_root: &Path,
+    browser: Option<&Path>,
+    headless: bool,
+) -> Result<PreparedRun, Invocation> {
+    runtime::runtime_root().map_err(|_| {
+        Invocation::error(
+            "runtime_directory_unavailable",
+            "neither XDG_RUNTIME_DIR nor TMPDIR is set",
+            EXIT_BLOCKED,
+        )
+    })?;
+    if evidence_root.to_str().is_none() {
+        return Err(Invocation::error(
+            "invalid_input",
+            "evidence path must be valid UTF-8",
+            EXIT_INVALID,
+        ));
+    }
+    prepare_run(request_id, job_path, evidence_root, browser, headless)
 }
 
 impl From<SchemaArg> for SchemaKind {
@@ -264,7 +369,7 @@ struct Prepared {
     _request_lock: store::RequestLock,
     browser: Option<PathBuf>,
     headless: bool,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     existing_intent: bool,
 }
 
@@ -380,7 +485,7 @@ fn finish_preparation(
         _request_lock: admission.request_lock,
         browser: browser.map(Path::to_path_buf),
         headless,
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         existing_intent,
     })))
 }
@@ -462,6 +567,14 @@ fn publish_executable_run(
     prepared: Box<Prepared>,
     wait_ms: Option<u64>,
 ) -> Result<Invocation, Invocation> {
+    publish_hosted_run(prepared, wait_ms)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn publish_hosted_run(
+    prepared: Box<Prepared>,
+    wait_ms: Option<u64>,
+) -> Result<Invocation, Invocation> {
     if prepared.existing_intent {
         return attach_or_recover_background_run(prepared, wait_ms);
     }
@@ -494,7 +607,7 @@ fn publish_executable_run(
     finalize(prepared, outcome.result, outcome.exit_code)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn start_background_run(
     prepared: Box<Prepared>,
     wait_ms: Option<u64>,
@@ -502,7 +615,7 @@ fn start_background_run(
     start_new_background_run(prepared, wait_ms)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn attach_or_recover_background_run(
     prepared: Box<Prepared>,
     wait_ms: Option<u64>,
@@ -513,7 +626,7 @@ fn attach_or_recover_background_run(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn existing_control_after_bootstrap(
     prepared: &Prepared,
 ) -> Result<Option<store::RunControl>, Invocation> {
@@ -530,7 +643,7 @@ fn existing_control_after_bootstrap(
     Ok(control)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn reconcile_abandoned_bootstrap(
     prepared: &Prepared,
 ) -> Result<Option<store::RunControl>, Invocation> {
@@ -544,7 +657,7 @@ fn reconcile_abandoned_bootstrap(
     reconcile_abandoned_bootstrap_locked(prepared)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn reconcile_abandoned_bootstrap_locked(
     prepared: &Prepared,
 ) -> Result<Option<store::RunControl>, Invocation> {
@@ -554,7 +667,7 @@ fn reconcile_abandoned_bootstrap_locked(
         .transpose()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn reconcile_abandoned_control(
     prepared: &Prepared,
     mut control: store::RunControl,
@@ -571,12 +684,12 @@ fn reconcile_abandoned_control(
     Ok(control)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn bootstrap_has_no_owner(control: &store::RunControl) -> bool {
     control.host.is_none() && control.watchdog.is_none()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn bootstrap_socket_is_absent(prepared: &Prepared, socket: &Path) -> Result<bool, Invocation> {
     match fs::symlink_metadata(socket) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
@@ -587,7 +700,7 @@ fn bootstrap_socket_is_absent(prepared: &Prepared, socket: &Path) -> Result<bool
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn publish_abandoned_bootstrap(
     prepared: &Prepared,
     control: &mut store::RunControl,
@@ -607,12 +720,12 @@ fn publish_abandoned_bootstrap(
         .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn control_is_bootstrapping(control: &store::RunControl) -> bool {
     control.result.get("terminal").and_then(Value::as_bool) != Some(true) && control.host.is_none()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn attach_to_existing_control(
     prepared: Box<Prepared>,
     control: store::RunControl,
@@ -622,19 +735,29 @@ fn attach_to_existing_control(
     if control.result.get("terminal").and_then(Value::as_bool) == Some(true) {
         return recover_or_return_terminal_control(prepared, control, wait_ms);
     }
+    confirm_existing_host_reachable(&prepared, &control)?;
+    Ok(wait_existing_run(prepared, wait_ms))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn confirm_existing_host_reachable(
+    prepared: &Prepared,
+    control: &store::RunControl,
+) -> Result<(), Invocation> {
     if client::request_host_ready(
         &control.socket,
         &prepared.intent.run_id,
         &prepared.intent.job_digest,
     )
-    .is_err()
+    .is_ok()
     {
-        confirm_dead_or_reject_unreachable_host(&prepared, &control)?;
+        Ok(())
+    } else {
+        confirm_dead_or_reject_unreachable_host(prepared, control)
     }
-    Ok(wait_existing_run(prepared, wait_ms))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn recover_or_return_terminal_control(
     prepared: Box<Prepared>,
     control: store::RunControl,
@@ -654,13 +777,13 @@ fn recover_or_return_terminal_control(
     Ok(wait_existing_run(prepared, wait_ms))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn recover_existing_without_control(prepared: Box<Prepared>) -> Result<Invocation, Invocation> {
     let (result, exit_code) = required_recovered_result(&prepared)?;
     finalize(prepared, result, exit_code)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn required_recovered_result(prepared: &Prepared) -> Result<(Value, u8), Invocation> {
     recover_flow_result(prepared)
         .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))
@@ -674,36 +797,64 @@ fn required_recovered_result(prepared: &Prepared) -> Result<(Value, u8), Invocat
         })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn wait_existing_run(prepared: Box<Prepared>, wait_ms: Option<u64>) -> Invocation {
     let run_id = prepared.intent.run_id.clone();
     drop(prepared);
     client::wait_for_run(&run_id, wait_ms.or(Some(15_000)))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn confirm_dead_or_reject_unreachable_host(
     prepared: &Prepared,
     control: &store::RunControl,
 ) -> Result<(), Invocation> {
-    let acquired = store::try_lock_existing_run(&prepared.state_root, &prepared.intent.run_id)
-        .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))?;
+    store::try_lock_existing_run(&prepared.state_root, &prepared.intent.run_id)
+        .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))
+        .and_then(|acquired| finish_dead_host_confirmation(prepared, control, acquired))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn finish_dead_host_confirmation(
+    prepared: &Prepared,
+    control: &store::RunControl,
+    acquired: Option<store::RunLock>,
+) -> Result<(), Invocation> {
     if let Some(lock) = acquired {
-        remove_confirmed_dead_socket(&control.socket)
-            .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))?;
-        drop(lock);
-        return Ok(());
+        return remove_dead_host_socket(prepared, control, lock);
     }
-    let lock_present = store::run_lock_present(&prepared.state_root, &prepared.intent.run_id)
+    reject_unreachable_host(prepared)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn remove_dead_host_socket(
+    prepared: &Prepared,
+    control: &store::RunControl,
+    lock: store::RunLock,
+) -> Result<(), Invocation> {
+    remove_confirmed_dead_socket(&control.socket)
         .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))?;
-    Err(internal_error(if lock_present {
+    drop(lock);
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn reject_unreachable_host(prepared: &Prepared) -> Result<(), Invocation> {
+    store::run_lock_present(&prepared.state_root, &prepared.intent.run_id)
+        .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))
+        .and_then(|lock_present| Err(internal_error(unreachable_host_message(lock_present))))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn unreachable_host_message(lock_present: bool) -> String {
+    if lock_present {
         "existing run host holds its lock but failed the live IPC identity check".into()
     } else {
         "existing browser run has no death-detection lock; it will not be restarted".into()
-    }))
+    }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn remove_confirmed_dead_socket(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::FileTypeExt;
 
@@ -718,7 +869,7 @@ fn remove_confirmed_dead_socket(path: &Path) -> Result<(), String> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn validate_existing_control(
     prepared: &Prepared,
     control: &store::RunControl,
@@ -736,7 +887,7 @@ fn validate_existing_control(
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn start_new_background_run(
     prepared: Box<Prepared>,
     wait_ms: Option<u64>,
@@ -755,7 +906,7 @@ fn start_new_background_run(
     Ok(client::wait_for_run(&run_id, Some(wait)))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn initialize_run_basis(
     prepared: &Prepared,
     watchdog: &process::WatchdogBootstrap,
@@ -783,7 +934,7 @@ fn initialize_run_basis(
     Ok(lock)
 }
 
-#[cfg(all(target_os = "linux", debug_assertions))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), debug_assertions))]
 fn caller_bootstrap_fault(prepared: &Prepared, runtime_dir: &Path) -> Result<(), Invocation> {
     match std::env::var("MANUVRA_TEST_CALLER_BOOTSTRAP_FAULT").as_deref() {
         Ok("after_run_basis") => publish_caller_fault_marker(prepared, runtime_dir),
@@ -791,7 +942,7 @@ fn caller_bootstrap_fault(prepared: &Prepared, runtime_dir: &Path) -> Result<(),
     }
 }
 
-#[cfg(all(target_os = "linux", debug_assertions))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), debug_assertions))]
 fn publish_caller_fault_marker(prepared: &Prepared, runtime_dir: &Path) -> Result<(), Invocation> {
     store::atomic_write_private(
         &runtime_dir.join("caller-bootstrap-fault.ready"),
@@ -801,29 +952,28 @@ fn publish_caller_fault_marker(prepared: &Prepared, runtime_dir: &Path) -> Resul
     park_caller_forever()
 }
 
-#[cfg(all(target_os = "linux", debug_assertions))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), debug_assertions))]
 fn park_caller_forever() -> ! {
     loop {
         std::thread::park();
     }
 }
 
-#[cfg(all(target_os = "linux", not(debug_assertions)))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), not(debug_assertions)))]
 fn caller_bootstrap_fault(_: &Prepared, _: &Path) -> Result<(), Invocation> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn validated_runtime_run_dir(prepared: &Prepared) -> Result<PathBuf, Invocation> {
-    let runtime_root = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .ok_or_else(|| internal_error("XDG_RUNTIME_DIR is required for background runs".into()))?;
+    let runtime_root = runtime::runtime_root()
+        .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))?;
     reject_sensitive_internal_path(&runtime_root, &prepared.redactor, "runtime")?;
     process::runtime_run_dir(&prepared.intent.run_id)
         .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn host_bootstrap(
     prepared: &Prepared,
     runtime_dir: PathBuf,
@@ -860,7 +1010,7 @@ fn host_bootstrap(
     (host, watchdog, lifetime)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn initial_watchdog_result(prepared: &Prepared) -> Value {
     let manifest = prepared
         .intent
@@ -893,7 +1043,7 @@ fn initial_watchdog_result(prepared: &Prepared) -> Value {
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn await_host_readiness(prepared: &Prepared) -> Result<(), Invocation> {
     let readiness_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
@@ -909,7 +1059,7 @@ fn await_host_readiness(prepared: &Prepared) -> Result<(), Invocation> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn host_is_ready(prepared: &Prepared) -> Result<bool, Invocation> {
     let Some(control) = store::read_run_control(&prepared.state_root, &prepared.intent.run_id)
         .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))?
@@ -928,7 +1078,7 @@ fn host_is_ready(prepared: &Prepared) -> Result<bool, Invocation> {
     .is_ok())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn validate_readiness_control(
     prepared: &Prepared,
     control: &store::RunControl,
@@ -1544,17 +1694,17 @@ pub(crate) fn internal_error(message: String) -> Invocation {
 
 #[cfg(test)]
 mod boundary_tests {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use super::remove_confirmed_dead_socket;
     use super::{role_matches_path, validate_evidence_shape};
     use manuvra_contract::{Artifact, Manifest, SchemaVersion};
     use serde_json::json;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::os::unix::net::UnixListener;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use tempfile::TempDir;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn confirmed_dead_socket_removal_is_bounded_to_sockets() {
         let temporary = TempDir::new().unwrap();
