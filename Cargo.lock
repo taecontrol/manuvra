@@ -787,7 +787,7 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
 name = "manuvra-chrome"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "libc",
@@ -800,7 +800,7 @@ dependencies = [
 
 [[package]]
 name = "manuvra-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "clap",
  "hex",
@@ -817,7 +817,7 @@ dependencies = [
 
 [[package]]
 name = "manuvra-contract"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "schemars",
  "serde",
@@ -828,7 +828,7 @@ dependencies = [
 
 [[package]]
 name = "manuvra-flow"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "hex",
  "libc",
@@ -845,7 +845,7 @@ dependencies = [
 
 [[package]]
 name = "manuvra-jev"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "httpdate",
  "rand 0.9.5",
