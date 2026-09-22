@@ -1,6 +1,60 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+fail() {
+  echo "$1" >&2
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || fail "$1 is required for the money journey matrix"
+}
+
+epoch_millis() {
+  printf '%s000\n' "$(date +%s)"
+}
+
+sha256_file() {
+  shasum -a 256 "$1" | awk '{print $1}'
+}
+
+port_is_open() {
+  nc -z -w 2 127.0.0.1 4351 >/dev/null 2>&1
+}
+
+validate_money_dir() {
+  [[ -n "${MONEY_DIR:-}" ]] || fail "MONEY_DIR is required for the money journey matrix"
+  [[ -d "$MONEY_DIR" ]] || fail "MONEY_DIR is not a directory: $MONEY_DIR"
+  [[ -f "$MONEY_DIR/package.json" ]] || fail "MONEY_DIR has no package.json: $MONEY_DIR"
+  [[ -f "$MONEY_DIR/scripts/app-driver.mjs" ]] ||
+    fail "MONEY_DIR has no scripts/app-driver.mjs: $MONEY_DIR"
+}
+
+preflight_fixture() {
+  validate_money_dir
+  require_command jq
+  require_command nc
+  require_command node
+  require_command pnpm
+  if port_is_open; then
+    fail "port 4351 is already in use"
+  fi
+}
+
+preflight_matrix() {
+  preflight_fixture
+  require_command awk
+  require_command cargo
+  require_command date
+  require_command git
+  require_command rg
+  require_command rustc
+  require_command shasum
+  [[ -n "${TMPDIR:-}" ]] || fail "TMPDIR is required for Darwin headed browser runs"
+  [[ -d "$TMPDIR" ]] || fail "TMPDIR is not a directory: $TMPDIR"
+  : "${TYPESAFE_API_KEY:?TYPESAFE_API_KEY is required for the money journey matrix}"
+}
+
 verification_facts_are_visible() {
   local payload=$1 journey=$2 expected_name=$3
   local run_root snapshot_relative snapshot
@@ -30,8 +84,8 @@ verification_facts_are_visible() {
   esac
 }
 
-self_test_verification_facts() {
-  local test_root payload snapshot
+self_test_portable_helpers() {
+  local test_root payload snapshot rows build report linux_report milliseconds
   test_root=$(mktemp -d)
   trap 'rm -rf -- "$test_root"' RETURN
   mkdir -p "$test_root/escalations" "$test_root/observations"
@@ -53,26 +107,126 @@ self_test_verification_facts() {
     echo "forced escalation attestation accepted a snapshot without the account name" >&2
     return 1
   fi
+
+  printf 'portable digest fixture\n' >"$test_root/digest"
+  [[ "$(sha256_file "$test_root/digest")" == \
+    "3bcb080d1c31c3ce588420877f62ccd50f67f5cfcb577464edb084b4bde6d176" ]]
+  milliseconds=$(epoch_millis)
+  [[ "$milliseconds" != *[!0-9]* && ${#milliseconds} -ge 13 ]]
+
+  build="$test_root/build.json"
+  rows="$test_root/runs.jsonl"
+  report="$test_root/report.json"
+  printf '%s\n' '{"source_revision":"fixture","sha256":"fixture"}' >"$build"
+  printf '%s\n' '{"classification":"autonomous","checks":{"fixture":true}}' >"$rows"
+  write_report "$build" "$rows" "$report" "$BASH_VERSION"
+  jq -e --arg bash_version "$BASH_VERSION" \
+    '.bash_version == $bash_version and .counts.autonomous == 1 and .checks.every_run_integrity_persistence_cleanup_and_leaks' \
+    "$report" >/dev/null
+  linux_report="$test_root/linux-report.json"
+  write_report "$build" "$rows" "$linux_report" "5.2.0(1)-release"
+  jq -e '.bash_version == "5.2.0(1)-release"' "$linux_report" >/dev/null
+}
+
+active_fixture=
+active_fixture_state=
+fixture_test_root=
+cleanup_active_fixture() {
+  if [[ -n "$active_fixture" ]]; then
+    (cd "$money_dir" && VERIFY_STATE="$active_fixture_state" \
+      pnpm verify:app cleanup --run-id "$active_fixture") >/dev/null || true
+  fi
+}
+
+cleanup_fixture_self_test() {
+  cleanup_active_fixture
+  if [[ -n "$fixture_test_root" ]]; then
+    rm -rf -- "$fixture_test_root"
+  fi
+}
+
+start_fixture() {
+  local run_id=$1 fixture_state=$2 launch=$3 doctor=$4 candidate
+  active_fixture=$run_id
+  active_fixture_state=$fixture_state
+  (cd "$money_dir" && VERIFY_STATE="$fixture_state" \
+    pnpm verify:app launch --run-id "$run_id" --port 4351) >"$launch"
+  candidate=$(jq -r '.result.candidate // empty' "$launch")
+  [[ -n "$candidate" ]] || fail "fixture launch did not publish a candidate"
+  (cd "$money_dir" && VERIFY_STATE="$fixture_state" node scripts/app-driver.mjs doctor \
+    --run-id "$run_id" --candidate "$candidate") >"$doctor"
+  jq -e '.status == "completed"' "$doctor" >/dev/null || fail "fixture doctor failed"
+}
+
+stop_fixture() {
+  local output=$1 errors=$2 code
+  set +e
+  (cd "$money_dir" && VERIFY_STATE="$active_fixture_state" \
+    pnpm verify:app cleanup --run-id "$active_fixture") >"$output" 2>"$errors"
+  code=$?
+  set -e
+  [[ $code -eq 0 ]] || return "$code"
+  jq -e '.status == "completed" and .result.cleanup == "cleaned"' "$output" >/dev/null || return 1
+  active_fixture=
+  active_fixture_state=
+}
+
+self_test_fixture() {
+  local run_id
+  preflight_fixture
+  fixture_test_root=$(mktemp -d)
+  fixture_test_root=$(cd "$fixture_test_root" && pwd -P)
+  trap cleanup_fixture_self_test EXIT
+  run_id="manuvra-money-preflight-$(date +%Y%m%d-%H%M%S)-$$"
+  start_fixture "$run_id" "$fixture_test_root/state" "$fixture_test_root/launch.json" \
+    "$fixture_test_root/doctor.json" >/dev/null
+  stop_fixture "$fixture_test_root/cleanup.json" "$fixture_test_root/cleanup.stderr"
+  if port_is_open; then
+    fail "fixture self-test left port 4351 open"
+  fi
+}
+
+write_report() {
+  local build=$1 rows=$2 destination=$3 bash_version=$4
+  jq -s \
+    --slurpfile build "$build" \
+    --arg bash_version "$bash_version" \
+    '{schema_version:1,bash_version:$bash_version,build:$build[0],runs:.,
+      counts:((group_by(.classification) | map({key:.[0].classification,value:length}) | from_entries) +
+        {autonomous:([.[]|select(.classification=="autonomous")]|length),
+         assisted:([.[]|select(.classification=="assisted")]|length),
+         failed:([.[]|select(.classification=="failed")]|length)}),
+      checks:{release_binary:true,fresh_fixture_per_run:true,
+        every_run_integrity_persistence_cleanup_and_leaks:([.[].checks[]]|all)}}' \
+    "$rows" >"$destination"
 }
 
 if [[ ${1:-} == --self-test ]]; then
-  self_test_verification_facts
+  self_test_portable_helpers
+  exit 0
+fi
+
+if [[ ${1:-} == --fixture-self-test ]]; then
+  money_dir=${MONEY_DIR:-}
+  self_test_fixture
   exit 0
 fi
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-money_dir=${MONEY_DIR:-/home/guetteluis/Work/personal/money}
-runtime_root=${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR is required for headed browser runs}
-: "${TYPESAFE_API_KEY:?TYPESAFE_API_KEY is required for the money journey matrix}"
+money_dir=${MONEY_DIR:-}
+preflight_matrix
+runtime_root=$TMPDIR
+unset XDG_RUNTIME_DIR
 
 stamp=$(date +%Y%m%d-%H%M%S)-$$
 matrix_root="$repo_root/.work/live/money-journey/$stamp"
 report_rows="$matrix_root/runs.jsonl"
 mkdir -p "$matrix_root"
+trap cleanup_active_fixture EXIT
 
 cargo build --release --locked --manifest-path "$repo_root/Cargo.toml" --bin manuvra
 manuvra="$repo_root/target/release/manuvra"
-binary_digest=$(sha256sum "$manuvra" | cut -d' ' -f1)
+binary_digest=$(sha256_file "$manuvra")
 source_revision=$(git -C "$repo_root" rev-parse HEAD)
 manuvra_version=$($manuvra version | jq -r '.version')
 jq -n \
@@ -81,16 +235,11 @@ jq -n \
   --arg source_revision "$source_revision" \
   --arg version "$manuvra_version" \
   --arg rustc "$(rustc --version)" \
-  '{binary:$binary,sha256:$sha256,source_revision:$source_revision,version:$version,rustc:$rustc}' \
+  --arg bash_version "$BASH_VERSION" \
+  --arg tmpdir "$TMPDIR" \
+  '{binary:$binary,sha256:$sha256,source_revision:$source_revision,version:$version,
+    rustc:$rustc,bash_version:$bash_version,tmpdir:$tmpdir,xdg_runtime_dir:null}' \
   >"$matrix_root/build.json"
-
-active_fixture=
-cleanup_active_fixture() {
-  if [[ -n "$active_fixture" ]]; then
-    (cd "$money_dir" && pnpm verify:app cleanup --run-id "$active_fixture") >/dev/null || true
-  fi
-}
-trap cleanup_active_fixture EXIT
 
 wait_checkpoint() {
   local state_root=$1 run_id=$2 current=$3
@@ -100,7 +249,7 @@ wait_checkpoint() {
     [[ "$state" == running ]] || return 0
     next="${current%.json}-status-$attempt.json"
     set +e
-    XDG_STATE_HOME="$state_root" XDG_RUNTIME_DIR="$runtime_root" \
+    XDG_STATE_HOME="$state_root" \
       "$manuvra" status "$run_id" --wait-ms 30000 >"$next" 2>"${next%.json}.stderr"
     code=$?
     set -e
@@ -146,7 +295,7 @@ verify_manifest() {
   jq -e '.complete == true and ([.artifacts[].complete] | all)' "$manifest" >/dev/null
   while IFS=$'\t' read -r path expected; do
     [[ -f "$path" ]]
-    [[ "$(sha256sum "$path" | cut -d' ' -f1)" == "$expected" ]]
+    [[ "$(sha256_file "$path")" == "$expected" ]]
   done < <(jq -r '.artifacts[] | [.path,.digest] | @tsv' "$manifest")
 }
 
@@ -183,14 +332,12 @@ run_case() {
   local label="$journey-$iteration" case_root="$matrix_root/$journey/$iteration"
   local state_root="$case_root/state" evidence_root="$case_root/evidence"
   local job="$fixture" current="$case_root/current-result.json"
+  local fixture_state="$case_root/money-fixture"
   mkdir -p "$case_root" "$state_root" "$evidence_root"
 
   active_fixture="manuvra-money-$journey-$iteration-$stamp"
-  local launch="$case_root/launch.json" candidate
-  (cd "$money_dir" && pnpm verify:app launch --run-id "$active_fixture" --port 4351) >"$launch"
-  candidate=$(jq -r '.result.candidate' "$launch")
-  (cd "$money_dir" && node scripts/app-driver.mjs doctor \
-    --run-id "$active_fixture" --candidate "$candidate") >"$case_root/doctor.json"
+  local launch="$case_root/launch.json"
+  start_fixture "$active_fixture" "$fixture_state" "$launch" "$case_root/doctor.json"
 
   if [[ "$forced" == yes ]]; then
     job="$case_root/job.json"
@@ -200,9 +347,9 @@ run_case() {
   local request_id="money-$journey-$iteration-$stamp" code started_ms ended_ms run_id state
   local assists=0 attestations=0 first_stop= first_stop_payload= forced_stop_seen=false failure=
   local manifest_ok=false persistence_ok=false cleanup_ok=false leak_free=false
-  started_ms=$(date +%s%3N)
+  started_ms=$(epoch_millis)
   set +e
-  XDG_STATE_HOME="$state_root" XDG_RUNTIME_DIR="$runtime_root" \
+  XDG_STATE_HOME="$state_root" \
     "$manuvra" run --request-id "$request_id" --job "$job" --evidence "$evidence_root" \
     --wait-ms 30000 >"$current" 2>"$case_root/initial-result.stderr"
   code=$?
@@ -275,7 +422,7 @@ run_case() {
 
     resume_result="$case_root/resume-$assists.json"
     set +e
-    XDG_STATE_HOME="$state_root" XDG_RUNTIME_DIR="$runtime_root" \
+    XDG_STATE_HOME="$state_root" \
       "$manuvra" resume "$run_id" \
       --request-id "$request_id-resume-$assists" --input "$disposition" \
       >"$resume_result" 2>"${resume_result%.json}.stderr"
@@ -292,7 +439,7 @@ run_case() {
       break
     }
   done
-  ended_ms=$(date +%s%3N)
+  ended_ms=$(epoch_millis)
 
   state=$(jq -r '.state // "invalid"' "$current")
   if [[ -z "$failure" && "$state" != passed ]]; then
@@ -319,7 +466,7 @@ run_case() {
   fi
 
   local observation="$case_root/persistence.json"
-  (cd "$money_dir" && node scripts/app-driver.mjs observe \
+  (cd "$money_dir" && VERIFY_STATE="$fixture_state" node scripts/app-driver.mjs observe \
     --run-id "$active_fixture" --feature "$feature") >"$observation"
   if verify_persistence "$journey" "$expected_name" "$observation"; then
     persistence_ok=true
@@ -351,14 +498,9 @@ run_case() {
     first_stop_json=null
   fi
 
-  local cleanup_code port_closed=false
-  set +e
-  (cd "$money_dir" && pnpm verify:app cleanup --run-id "$active_fixture") \
-    >"$case_root/cleanup.json" 2>"$case_root/cleanup.stderr"
-  cleanup_code=$?
-  set -e
-  active_fixture=
-  if ! timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/4351' 2>/dev/null; then
+  local cleanup_code=0 port_closed=false
+  stop_fixture "$case_root/cleanup.json" "$case_root/cleanup.stderr" || cleanup_code=$?
+  if ! port_is_open; then
     port_closed=true
   fi
   if [[ $cleanup_code -eq 0 && "$port_closed" == true ]] &&
@@ -417,16 +559,7 @@ done
 run_case forced-escalation 1 "$repo_root/tests/live/create-account-forced-pause.json" \
   "Review wallet" accounts.create yes
 
-jq -s \
-  --slurpfile build "$matrix_root/build.json" \
-  '{schema_version:1,build:$build[0],runs:.,
-    counts:((group_by(.classification) | map({key:.[0].classification,value:length}) | from_entries) +
-      {autonomous:([.[]|select(.classification=="autonomous")]|length),
-       assisted:([.[]|select(.classification=="assisted")]|length),
-       failed:([.[]|select(.classification=="failed")]|length)}),
-    checks:{release_binary:true,fresh_fixture_per_run:true,
-      every_run_integrity_persistence_cleanup_and_leaks:([.[].checks[]]|all)}}' \
-  "$report_rows" >"$matrix_root/report.json"
+write_report "$matrix_root/build.json" "$report_rows" "$matrix_root/report.json" "$BASH_VERSION"
 
 if rg -a -l -F -- "$TYPESAFE_API_KEY" "$matrix_root"; then
   echo "provider key leaked into matrix evidence" >&2

@@ -202,7 +202,7 @@ make test
 make crap
 ```
 
-`make live` builds a release binary and runs the Money journey matrix against fresh fixtures. It requires Chromium, a headed desktop, `TYPESAFE_API_KEY`, `jq`, and the Money repository at `/home/guetteluis/Work/personal/money`. Set `MONEY_DIR` to use another checkout. The matrix runs the create-unit, create-account, and record-transaction journeys three times each, followed by one forced escalation round trip. It writes timestamped evidence and a report under `.work/live/money-journey/`.
+`make live` uses `/bin/bash`, builds a release binary, and runs the Money journey matrix against fresh fixtures. Set `MONEY_DIR` explicitly to a disposable Money checkout and provide `TYPESAFE_API_KEY` in the environment. The checkout must have its documented Node and pnpm application-driver dependencies ready. The command also requires `jq`, `rg`, native `date`, `shasum`, and `nc`, Rust build tools, Google Chrome, and a headed desktop. On macOS the matrix leaves `XDG_RUNTIME_DIR` unset so Manuvra exercises its private `TMPDIR` runtime fallback. It runs the create-unit, create-account, and record-transaction journeys three times each, followed by one forced escalation round trip. It retains timestamped, redacted Evidence and a `report.json` under `.work/live/money-journey/`; the report records the source revision, release-binary digest, Bash version, Run classifications, application persistence checks, and cleanup results.
 
 Contributors and coding agents should follow [docs/CODING_STANDARDS.md](docs/CODING_STANDARDS.md). The [architecture decision records](docs/adrs/) explain the project's design choices.
 
