@@ -1,4 +1,4 @@
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::endpoint::Endpoint;
 use crate::input::{
     InputCancellation, PerformError, PerformFact, PreparedInput, PreparedOperation,
@@ -10,21 +10,41 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::env;
 use std::fs;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Child;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::thread;
 use std::time::{Duration, Instant};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const SNAPSHOT: &str = include_str!("snapshot.js");
+#[cfg(target_os = "macos")]
+#[path = "owned/darwin.rs"]
+mod platform;
 #[cfg(target_os = "linux")]
+#[path = "owned/linux.rs"]
+mod platform;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+mod platform {
+    use std::process::Child;
+
+    pub struct BrowserOwnership;
+
+    pub fn terminate(child: &mut Child, _ownership: &mut BrowserOwnership) -> Result<(), String> {
+        child.kill().map_err(|error| error.to_string())?;
+        child.wait().map_err(|error| error.to_string())?;
+        Ok(())
+    }
+}
+
+const SNAPSHOT: &str = include_str!("snapshot.js");
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const COVERAGE_PROBE: &str = r#"(() => {
   if (window.__manuvraCoverageProbeInstalled) return;
   window.__manuvraCoverageProbeInstalled = true;
@@ -89,7 +109,7 @@ pub struct OwnedBrowser {
     profile: PathBuf,
     client: Arc<CdpClient>,
     provenance: BrowserProvenance,
-    owns_process_group: bool,
+    ownership: platform::BrowserOwnership,
     closed: bool,
 }
 
@@ -108,12 +128,12 @@ pub enum BrowserError {
 }
 
 impl OwnedBrowser {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn launch(config: BrowserConfig) -> Result<Self, BrowserError> {
         PreparedBrowser::new(config)?.launch()
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     pub fn launch(_config: BrowserConfig) -> Result<Self, BrowserError> {
         Err(BrowserError::UnsupportedPlatform)
     }
@@ -228,7 +248,7 @@ impl OwnedBrowser {
         if self.closed {
             return Ok(());
         }
-        terminate(&mut self.child, self.owns_process_group).map_err(BrowserError::Control)?;
+        platform::terminate(&mut self.child, &mut self.ownership).map_err(BrowserError::Control)?;
         fs::remove_dir_all(&self.profile)
             .map_err(|error| BrowserError::Control(safe_error(&error.to_string())))?;
         self.closed = true;
@@ -266,17 +286,21 @@ impl Drop for InstalledMasks<'_> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct PreparedBrowser {
     binary: PathBuf,
     profile: PathBuf,
     config: BrowserConfig,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl PreparedBrowser {
     fn new(config: BrowserConfig) -> Result<Self, BrowserError> {
-        let binary = discover_binary(config.explicit_binary.as_deref())?;
+        let binary = platform::discover_binary(
+            config.explicit_binary.as_deref(),
+            env::var_os("MANUVRA_BROWSER").map(PathBuf::from),
+            env::var_os("PATH"),
+        )?;
         let profile = private_profile()?;
         Ok(Self {
             binary,
@@ -290,36 +314,38 @@ impl PreparedBrowser {
     }
 
     fn spawn(self) -> Result<StartingBrowser, BrowserError> {
-        let mut command = browser_command(&self.binary, &self.profile, &self.config);
-        configure_linux_child(&mut command, !self.config.inherit_process_group);
-        let child = match command.spawn() {
-            Ok(child) => child,
+        let command = browser_command(&self.binary, &self.profile, &self.config);
+        let (child, ownership) = match platform::spawn(command, self.config.inherit_process_group) {
+            Ok(spawned) => spawned,
             Err(error) => {
                 let _ = fs::remove_dir_all(&self.profile);
-                return Err(BrowserError::Launch(safe_error(&error.to_string())));
+                return Err(BrowserError::Launch(safe_error(&error)));
             }
         };
         Ok(StartingBrowser {
             prepared: Some(self),
             child: Some(child),
+            ownership: Some(ownership),
         })
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct StartingBrowser {
     prepared: Option<PreparedBrowser>,
     child: Option<Child>,
+    ownership: Option<platform::BrowserOwnership>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl StartingBrowser {
-    fn connect_endpoint(self) -> Result<OwnedBrowser, BrowserError> {
-        let endpoint = wait_for_endpoint(&self.prepared().profile, START_TIMEOUT)?;
+    fn connect_endpoint(mut self) -> Result<OwnedBrowser, BrowserError> {
+        let profile = self.prepared().profile.clone();
+        let endpoint = wait_for_endpoint(self.child_mut(), &profile, START_TIMEOUT)?;
         self.connect_page(endpoint)
     }
-    fn connect_page(self, endpoint: Endpoint) -> Result<OwnedBrowser, BrowserError> {
-        let page = wait_for_page(&endpoint, START_TIMEOUT)?;
+    fn connect_page(mut self, endpoint: Endpoint) -> Result<OwnedBrowser, BrowserError> {
+        let page = wait_for_page(self.child_mut(), &endpoint, START_TIMEOUT)?;
         self.connect_client(page)
     }
     fn connect_client(self, page: (String, String)) -> Result<OwnedBrowser, BrowserError> {
@@ -351,47 +377,55 @@ impl StartingBrowser {
                 },
                 display_mode: display_mode(prepared.config.headless).into(),
             },
-            owns_process_group: !prepared.config.inherit_process_group,
+            ownership: take_ownership(&mut self.ownership),
             closed: false,
         })
     }
     fn prepared(&self) -> &PreparedBrowser {
         self.prepared.as_ref().expect("prepared browser")
     }
+
+    fn child_mut(&mut self) -> &mut Child {
+        self.child.as_mut().expect("Chromium child")
+    }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn display_mode(headless: bool) -> &'static str {
     if headless { "headless" } else { "headed" }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Drop for StartingBrowser {
     fn drop(&mut self) {
-        let owns_process_group = self
-            .prepared
-            .as_ref()
-            .is_none_or(|prepared| !prepared.config.inherit_process_group);
-        cleanup_starting_child(self.child.as_mut(), owns_process_group);
+        cleanup_starting_child(self.child.as_mut(), self.ownership.as_mut());
         cleanup_starting_profile(self.prepared.as_ref());
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn take_prepared(value: &mut Option<PreparedBrowser>) -> PreparedBrowser {
     value.take().expect("prepared browser")
 }
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn take_child(value: &mut Option<Child>) -> Child {
     value.take().expect("Chromium child")
 }
-#[cfg(target_os = "linux")]
-fn cleanup_starting_child(child: Option<&mut Child>, owns_process_group: bool) {
-    if let Some(child) = child {
-        let _ = terminate(child, owns_process_group);
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn take_ownership(value: &mut Option<platform::BrowserOwnership>) -> platform::BrowserOwnership {
+    value.take().expect("Chromium ownership")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn cleanup_starting_child(
+    child: Option<&mut Child>,
+    ownership: Option<&mut platform::BrowserOwnership>,
+) {
+    if let (Some(child), Some(ownership)) = (child, ownership) {
+        let _ = platform::terminate(child, ownership);
     }
 }
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn cleanup_starting_profile(prepared: Option<&PreparedBrowser>) {
     if let Some(prepared) = prepared {
         let _ = fs::remove_dir_all(&prepared.profile);
@@ -404,26 +438,7 @@ impl Drop for OwnedBrowser {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn configure_linux_child(command: &mut Command, own_process_group: bool) {
-    use std::os::unix::process::CommandExt;
-    if own_process_group {
-        command.process_group(0);
-    }
-    unsafe {
-        command.pre_exec(|| {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::getppid() == 1 {
-                return Err(std::io::Error::other("parent exited before Chromium spawn"));
-            }
-            Ok(())
-        });
-    }
-}
-
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn browser_command(binary: &Path, profile: &Path, config: &BrowserConfig) -> Command {
     let mut command = Command::new(binary);
     command
@@ -445,64 +460,7 @@ fn browser_command(binary: &Path, profile: &Path, config: &BrowserConfig) -> Com
     command
 }
 
-#[cfg(target_os = "linux")]
-fn discover_binary(explicit: Option<&Path>) -> Result<PathBuf, BrowserError> {
-    discover_binary_from(
-        explicit,
-        env::var_os("MANUVRA_BROWSER").map(PathBuf::from),
-        env::var_os("PATH"),
-    )
-}
-
-#[cfg(target_os = "linux")]
-fn discover_binary_from(
-    explicit: Option<&Path>,
-    environment: Option<PathBuf>,
-    search_path: Option<std::ffi::OsString>,
-) -> Result<PathBuf, BrowserError> {
-    let configured = explicit.map(Path::to_path_buf).or(environment);
-    if let Some(path) = configured {
-        return usable_binary(&path).ok_or(BrowserError::Unavailable);
-    }
-    for name in [
-        "chromium",
-        "chromium-browser",
-        "google-chrome",
-        "google-chrome-stable",
-    ] {
-        if let Some(path) = find_on_path(name, search_path.as_deref()) {
-            return Ok(path);
-        }
-    }
-    for path in [
-        Path::new("/usr/bin/chromium"),
-        Path::new("/usr/bin/google-chrome"),
-    ] {
-        if let Some(path) = usable_binary(path) {
-            return Ok(path);
-        }
-    }
-    Err(BrowserError::Unavailable)
-}
-
-#[cfg(target_os = "linux")]
-fn find_on_path(name: &str, search_path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
-    env::split_paths(search_path?).find_map(|directory| usable_binary(&directory.join(name)))
-}
-
-#[cfg(target_os = "linux")]
-fn usable_binary(path: &Path) -> Option<PathBuf> {
-    let metadata = path.metadata().ok()?;
-    if !metadata.is_file() {
-        return None;
-    }
-    use std::os::unix::fs::PermissionsExt;
-    (metadata.permissions().mode() & 0o111 != 0)
-        .then(|| fs::canonicalize(path).ok())
-        .flatten()
-}
-
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn private_profile() -> Result<PathBuf, BrowserError> {
     use std::os::unix::fs::DirBuilderExt;
     let stamp = SystemTime::now()
@@ -517,8 +475,12 @@ fn private_profile() -> Result<PathBuf, BrowserError> {
     Ok(path)
 }
 
-#[cfg(target_os = "linux")]
-fn wait_for_endpoint(profile: &Path, timeout: Duration) -> Result<Endpoint, BrowserError> {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn wait_for_endpoint(
+    child: &mut Child,
+    profile: &Path,
+    timeout: Duration,
+) -> Result<Endpoint, BrowserError> {
     let deadline = Instant::now() + timeout;
     let path = profile.join("DevToolsActivePort");
     loop {
@@ -527,6 +489,15 @@ fn wait_for_endpoint(profile: &Path, timeout: Duration) -> Result<Endpoint, Brow
         {
             return Endpoint::parse(&format!("127.0.0.1:{port}"))
                 .map_err(|error| BrowserError::Launch(error.to_string()));
+        }
+        if child
+            .try_wait()
+            .map_err(|error| BrowserError::Launch(safe_error(&error.to_string())))?
+            .is_some()
+        {
+            return Err(BrowserError::Launch(
+                "Chromium exited before the CDP endpoint became ready".into(),
+            ));
         }
         if Instant::now() >= deadline {
             return Err(BrowserError::Launch(
@@ -537,21 +508,18 @@ fn wait_for_endpoint(profile: &Path, timeout: Duration) -> Result<Endpoint, Brow
     }
 }
 
-#[cfg(target_os = "linux")]
-fn wait_for_page(endpoint: &Endpoint, timeout: Duration) -> Result<(String, String), BrowserError> {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn wait_for_page(
+    child: &mut Child,
+    endpoint: &Endpoint,
+    timeout: Duration,
+) -> Result<(String, String), BrowserError> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Ok(items) = endpoint.get_json("/json/list", Duration::from_millis(300))
-            && let Some(url) = items.as_array().and_then(|items| {
-                items.iter().find_map(|item| {
-                    (item.get("type").and_then(Value::as_str) == Some("page"))
-                        .then(|| item.get("webSocketDebuggerUrl").and_then(Value::as_str))
-                        .flatten()
-                })
-            })
-        {
-            return Ok((url.to_owned(), browser_version(endpoint)));
+        if let Some(page) = ready_page(endpoint) {
+            return Ok(page);
         }
+        require_browser_running(child, "Chromium exited before a CDP target became ready")?;
         if Instant::now() >= deadline {
             return Err(BrowserError::Launch("CDP page did not become ready".into()));
         }
@@ -559,7 +527,43 @@ fn wait_for_page(endpoint: &Endpoint, timeout: Duration) -> Result<(String, Stri
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn ready_page(endpoint: &Endpoint) -> Option<(String, String)> {
+    let items = endpoint
+        .get_json("/json/list", Duration::from_millis(300))
+        .ok()?;
+    page_websocket_url(&items).map(|url| (url, browser_version(endpoint)))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn browser_exited(child: &mut Child) -> Result<bool, BrowserError> {
+    child
+        .try_wait()
+        .map(|status| status.is_some())
+        .map_err(|error| BrowserError::Launch(safe_error(&error.to_string())))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn require_browser_running(child: &mut Child, message: &str) -> Result<(), BrowserError> {
+    (!browser_exited(child)?)
+        .then_some(())
+        .ok_or_else(|| BrowserError::Launch(message.into()))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn page_websocket_url(items: &Value) -> Option<String> {
+    items.as_array()?.iter().find_map(|item| {
+        (item.get("type").and_then(Value::as_str) == Some("page"))
+            .then(|| {
+                item.get("webSocketDebuggerUrl")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .flatten()
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn browser_version(endpoint: &Endpoint) -> String {
     endpoint
         .get_json("/json/version", Duration::from_millis(300))
@@ -573,7 +577,7 @@ fn browser_version(endpoint: &Endpoint) -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn set_viewport(client: &CdpClient, width: u16, height: u16) -> Result<(), BrowserError> {
     command(
         client,
@@ -588,7 +592,7 @@ fn set_viewport(client: &CdpClient, width: u16, height: u16) -> Result<(), Brows
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn install_coverage_probe(client: &CdpClient) -> Result<(), BrowserError> {
     command(
         client,
@@ -705,121 +709,6 @@ fn masking_script(sensitive: &[String]) -> Result<String, BrowserError> {
     ))
 }
 
-#[cfg(target_os = "linux")]
-fn terminate(child: &mut Child, owns_process_group: bool) -> Result<(), String> {
-    if !owns_process_group {
-        return terminate_process(child);
-    }
-    let process_group = child.id() as i32;
-    signal_process_group(process_group, libc::SIGTERM)?;
-    if wait_for_process_group_exit(child, process_group, Duration::from_secs(2)) {
-        return Ok(());
-    }
-    force_terminate_process_group(child, process_group)
-}
-
-#[cfg(target_os = "linux")]
-fn terminate_process(child: &mut Child) -> Result<(), String> {
-    let pid = child_pid(child)?;
-    signal_process(pid)?;
-    if wait_for_process_exit(child, Duration::from_secs(2))? {
-        Ok(())
-    } else {
-        force_terminate_process(child)
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn child_pid(child: &Child) -> Result<i32, String> {
-    child
-        .id()
-        .try_into()
-        .map_err(|_| "Chromium process id does not fit pid_t".to_owned())
-}
-
-#[cfg(target_os = "linux")]
-fn signal_process(pid: i32) -> Result<(), String> {
-    let result = unsafe { libc::kill(pid, libc::SIGTERM) };
-    if result == -1 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
-        Err(safe_error(&std::io::Error::last_os_error().to_string()))
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn wait_for_process_exit(child: &mut Child, timeout: Duration) -> Result<bool, String> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if child
-            .try_wait()
-            .map_err(|error| error.to_string())?
-            .is_some()
-        {
-            return Ok(true);
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    Ok(false)
-}
-
-#[cfg(target_os = "linux")]
-fn force_terminate_process(child: &mut Child) -> Result<(), String> {
-    let signaled = child.kill().map_err(|error| safe_error(&error.to_string()));
-    signaled.and_then(|()| {
-        child
-            .wait()
-            .map(|_| ())
-            .map_err(|error| safe_error(&error.to_string()))
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn force_terminate_process_group(child: &mut Child, process_group: i32) -> Result<(), String> {
-    signal_process_group(process_group, libc::SIGKILL)?;
-    let _ = child.wait();
-    wait_for_process_group_exit(child, process_group, Duration::from_secs(1))
-        .then_some(())
-        .ok_or_else(|| "Chromium process group remained alive after SIGKILL".into())
-}
-
-#[cfg(target_os = "linux")]
-fn wait_for_process_group_exit(child: &mut Child, process_group: i32, timeout: Duration) -> bool {
-    let end = Instant::now() + timeout;
-    while Instant::now() < end {
-        let _ = child.try_wait();
-        if !process_group_exists(process_group) {
-            let _ = child.wait();
-            return true;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    false
-}
-
-#[cfg(target_os = "linux")]
-fn signal_process_group(process_group: i32, signal: i32) -> Result<(), String> {
-    let result = unsafe { libc::kill(-process_group, signal) };
-    if result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-        Ok(())
-    } else {
-        Err(safe_error(&std::io::Error::last_os_error().to_string()))
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn process_group_exists(process_group: i32) -> bool {
-    let result = unsafe { libc::kill(-process_group, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn terminate(child: &mut Child, _owns_process_group: bool) -> Result<(), String> {
-    child.kill().map_err(|error| error.to_string())?;
-    child.wait().map_err(|error| error.to_string())?;
-    Ok(())
-}
-
 fn safe_error(message: &str) -> String {
     message.replace(
         env::var("TYPESAFE_API_KEY").as_deref().unwrap_or("\0"),
@@ -831,9 +720,9 @@ fn safe_error(message: &str) -> String {
 mod tests {
     use super::*;
     use crate::transport::test_support::ScriptedChrome;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::io::{BufRead, BufReader, Write};
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::net::TcpListener;
     #[cfg(target_os = "linux")]
     use std::os::unix::process::CommandExt;
@@ -854,7 +743,7 @@ mod tests {
             fs::set_permissions(binary, fs::Permissions::from_mode(0o700)).unwrap();
         }
         assert_eq!(
-            discover_binary_from(
+            platform::discover_binary_from(
                 Some(&explicit),
                 Some(environment.clone()),
                 Some(path_dir.clone().into_os_string())
@@ -863,7 +752,7 @@ mod tests {
             fs::canonicalize(&explicit).unwrap()
         );
         assert_eq!(
-            discover_binary_from(
+            platform::discover_binary_from(
                 None,
                 Some(environment.clone()),
                 Some(path_dir.clone().into_os_string())
@@ -872,7 +761,7 @@ mod tests {
             fs::canonicalize(&environment).unwrap()
         );
         assert_eq!(
-            discover_binary_from(None, None, Some(path_dir.into_os_string())).unwrap(),
+            platform::discover_binary_from(None, None, Some(path_dir.into_os_string())).unwrap(),
             fs::canonicalize(&path_binary).unwrap()
         );
     }
@@ -890,16 +779,16 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&fallback, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(matches!(
-            discover_binary(Some(&binary)),
+            platform::discover_binary(Some(&binary), None, None),
             Err(BrowserError::Unavailable)
         ));
         assert!(matches!(
-            discover_binary_from(None, Some(binary), Some(path_dir.into_os_string())),
+            platform::discover_binary_from(None, Some(binary), Some(path_dir.into_os_string())),
             Err(BrowserError::Unavailable)
         ));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn prepared_spawn_cleans_its_profile_on_success_and_failure() {
         let config = BrowserConfig {
@@ -934,7 +823,54 @@ mod tests {
         assert!(!failed_profile.exists());
     }
 
-    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_profile_is_owner_only_and_startup_exit_removes_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let binary = temporary.path().join("exits-before-cdp");
+        fs::write(&binary, "#!/bin/sh\nexit 17\n").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let profile = private_profile().unwrap();
+        assert_eq!(
+            profile.metadata().unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let error = PreparedBrowser {
+            binary,
+            profile: profile.clone(),
+            config: BrowserConfig {
+                explicit_binary: None,
+                headless: true,
+                width: 800,
+                height: 600,
+                inherit_process_group: false,
+            },
+        }
+        .launch()
+        .err()
+        .expect("browser that exits before CDP must fail startup");
+        assert!(
+            matches!(error, BrowserError::Launch(message) if message.contains("before the CDP endpoint"))
+        );
+        assert!(!profile.exists());
+    }
+
+    #[test]
+    fn missing_explicit_executable_is_structured_before_profile_creation() {
+        let missing = tempfile::tempdir().unwrap().path().join("missing-browser");
+        let error = PreparedBrowser::new(BrowserConfig {
+            explicit_binary: Some(missing),
+            headless: true,
+            width: 800,
+            height: 600,
+            inherit_process_group: false,
+        })
+        .err()
+        .expect("missing explicit browser must be rejected");
+        assert!(matches!(error, BrowserError::Unavailable));
+    }
+
     #[test]
     fn starting_browser_installs_probe_and_viewport_before_ownership_transfer() {
         let chrome = ScriptedChrome::start();
@@ -945,8 +881,8 @@ mod tests {
         let client = chrome.connect_raw();
         let profile = private_profile().unwrap();
         let mut command = Command::new("sleep");
-        command.arg("30").process_group(0);
-        let child = command.spawn().unwrap();
+        command.arg("30");
+        let (child, ownership) = platform::spawn(command, false).unwrap();
         let starting = StartingBrowser {
             prepared: Some(PreparedBrowser {
                 binary: PathBuf::from("/usr/bin/chromium"),
@@ -960,6 +896,7 @@ mod tests {
                 },
             }),
             child: Some(child),
+            ownership: Some(ownership),
         };
         let mut browser = starting.finish(client, "Chromium Test".into()).unwrap();
         assert_eq!(browser.provenance().viewport.width, 800);
@@ -967,10 +904,10 @@ mod tests {
         assert!(!profile.exists());
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn owned_browser_command_scrubs_the_provider_key_and_uses_an_ephemeral_port() {
+    fn owned_browser_command_is_direct_loopback_ephemeral_and_scrubs_the_provider_key() {
         let temporary = tempfile::tempdir().unwrap();
+        let binary = Path::new("/direct/app-bundle/browser");
         let config = BrowserConfig {
             explicit_binary: None,
             headless: false,
@@ -978,7 +915,13 @@ mod tests {
             height: 780,
             inherit_process_group: false,
         };
-        let command = browser_command(Path::new("/usr/bin/chromium"), temporary.path(), &config);
+        let command = browser_command(binary, temporary.path(), &config);
+        assert_eq!(command.get_program(), binary);
+        assert!(
+            command
+                .get_args()
+                .any(|arg| arg == "--remote-debugging-address=127.0.0.1")
+        );
         assert!(
             command
                 .get_args()
@@ -1109,7 +1052,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn endpoint_and_page_discovery_helpers_use_owned_loopback_files_and_http() {
         let temporary = tempfile::tempdir().unwrap();
@@ -1118,8 +1061,9 @@ mod tests {
             "45678\n/devtools/browser/x\n",
         )
         .unwrap();
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
         assert_eq!(
-            wait_for_endpoint(temporary.path(), Duration::from_millis(50))
+            wait_for_endpoint(&mut child, temporary.path(), Duration::from_millis(50))
                 .unwrap()
                 .port(),
             45678
@@ -1149,10 +1093,13 @@ mod tests {
             }
         });
         let page = wait_for_page(
+            &mut child,
             &Endpoint::parse(&address.to_string()).unwrap(),
             Duration::from_secs(1),
         )
         .unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
         worker.join().unwrap();
         assert_eq!(page.0, "ws://127.0.0.1/devtools/page/1");
     }
@@ -1167,6 +1114,7 @@ mod tests {
         let mut command = Command::new("sleep");
         command.arg("30").process_group(0);
         let child = command.spawn().unwrap();
+        let ownership = platform::ownership_for_test(&child, true);
         let mut browser = OwnedBrowser {
             child,
             profile: profile.clone(),
@@ -1180,7 +1128,7 @@ mod tests {
                 },
                 display_mode: "headless".into(),
             },
-            owns_process_group: true,
+            ownership,
             closed: false,
         };
         browser.close().unwrap();
@@ -1196,6 +1144,7 @@ mod tests {
         let client = chrome.connect_raw();
         let child = Command::new("sleep").arg("30").spawn().unwrap();
         let pid = child.id();
+        let ownership = platform::ownership_for_test(&child, false);
         let mut browser = OwnedBrowser {
             child,
             profile,
@@ -1209,7 +1158,7 @@ mod tests {
                 },
                 display_mode: "headless".into(),
             },
-            owns_process_group: false,
+            ownership,
             closed: false,
         };
         browser.close().unwrap();
@@ -1236,6 +1185,7 @@ mod tests {
             .read_line(&mut descendant)
             .unwrap();
         let descendant: i32 = descendant.trim().parse().unwrap();
+        let ownership = platform::ownership_for_test(&child, true);
         let mut browser = OwnedBrowser {
             child,
             profile,
@@ -1249,7 +1199,7 @@ mod tests {
                 },
                 display_mode: "headless".into(),
             },
-            owns_process_group: true,
+            ownership,
             closed: false,
         };
         browser.close().unwrap();
@@ -1271,6 +1221,7 @@ mod tests {
     fn browser_with_client(client: Arc<CdpClient>) -> OwnedBrowser {
         let profile = tempfile::tempdir().unwrap().keep();
         let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let ownership = platform::ownership_for_test(&child, false);
         OwnedBrowser {
             child,
             profile,
@@ -1284,7 +1235,7 @@ mod tests {
                 },
                 display_mode: "headless".into(),
             },
-            owns_process_group: false,
+            ownership,
             closed: false,
         }
     }
