@@ -13,8 +13,8 @@ mod platform;
 #[path = "process/linux.rs"]
 mod platform;
 
-#[cfg(target_os = "linux")]
-pub use platform::process_is_same;
+#[cfg(all(test, target_os = "linux"))]
+use platform::process_is_same;
 pub use platform::{child_exited_without_reaping, process_identity, signal_process_group};
 
 pub const IPC_VERSION: u16 = 1;

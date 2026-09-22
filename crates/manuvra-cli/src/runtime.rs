@@ -45,6 +45,7 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
+    #[cfg(target_os = "macos")]
     use tempfile::TempDir;
 
     #[test]
