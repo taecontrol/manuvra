@@ -48,6 +48,14 @@ At runtime, Manuvra looks for the browser specified by `--browser`, then `MANUVR
 
 Manuvra stores durable run records under `XDG_STATE_HOME`, or the user's standard XDG state directory when that variable is unset. It requires `XDG_RUNTIME_DIR` for private control sockets and other short-lived state. The caller chooses a separate evidence root for each `run` command.
 
+Install the [Manuvra skill](skills/manuvra/SKILL.md) for your coding agents with the [skills](https://skills.sh/) CLI:
+
+```bash
+npx skills add taecontrol/manuvra --skill manuvra
+```
+
+Add `-g` to install it for your user instead of the current project.
+
 ## Write a job
 
 Ask the installed binary for its current contracts before writing input:
