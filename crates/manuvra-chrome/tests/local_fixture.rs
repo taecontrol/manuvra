@@ -1,4 +1,4 @@
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use manuvra_chrome::{
     BrowserConfig, InputCancellation, Observation, OwnedBrowser, PerformError, PreparedInput,
@@ -6,12 +6,107 @@ use manuvra_chrome::{
 };
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+#[cfg(target_os = "macos")]
+use std::path::PathBuf;
+#[cfg(target_os = "macos")]
+use std::process::Command;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+#[cfg(target_os = "macos")]
+use std::time::{Duration, Instant};
 
 const FIXTURE: &str = include_str!("../../../tests/fixtures/browser-adversarial.html");
 const INPUT_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-input-strategies.html");
+static REAL_BROWSER: Mutex<()> = Mutex::new(());
+
+#[cfg(target_os = "macos")]
+struct BrowserLifecycle {
+    process_group: i32,
+    profile: PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+impl BrowserLifecycle {
+    fn observe(browser: &OwnedBrowser) -> Self {
+        let path = &browser.provenance().browser_path;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let rows = process_rows();
+            if let Some((pid, process_group, command)) = rows.iter().find(|(_, _, command)| {
+                command.contains(path) && command.contains("--remote-debugging-port=0")
+            }) {
+                let profile = command
+                    .split_whitespace()
+                    .find_map(|argument| argument.strip_prefix("--user-data-dir="))
+                    .map(PathBuf::from)
+                    .expect("owned Chrome command has an isolated profile");
+                assert_eq!(pid, process_group, "standalone Chrome must lead its group");
+                assert!(profile.is_dir());
+                let owned = format!("--user-data-dir={}", profile.display());
+                let observed: Vec<_> = rows
+                    .iter()
+                    .filter(|(_, _, command)| command.contains(&owned))
+                    .collect();
+                if observed.len() > 1 {
+                    assert!(observed.iter().all(|(_, group, _)| group == process_group));
+                    eprintln!(
+                        "owned Chrome group observed: pgid={process_group} members={} profile={}",
+                        observed.len(),
+                        profile.display()
+                    );
+                    return Self {
+                        process_group: *process_group,
+                        profile,
+                    };
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Chrome helper group was not observable"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn assert_cleaned(self) {
+        assert!(
+            !self.profile.exists(),
+            "owned Chrome profile survived close"
+        );
+        assert_eq!(unsafe { libc::kill(-self.process_group, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "owned Chrome group survived close"
+        );
+        eprintln!(
+            "owned Chrome cleanup observed: pgid={} removed profile={}",
+            self.process_group,
+            self.profile.display()
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn process_rows() -> Vec<(i32, i32, String)> {
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,pgid=,command="])
+        .output()
+        .expect("inspect Chrome process group");
+    assert!(output.status.success());
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let process_group = fields.next()?.parse().ok()?;
+            Some((pid, process_group, fields.collect::<Vec<_>>().join(" ")))
+        })
+        .collect()
+}
 
 struct FixtureServer {
     address: std::net::SocketAddr,
@@ -102,6 +197,7 @@ fn prepared(
 #[test]
 #[ignore = "requires the local Chromium executable"]
 fn production_snapshot_and_masking_cover_truncation_split_nodes_and_zero_masks() {
+    let _serial = REAL_BROWSER.lock().unwrap();
     let server = FixtureServer::start();
     let mut browser = OwnedBrowser::launch(BrowserConfig {
         explicit_binary: None,
@@ -111,6 +207,9 @@ fn production_snapshot_and_masking_cover_truncation_split_nodes_and_zero_masks()
         inherit_process_group: false,
     })
     .unwrap();
+    assert_ne!(browser.provenance().browser_version, "unknown");
+    #[cfg(target_os = "macos")]
+    let lifecycle = BrowserLifecycle::observe(&browser);
     browser.navigate(&server.url()).unwrap();
 
     let observed = browser.observe().unwrap();
@@ -139,12 +238,16 @@ fn production_snapshot_and_masking_cover_truncation_split_nodes_and_zero_masks()
     assert!(absent.redaction.verifies(1));
     assert_eq!(absent.redaction.matched_values, 0);
     assert_eq!(absent.redaction.mask_count, 0);
+    eprintln!("real Chrome CDP snapshot, screenshot, and masking fixture completed");
     browser.close().unwrap();
+    #[cfg(target_os = "macos")]
+    lifecycle.assert_cleaned();
 }
 
 #[test]
 #[ignore = "requires the local Chromium executable"]
 fn production_input_strategies_cover_native_and_bounded_fallback_paths() {
+    let _serial = REAL_BROWSER.lock().unwrap();
     let server = FixtureServer::with_body(INPUT_FIXTURE);
     let mut browser = OwnedBrowser::launch(BrowserConfig {
         explicit_binary: None,
@@ -154,6 +257,9 @@ fn production_input_strategies_cover_native_and_bounded_fallback_paths() {
         inherit_process_group: false,
     })
     .unwrap();
+    assert_ne!(browser.provenance().browser_version, "unknown");
+    #[cfg(target_os = "macos")]
+    let lifecycle = BrowserLifecycle::observe(&browser);
     browser.navigate(&server.url()).unwrap();
     let cancellation = InputCancellation::default();
     let mut sequence = 1;
@@ -425,5 +531,8 @@ fn production_input_strategies_cover_native_and_bounded_fallback_paths() {
         browser.perform(stale, &cancellation),
         Err(PerformError::Rejected(reason)) if reason == "document_changed" || reason == "target_missing"
     ));
+    eprintln!("real Chrome CDP input and readback fixture completed");
     browser.close().unwrap();
+    #[cfg(target_os = "macos")]
+    lifecycle.assert_cleaned();
 }

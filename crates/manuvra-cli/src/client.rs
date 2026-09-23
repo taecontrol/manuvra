@@ -1,23 +1,26 @@
 use crate::Invocation;
-#[cfg(target_os = "linux")]
+#[cfg(target_os = "macos")]
+#[path = "client/darwin.rs"]
+mod platform;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::process::{IPC_VERSION, now_unix_ms};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::store::{self, RunControl};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::{EXIT_INTERNAL, internal_error, result_exit_code};
 use crate::{validate_request_id, validate_run_id};
 use manuvra_contract::DispositionRequest;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use manuvra_contract::SchemaVersion;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use serde_json::{Value, json};
 use std::fs;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::io::Read;
 use std::path::Path;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::path::PathBuf;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::time::{Duration, Instant};
 
 pub fn status(run_id: Option<&str>, request_id: Option<&str>, wait_ms: Option<u64>) -> Invocation {
@@ -30,23 +33,23 @@ fn try_status(
     wait_ms: Option<u64>,
 ) -> Result<Invocation, Invocation> {
     validate_status_selectors(run_id, request_id)?;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = wait_ms;
         Err(Invocation::error(
             "unsupported_platform",
-            "background runs are supported only on Linux",
+            "background runs are unsupported on this platform",
             3,
         ))
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        try_status_linux(run_id, request_id, wait_ms)
+        try_status_supported(run_id, request_id, wait_ms)
     }
 }
 
-#[cfg(target_os = "linux")]
-fn try_status_linux(
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn try_status_supported(
     run_id: Option<&str>,
     request_id: Option<&str>,
     wait_ms: Option<u64>,
@@ -74,7 +77,7 @@ fn validate_status_selectors(
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn refresh_status_from_host(control: &mut RunControl) {
     if is_terminal(control) {
         return;
@@ -88,7 +91,7 @@ fn refresh_status_from_host(control: &mut RunControl) {
     control.result = result;
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn wait_for_run(run_id: &str, wait_ms: Option<u64>) -> Invocation {
     let root = match store::state_root() {
         Ok(root) => root,
@@ -104,17 +107,17 @@ pub fn abort(run_id: &str, request_id: &str) -> Invocation {
     if let Err(error) = validate_control_ids(run_id, request_id) {
         return error;
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Invocation::error(
             "unsupported_platform",
-            "background runs are supported only on Linux",
+            "background runs are unsupported on this platform",
             3,
         )
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        abort_linux(run_id, request_id)
+        abort_supported(run_id, request_id)
     }
 }
 
@@ -123,23 +126,23 @@ pub fn resume(run_id: &str, request_id: &str, input: &Path) -> Invocation {
         Ok(disposition) => disposition,
         Err(error) => return error,
     };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = disposition;
         Invocation::error(
             "unsupported_platform",
-            "background runs are supported only on Linux",
+            "background runs are unsupported on this platform",
             3,
         )
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        resume_linux(run_id, request_id, disposition).unwrap_or_else(|error| error)
+        resume_supported(run_id, request_id, disposition).unwrap_or_else(|error| error)
     }
 }
 
-#[cfg(target_os = "linux")]
-fn resume_linux(
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn resume_supported(
     run_id: &str,
     request_id: &str,
     disposition: DispositionRequest,
@@ -152,7 +155,7 @@ fn resume_linux(
     )
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn resume_at_root(
     root: Result<PathBuf, Invocation>,
     run_id: &str,
@@ -194,7 +197,7 @@ fn validate_control_ids(run_id: &str, request_id: &str) -> Result<(), Invocation
         .map_err(|message| Invocation::error("invalid_request_id", message, 64))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn resume_digest(
     root: &Path,
     run_id: &str,
@@ -209,7 +212,7 @@ fn resume_digest(
     store::keyed_digest(root, store::DOMAIN_RESUME_REQUEST, &digest_bytes).map_err(internal_error)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 enum ResumeStart {
     Prior(Invocation),
     Send {
@@ -218,7 +221,7 @@ enum ResumeStart {
     },
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl ResumeStart {
     fn finish(
         self,
@@ -246,7 +249,7 @@ impl ResumeStart {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn prepare_resume(
     root: &Path,
     run_id: &str,
@@ -259,7 +262,7 @@ fn prepare_resume(
     prepare_new_resume(root, run_id, request_id, digest)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn prepare_prior_resume(
     root: &Path,
     run_id: &str,
@@ -283,7 +286,7 @@ fn prepare_prior_resume(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn prepare_new_resume(
     root: &Path,
     run_id: &str,
@@ -301,7 +304,7 @@ fn prepare_new_resume(
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn load_resume_control(root: &Path, run_id: &str) -> Result<RunControl, Invocation> {
     let control = store::read_run_control(root, run_id)
         .map_err(internal_error)?
@@ -309,7 +312,7 @@ fn load_resume_control(root: &Path, run_id: &str) -> Result<RunControl, Invocati
     Ok(control)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn reject_terminal_resume(control: &RunControl) -> Result<(), Invocation> {
     if is_terminal(control) {
         return Err(Invocation::error(
@@ -321,7 +324,7 @@ fn reject_terminal_resume(control: &RunControl) -> Result<(), Invocation> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn submit_resume(
     root: &Path,
     run_id: &str,
@@ -347,7 +350,7 @@ fn submit_resume(
     wait_for_resume_completion(root, request_id, &digest, control.lifetime_deadline_unix_ms)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn send_or_recover_resume(
     root: &Path,
     run_id: &str,
@@ -368,7 +371,7 @@ fn send_or_recover_resume(
     Err(error)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn completed_resume(
     root: &Path,
     request_id: &str,
@@ -386,7 +389,7 @@ fn completed_resume(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn record_resume_intent(
     root: &Path,
     run_id: &str,
@@ -404,7 +407,7 @@ fn record_resume_intent(
     store::record_control_intent(root, request_id, &intent).map_err(internal_error)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn wait_for_resume_completion(
     root: &Path,
     request_id: &str,
@@ -428,7 +431,7 @@ fn wait_for_resume_completion(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn send_resume(control: &RunControl, payload: &Value) -> Result<(), Invocation> {
     let response = request_value(&control.socket, payload).map_err(map_resume_send_error)?;
     response_identity_matches(&response, &control.run_id, &control.job_digest)
@@ -436,7 +439,7 @@ fn send_resume(control: &RunControl, payload: &Value) -> Result<(), Invocation> 
         .ok_or_else(|| internal_error("run host response does not match durable control".into()))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn map_resume_send_error(error: String) -> Invocation {
     match error.as_str() {
         "stale_escalation" => Invocation::error(
@@ -449,7 +452,7 @@ fn map_resume_send_error(error: String) -> Invocation {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn request_conflict() -> Invocation {
     Invocation::error(
         "request_conflict",
@@ -458,7 +461,7 @@ fn request_conflict() -> Invocation {
     )
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn classify_prior_resume(
     root: &Path,
     entry: store::RequestEntry,
@@ -472,7 +475,7 @@ fn classify_prior_resume(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn validate_prior_resume_record(
     root: &Path,
     record: store::RequestRecord,
@@ -484,7 +487,7 @@ fn validate_prior_resume_record(
     validate_prior_resume_result(record)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn validate_prior_resume_error(record: store::RequestRecord) -> Result<Invocation, Invocation> {
     let code = record
         .result
@@ -504,7 +507,7 @@ fn validate_prior_resume_error(record: store::RequestRecord) -> Result<Invocatio
         })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn resume_error_exit_code(code: &str) -> Option<u8> {
     match code {
         "internal" => Some(70),
@@ -513,7 +516,7 @@ fn resume_error_exit_code(code: &str) -> Option<u8> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn validate_prior_resume_result(record: store::RequestRecord) -> Result<Invocation, Invocation> {
     let (manifest, exit_code) = validate_resume_result_shape(&record)?;
     validate_terminal_resume_evidence(&record, manifest)?;
@@ -523,7 +526,7 @@ fn validate_prior_resume_result(record: store::RequestRecord) -> Result<Invocati
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn validate_resume_result_shape(record: &store::RequestRecord) -> Result<(&str, u8), Invocation> {
     let manifest = record
         .result
@@ -539,7 +542,7 @@ fn validate_resume_result_shape(record: &store::RequestRecord) -> Result<(&str, 
     Ok((manifest, exit_code))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn resume_result_identity_matches(record: &store::RequestRecord) -> bool {
     record.result.get("schema_version").and_then(Value::as_u64) == Some(1)
         && record.result.get("run_id").and_then(Value::as_str) == Some(record.run_id.as_str())
@@ -555,7 +558,7 @@ fn resume_result_identity_matches(record: &store::RequestRecord) -> bool {
             .is_some()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn validate_terminal_resume_evidence(
     record: &store::RequestRecord,
     manifest: &str,
@@ -585,7 +588,7 @@ fn validate_terminal_resume_evidence(
     .map_err(internal_error)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn persist_resume_error(
     root: &Path,
     run_id: &str,
@@ -604,7 +607,7 @@ fn persist_resume_error(
     store::finalize_control_request(root, request_id, &record).map_err(internal_error)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn resume_record(
     root: &Path,
     request_id: &str,
@@ -617,12 +620,12 @@ fn resume_record(
         .map_err(internal_error)
 }
 
-#[cfg(target_os = "linux")]
-fn abort_linux(run_id: &str, request_id: &str) -> Invocation {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn abort_supported(run_id: &str, request_id: &str) -> Invocation {
     abort_in_state(run_id, request_id).unwrap_or_else(|invocation| invocation)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn abort_in_state(run_id: &str, request_id: &str) -> Result<Invocation, Invocation> {
     let root = store::state_root().map_err(internal_error)?;
     let _request_lock = store::lock_request(&root, request_id).map_err(internal_error)?;
@@ -633,14 +636,14 @@ fn abort_in_state(run_id: &str, request_id: &str) -> Result<Invocation, Invocati
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn abort_digest(root: &Path, run_id: &str) -> Result<String, String> {
     serde_json::to_vec(&json!({"command":"abort","run_id":run_id}))
         .map_err(|error| error.to_string())
         .and_then(|bytes| store::keyed_digest(root, store::DOMAIN_ABORT_REQUEST, &bytes))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn prior_abort(
     root: &Path,
     request_id: &str,
@@ -651,7 +654,7 @@ fn prior_abort(
         .map_or(Ok(None), |entry| classify_prior_abort(entry, digest))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn classify_prior_abort(
     entry: store::RequestEntry,
     digest: &str,
@@ -667,7 +670,7 @@ fn classify_prior_abort(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn abort_new(
     root: &Path,
     run_id: &str,
@@ -684,7 +687,7 @@ fn abort_new(
     Ok(await_abort(root, run_id, request_id, digest))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn await_abort(root: &Path, run_id: &str, request_id: &str, digest: String) -> Invocation {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -695,7 +698,7 @@ fn await_abort(root: &Path, run_id: &str, request_id: &str, digest: String) -> I
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn poll_abort(
     root: &Path,
     run_id: &str,
@@ -714,12 +717,12 @@ fn poll_abort(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn is_terminal(control: &RunControl) -> bool {
     control.result.get("terminal").and_then(Value::as_bool) == Some(true)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn finalize_abort(
     root: &Path,
     request_id: &str,
@@ -741,7 +744,7 @@ fn finalize_abort(
         .unwrap_or_else(internal_error)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn resolve_run_id(
     root: &Path,
     run_id: Option<&str>,
@@ -755,7 +758,7 @@ fn resolve_run_id(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn wait_for_control(
     root: &Path,
     run_id: &str,
@@ -775,7 +778,7 @@ fn wait_for_control(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn poll_control(
     root: &Path,
     run_id: &str,
@@ -796,7 +799,7 @@ fn poll_control(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn read_control(root: &Path, run_id: &str) -> Result<Option<RunControl>, Invocation> {
     let control = store::read_run_control(root, run_id).map_err(internal_error)?;
     control
@@ -804,7 +807,7 @@ fn read_control(root: &Path, run_id: &str) -> Result<Option<RunControl>, Invocat
         .unwrap_or(Ok(None))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn reconcile_confirmed_host_loss(
     root: &Path,
     mut control: RunControl,
@@ -836,7 +839,7 @@ fn reconcile_confirmed_host_loss(
     Ok(control)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn socket_is_absent(path: &Path) -> Result<bool, String> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(false),
@@ -845,7 +848,7 @@ fn socket_is_absent(path: &Path) -> Result<bool, String> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn current_action(_root: &Path, control: &RunControl) -> &'static str {
     if store::unresolved_action(&control.evidence_root, &control.run_id).unwrap_or(true) {
         "uncertain"
@@ -854,17 +857,17 @@ fn current_action(_root: &Path, control: &RunControl) -> &'static str {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn is_immediate(wait_ms: Option<u64>) -> bool {
     wait_ms.is_none_or(|wait| wait == 0)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn deadline_elapsed(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|value| Instant::now() >= value)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn control_ready(
     control: &RunControl,
     initial_sequence: Option<u64>,
@@ -878,14 +881,14 @@ fn control_ready(
         || deadline_elapsed(deadline)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn validate_control(control: RunControl) -> Result<RunControl, Invocation> {
     (control.ipc_version == IPC_VERSION)
         .then_some(control)
         .ok_or_else(|| internal_error("run host IPC version is incompatible".into()))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_invocation(control: RunControl) -> Invocation {
     let exit_code = result_exit_code(&control.result).unwrap_or(EXIT_INTERNAL);
     Invocation {
@@ -894,23 +897,27 @@ fn run_invocation(control: RunControl) -> Invocation {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn request(socket: &Path, kind: &str) -> Result<Value, String> {
     request_value(socket, &json!({"kind":kind,"ipc_version":IPC_VERSION}))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn request_value(socket: &Path, payload: &Value) -> Result<Value, String> {
     use std::net::Shutdown;
     use std::os::unix::net::UnixStream;
 
+    #[cfg(test)]
+    let io_timeout = Duration::from_secs(5);
+    #[cfg(not(test))]
+    let io_timeout = Duration::from_millis(250);
     validate_socket(socket)?;
     let mut stream = UnixStream::connect(socket).map_err(|error| error.to_string())?;
     stream
-        .set_read_timeout(Some(Duration::from_millis(250)))
-        .and_then(|()| stream.set_write_timeout(Some(Duration::from_millis(250))))
+        .set_read_timeout(Some(io_timeout))
+        .and_then(|()| stream.set_write_timeout(Some(io_timeout)))
         .map_err(|error| error.to_string())?;
-    serde_json::to_writer(&mut stream, payload).map_err(|error| error.to_string())?;
+    crate::control_socket::write_frame(&mut stream, payload)?;
     stream
         .shutdown(Shutdown::Write)
         .map_err(|error| error.to_string())?;
@@ -927,7 +934,12 @@ pub(crate) fn request_host_deadline(control: &RunControl) -> Result<(), String> 
     request_effect_for_control(control, "deadline").map(|_| ())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(target_os = "macos")]
+pub(crate) fn request_host_deadline(control: &crate::store::RunControl) -> Result<(), String> {
+    platform::request_deadline(control, crate::process::IPC_VERSION)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn request_host_ready(
     socket: &Path,
     run_id: &str,
@@ -939,7 +951,7 @@ pub(crate) fn request_host_ready(
         .ok_or_else(|| "run host readiness response does not match the admitted run".into())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn request_for_control(control: &RunControl, kind: &str) -> Result<Value, String> {
     let response = request(&control.socket, kind)?;
     response_identity_matches(&response, &control.run_id, &control.job_digest)
@@ -947,7 +959,7 @@ fn request_for_control(control: &RunControl, kind: &str) -> Result<Value, String
         .ok_or_else(|| "run host response does not match durable control".into())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn request_effect_for_control(control: &RunControl, kind: &str) -> Result<Value, String> {
     let response = request_value(
         &control.socket,
@@ -963,13 +975,13 @@ fn request_effect_for_control(control: &RunControl, kind: &str) -> Result<Value,
         .ok_or_else(|| "run host response does not match durable control".into())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn response_identity_matches(response: &Value, run_id: &str, job_digest: &str) -> bool {
     response.get("run_id").and_then(Value::as_str) == Some(run_id)
         && response.get("job_digest").and_then(Value::as_str) == Some(job_digest)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn validate_socket(socket: &Path) -> Result<(), String> {
     use std::os::unix::fs::FileTypeExt;
     let metadata = std::fs::symlink_metadata(socket)
@@ -979,7 +991,7 @@ fn validate_socket(socket: &Path) -> Result<(), String> {
         .ok_or_else(|| "run host socket is not a private Unix socket".into())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn validate_response(response: Value) -> Result<Value, String> {
     let version_ok =
         response.get("ipc_version").and_then(Value::as_u64) == Some(u64::from(IPC_VERSION));
@@ -995,7 +1007,7 @@ fn validate_response(response: Value) -> Result<Value, String> {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
     use manuvra_contract::{
@@ -1146,7 +1158,8 @@ mod tests {
         )
         .unwrap();
         let redactor = crate::evidence::Redactor::for_job_with_provider_key(&job, None).unwrap();
-        let evidence_root = temporary.path().join("evidence");
+        let evidence_root =
+            crate::evidence::prepare_root(&temporary.path().join("evidence"), &redactor).unwrap();
         let published = crate::evidence::publish(
             &evidence_root,
             "original-request",
@@ -1168,7 +1181,10 @@ mod tests {
         .unwrap();
         let invocation = match validate_prior_resume_record(&state_root, record) {
             Ok(invocation) => invocation,
-            Err(_) => panic!("valid published resume evidence should be accepted"),
+            Err(error) => panic!(
+                "valid published resume evidence should be accepted: {}",
+                error.output
+            ),
         };
         assert_eq!(invocation.output["reason"]["code"], "missing_value");
     }
@@ -1195,7 +1211,9 @@ mod tests {
             .unwrap();
             let redactor =
                 crate::evidence::Redactor::for_job_with_provider_key(&job, None).unwrap();
-            let evidence_root = temporary.path().join("evidence");
+            let evidence_root =
+                crate::evidence::prepare_root(&temporary.path().join("evidence"), &redactor)
+                    .unwrap();
             let run_id = format!("r_corrupt_{corruption}");
             let published = crate::evidence::publish(
                 &evidence_root,
@@ -1440,9 +1458,7 @@ mod tests {
         let server_root = root.clone();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut bytes = Vec::new();
-            stream.read_to_end(&mut bytes).unwrap();
-            let request: Value = serde_json::from_slice(&bytes).unwrap();
+            let request: Value = crate::control_socket::read_frame(&mut stream).unwrap();
             assert_eq!(request["kind"], "resume");
             assert_eq!(request["request"]["escalation_id"], "e_1");
             assert_eq!(request["request_id"], "resume-request");
@@ -1455,6 +1471,7 @@ mod tests {
             )
             .unwrap();
             stream.flush().unwrap();
+            drop(stream);
             let result = json!({
                 "schema_version":1,
                 "request_id":"original",
@@ -1533,14 +1550,15 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn absent_socket_plus_obtainable_lock_publishes_host_loss_once() {
         let temporary = TempDir::new().unwrap();
         let root = temporary.path().join("state");
         let mut control = test_control(&root, false);
         control.host = Some(store::ProcessIdentity {
             pid: u32::MAX,
-            start_ticks: 1,
+            process_group: u32::MAX,
+            start_marker: 1,
             session_id: 1,
         });
         let lock = store::lock_run(&root, &control.run_id).unwrap();
@@ -1583,9 +1601,7 @@ mod tests {
             let listener = UnixListener::bind(&socket).unwrap();
             let server = std::thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut request = Vec::new();
-                stream.read_to_end(&mut request).unwrap();
-                let request: Value = serde_json::from_slice(&request).unwrap();
+                let request: Value = crate::control_socket::read_frame(&mut stream).unwrap();
                 assert_eq!(request["kind"], "ready");
                 serde_json::to_writer(
                     &mut stream,

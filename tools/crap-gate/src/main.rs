@@ -14,9 +14,7 @@ struct Args {
     #[arg(long)]
     rust_root: PathBuf,
     #[arg(long)]
-    exclude: Vec<String>,
-    #[arg(long)]
-    rust_coverage_ignore_regex: Option<String>,
+    platform_profiles: PathBuf,
     #[arg(long)]
     report_json: Option<PathBuf>,
     #[arg(long, default_value = "cargo-crap")]
@@ -36,8 +34,7 @@ impl From<Args> for GateConfig {
             repo_root: args.repo_root,
             rust_manifest: args.rust_manifest,
             rust_root: args.rust_root,
-            exclude: args.exclude,
-            rust_coverage_ignore_regex: args.rust_coverage_ignore_regex,
+            platform_profiles: args.platform_profiles,
             report_json: args.report_json,
             cargo_crap: args.cargo_crap,
             cargo_llvm_cov: args.cargo_llvm_cov,

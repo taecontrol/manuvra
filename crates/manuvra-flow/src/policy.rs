@@ -2,7 +2,7 @@ use crate::judgment::{Judgments, Operation, selected_operation};
 use crate::verification::DoneResult;
 use manuvra_chrome::{Element, Observation};
 use manuvra_contract::{DoneCondition, JobOptions, Step};
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -30,7 +30,7 @@ struct TargetIdentity {
     document_id: String,
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 #[derive(Serialize)]
 struct OfferedCandidate<'a> {
     id: &'a str,
@@ -43,7 +43,7 @@ struct OfferedCandidate<'a> {
 }
 
 impl Candidate {
-    #[cfg(any(target_os = "linux", test))]
+    #[cfg(any(target_os = "linux", target_os = "macos", test))]
     pub(crate) fn offered(&self) -> serde_json::Value {
         serde_json::to_value(OfferedCandidate {
             id: &self.id,
@@ -230,7 +230,7 @@ impl Policy {
         self.mint(observation, candidate)
     }
 
-    #[cfg(any(target_os = "linux", test))]
+    #[cfg(any(target_os = "linux", target_os = "macos", test))]
     pub(crate) fn caller_candidate(
         &self,
         observation: &Observation,
@@ -311,7 +311,7 @@ impl Policy {
         }
     }
 
-    #[cfg(any(target_os = "linux", test))]
+    #[cfg(any(target_os = "linux", target_os = "macos", test))]
     pub(crate) fn authorize_caller(
         &mut self,
         step: &Step,
@@ -333,7 +333,7 @@ impl Policy {
         }
     }
 
-    #[cfg(any(target_os = "linux", test))]
+    #[cfg(any(target_os = "linux", target_os = "macos", test))]
     pub(crate) fn release_unused(&mut self, permit: Box<Permit>) -> Candidate {
         let (candidate, _, replay_key, action_sequence) = permit.consume();
         debug_assert_eq!(action_sequence, u64::from(self.actions));
@@ -344,7 +344,7 @@ impl Policy {
         candidate
     }
 
-    #[cfg(any(target_os = "linux", test))]
+    #[cfg(any(target_os = "linux", target_os = "macos", test))]
     pub(crate) fn release_not_performed(&mut self, replay_key: &str) {
         if self.replay.remove(replay_key) {
             self.step_mutations = self.step_mutations.saturating_sub(1);
@@ -424,14 +424,14 @@ impl Policy {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn candidate_matches(observation: &Observation, target: &Element, candidate: &Candidate) -> bool {
     candidate_identity_matches(observation, target, candidate)
         && candidate_semantics_match(target, candidate)
         && candidate_operation_supported(target, candidate.operation)
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn candidate_identity_matches(
     observation: &Observation,
     target: &Element,
@@ -441,7 +441,7 @@ fn candidate_identity_matches(
         && Some(target.node_id) == candidate.target_identity.node_id
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn candidate_semantics_match(target: &Element, candidate: &Candidate) -> bool {
     Some(target.name.as_str()) == candidate.target_name.as_deref()
         && Some(target.role.as_str()) == candidate.target_role.as_deref()
@@ -449,7 +449,7 @@ fn candidate_semantics_match(target: &Element, candidate: &Candidate) -> bool {
         && target.input_type == candidate.target_input_type
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn candidate_operation_supported(target: &Element, operation: Operation) -> bool {
     let expected = match operation {
         Operation::Click => "CLICK",
