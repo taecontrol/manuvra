@@ -38,22 +38,28 @@ pub fn owned_group_has_member(identity: &ProcessIdentity) -> Result<bool, String
         // group may have been reused, so signalling the recorded group would be unsafe.
         return Ok(false);
     }
+    if !session_group_has_member(identity.process_group, identity.session_id)? {
+        return Ok(false);
+    }
+    process_exists(identity.pid).map(|exists| !exists)
+}
+
+fn session_group_has_member(process_group: u32, session_id: u32) -> Result<bool, String> {
     let entries =
         fs::read_dir("/proc").map_err(|error| format!("cannot inspect /proc: {error}"))?;
     for entry in entries {
         let entry = entry.map_err(|error| format!("cannot inspect /proc entry: {error}"))?;
-        let Some(pid) = entry
+        let pid = entry
             .file_name()
             .to_str()
-            .and_then(|name| name.parse().ok())
-        else {
-            continue;
-        };
-        if proc_identity_fields(pid).is_ok_and(|fields| {
-            fields.process_group == identity.process_group
-                && fields.session_id == identity.session_id
-        }) {
-            return process_exists(identity.pid).map(|exists| !exists);
+            .and_then(|name| name.parse().ok());
+        if pid
+            .and_then(|pid| proc_identity_fields(pid).ok())
+            .is_some_and(|fields| {
+                fields.process_group == process_group && fields.session_id == session_id
+            })
+        {
+            return Ok(true);
         }
     }
     Ok(false)
@@ -140,5 +146,27 @@ fn signal_group(process_group: u32, signal: i32) -> Result<bool, String> {
         Ok(false)
     } else {
         Err(format!("cannot signal owned process group: {error}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    #[test]
+    fn exited_group_without_members_is_not_owned_or_signalled() {
+        let mut child = Command::new("true")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let identity = process_identity(child.id()).unwrap();
+        assert_eq!(identity.pid, identity.process_group);
+        assert!(child.wait().unwrap().success());
+        assert!(!process_is_same(&identity));
+        assert!(!owned_group_has_member(&identity).unwrap());
+        assert!(!signal_process_group(&identity, libc::SIGKILL).unwrap());
     }
 }

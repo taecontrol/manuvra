@@ -184,3 +184,79 @@ fn process_group_exists(process_group: i32) -> bool {
 pub(super) fn ownership_for_test(_child: &Child, owns_process_group: bool) -> BrowserOwnership {
     BrowserOwnership { owns_process_group }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Stdio;
+
+    const GRACEFUL_TIMEOUT: Duration = Duration::from_secs(2);
+
+    fn spawn_reporting(
+        script: &str,
+        inherit_process_group: bool,
+    ) -> (Child, BrowserOwnership, i32) {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script]).stdout(Stdio::piped());
+        let (mut child, ownership) = spawn(command, inherit_process_group).unwrap();
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        (child, ownership, line.trim().parse().unwrap())
+    }
+
+    fn assert_gone(pid: i32) {
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "process {pid} survived");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
+    #[test]
+    fn owned_group_term_resistance_escalates_to_group_sigkill() {
+        // The descendant inherits the ignored SIGTERM at fork, so it resists before its PID is read.
+        let (mut child, mut ownership, descendant) =
+            spawn_reporting("trap '' TERM; sleep 30 & echo $!; wait", false);
+        let started = Instant::now();
+        terminate(&mut child, &mut ownership).unwrap();
+        assert!(started.elapsed() >= GRACEFUL_TIMEOUT);
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
+        assert_gone(descendant);
+    }
+
+    #[test]
+    fn owned_group_is_cleaned_after_its_leader_was_already_reaped() {
+        let (mut child, mut ownership, descendant) =
+            spawn_reporting("trap '' TERM; sleep 30 & echo $!; exit 0", false);
+        assert!(child.wait().unwrap().success());
+        let started = Instant::now();
+        terminate(&mut child, &mut ownership).unwrap();
+        assert!(started.elapsed() >= GRACEFUL_TIMEOUT);
+        assert_gone(descendant);
+    }
+
+    #[test]
+    fn inherited_group_term_resistance_kills_only_the_exact_child() {
+        let (mut child, mut ownership, pid) =
+            spawn_reporting("trap '' TERM; echo $$; exec sleep 30", true);
+        assert_eq!(pid, child_pid(&child).unwrap());
+        let started = Instant::now();
+        terminate(&mut child, &mut ownership).unwrap();
+        assert!(started.elapsed() >= GRACEFUL_TIMEOUT);
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
+        assert_gone(pid);
+    }
+
+    #[test]
+    fn inherited_group_child_that_honours_sigterm_is_reaped_without_escalation() {
+        let (mut child, mut ownership, _) = spawn_reporting("echo $$; exec sleep 30", true);
+        let started = Instant::now();
+        terminate(&mut child, &mut ownership).unwrap();
+        assert!(started.elapsed() < GRACEFUL_TIMEOUT);
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGTERM));
+    }
+}

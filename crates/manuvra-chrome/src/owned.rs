@@ -1175,7 +1175,7 @@ mod tests {
         command
             .args([
                 "-c",
-                "sh -c 'trap \"\" TERM; exec sleep 30' & echo $!; wait",
+                "sh -c 'trap \"\" TERM; echo $$; exec sleep 30' & wait",
             ])
             .process_group(0)
             .stdout(Stdio::piped());
