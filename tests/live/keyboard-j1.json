@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "target": {"kind": "browser", "url": "http://127.0.0.1:4352/"},
+  "context": {"journey": "Close the breakdown popover with Escape", "revision": "synthetic keyboard fixture", "environment": "fresh disposable fixture", "actor": "coding agent", "authority": "use keyboard in this fixture"},
+  "values": {},
+  "steps": [{"id": "close", "goal": "Press Escape to close the breakdown popover", "done_when": [{"dialog_closed": "Breakdown"}, {"focused": "Open breakdown", "role": "button"}]}],
+  "expectations": [],
+  "options": {"allowed_origins": ["http://127.0.0.1:4352"], "active_timeout_ms": 120000, "pause_timeout_ms": 120000, "lifetime_ms": 300000}
+}

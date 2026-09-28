@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "target": {"kind": "browser", "url": "http://127.0.0.1:4352/"},
+  "context": {"journey": "Tab to Save and activate once", "revision": "synthetic keyboard fixture", "environment": "fresh disposable fixture", "actor": "coding agent", "authority": "use keyboard in this fixture"},
+  "values": {},
+  "steps": [
+    {"id": "focus", "goal": "Press Tab to move focus to Save", "done_when": [{"focused": "Save", "role": "button"}]},
+    {"id": "activate", "goal": "Press Enter to activate Save", "done_when": [{"text_visible": "Activations: 1"}]}
+  ],
+  "expectations": [],
+  "options": {"allowed_origins": ["http://127.0.0.1:4352"], "active_timeout_ms": 120000, "pause_timeout_ms": 120000, "lifetime_ms": 300000}
+}
