@@ -1050,8 +1050,12 @@ impl<'a> HostedMachine<'a> {
             .extend(journal.entries()[journal_start..].iter().cloned());
         self.artifacts.caller_assisted = true;
         self.clear_pause();
-        if let Err(stop) = performed {
-            self.record_resumed_action_stop(stop, done, captured.raw);
+        match performed {
+            Err(actions::ActionStop::Reobserve(replay_key)) => {
+                self.policy.release_not_performed(&replay_key);
+            }
+            Err(stop) => self.record_resumed_action_stop(stop, done, captured.raw),
+            Ok(_) => {}
         }
     }
 
@@ -3988,6 +3992,68 @@ mod tests {
             "candidate_revalidation_failed"
         );
         assert!(journal.0.is_empty());
+    }
+
+    #[test]
+    fn caller_execute_rejected_at_dispatch_reobserves_and_releases_replay() {
+        let job = key_activation_job(true);
+        let redactor = Redactor::for_job(&job).unwrap();
+        let focused = key_observation("Save");
+        let browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::from([
+                observation_page(focused.clone()),
+                observation_page(focused.clone()),
+            ])),
+            fallback: focused.clone(),
+            dispatch_result: Some(Err(manuvra_chrome::PerformError::Rejected(
+                "focus_changed".into(),
+            ))),
+        };
+        let provider = KeyProvider("Enter", 1.0, AtomicUsize::new(0));
+        let mut machine = HostedMachine::new(&job, &redactor);
+        let mut journal = MemoryJournal::default();
+        let cancellation = manuvra_chrome::InputCancellation::default();
+        let control = RecordingHostedControl::default();
+        machine.drive(
+            &browser,
+            &provider,
+            &mut journal,
+            &cancellation,
+            None,
+            &control,
+        );
+        let candidate = machine
+            .artifacts
+            .pending
+            .as_ref()
+            .unwrap()
+            .candidate
+            .as_ref()
+            .unwrap()
+            .clone();
+        machine.apply_execute(
+            &candidate.id,
+            &browser,
+            &provider,
+            &mut journal,
+            &cancellation,
+        );
+        assert!(machine.artifacts.stop.is_none());
+        assert!(machine.artifacts.pending.is_none());
+        assert_eq!(
+            journal
+                .0
+                .iter()
+                .find(|event| event["event"] == "action_fact")
+                .unwrap()["fact"]["outcome"],
+            "not_performed"
+        );
+        assert_eq!(machine.policy.step_mutations(), 0);
+        let permit = machine
+            .policy
+            .authorize_caller(&job.steps[0], &focused, &candidate)
+            .unwrap();
+        machine.policy.release_unused(Box::new(permit));
     }
 
     #[test]

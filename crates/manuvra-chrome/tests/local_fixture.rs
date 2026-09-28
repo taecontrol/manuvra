@@ -532,6 +532,7 @@ fn production_snapshot_observes_indexed_dialog_and_body_focus() {
         ("button", true, "Save", "button", true),
         ("dialog", true, "Breakdown", "interactive", false),
         ("native-dialog", true, "Native breakdown", "dialog", false),
+        ("shadow", true, "Shadow details", "interactive", false),
         ("body", false, "", "", false),
     ] {
         browser
@@ -547,6 +548,60 @@ fn production_snapshot_observes_indexed_dialog_and_body_focus() {
             assert!(!anchor.name.contains("Descendant text"));
         }
     }
+    browser.close().unwrap();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn production_snapshot_resolves_dialog_across_open_shadow_root() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(FOCUS_FIXTURE);
+    let mut browser = OwnedBrowser::launch(BrowserConfig {
+        explicit_binary: None,
+        headless: true,
+        width: 1120,
+        height: 780,
+        inherit_process_group: false,
+    })
+    .unwrap();
+    browser
+        .navigate(&format!("{}?focus=shadow-dialog", server.url()))
+        .unwrap();
+    let observed = browser.observe().unwrap();
+    let anchor = observed.focus_anchor.as_ref().unwrap();
+    assert_eq!(anchor.name, "Confirm");
+    assert_eq!(anchor.in_dialog.as_deref(), Some("Checkout"));
+    let button = observed
+        .elements
+        .iter()
+        .find(|element| element.name == "Confirm")
+        .unwrap();
+    assert_eq!(button.in_dialog.as_deref(), Some("Checkout"));
+    assert_eq!(observed.focused, Some(button.index));
+    browser.close().unwrap();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn production_snapshot_uses_aria_name_inside_shadow_dialog() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(FOCUS_FIXTURE);
+    let mut browser = OwnedBrowser::launch(BrowserConfig {
+        explicit_binary: None,
+        headless: true,
+        width: 1120,
+        height: 780,
+        inherit_process_group: false,
+    })
+    .unwrap();
+    browser
+        .navigate(&format!("{}?focus=shadow-dialog-pin", server.url()))
+        .unwrap();
+    let observed = browser.observe().unwrap();
+    let anchor = observed.focus_anchor.as_ref().unwrap();
+    assert_eq!(anchor.name, "PIN");
+    assert_eq!(anchor.in_dialog.as_deref(), Some("Checkout"));
+    assert_eq!(observed.focused, None);
     browser.close().unwrap();
 }
 

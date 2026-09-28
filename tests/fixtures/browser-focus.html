@@ -7,9 +7,18 @@
   <div id="content" tabindex="-1">Descendant text must not name the focus</div>
 </section>
 <dialog id="native-dialog" open tabindex="-1" aria-label="Native breakdown"></dialog>
+<section id="shadow-host"></section>
+<dialog open aria-label="Checkout"><div id="dialog-shadow-host"></div></dialog>
 <script>
+  const shadow = document.querySelector('#shadow-host').attachShadow({mode: 'open'});
+  shadow.innerHTML = '<span id="shadow-label">Shadow details</span><div id="shadow-content" tabindex="-1" aria-labelledby="shadow-label"></div>';
+  const dialogShadow = document.querySelector('#dialog-shadow-host').attachShadow({mode: 'open'});
+  dialogShadow.innerHTML = '<button>Confirm</button><div id="pin" tabindex="-1" aria-label="PIN">Descendant text must not name the focus</div>';
   const target = new URL(location.href).searchParams.get('focus');
   if (target === 'button') document.querySelector('#save').focus();
   if (target === 'dialog') document.querySelector('#content').focus();
   if (target === 'native-dialog') document.querySelector('#native-dialog').focus();
+  if (target === 'shadow') shadow.querySelector('#shadow-content').focus();
+  if (target === 'shadow-dialog') dialogShadow.querySelector('button').focus();
+  if (target === 'shadow-dialog-pin') dialogShadow.querySelector('#pin').focus();
 </script>
