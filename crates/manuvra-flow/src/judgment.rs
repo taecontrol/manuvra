@@ -124,7 +124,7 @@ fn offer_hover(request: &mut Value, step: &Step, observation: &Observation, valu
         .map(|region| (hover_region_key(region), values.hover_region_view(region)))
         .collect();
     request["questions"]["operation"]["criteria"]["HOVER"] = json!(
-        "Move the pointer over a listed hover region. Use this when the control this step needs is not among the visible CLICK targets but appears in a hover region's reveals_on_hover, including for goals that say open, choose, or use."
+        "Move the pointer over a listed hover region. Use this when the control this step needs is not among the visible CLICK targets but appears in a hover region's reveals_on_hover, including for goals that say open, choose, or use. Never choose this when the control this step needs is already among the visible CLICK targets and is not in any hover region's reveals_on_hover."
     );
     request["questions"]["hover_target"] = json!({"type":"choice","instructions":{"premise":"The operation is HOVER","rules":"Assume the named operation was selected independently. Choose the hover region that reveals the control that directly advances only the current step.","goal":values.mask(&step.goal)},"criteria":criteria});
 }
@@ -542,7 +542,7 @@ mod tests {
         );
         assert_eq!(
             offered["questions"]["operation"]["criteria"]["HOVER"],
-            "Move the pointer over a listed hover region. Use this when the control this step needs is not among the visible CLICK targets but appears in a hover region's reveals_on_hover, including for goals that say open, choose, or use."
+            "Move the pointer over a listed hover region. Use this when the control this step needs is not among the visible CLICK targets but appears in a hover region's reveals_on_hover, including for goals that say open, choose, or use. Never choose this when the control this step needs is already among the visible CLICK targets and is not in any hover region's reveals_on_hover."
         );
         assert_eq!(
             offered["questions"]["hover_target"],
