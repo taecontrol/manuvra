@@ -55,6 +55,36 @@ preflight_matrix() {
   : "${TYPESAFE_API_KEY:?TYPESAFE_API_KEY is required for the money journey matrix}"
 }
 
+configure_runtime_root() {
+  case "$1" in
+    Linux)
+      [[ -n "${XDG_RUNTIME_DIR:-}" ]] || fail "XDG_RUNTIME_DIR is required for Linux background runs"
+      [[ -d "$XDG_RUNTIME_DIR" ]] || fail "XDG_RUNTIME_DIR is not a directory: $XDG_RUNTIME_DIR"
+      runtime_root=$XDG_RUNTIME_DIR
+      ;;
+    Darwin)
+      runtime_root=$TMPDIR
+      unset XDG_RUNTIME_DIR
+      ;;
+    *) fail "unsupported platform for the money journey matrix: $1" ;;
+  esac
+}
+
+self_test_runtime_root() {
+  local test_root
+  test_root=$(mktemp -d)
+  trap 'rm -rf -- "$test_root"' RETURN
+  (XDG_RUNTIME_DIR="$test_root"; configure_runtime_root Linux;
+    [[ "$runtime_root" == "$test_root" && "$XDG_RUNTIME_DIR" == "$test_root" ]])
+  if (unset XDG_RUNTIME_DIR; configure_runtime_root Linux) >/dev/null 2>&1; then
+    echo "Linux runtime preflight accepted missing XDG_RUNTIME_DIR" >&2
+    return 1
+  fi
+  (TMPDIR="$test_root" XDG_RUNTIME_DIR="$test_root/xdg";
+    configure_runtime_root Darwin;
+    [[ "$runtime_root" == "$test_root" && -z "${XDG_RUNTIME_DIR+x}" ]])
+}
+
 verification_facts_are_visible() {
   local payload=$1 journey=$2 expected_name=$3
   local run_root snapshot_relative snapshot
@@ -206,6 +236,11 @@ if [[ ${1:-} == --self-test ]]; then
   exit 0
 fi
 
+if [[ ${1:-} == --runtime-self-test ]]; then
+  self_test_runtime_root
+  exit 0
+fi
+
 if [[ ${1:-} == --fixture-self-test ]]; then
   money_dir=${MONEY_DIR:-}
   self_test_fixture
@@ -215,8 +250,7 @@ fi
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 money_dir=${MONEY_DIR:-}
 preflight_matrix
-runtime_root=$TMPDIR
-unset XDG_RUNTIME_DIR
+configure_runtime_root "$(uname -s)"
 
 stamp=$(date +%Y%m%d-%H%M%S)-$$
 matrix_root="$repo_root/.work/live/money-journey/$stamp"
@@ -237,8 +271,10 @@ jq -n \
   --arg rustc "$(rustc --version)" \
   --arg bash_version "$BASH_VERSION" \
   --arg tmpdir "$TMPDIR" \
+  --arg xdg_runtime_dir "${XDG_RUNTIME_DIR:-}" \
   '{binary:$binary,sha256:$sha256,source_revision:$source_revision,version:$version,
-    rustc:$rustc,bash_version:$bash_version,tmpdir:$tmpdir,xdg_runtime_dir:null}' \
+    rustc:$rustc,bash_version:$bash_version,tmpdir:$tmpdir,
+    xdg_runtime_dir:(if $xdg_runtime_dir == "" then null else $xdg_runtime_dir end)}' \
   >"$matrix_root/build.json"
 
 wait_checkpoint() {
