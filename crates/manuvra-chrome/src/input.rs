@@ -1,4 +1,6 @@
+use crate::FocusAnchor;
 use crate::transport::{CdpClient, CommandOutcome};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
 #[cfg(test)]
@@ -14,6 +16,21 @@ pub enum PreparedOperation {
     SetValue,
     ScrollUp,
     ScrollDown,
+    PressKey(Key),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Key {
+    Escape,
+    Tab,
+    #[serde(rename = "Shift+Tab")]
+    ShiftTab,
+}
+
+impl Key {
+    pub fn from_choice(choice: &str) -> Option<Self> {
+        serde_json::from_value(Value::String(choice.to_owned())).ok()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -26,6 +43,7 @@ pub struct PreparedInput {
     pub option_node_id: Option<u64>,
     pub combobox: bool,
     pub action_sequence: u64,
+    pub focus_anchor: Option<FocusAnchor>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -90,6 +108,11 @@ pub(crate) fn perform(
     client.set_action_sequence(input.action_sequence);
     let fence = client.cursor();
     let result = perform_input(client, &input, cancellation);
+    if matches!(input.operation, PreparedOperation::PressKey(_))
+        && client.snapshot_since(fence).overflowed
+    {
+        return Err(PerformError::Uncertain("CDP journal overflowed".into()));
+    }
     complete_with_journal(client, fence, result)
 }
 
@@ -98,6 +121,10 @@ fn perform_input(
     input: &PreparedInput,
     cancellation: &InputCancellation,
 ) -> Result<PerformFact, PerformError> {
+    if matches!(input.operation, PreparedOperation::PressKey(_)) {
+        revalidate_focus(client, input, cancellation)?;
+        return dispatch_prepared(client, input, &Value::Null, cancellation);
+    }
     let target = if matches!(
         input.operation,
         PreparedOperation::ScrollUp | PreparedOperation::ScrollDown
@@ -120,9 +147,82 @@ fn dispatch_prepared(
         PreparedOperation::TypeText => type_text(client, input, target, cancellation),
         PreparedOperation::Select => select(client, input, cancellation),
         PreparedOperation::SetValue => set_value(client, input, cancellation),
-        PreparedOperation::ScrollUp => scroll(client, -1, cancellation),
-        PreparedOperation::ScrollDown => scroll(client, 1, cancellation),
+        PreparedOperation::ScrollUp | PreparedOperation::ScrollDown => {
+            scroll(client, scroll_direction(input.operation), cancellation)
+        }
+        PreparedOperation::PressKey(key) => press_key(client, key, cancellation),
     }
+}
+
+fn scroll_direction(operation: PreparedOperation) -> i8 {
+    if operation == PreparedOperation::ScrollUp {
+        -1
+    } else {
+        1
+    }
+}
+
+fn revalidate_focus(
+    client: &CdpClient,
+    input: &PreparedInput,
+    cancellation: &InputCancellation,
+) -> Result<(), PerformError> {
+    let response = command(
+        client,
+        "Runtime.evaluate",
+        json!({"expression":include_str!("snapshot.js"),"returnByValue":true}),
+        cancellation,
+    )?;
+    let fresh: crate::Observation = serde_json::from_value(
+        response
+            .pointer("/result/value")
+            .cloned()
+            .unwrap_or(Value::Null),
+    )
+    .map_err(|_| PerformError::Rejected("focus observation unavailable".into()))?;
+    if fresh.document_id != input.document_id {
+        return Err(PerformError::Rejected("document_changed".into()));
+    }
+    if fresh.focus_anchor != input.focus_anchor {
+        return Err(PerformError::Rejected("focus_changed".into()));
+    }
+    Ok(())
+}
+
+fn press_key(
+    client: &CdpClient,
+    key: Key,
+    cancellation: &InputCancellation,
+) -> Result<PerformFact, PerformError> {
+    let (name, code, virtual_key, modifiers) = match key {
+        Key::Escape => ("Escape", "Escape", 27, 0),
+        Key::Tab => ("Tab", "Tab", 9, 0),
+        Key::ShiftTab => ("Tab", "Tab", 9, 8),
+    };
+    let params = |event_type| {
+        json!({
+            "type":event_type,"key":name,"code":code,
+            "windowsVirtualKeyCode":virtual_key,"nativeVirtualKeyCode":virtual_key,
+            "modifiers":modifiers
+        })
+    };
+    command(
+        client,
+        "Input.dispatchKeyEvent",
+        params("keyDown"),
+        cancellation,
+    )?;
+    command_after_suboperation(
+        client,
+        "Input.dispatchKeyEvent",
+        params("keyUp"),
+        cancellation,
+    )?;
+    Ok(PerformFact {
+        readback: None,
+        readback_matches: None,
+        suboperations: vec!["key_down".into(), "key_up".into()],
+    })
 }
 
 fn complete_with_journal(
@@ -562,7 +662,167 @@ mod tests {
             option_node_id: None,
             combobox: false,
             action_sequence: 1,
+            focus_anchor: None,
         }
+    }
+
+    fn focus_input(key: Key) -> PreparedInput {
+        PreparedInput {
+            document_id: "d".into(),
+            node_id: 0,
+            operation: PreparedOperation::PressKey(key),
+            text: None,
+            previous_text: None,
+            option_node_id: None,
+            combobox: false,
+            action_sequence: 1,
+            focus_anchor: Some(FocusAnchor {
+                node_id: 7,
+                context: "main".into(),
+                role: "button".into(),
+                name: "Open".into(),
+                in_dialog: None,
+                covered: true,
+                surface: None,
+            }),
+        }
+    }
+
+    fn reply_focus(chrome: &ScriptedChrome, anchor: Option<FocusAnchor>, document_id: &str) {
+        chrome.reply(
+            "Runtime.evaluate",
+            json!({"result":{"value":{
+                "document_id":document_id,"url":"http://example.test/","route":"/","title":"x",
+                "focused":null,"focus_anchor":anchor,"elements":[],
+                "viewport":{"width":10,"height":10,"scroll_x":0,"scroll_y":0,"document_height":10}
+            }}}),
+        );
+    }
+
+    #[test]
+    fn press_key_dispatches_exactly_two_events_with_shift_modifier() {
+        for key in [Key::Escape, Key::Tab, Key::ShiftTab] {
+            let chrome = ScriptedChrome::start();
+            let input = focus_input(key);
+            reply_focus(&chrome, input.focus_anchor.clone(), "d");
+            let fact =
+                perform(&chrome.connect_raw(), input, &InputCancellation::default()).unwrap();
+            assert_eq!(fact.suboperations, ["key_down", "key_up"]);
+            let events = chrome.received("Input.dispatchKeyEvent");
+            assert_eq!(events.len(), 2, "{key:?}");
+            assert_eq!(events[0]["params"]["type"], "keyDown");
+            assert_eq!(events[1]["params"]["type"], "keyUp");
+            assert_eq!(
+                events[0]["params"]["key"],
+                if key == Key::Escape { "Escape" } else { "Tab" }
+            );
+            assert_eq!(
+                events[0]["params"]["modifiers"],
+                if key == Key::ShiftTab { 8 } else { 0 }
+            );
+        }
+    }
+
+    #[test]
+    fn stale_focus_or_document_rejects_without_key_dispatch() {
+        let mut renamed = focus_input(Key::Tab).focus_anchor;
+        renamed.as_mut().unwrap().name = "Other".into();
+        for (anchor, document) in [
+            (None, "d"),
+            (renamed, "d"),
+            (focus_input(Key::Tab).focus_anchor, "changed"),
+        ] {
+            let chrome = ScriptedChrome::start();
+            reply_focus(&chrome, anchor, document);
+            let result = perform(
+                &chrome.connect_raw(),
+                focus_input(Key::Tab),
+                &InputCancellation::default(),
+            );
+            assert!(matches!(result, Err(PerformError::Rejected(_))));
+            assert!(chrome.received("Input.dispatchKeyEvent").is_empty());
+        }
+    }
+
+    #[test]
+    fn key_dispatch_failures_preserve_the_suboperation_boundary() {
+        let not_sent = ScriptedChrome::start();
+        let cancellation = InputCancellation::default();
+        cancellation.cancel();
+        assert!(matches!(
+            press_key(&not_sent.connect_raw(), Key::Tab, &cancellation),
+            Err(PerformError::NotPerformed(_))
+        ));
+        assert!(not_sent.received("Input.dispatchKeyEvent").is_empty());
+
+        let first = ScriptedChrome::start();
+        reply_focus(&first, focus_input(Key::Tab).focus_anchor, "d");
+        first.reject_on_call("Input.dispatchKeyEvent", 1);
+        assert!(matches!(
+            perform(
+                &first.connect_raw(),
+                focus_input(Key::Tab),
+                &InputCancellation::default()
+            ),
+            Err(PerformError::Rejected(_))
+        ));
+        assert_eq!(first.received("Input.dispatchKeyEvent").len(), 1);
+
+        let unknown = ScriptedChrome::start();
+        unknown.reply_invalid_json("Input.dispatchKeyEvent");
+        assert!(matches!(
+            press_key(
+                &unknown.connect_raw(),
+                Key::Tab,
+                &InputCancellation::default()
+            ),
+            Err(PerformError::Uncertain(_))
+        ));
+        assert_eq!(unknown.received("Input.dispatchKeyEvent").len(), 1);
+
+        let second = ScriptedChrome::start();
+        reply_focus(&second, focus_input(Key::Tab).focus_anchor, "d");
+        second.reject_on_call("Input.dispatchKeyEvent", 2);
+        assert!(matches!(
+            perform(
+                &second.connect_raw(),
+                focus_input(Key::Tab),
+                &InputCancellation::default()
+            ),
+            Err(PerformError::Uncertain(_))
+        ));
+        assert_eq!(second.received("Input.dispatchKeyEvent").len(), 2);
+
+        let cancelled = ScriptedChrome::start();
+        reply_focus(&cancelled, focus_input(Key::Tab).focus_anchor, "d");
+        let cancellation = InputCancellation::default();
+        cancellation.cancel_before_boundary(1);
+        assert!(matches!(
+            perform(
+                &cancelled.connect_raw(),
+                focus_input(Key::Tab),
+                &cancellation
+            ),
+            Err(PerformError::Uncertain(_))
+        ));
+        assert_eq!(cancelled.received("Input.dispatchKeyEvent").len(), 1);
+    }
+
+    #[test]
+    fn key_journal_overflow_is_uncertain() {
+        let chrome = ScriptedChrome::start();
+        for index in 0..10_100 {
+            chrome.push_event("DOM.attributeModified", json!({"nodeId":index}));
+        }
+        reply_focus(&chrome, focus_input(Key::Tab).focus_anchor, "d");
+        let result = perform(
+            &chrome.connect_raw(),
+            focus_input(Key::Tab),
+            &InputCancellation::default(),
+        );
+        assert!(
+            matches!(result, Err(PerformError::Uncertain(reason)) if reason == "CDP journal overflowed")
+        );
     }
 
     #[test]

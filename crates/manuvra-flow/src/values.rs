@@ -158,6 +158,7 @@ mod tests {
                 name: "raw-secret-742".into(),
                 in_dialog: None,
                 covered: true,
+                surface: None,
             }),
             visible_text: "raw-secret-742".into(),
             covered_text: "RAW SECRET".into(),

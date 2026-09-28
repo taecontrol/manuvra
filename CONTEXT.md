@@ -23,6 +23,9 @@ _Avoid_: session, execution, attempt
 The Chromium page under Manuvra's control.
 _Avoid_: tab, window, device
 
+**Focus anchor**:
+The observed identity of the target's active element: node, role, name, and containing dialog, or no focus when the document or body is active. A key candidate is bound to this anchor and revalidated immediately before dispatch.
+
 **Permit**:
 The single-use authorization minted only by the policy owner after done-first, gate, budget, replay-ledger and origin checks. No mutation is dispatched without one.
 _Avoid_: lock, lease, approval

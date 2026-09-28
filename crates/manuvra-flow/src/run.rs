@@ -2376,7 +2376,7 @@ impl StepDriver<'_> {
     ) -> Stop {
         match stop {
             policy::PolicyStop::Uncertain(reason) => {
-                let candidate = (reason == "operation_below_gate")
+                let candidate = (reason == "operation_below_gate" || reason == "key_below_gate")
                     .then(|| self.policy.caller_candidate(&captured.raw, judgments).ok())
                     .flatten();
                 escalate(
@@ -2556,7 +2556,7 @@ fn escalate(
         .to_string();
     let offered_candidate = pending.candidate.as_ref().map(policy::Candidate::offered);
     let candidates = offered_candidate.as_ref().map_or_else(
-        || judgments.map(|value|json!({"operation":value.operation,"click_target":value.click_target,"type_target":value.type_target,"select_target":value.select_target,"type_value":value.type_value})).unwrap_or_else(||json!({})),
+        || judgments.map(|value|json!({"operation":value.operation,"click_target":value.click_target,"type_target":value.type_target,"select_target":value.select_target,"type_value":value.type_value,"key":value.key})).unwrap_or_else(||json!({})),
         |candidate| json!([candidate]),
     );
     let latest=artifacts.observations.last().map(|(name,_,png)|json!({"snapshot":format!("observations/{name}.json"),"screenshot":png.as_ref().map(|_|format!("observations/{name}.png"))})).unwrap_or(Value::Null);
@@ -3368,6 +3368,43 @@ mod tests {
 
     struct TypeTextProvider(std::sync::atomic::AtomicUsize);
 
+    struct KeyProvider(&'static str, f64, AtomicUsize);
+
+    impl manuvra_jev::Evaluator for KeyProvider {
+        fn evaluate(
+            &self,
+            _request: &Value,
+            _deadline: Instant,
+        ) -> Result<manuvra_jev::Evaluation, manuvra_jev::JevError> {
+            self.2.fetch_add(1, Ordering::SeqCst);
+            let choice = |selected: &str, confidence| {
+                let mut probabilities = BTreeMap::from([(selected.into(), confidence)]);
+                if confidence < 1.0 {
+                    probabilities.insert("Escape".into(), 1.0 - confidence);
+                }
+                manuvra_jev::Answer::Choice {
+                    choice: selected.into(),
+                    probabilities,
+                    confidence,
+                }
+            };
+            Ok(manuvra_jev::Evaluation {
+                answers: BTreeMap::from([
+                    ("operation".into(), choice("PRESS_KEY", 1.0)),
+                    ("click_target".into(), choice("NO_CLICK_TARGET", 1.0)),
+                    ("type_target".into(), choice("NO_TYPE_TEXT_TARGET", 1.0)),
+                    ("select_target".into(), choice("NO_SELECT_TARGET", 1.0)),
+                    ("type_value".into(), choice("NONE_FITS", 1.0)),
+                    ("key".into(), choice(self.0, self.1)),
+                    ("step_done".into(), manuvra_jev::Answer::Noul { noul: 0.01 }),
+                ]),
+                usage: BTreeMap::new(),
+                request_id: Some("key-fixture".into()),
+                model: "jev-test".into(),
+            })
+        }
+    }
+
     impl manuvra_jev::Evaluator for TypeTextProvider {
         fn evaluate(
             &self,
@@ -3387,6 +3424,7 @@ mod tests {
                     ("type_target".into(), choice("1")),
                     ("select_target".into(), choice("NO_SELECT_TARGET")),
                     ("type_value".into(), choice("name")),
+                    ("key".into(), choice("Escape")),
                     ("step_done".into(), manuvra_jev::Answer::Noul { noul: 0.01 }),
                 ]),
                 usage: BTreeMap::new(),
@@ -3428,6 +3466,7 @@ mod tests {
                     ("type_target".into(), choice(first("type_target"))),
                     ("select_target".into(), choice(first("select_target"))),
                     ("type_value".into(), choice(first("type_value"))),
+                    ("key".into(), choice(first("key"))),
                     ("step_done".into(), manuvra_jev::Answer::Noul { noul: 0.01 }),
                 ]),
                 usage: BTreeMap::new(),
@@ -3458,6 +3497,7 @@ mod tests {
                     ("type_target".into(), choice("1", 1.0)),
                     ("select_target".into(), choice("NO_SELECT_TARGET", 1.0)),
                     ("type_value".into(), choice("name", 1.0)),
+                    ("key".into(), choice("Escape", 1.0)),
                     ("step_done".into(), manuvra_jev::Answer::Noul { noul: 0.01 }),
                 ]),
                 usage: BTreeMap::new(),
@@ -3488,6 +3528,7 @@ mod tests {
                     ("type_target".into(), choice("1")),
                     ("select_target".into(), choice("NO_SELECT_TARGET")),
                     ("type_value".into(), choice("name")),
+                    ("key".into(), choice("Escape")),
                     ("step_done".into(), manuvra_jev::Answer::Noul { noul }),
                 ]),
                 usage: BTreeMap::new(),
@@ -3775,6 +3816,183 @@ mod tests {
                 mask_count: 0,
             },
         })
+    }
+
+    fn key_observation(name: &str) -> Observation {
+        let mut observation = observed("");
+        observation.focus_anchor = Some(manuvra_chrome::FocusAnchor {
+            node_id: match name {
+                "First" => 1,
+                "Second" => 2,
+                _ => 3,
+            },
+            context: "main".into(),
+            role: "button".into(),
+            name: name.into(),
+            in_dialog: None,
+            covered: true,
+            surface: None,
+        });
+        observation
+    }
+
+    #[test]
+    fn autonomous_escape_records_anchor_and_observes_restored_focus() {
+        let job = Job::parse(serde_json::to_vec(&json!({
+            "schema_version":1,"target":{"kind":"browser","url":"http://127.0.0.1:4351/"},
+            "context":{"journey":"key","revision":"fixture","environment":"fake","actor":"synthetic","authority":"close"},
+            "steps":[{"id":"close","goal":"Press Escape to close the breakdown popover","done_when":[{"dialog_closed":"Breakdown"}],"mutation_limit":1}]
+        })).unwrap().as_slice()).unwrap();
+        let redactor = Redactor::for_job(&job).unwrap();
+        let mut before = key_observation("First");
+        before.dialogs.push("Breakdown".into());
+        before.focus_anchor.as_mut().unwrap().in_dialog = Some("Breakdown".into());
+        let after = key_observation("Open breakdown");
+        let browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::from([
+                observation_page(before),
+                observation_page(after.clone()),
+            ])),
+            fallback: after,
+            dispatch_result: Some(Ok(manuvra_chrome::PerformFact {
+                readback: None,
+                readback_matches: None,
+                suboperations: vec!["key_down".into(), "key_up".into()],
+            })),
+        };
+        let provider = KeyProvider("Escape", 1.0, AtomicUsize::new(0));
+        let mut journal = MemoryJournal::default();
+        let artifacts = drive_steps(
+            &job,
+            &redactor,
+            &browser,
+            &provider,
+            &mut journal,
+            &manuvra_chrome::InputCancellation::default(),
+            None,
+            None,
+        );
+        assert!(artifacts.stop.is_none());
+        assert_eq!(artifacts.verdicts[0].result, VerdictResult::Satisfied);
+        assert_eq!(provider.2.load(Ordering::SeqCst), 1);
+        let prepared = artifacts
+            .trace
+            .iter()
+            .find(|value| value["event"] == "action_prepared")
+            .unwrap();
+        let fact = artifacts
+            .trace
+            .iter()
+            .find(|value| value["event"] == "action_fact")
+            .unwrap();
+        assert_eq!(prepared["operation"], "PRESS_KEY");
+        assert_eq!(prepared["key"], "Escape");
+        assert_eq!(prepared["focus_anchor"]["name"], "First");
+        assert_eq!(fact["fact"]["key"], "Escape");
+        assert!(
+            artifacts
+                .observations
+                .iter()
+                .any(|(_, value, _)| value["focus_anchor"]["name"] == "Open breakdown")
+        );
+    }
+
+    #[test]
+    fn autonomous_tab_reaches_focus_condition_within_mutation_limit() {
+        let job = Job::parse(serde_json::to_vec(&json!({
+            "schema_version":1,"target":{"kind":"browser","url":"http://127.0.0.1:4351/"},
+            "context":{"journey":"key","revision":"fixture","environment":"fake","actor":"synthetic","authority":"focus"},
+            "steps":[{"id":"move","goal":"Press Tab to focus Third","done_when":[{"focused":"Third"}],"mutation_limit":2}]
+        })).unwrap().as_slice()).unwrap();
+        let redactor = Redactor::for_job(&job).unwrap();
+        let third = key_observation("Third");
+        let browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::from([
+                observation_page(key_observation("First")),
+                observation_page(key_observation("Second")),
+                observation_page(third.clone()),
+            ])),
+            fallback: third,
+            dispatch_result: Some(Ok(manuvra_chrome::PerformFact {
+                readback: None,
+                readback_matches: None,
+                suboperations: vec!["key_down".into(), "key_up".into()],
+            })),
+        };
+        let provider = KeyProvider("Tab", 1.0, AtomicUsize::new(0));
+        let mut journal = MemoryJournal::default();
+        let artifacts = drive_steps(
+            &job,
+            &redactor,
+            &browser,
+            &provider,
+            &mut journal,
+            &manuvra_chrome::InputCancellation::default(),
+            None,
+            None,
+        );
+        assert!(artifacts.stop.is_none());
+        assert_eq!(artifacts.verdicts[0].result, VerdictResult::Satisfied);
+        assert_eq!(provider.2.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            artifacts
+                .trace
+                .iter()
+                .filter(|value| value["event"] == "action_fact")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn low_key_confidence_offers_a_focus_bound_candidate_without_dispatch() {
+        let job = Job::parse(serde_json::to_vec(&json!({
+            "schema_version":1,"target":{"kind":"browser","url":"http://127.0.0.1:4351/"},
+            "context":{"journey":"key","revision":"fixture","environment":"fake","actor":"synthetic","authority":"focus"},
+            "steps":[{"id":"move","goal":"Press Tab to focus Second","done_when":[{"focused":"Second"}],"mutation_limit":1}]
+        })).unwrap().as_slice()).unwrap();
+        let redactor = Redactor::for_job(&job).unwrap();
+        let first = key_observation("First");
+        let browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::from([
+                observation_page(first.clone()),
+                observation_page(first.clone()),
+            ])),
+            fallback: first,
+            dispatch_result: None,
+        };
+        let provider = KeyProvider("Tab", 0.69, AtomicUsize::new(0));
+        let mut journal = MemoryJournal::default();
+        let artifacts = drive_steps(
+            &job,
+            &redactor,
+            &browser,
+            &provider,
+            &mut journal,
+            &manuvra_chrome::InputCancellation::default(),
+            None,
+            None,
+        );
+        assert_eq!(artifacts.stop.as_ref().unwrap().code, "key_below_gate");
+        assert_eq!(provider.2.load(Ordering::SeqCst), 2);
+        assert!(
+            artifacts
+                .trace
+                .iter()
+                .all(|event| event["event"] != "action_prepared")
+        );
+        assert_eq!(
+            artifacts.escalations[0].1["offered_candidate"]["operation"],
+            "PRESS_KEY"
+        );
+        assert_eq!(
+            artifacts.escalations[0].1["offered_candidate"]["key"],
+            "Tab"
+        );
+        assert_eq!(
+            artifacts.escalations[0].1["offered_candidate"]["target_name"],
+            "First"
+        );
     }
 
     fn job(wanted: &str) -> Job {
@@ -4348,6 +4566,7 @@ mod tests {
             name: "Wanted".into(),
             in_dialog: None,
             covered: true,
+            surface: None,
         });
         let exported = redacted_observation(&observation, &redactor).unwrap();
         let text = exported.to_string();
@@ -4947,6 +5166,11 @@ mod tests {
                 probabilities: BTreeMap::from([("name".into(), 1.0)]),
                 confidence: 1.0,
             },
+            key: judgment::ChoiceJudgment {
+                choice: "Escape".into(),
+                probabilities: BTreeMap::from([("Escape".into(), 1.0)]),
+                confidence: 1.0,
+            },
             step_done: 0.0,
             usage: BTreeMap::new(),
             request_id: None,
@@ -5025,6 +5249,7 @@ mod tests {
             type_target: choice("1"),
             select_target: choice("1"),
             type_value: choice("name"),
+            key: choice("Escape"),
             step_done: 0.0,
             usage: BTreeMap::new(),
             request_id: None,

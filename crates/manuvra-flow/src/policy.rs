@@ -1,6 +1,6 @@
 use crate::judgment::{Judgments, Operation, selected_operation};
 use crate::verification::DoneResult;
-use manuvra_chrome::{Element, Observation};
+use manuvra_chrome::{Element, FocusAnchor, FocusSurface, Key, Observation};
 use manuvra_contract::{DoneCondition, JobOptions, Step};
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 use serde::Serialize;
@@ -22,6 +22,8 @@ pub(crate) struct Candidate {
     pub(crate) target_dialog: Option<String>,
     pub(crate) target_input_type: Option<String>,
     pub(crate) value_name: Option<String>,
+    pub(crate) key: Option<Key>,
+    pub(crate) focus_anchor: Option<FocusAnchor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +42,8 @@ struct OfferedCandidate<'a> {
     target_dialog: Option<&'a str>,
     target_input_type: Option<&'a str>,
     value_name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key: Option<Key>,
 }
 
 impl Candidate {
@@ -53,6 +57,7 @@ impl Candidate {
             target_dialog: self.target_dialog.as_deref(),
             target_input_type: self.target_input_type.as_deref(),
             value_name: self.value_name.as_deref(),
+            key: self.key,
         })
         .expect("offered candidate is serializable")
     }
@@ -179,15 +184,10 @@ impl Policy {
         if let Some(next) = done_first(step, done, done_reobserved) {
             return next;
         }
-        if let Some(surface) = unsupported_surface(observation, judgments) {
-            return Next::Stop(PolicyStop::UnsupportedSurface(surface));
-        }
-        let Ok(operation) = selected_operation(judgments) else {
-            return Next::Stop(PolicyStop::Blocked("provider_invalid_response"));
+        let operation = match ready_operation(observation, judgments, operation_reobserved) {
+            Ok(operation) => operation,
+            Err(next) => return next,
         };
-        if let Some(next) = operation_gate(judgments, operation_reobserved) {
-            return next;
-        }
         self.decide_operation(step, observation, judgments, operation)
     }
 
@@ -207,7 +207,7 @@ impl Policy {
                 self.authorize_scroll(observation, operation)
             }
             Operation::Blocked => Next::Stop(PolicyStop::Blocked("operation_blocked")),
-            Operation::Click | Operation::TypeText | Operation::Select => {
+            Operation::Click | Operation::TypeText | Operation::Select | Operation::PressKey => {
                 self.authorize(step, observation, judgments, operation)
             }
         }
@@ -239,7 +239,7 @@ impl Policy {
         let operation = selected_operation(judgments)
             .map_err(|_| PolicyStop::Blocked("provider_invalid_response"))?;
         match operation {
-            Operation::Click | Operation::TypeText | Operation::Select => {
+            Operation::Click | Operation::TypeText | Operation::Select | Operation::PressKey => {
                 self.candidate(observation, judgments, operation)
             }
             _ => Err(PolicyStop::Blocked("provider_invalid_response")),
@@ -252,6 +252,11 @@ impl Policy {
         judgments: &Judgments,
         operation: Operation,
     ) -> Result<Candidate, PolicyStop> {
+        if operation == Operation::PressKey {
+            let key = Key::from_choice(&judgments.key.choice)
+                .ok_or(PolicyStop::Blocked("provider_invalid_response"))?;
+            return Ok(self.key_candidate(observation, key));
+        }
         let target = selected_target(observation, judgments, operation)?;
         let value_name = selected_value(judgments, operation)?;
         Ok(Candidate {
@@ -267,7 +272,29 @@ impl Policy {
             target_dialog: target.in_dialog.clone(),
             target_input_type: target.input_type.clone(),
             value_name,
+            key: None,
+            focus_anchor: None,
         })
+    }
+
+    fn key_candidate(&self, observation: &Observation, key: Key) -> Candidate {
+        let anchor = observation.focus_anchor.clone();
+        Candidate {
+            id: format!("c_{}", self.actions + 1),
+            operation: Operation::PressKey,
+            target_index: None,
+            target_name: anchor.as_ref().map(|anchor| anchor.name.clone()),
+            target_identity: TargetIdentity {
+                node_id: anchor.as_ref().map(|anchor| anchor.node_id),
+                document_id: observation.document_id.clone(),
+            },
+            target_role: anchor.as_ref().map(|anchor| anchor.role.clone()),
+            target_dialog: anchor.as_ref().and_then(|anchor| anchor.in_dialog.clone()),
+            target_input_type: None,
+            value_name: None,
+            key: Some(key),
+            focus_anchor: anchor,
+        }
     }
 
     fn authorize_scroll(&mut self, observation: &Observation, operation: Operation) -> Next {
@@ -298,6 +325,8 @@ impl Policy {
             target_dialog: None,
             target_input_type: None,
             value_name: None,
+            key: None,
+            focus_anchor: None,
         };
         self.mint(observation, candidate)
     }
@@ -367,6 +396,8 @@ impl Policy {
             .and_then(|index| observation.elements.iter().find(|item| item.index == index))
         {
             replay_key(observation, target, &candidate)
+        } else if candidate.operation == Operation::PressKey {
+            key_replay_key(observation, &candidate)
         } else if matches!(
             candidate.operation,
             Operation::ScrollUp | Operation::ScrollDown
@@ -470,6 +501,52 @@ fn operation_gate(judgments: &Judgments, already_reobserved: bool) -> Option<Nex
     })
 }
 
+fn ready_operation(
+    observation: &Observation,
+    judgments: &Judgments,
+    already_reobserved: bool,
+) -> Result<Operation, Next> {
+    let operation = selected_operation(judgments).ok();
+    if operation != Some(Operation::PressKey)
+        && let Some(surface) = unsupported_surface(observation, judgments)
+    {
+        return Err(Next::Stop(PolicyStop::UnsupportedSurface(surface)));
+    }
+    let operation =
+        operation.ok_or(Next::Stop(PolicyStop::Blocked("provider_invalid_response")))?;
+    if let Some(next) = operation_gate(judgments, already_reobserved) {
+        return Err(next);
+    }
+    if operation == Operation::PressKey
+        && let Some(next) = key_preflight(observation, judgments, already_reobserved)
+    {
+        return Err(next);
+    }
+    Ok(operation)
+}
+
+fn key_preflight(
+    observation: &Observation,
+    judgments: &Judgments,
+    already_reobserved: bool,
+) -> Option<Next> {
+    if Key::from_choice(&judgments.key.choice).is_none() {
+        return Some(Next::Stop(PolicyStop::Blocked("provider_invalid_response")));
+    }
+    if let Some(next) = key_gate(judgments, already_reobserved) {
+        return Some(next);
+    }
+    key_surface(observation).map(|surface| Next::Stop(PolicyStop::UnsupportedSurface(surface)))
+}
+
+fn key_gate(judgments: &Judgments, already_reobserved: bool) -> Option<Next> {
+    (judgments.key.confidence < GATE).then_some(if already_reobserved {
+        Next::Stop(PolicyStop::Uncertain("key_below_gate"))
+    } else {
+        Next::ReobserveOperation
+    })
+}
+
 pub fn done_first(step: &Step, done: DoneResult, already_reobserved: bool) -> Option<Next> {
     match done {
         DoneResult::Satisfied => Some(Next::Complete),
@@ -547,6 +624,18 @@ fn scroll_replay_key(observation: &Observation, operation: Operation) -> String 
     hex::encode(Sha256::digest(stable.to_string().as_bytes()))
 }
 
+fn key_replay_key(observation: &Observation, candidate: &Candidate) -> String {
+    let anchor = candidate.focus_anchor.as_ref();
+    let stable = serde_json::json!({
+        "operation":candidate.operation,"key":candidate.key,
+        "target_role":anchor.map(|anchor|anchor.role.as_str()),
+        "target_name":anchor.map(|anchor|anchor.name.to_ascii_lowercase()),
+        "dialog":anchor.and_then(|anchor|anchor.in_dialog.as_deref()),
+        "no_focus":anchor.is_none(),"route":observation.route,
+    });
+    hex::encode(Sha256::digest(stable.to_string().as_bytes()))
+}
+
 fn unsupported_surface(observation: &Observation, judgments: &Judgments) -> Option<&'static str> {
     let selected_target = match selected_operation(judgments).ok() {
         Some(Operation::Click) => parse_target(observation, &judgments.click_target.choice),
@@ -561,6 +650,17 @@ fn unsupported_surface(observation: &Observation, judgments: &Judgments) -> Opti
         .is_none()
         .then(|| named_surface_gap(&observation.coverage.gaps))
         .flatten()
+}
+
+fn key_surface(observation: &Observation) -> Option<&'static str> {
+    let anchor = observation.focus_anchor.as_ref()?;
+    match anchor.surface {
+        Some(FocusSurface::Canvas) => Some("canvas_control"),
+        Some(FocusSurface::CrossOriginFrame) => Some("cross_origin_frame"),
+        Some(FocusSurface::ClosedShadowRoot) => Some("closed_shadow_root"),
+        None if !anchor.covered => Some("closed_shadow_root"),
+        None => None,
+    }
 }
 
 fn named_surface_gap(gaps: &[String]) -> Option<&'static str> {
@@ -578,7 +678,7 @@ fn named_surface_gap(gaps: &[String]) -> Option<&'static str> {
 mod tests {
     use super::*;
     use crate::judgment::ChoiceJudgment;
-    use manuvra_chrome::{Coverage, Rect, ViewportState};
+    use manuvra_chrome::{Coverage, FocusAnchor, Rect, ViewportState};
     use manuvra_contract::{DoneCondition, JobOptions};
     use serde_json::Value;
     use std::collections::BTreeMap;
@@ -641,12 +741,183 @@ mod tests {
             type_target: choice("1"),
             select_target: choice("1"),
             type_value: choice("name"),
+            key: choice("Escape"),
             step_done: 0.5,
             usage: BTreeMap::new(),
             request_id: None,
             model: "jev".into(),
             request: Value::Null,
         }
+    }
+
+    fn focused(name: &str) -> Observation {
+        let mut observed = observation("CLICK", "button");
+        observed.focus_anchor = Some(FocusAnchor {
+            node_id: 9,
+            context: "main".into(),
+            role: "button".into(),
+            name: name.into(),
+            in_dialog: None,
+            covered: true,
+            surface: None,
+        });
+        observed
+    }
+
+    #[test]
+    fn key_gate_reobserves_once_and_does_not_gate_other_operations() {
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        let mut key = judgments("PRESS_KEY");
+        key.key.confidence = 0.69;
+        assert!(matches!(
+            decide_not_done(&mut policy, &step(), &focused("A"), &key, false),
+            Next::ReobserveOperation
+        ));
+        assert!(matches!(
+            decide_not_done(&mut policy, &step(), &focused("A"), &key, true),
+            Next::Stop(PolicyStop::Uncertain("key_below_gate"))
+        ));
+        let candidate = policy.caller_candidate(&focused("A"), &key).unwrap();
+        assert_eq!(candidate.key, Some(Key::Escape));
+        assert!(matches!(
+            policy.authorize_caller(&step(), &focused("A"), &candidate),
+            Err(PolicyStop::Uncertain("candidate_revalidation_failed"))
+        ));
+        key.operation.confidence = 0.69;
+        assert!(matches!(
+            decide_not_done(&mut policy, &step(), &focused("A"), &key, true),
+            Next::Stop(PolicyStop::Uncertain("operation_below_gate"))
+        ));
+        key.operation.confidence = 1.0;
+        key.key.choice = "Control+W".into();
+        assert!(matches!(
+            decide_not_done(&mut policy, &step(), &focused("A"), &key, false),
+            Next::Stop(PolicyStop::Blocked("provider_invalid_response"))
+        ));
+        assert!(policy.caller_candidate(&focused("A"), &key).is_err());
+        for operation in ["CLICK", "TYPE_TEXT"] {
+            let mut other = judgments(operation);
+            other.key.confidence = 0.01;
+            other.key.choice = "Control+W".into();
+            let observed = observation(
+                operation,
+                if operation == "CLICK" {
+                    "button"
+                } else {
+                    "textbox"
+                },
+            );
+            assert!(matches!(
+                decide_not_done(
+                    &mut Policy::new(&JobOptions::default(), "http://example.test/"),
+                    &step(),
+                    &observed,
+                    &other,
+                    false
+                ),
+                Next::Mutate(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn key_permits_consume_budget_and_replay_tracks_focus_semantics() {
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        let key = judgments("PRESS_KEY");
+        let first = decide_not_done(&mut policy, &step(), &focused("A"), &key, false);
+        let Next::Mutate(permit) = first else {
+            panic!("first key permit")
+        };
+        let (_, _, replay_key, sequence) = permit.consume();
+        assert_eq!(sequence, 1);
+        assert_eq!(policy.step_mutations(), 1);
+        assert!(matches!(
+            decide_not_done(&mut policy, &step(), &focused("A"), &key, false),
+            Next::Stop(PolicyStop::Uncertain("replay_forbidden"))
+        ));
+        assert!(matches!(
+            decide_not_done(&mut policy, &step(), &focused("B"), &key, false),
+            Next::Mutate(_)
+        ));
+        assert_eq!(policy.step_mutations(), 2);
+        assert!(matches!(
+            decide_not_done(&mut policy, &step(), &focused("C"), &key, false),
+            Next::Stop(PolicyStop::Blocked("budget_exhausted"))
+        ));
+        policy.release_not_performed(&replay_key);
+        assert_eq!(policy.step_mutations(), 1);
+        assert!(matches!(
+            decide_not_done(&mut policy, &step(), &focused("A"), &key, false),
+            Next::Mutate(_)
+        ));
+        let options = JobOptions {
+            max_actions: Some(1),
+            ..JobOptions::default()
+        };
+        let mut bounded = Policy::new(&options, "http://example.test/");
+        assert!(matches!(
+            decide_not_done(&mut bounded, &step(), &focused("A"), &key, false),
+            Next::Mutate(_)
+        ));
+        assert!(matches!(
+            decide_not_done(&mut bounded, &step(), &focused("B"), &key, false),
+            Next::Stop(PolicyStop::Blocked("budget_exhausted"))
+        ));
+    }
+
+    #[test]
+    fn key_surface_checks_only_the_focus_anchor() {
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        let mut observed = focused("A");
+        observed.coverage.gaps.push("canvas".into());
+        assert!(matches!(
+            decide_not_done(
+                &mut policy,
+                &step(),
+                &observed,
+                &judgments("PRESS_KEY"),
+                false
+            ),
+            Next::Mutate(_)
+        ));
+        let mut unsafe_focus = focused("frame");
+        unsafe_focus.focus_anchor.as_mut().unwrap().role = "iframe".into();
+        unsafe_focus.focus_anchor.as_mut().unwrap().covered = false;
+        unsafe_focus.focus_anchor.as_mut().unwrap().surface = Some(FocusSurface::CrossOriginFrame);
+        unsafe_focus.coverage.gaps.push("cross_origin_frame".into());
+        assert!(matches!(
+            decide_not_done(
+                &mut policy,
+                &step(),
+                &unsafe_focus,
+                &judgments("PRESS_KEY"),
+                false
+            ),
+            Next::Stop(PolicyStop::UnsupportedSurface("cross_origin_frame"))
+        ));
+        for (surface, reason) in [
+            (FocusSurface::Canvas, "canvas_control"),
+            (FocusSurface::ClosedShadowRoot, "closed_shadow_root"),
+        ] {
+            let mut anchor = focused("A");
+            anchor.focus_anchor.as_mut().unwrap().surface = Some(surface);
+            assert!(matches!(
+                decide_not_done(&mut policy, &step(), &anchor, &judgments("PRESS_KEY"), false),
+                Next::Stop(PolicyStop::UnsupportedSurface(actual)) if actual == reason
+            ));
+        }
+        let mut no_focus = focused("A");
+        no_focus.focus_anchor = None;
+        assert!(matches!(
+            decide_not_done(
+                &mut Policy::new(&JobOptions::default(), "http://example.test/"),
+                &step(),
+                &no_focus,
+                &judgments("PRESS_KEY"),
+                false
+            ),
+            Next::Mutate(_)
+        ));
     }
     fn step() -> Step {
         Step {
@@ -798,7 +1069,7 @@ mod tests {
     }
 
     #[test]
-    fn only_operation_confidence_is_gated() {
+    fn operation_and_key_confidence_are_gated_without_gating_targets_or_values() {
         let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
         let mut click = judgments("CLICK");
         click.type_target.confidence = 0.01;

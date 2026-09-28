@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 const FIXTURE: &str = include_str!("../../../tests/fixtures/browser-adversarial.html");
 const INPUT_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-input-strategies.html");
 const FOCUS_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-focus.html");
+const KEYBOARD_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-keyboard-focus.html");
 static REAL_BROWSER: Mutex<()> = Mutex::new(());
 
 #[cfg(target_os = "macos")]
@@ -192,7 +193,118 @@ fn prepared(
         option_node_id,
         combobox: element.role == "combobox" && operation == PreparedOperation::TypeText,
         action_sequence: sequence,
+        focus_anchor: None,
     }
+}
+
+fn prepared_key(
+    observation: &Observation,
+    key: manuvra_chrome::Key,
+    sequence: u64,
+) -> PreparedInput {
+    PreparedInput {
+        document_id: observation.document_id.clone(),
+        node_id: 0,
+        operation: PreparedOperation::PressKey(key),
+        text: None,
+        previous_text: None,
+        option_node_id: None,
+        combobox: false,
+        action_sequence: sequence,
+        focus_anchor: observation.focus_anchor.clone(),
+    }
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn keyboard_popover_traps_tab_and_escape_restores_trigger_focus() {
+    use manuvra_chrome::Key;
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(KEYBOARD_FIXTURE);
+    let mut browser = OwnedBrowser::launch(BrowserConfig {
+        explicit_binary: None,
+        headless: true,
+        width: 1120,
+        height: 780,
+        inherit_process_group: false,
+    })
+    .unwrap();
+    #[cfg(target_os = "macos")]
+    let lifecycle = BrowserLifecycle::observe(&browser);
+    browser.navigate(&server.url()).unwrap();
+    let mut observed = browser.observe().unwrap();
+    assert!(observed.focus_anchor.is_none());
+    browser
+        .perform(
+            prepared_key(&observed, Key::Tab, 1),
+            &InputCancellation::default(),
+        )
+        .unwrap();
+    observed = browser.observe().unwrap();
+    assert_eq!(observed.focus_anchor.as_ref().unwrap().name, "Before");
+    for (key, expected) in [
+        (Key::Tab, "Open breakdown"),
+        (Key::ShiftTab, "Before"),
+        (Key::Tab, "Open breakdown"),
+    ] {
+        browser
+            .perform(
+                prepared_key(&observed, key, 2),
+                &InputCancellation::default(),
+            )
+            .unwrap();
+        observed = browser.observe().unwrap();
+        assert_eq!(observed.focus_anchor.as_ref().unwrap().name, expected);
+    }
+    browser
+        .perform(
+            prepared(
+                &observed,
+                "Open breakdown",
+                PreparedOperation::Click,
+                None,
+                None,
+                3,
+            ),
+            &InputCancellation::default(),
+        )
+        .unwrap();
+    observed = browser.observe().unwrap();
+    assert_eq!(observed.focus_anchor.as_ref().unwrap().name, "First item");
+    assert_eq!(
+        observed.focus_anchor.as_ref().unwrap().in_dialog.as_deref(),
+        Some("Breakdown")
+    );
+    for (key, expected) in [
+        (Key::ShiftTab, "Last item"),
+        (Key::Tab, "First item"),
+        (Key::Tab, "Last item"),
+        (Key::Tab, "First item"),
+    ] {
+        browser
+            .perform(
+                prepared_key(&observed, key, 4),
+                &InputCancellation::default(),
+            )
+            .unwrap();
+        observed = browser.observe().unwrap();
+        assert_eq!(observed.focus_anchor.as_ref().unwrap().name, expected);
+    }
+    browser
+        .perform(
+            prepared_key(&observed, Key::Escape, 5),
+            &InputCancellation::default(),
+        )
+        .unwrap();
+    observed = browser.observe().unwrap();
+    assert!(observed.dialogs.is_empty());
+    assert_eq!(
+        observed.focus_anchor.as_ref().unwrap().name,
+        "Open breakdown"
+    );
+    browser.close().unwrap();
+    #[cfg(target_os = "macos")]
+    lifecycle.assert_cleaned();
 }
 
 #[test]
@@ -542,6 +654,7 @@ fn production_input_strategies_cover_native_and_bounded_fallback_paths() {
             option_node_id: None,
             combobox: false,
             action_sequence: sequence,
+            focus_anchor: None,
         };
         browser.perform(scroll, &cancellation).unwrap();
         sequence += 1;

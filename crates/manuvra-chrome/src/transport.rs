@@ -829,8 +829,10 @@ pub(crate) mod test_support {
 
     #[derive(Default)]
     struct Script {
+        received: Vec<Value>,
         replies: HashMap<String, Vec<Value>>,
         reject: HashSet<String>,
+        reject_on_call: HashMap<String, usize>,
         pending_events: VecDeque<Value>,
         ping_once: bool,
         invalid_json_methods: HashSet<String>,
@@ -886,12 +888,31 @@ pub(crate) mod test_support {
                 .push(result);
         }
 
+        pub fn received(&self, method: &str) -> Vec<Value> {
+            self.script
+                .lock()
+                .expect("scripted Chrome")
+                .received
+                .iter()
+                .filter(|value| value["method"] == method)
+                .cloned()
+                .collect()
+        }
+
         pub fn reject(&self, method: &str) {
             self.script
                 .lock()
                 .expect("scripted Chrome")
                 .reject
                 .insert(method.to_owned());
+        }
+
+        pub fn reject_on_call(&self, method: &str, call: usize) {
+            self.script
+                .lock()
+                .expect("scripted Chrome")
+                .reject_on_call
+                .insert(method.to_owned(), call);
         }
 
         pub fn push_event(&self, method: &str, params: Value) {
@@ -1118,8 +1139,16 @@ pub(crate) mod test_support {
             .to_owned();
         let (reply, invalid) = {
             let mut script = script.lock().expect("scripted Chrome");
+            script.received.push(value.clone());
             let invalid = script.invalid_json_methods.contains(&method);
-            let reply = if script.reject.contains(&method) {
+            let call = script
+                .received
+                .iter()
+                .filter(|item| item["method"] == method)
+                .count();
+            let reply = if script.reject.contains(&method)
+                || script.reject_on_call.get(&method) == Some(&call)
+            {
                 json!({"id": id, "error": {"message": "rejected"}})
             } else {
                 let result = script

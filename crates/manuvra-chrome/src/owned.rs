@@ -1014,6 +1014,7 @@ mod tests {
                     option_node_id: None,
                     combobox: false,
                     action_sequence: 1,
+                    focus_anchor: None,
                 },
                 &InputCancellation::default(),
             )

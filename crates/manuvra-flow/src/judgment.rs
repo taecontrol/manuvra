@@ -13,6 +13,7 @@ pub enum Operation {
     Click,
     TypeText,
     Select,
+    PressKey,
     ScrollUp,
     ScrollDown,
     Wait,
@@ -33,6 +34,7 @@ pub struct Judgments {
     pub type_target: ChoiceJudgment,
     pub select_target: ChoiceJudgment,
     pub type_value: ChoiceJudgment,
+    pub key: ChoiceJudgment,
     pub step_done: f64,
     pub usage: BTreeMap<String, u64>,
     pub request_id: Option<String>,
@@ -84,6 +86,7 @@ pub fn request(
                 "CLICK":"Click a visible control or visible option that directly advances this step. Use this for goals that say open, choose, confirm, use, or submit.",
                 "TYPE_TEXT":"Replace a visible editable field only when this step's goal explicitly asks to fill, enter, or type a caller-provided value and code facts show the field is not already equal to that value. Never choose this for an open, choose, confirm, use, or submit goal.",
                 "SELECT":"Choose a caller-provided value from a visible native select whose observed options contain it.",
+                "PRESS_KEY":"Press one supported key at the currently focused element when the goal explicitly asks for a key press. Do not choose a click instead of a requested key press.",
                 "SCROLL_UP":"Scroll upward only when the needed target is outside the visible viewport above.",
                 "SCROLL_DOWN":"Scroll downward only when the needed target is outside the visible viewport below.",
                 "WAIT":"Wait briefly only because the page is visibly still updating.",
@@ -92,7 +95,8 @@ pub fn request(
             "click_target":{"type":"choice","instructions":{"premise":"The operation is CLICK","rules":target_rules,"goal":values.mask(&step.goal)},"criteria":target_criteria(observation,"CLICK",values)},
             "type_target":{"type":"choice","instructions":{"premise":"The operation is TYPE_TEXT","rules":target_rules,"goal":values.mask(&step.goal)},"criteria":target_criteria(observation,"TYPE_TEXT",values)},
             "select_target":{"type":"choice","instructions":{"premise":"The operation is SELECT","rules":target_rules,"goal":values.mask(&step.goal)},"criteria":target_criteria(observation,"SELECT",values)},
-            "type_value":{"type":"choice","instructions":{"premise":"The operation is TYPE_TEXT or SELECT into the independently selected field","rules":"Choose the caller-provided value name whose description belongs in that field, or NONE_FITS.","goal":values.mask(&step.goal)},"criteria":value_criteria}
+            "type_value":{"type":"choice","instructions":{"premise":"The operation is TYPE_TEXT or SELECT into the independently selected field","rules":"Choose the caller-provided value name whose description belongs in that field, or NONE_FITS.","goal":values.mask(&step.goal)},"criteria":value_criteria},
+            "key":{"type":"choice","instructions":{"premise":"The operation is PRESS_KEY","rules":"Choose the single key requested by this step. Other keys are unavailable in this version.","goal":values.mask(&step.goal)},"criteria":{"Escape":"Close the focused overlay with Escape.","Tab":"Move focus forward with Tab.","Shift+Tab":"Move focus backward with Shift+Tab."}}
         }
     })
 }
@@ -120,7 +124,9 @@ fn step_done_question(step: &Step, values: &Values<'_>) -> Value {
 
 fn operation_hint(goal: &str, observation: &Observation) -> Option<&'static str> {
     let goal = goal.trim().to_ascii_lowercase();
-    if goal.starts_with("fill ") || goal.starts_with("enter ") || goal.starts_with("type ") {
+    if goal.starts_with("press ") {
+        Some("PRESS_KEY")
+    } else if goal.starts_with("fill ") || goal.starts_with("enter ") || goal.starts_with("type ") {
         Some("TYPE_TEXT")
     } else if goal.starts_with("choose ") && native_select_matches_goal(&goal, observation) {
         Some("SELECT")
@@ -178,6 +184,7 @@ fn consume(request: Value, evaluation: Evaluation) -> Result<Judgments, JevError
         type_target: choice(&evaluation, "type_target")?,
         select_target: choice(&evaluation, "select_target")?,
         type_value: choice(&evaluation, "type_value")?,
+        key: choice(&evaluation, "key")?,
         step_done: noul(&evaluation, "step_done")?,
         usage: evaluation.usage,
         request_id: evaluation.request_id,
@@ -262,6 +269,7 @@ mod tests {
                     ("type_target".into(), choice("type_target")),
                     ("select_target".into(), choice("select_target")),
                     ("type_value".into(), choice("type_value")),
+                    ("key".into(), choice("key")),
                     ("step_done".into(), Answer::Noul { noul: 0.1 }),
                 ]),
                 usage: BTreeMap::new(),
@@ -288,6 +296,7 @@ mod tests {
                 name: "provider-secret-419".into(),
                 in_dialog: None,
                 covered: true,
+                surface: None,
             }),
             visible_text: "provider-secret-419".into(),
             covered_text: "".into(),
@@ -390,6 +399,11 @@ mod tests {
                 probabilities: BTreeMap::new(),
                 confidence: 1.0,
             },
+            key: ChoiceJudgment {
+                choice: "Escape".into(),
+                probabilities: BTreeMap::new(),
+                confidence: 1.0,
+            },
             step_done: 0.0,
             usage: BTreeMap::new(),
             request_id: None,
@@ -400,6 +414,7 @@ mod tests {
             ("CLICK", Operation::Click),
             ("TYPE_TEXT", Operation::TypeText),
             ("SELECT", Operation::Select),
+            ("PRESS_KEY", Operation::PressKey),
             ("SCROLL_UP", Operation::ScrollUp),
             ("SCROLL_DOWN", Operation::ScrollDown),
             ("WAIT", Operation::Wait),
@@ -462,6 +477,48 @@ mod tests {
         assert_eq!(
             operation_hint("Choose Country", &observation),
             Some("CLICK")
+        );
+    }
+
+    #[test]
+    fn key_question_shares_the_operation_request_and_hints_preserve_existing_goals() {
+        let job = Job::parse(serde_json::to_vec(&json!({
+            "schema_version":1,"target":{"kind":"browser","url":"http://example.test"},
+            "context":{"journey":"x","revision":"x","environment":"x","actor":"x","authority":"x"},
+            "steps":[{"id":"key","goal":"Press Escape to close the popover","done_when":[{"dialog_closed":"Popover"}]}]
+        })).unwrap().as_slice()).unwrap();
+        let observation: Observation = serde_json::from_value(json!({
+            "document_id":"d","url":"http://example.test/","route":"/","title":"x",
+            "elements":[],"viewport":{"width":1,"height":1,"scroll_x":0.0,"scroll_y":0.0,"document_height":1.0}
+        })).unwrap();
+        let request = request(&job.steps[0], &observation, &[], &Values::new(&job));
+        assert_eq!(
+            request["state"]["code_facts"]["operation_hint_from_atomic_goal"],
+            "PRESS_KEY"
+        );
+        assert_eq!(request["questions"]["key"]["type"], "choice");
+        assert_eq!(
+            request["questions"]["key"]["criteria"]
+                .as_object()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            operation_hint("Enter account_name in Name", &observation),
+            Some("TYPE_TEXT")
+        );
+        assert_eq!(
+            operation_hint("Open the Home tab", &observation),
+            Some("CLICK")
+        );
+        assert_eq!(
+            operation_hint("Choose End date", &observation),
+            Some("CLICK")
+        );
+        assert_eq!(
+            operation_hint("Press Shift+Tab", &observation),
+            Some("PRESS_KEY")
         );
     }
 }

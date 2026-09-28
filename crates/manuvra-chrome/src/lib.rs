@@ -8,9 +8,11 @@ pub mod page;
 pub mod transport;
 
 pub use endpoint::{Endpoint, EndpointError};
-pub use input::{InputCancellation, PerformError, PerformFact, PreparedInput, PreparedOperation};
+pub use input::{
+    InputCancellation, Key, PerformError, PerformFact, PreparedInput, PreparedOperation,
+};
 pub use observation::{
-    Coverage, Element, FocusAnchor, Observation, Rect, SelectOption, ViewportState,
+    Coverage, Element, FocusAnchor, FocusSurface, Observation, Rect, SelectOption, ViewportState,
 };
 pub use owned::{
     BrowserConfig, BrowserError, BrowserProvenance, CapturedPage, OwnedBrowser, RedactionProof,

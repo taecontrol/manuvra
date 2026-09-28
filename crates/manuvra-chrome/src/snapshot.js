@@ -50,6 +50,8 @@
   };
   const role = (element) => {
     const explicit = element.getAttribute('role'); if (explicit) return explicit;
+    if (element.tagName === 'IFRAME' || element.tagName === 'FRAME') return 'iframe';
+    if (element.tagName === 'CANVAS') return 'canvas';
     if (element.tagName === 'DIALOG') return 'dialog';
     if (element.tagName === 'BUTTON' || element.tagName === 'SUMMARY') return 'button';
     if (element.tagName === 'A') return 'link'; if (element.tagName === 'SELECT') return 'combobox';
@@ -130,7 +132,7 @@
     const view = owner.defaultView;
     const closed = Boolean(view?.__manuvraClosedShadowHosts?.has(active));
     const crossOrigin = (active.tagName === 'IFRAME' || active.tagName === 'FRAME') && !active.contentDocument;
-    focusAnchor = {node_id:nodeId(active),context:context?.context || 'main',role:indexed?.role || role(active),name:indexed?.name || (dialog || ariaName),in_dialog:indexed?.in_dialog || dialog,covered:!closed && !crossOrigin};
+    focusAnchor = {node_id:nodeId(active),context:context?.context || 'main',role:indexed?.role || role(active),name:indexed?.name || (dialog || ariaName),in_dialog:indexed?.in_dialog || dialog,covered:!closed && !crossOrigin,surface:crossOrigin?'cross_origin_frame':closed?'closed_shadow_root':active.tagName==='CANVAS'?'canvas':null};
   }
   for (const context of contexts) for (const element of context.root.querySelectorAll('*')) {
     if (element.tagName === 'CANVAS') gaps.push('canvas');
