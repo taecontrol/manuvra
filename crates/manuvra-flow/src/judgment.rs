@@ -96,7 +96,7 @@ pub fn request(
             "type_target":{"type":"choice","instructions":{"premise":"The operation is TYPE_TEXT","rules":target_rules,"goal":values.mask(&step.goal)},"criteria":target_criteria(observation,"TYPE_TEXT",values)},
             "select_target":{"type":"choice","instructions":{"premise":"The operation is SELECT","rules":target_rules,"goal":values.mask(&step.goal)},"criteria":target_criteria(observation,"SELECT",values)},
             "type_value":{"type":"choice","instructions":{"premise":"The operation is TYPE_TEXT or SELECT into the independently selected field","rules":"Choose the caller-provided value name whose description belongs in that field, or NONE_FITS.","goal":values.mask(&step.goal)},"criteria":value_criteria},
-            "key":{"type":"choice","instructions":{"premise":"The operation is PRESS_KEY","rules":"Choose the single key requested by this step. Other keys are unavailable in this version.","goal":values.mask(&step.goal)},"criteria":{"Escape":"Close the focused overlay with Escape.","Tab":"Move focus forward with Tab.","Shift+Tab":"Move focus backward with Shift+Tab."}}
+            "key":{"type":"choice","instructions":{"premise":"The operation is PRESS_KEY","rules":"Choose the single key requested by this step. Other keys are unavailable in this version.","goal":values.mask(&step.goal)},"criteria":{"Escape":"Close the focused overlay with Escape.","Tab":"Move focus forward with Tab.","Shift+Tab":"Move focus backward with Shift+Tab.","Enter":"Activate the focused control with Enter.","Space":"Activate the focused control with Space."}}
         }
     })
 }
@@ -502,7 +502,7 @@ mod tests {
                 .as_object()
                 .unwrap()
                 .len(),
-            3
+            5
         );
         assert_eq!(
             operation_hint("Enter account_name in Name", &observation),

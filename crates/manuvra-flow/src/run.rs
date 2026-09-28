@@ -2567,7 +2567,7 @@ fn escalate(
             .map(|(name, _)| format!("decisions/{name}.json"))
     });
     let payload = redacted_value(
-        &json!({"id":id,"phase":"step","step_id":step.id,"step":{"goal":step.goal,"done_when":step.done_when},"done":done,"observation":latest,"decision":decision,"gate_reason":reason,"candidates":candidates,"offered_candidate":offered_candidate,"permitted_mutations":["CLICK","TYPE_TEXT"],"recent_actions":artifacts.trace.iter().rev().filter(|event|event.get("event").and_then(Value::as_str).is_some_and(|event|event.starts_with("action_"))).take(8).collect::<Vec<_>>(),"stopped_at":stopped}),
+        &json!({"id":id,"phase":"step","step_id":step.id,"step":{"goal":step.goal,"done_when":step.done_when},"done":done,"observation":latest,"decision":decision,"gate_reason":reason,"candidates":candidates,"offered_candidate":offered_candidate,"permitted_mutations":["CLICK","TYPE_TEXT","PRESS_KEY"],"recent_actions":artifacts.trace.iter().rev().filter(|event|event.get("event").and_then(Value::as_str).is_some_and(|event|event.starts_with("action_"))).take(8).collect::<Vec<_>>(),"stopped_at":stopped}),
         redactor,
     );
     artifacts.escalations.push((id.clone(), payload));
@@ -3834,6 +3834,239 @@ mod tests {
             surface: None,
         });
         observation
+    }
+
+    fn key_activation_job(force_stop: bool) -> Job {
+        let mut job = job("Activations: 1");
+        job.steps[0].goal = "Press Enter to activate Save".into();
+        job.steps[0].mutation_limit = 2;
+        if force_stop {
+            job.options.debug = Some(manuvra_contract::DebugOptions {
+                force_stop_at_step: "ready".into(),
+            });
+        }
+        job
+    }
+
+    #[test]
+    fn caller_execute_press_key_offers_anchor_and_dispatches_once() {
+        let job = key_activation_job(true);
+        let redactor = Redactor::for_job(&job).unwrap();
+        let focused = key_observation("Save");
+        let mut activated = focused.clone();
+        activated.visible_text = "Activations: 1".into();
+        let browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::from([
+                observation_page(focused.clone()),
+                observation_page(focused.clone()),
+                observation_page(activated.clone()),
+            ])),
+            fallback: activated,
+            dispatch_result: Some(Ok(manuvra_chrome::PerformFact {
+                readback: None,
+                readback_matches: None,
+                suboperations: vec!["key_down".into(), "key_up".into()],
+            })),
+        };
+        let provider = KeyProvider("Enter", 1.0, AtomicUsize::new(0));
+        let mut machine = HostedMachine::new(&job, &redactor);
+        let mut journal = MemoryJournal::default();
+        let cancellation = manuvra_chrome::InputCancellation::default();
+        let control = RecordingHostedControl::default();
+        machine.drive(
+            &browser,
+            &provider,
+            &mut journal,
+            &cancellation,
+            None,
+            &control,
+        );
+        let offered = &machine.artifacts.escalations[0].1["offered_candidate"];
+        assert_eq!(offered["operation"], "PRESS_KEY");
+        assert_eq!(offered["key"], "Enter");
+        assert_eq!(offered["focus_anchor"]["name"], "Save");
+        assert!(
+            machine.artifacts.escalations[0].1["permitted_mutations"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("PRESS_KEY"))
+        );
+        let candidate_id = offered["id"].as_str().unwrap().to_owned();
+        machine.apply_execute(
+            &candidate_id,
+            &browser,
+            &provider,
+            &mut journal,
+            &cancellation,
+        );
+        machine.drive(
+            &browser,
+            &provider,
+            &mut journal,
+            &cancellation,
+            None,
+            &control,
+        );
+        assert_eq!(machine.index, 1);
+        assert_eq!(
+            machine.artifacts.verdicts[0].result,
+            VerdictResult::Satisfied
+        );
+        assert_eq!(
+            journal
+                .0
+                .iter()
+                .filter(|event| event["event"] == "action_prepared")
+                .count(),
+            1
+        );
+        assert_eq!(
+            journal
+                .0
+                .iter()
+                .find(|event| event["event"] == "action_prepared")
+                .unwrap()["key"],
+            "Enter"
+        );
+        assert_eq!(provider.2.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn caller_execute_press_key_rejects_changed_focus_without_dispatch() {
+        let job = key_activation_job(true);
+        let redactor = Redactor::for_job(&job).unwrap();
+        let focused = key_observation("Save");
+        let browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::from([
+                observation_page(focused.clone()),
+                observation_page(key_observation("Other")),
+            ])),
+            fallback: focused,
+            dispatch_result: None,
+        };
+        let provider = KeyProvider("Enter", 1.0, AtomicUsize::new(0));
+        let mut machine = HostedMachine::new(&job, &redactor);
+        let mut journal = MemoryJournal::default();
+        let cancellation = manuvra_chrome::InputCancellation::default();
+        let control = RecordingHostedControl::default();
+        machine.drive(
+            &browser,
+            &provider,
+            &mut journal,
+            &cancellation,
+            None,
+            &control,
+        );
+        let candidate_id = machine
+            .artifacts
+            .pending
+            .as_ref()
+            .unwrap()
+            .candidate
+            .as_ref()
+            .unwrap()
+            .id
+            .clone();
+        machine.apply_execute(
+            &candidate_id,
+            &browser,
+            &provider,
+            &mut journal,
+            &cancellation,
+        );
+        assert_eq!(
+            machine.artifacts.stop.as_ref().unwrap().code,
+            "candidate_revalidation_failed"
+        );
+        assert!(journal.0.is_empty());
+    }
+
+    #[test]
+    fn uncertain_enter_cannot_be_executed_or_replayed_after_retry_observation() {
+        let job = key_activation_job(false);
+        let redactor = Redactor::for_job(&job).unwrap();
+        let focused = key_observation("Save");
+        let browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::from([
+                observation_page(focused.clone()),
+                observation_page(focused.clone()),
+            ])),
+            fallback: focused,
+            dispatch_result: Some(Err(manuvra_chrome::PerformError::Uncertain(
+                "lost key response".into(),
+            ))),
+        };
+        let provider = KeyProvider("Enter", 1.0, AtomicUsize::new(0));
+        let mut machine = HostedMachine::new(&job, &redactor);
+        let mut journal = MemoryJournal::default();
+        let cancellation = manuvra_chrome::InputCancellation::default();
+        let control = RecordingHostedControl::default();
+        machine.drive(
+            &browser,
+            &provider,
+            &mut journal,
+            &cancellation,
+            None,
+            &control,
+        );
+        assert_eq!(
+            machine.artifacts.stop.as_ref().unwrap().code,
+            "action_outcome_uncertain"
+        );
+        assert!(
+            machine
+                .artifacts
+                .pending
+                .as_ref()
+                .unwrap()
+                .candidate
+                .is_none()
+        );
+        assert!(
+            !machine
+                .artifacts
+                .escalation
+                .as_ref()
+                .unwrap()
+                .dispositions
+                .contains(&DispositionKind::Execute)
+        );
+        let escalation_id = machine.artifacts.escalation.as_ref().unwrap().id.clone();
+        machine.apply(
+            DispositionRequest {
+                schema_version: SchemaVersion,
+                escalation_id,
+                disposition: Disposition::RetryObservation(
+                    manuvra_contract::RetryObservationDisposition {
+                        kind: manuvra_contract::RetryObservationKind::RetryObservation,
+                    },
+                ),
+            },
+            &browser,
+            &provider,
+            &mut journal,
+            &cancellation,
+        );
+        machine.drive(
+            &browser,
+            &provider,
+            &mut journal,
+            &cancellation,
+            None,
+            &control,
+        );
+        assert_eq!(
+            machine.artifacts.stop.as_ref().unwrap().code,
+            "replay_forbidden"
+        );
+        assert_eq!(
+            journal
+                .0
+                .iter()
+                .filter(|event| event["event"] == "action_prepared")
+                .count(),
+            1
+        );
     }
 
     #[test]

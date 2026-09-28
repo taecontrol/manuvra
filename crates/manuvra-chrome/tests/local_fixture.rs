@@ -21,6 +21,8 @@ const FIXTURE: &str = include_str!("../../../tests/fixtures/browser-adversarial.
 const INPUT_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-input-strategies.html");
 const FOCUS_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-focus.html");
 const KEYBOARD_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-keyboard-focus.html");
+const ACTIVATION_FIXTURE: &str =
+    include_str!("../../../tests/fixtures/browser-keyboard-activation.html");
 static REAL_BROWSER: Mutex<()> = Mutex::new(());
 
 #[cfg(target_os = "macos")]
@@ -213,6 +215,52 @@ fn prepared_key(
         action_sequence: sequence,
         focus_anchor: observation.focus_anchor.clone(),
     }
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn enter_and_space_activate_a_focused_native_button_once_each() {
+    use manuvra_chrome::Key;
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(ACTIVATION_FIXTURE);
+    let mut browser = OwnedBrowser::launch(BrowserConfig {
+        explicit_binary: None,
+        headless: true,
+        width: 1120,
+        height: 780,
+        inherit_process_group: false,
+    })
+    .unwrap();
+    #[cfg(target_os = "macos")]
+    let lifecycle = BrowserLifecycle::observe(&browser);
+    for key in [Key::Enter, Key::Space] {
+        browser.navigate(&server.url()).unwrap();
+        let observed = browser.observe().unwrap();
+        browser
+            .perform(
+                prepared_key(&observed, Key::Tab, 1),
+                &InputCancellation::default(),
+            )
+            .unwrap();
+        let focused = browser.observe().unwrap();
+        assert_eq!(focused.focus_anchor.as_ref().unwrap().name, "Save");
+        browser
+            .perform(
+                prepared_key(&focused, key, 2),
+                &InputCancellation::default(),
+            )
+            .unwrap();
+        let after = browser.observe().unwrap();
+        assert!(
+            after.visible_text.contains("Activations: 1"),
+            "{key:?}: {}",
+            after.visible_text
+        );
+        assert_eq!(after.focus_anchor.as_ref().unwrap().name, "Save");
+    }
+    browser.close().unwrap();
+    #[cfg(target_os = "macos")]
+    lifecycle.assert_cleaned();
 }
 
 #[test]

@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Keyboard activation fixture</title></head>
+<body>
+  <button id="save" type="button">Save</button>
+  <p id="count">Activations: 0</p>
+  <script>
+    let activations = 0;
+    document.getElementById('save').addEventListener('click', () => {
+      document.getElementById('count').textContent = `Activations: ${++activations}`;
+    });
+  </script>
+</body>
+</html>

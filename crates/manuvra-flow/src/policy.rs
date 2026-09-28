@@ -44,6 +44,8 @@ struct OfferedCandidate<'a> {
     value_name: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     key: Option<Key>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    focus_anchor: Option<serde_json::Value>,
 }
 
 impl Candidate {
@@ -58,6 +60,11 @@ impl Candidate {
             target_input_type: self.target_input_type.as_deref(),
             value_name: self.value_name.as_deref(),
             key: self.key,
+            focus_anchor: (self.operation == Operation::PressKey).then(|| {
+                self.focus_anchor.as_ref().map_or(serde_json::Value::Null, |anchor| {
+                    serde_json::json!({"role":anchor.role,"name":anchor.name,"dialog":anchor.in_dialog})
+                })
+            }),
         })
         .expect("offered candidate is serializable")
     }
@@ -348,13 +355,7 @@ impl Policy {
         candidate: &Candidate,
     ) -> Result<Permit, PolicyStop> {
         self.authorize_context(step, observation)?;
-        let target = candidate
-            .target_index
-            .and_then(|index| observation.elements.iter().find(|item| item.index == index))
-            .filter(|target| candidate_matches(observation, target, candidate))
-            .ok_or(PolicyStop::Uncertain("candidate_revalidation_failed"))?;
-        let mut current = candidate.clone();
-        current.target_name = Some(target.name.clone());
+        let current = revalidate_caller_candidate(observation, candidate)?;
         match self.mint(observation, current) {
             Next::Mutate(permit) => Ok(*permit),
             Next::Stop(stop) => Err(stop),
@@ -453,6 +454,32 @@ impl Policy {
             .elapsed()
             .saturating_sub(self.paused_total.saturating_add(current_pause))
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn revalidate_caller_candidate(
+    observation: &Observation,
+    candidate: &Candidate,
+) -> Result<Candidate, PolicyStop> {
+    if candidate.operation == Operation::PressKey {
+        if observation.document_id != candidate.target_identity.document_id
+            || observation.focus_anchor != candidate.focus_anchor
+        {
+            return Err(PolicyStop::Uncertain("candidate_revalidation_failed"));
+        }
+        if let Some(surface) = key_surface(observation) {
+            return Err(PolicyStop::UnsupportedSurface(surface));
+        }
+        return Ok(candidate.clone());
+    }
+    let target = candidate
+        .target_index
+        .and_then(|index| observation.elements.iter().find(|item| item.index == index))
+        .filter(|target| candidate_matches(observation, target, candidate))
+        .ok_or(PolicyStop::Uncertain("candidate_revalidation_failed"))?;
+    let mut current = candidate.clone();
+    current.target_name = Some(target.name.clone());
+    Ok(current)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
@@ -779,9 +806,24 @@ mod tests {
         ));
         let candidate = policy.caller_candidate(&focused("A"), &key).unwrap();
         assert_eq!(candidate.key, Some(Key::Escape));
+        let mut changed_focus = focused("B");
         assert!(matches!(
-            policy.authorize_caller(&step(), &focused("A"), &candidate),
+            policy.authorize_caller(&step(), &changed_focus, &candidate),
             Err(PolicyStop::Uncertain("candidate_revalidation_failed"))
+        ));
+        changed_focus.focus_anchor.as_mut().unwrap().surface = Some(FocusSurface::Canvas);
+        assert!(matches!(
+            policy.authorize_caller(&step(), &changed_focus, &candidate),
+            Err(PolicyStop::Uncertain("candidate_revalidation_failed"))
+        ));
+        changed_focus = focused("A");
+        let permit = policy
+            .authorize_caller(&step(), &changed_focus, &candidate)
+            .unwrap();
+        drop(permit);
+        assert!(matches!(
+            policy.authorize_caller(&step(), &changed_focus, &candidate),
+            Err(PolicyStop::Uncertain("replay_forbidden"))
         ));
         key.operation.confidence = 0.69;
         assert!(matches!(

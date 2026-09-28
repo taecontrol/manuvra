@@ -25,6 +25,8 @@ pub enum Key {
     Tab,
     #[serde(rename = "Shift+Tab")]
     ShiftTab,
+    Enter,
+    Space,
 }
 
 impl Key {
@@ -198,13 +200,23 @@ fn press_key(
         Key::Escape => ("Escape", "Escape", 27, 0),
         Key::Tab => ("Tab", "Tab", 9, 0),
         Key::ShiftTab => ("Tab", "Tab", 9, 8),
+        Key::Enter => ("Enter", "Enter", 13, 0),
+        Key::Space => (" ", "Space", 32, 0),
     };
     let params = |event_type| {
-        json!({
+        let mut event = json!({
             "type":event_type,"key":name,"code":code,
             "windowsVirtualKeyCode":virtual_key,"nativeVirtualKeyCode":virtual_key,
             "modifiers":modifiers
-        })
+        });
+        if event_type == "keyDown" {
+            match key {
+                Key::Enter => event["text"] = json!("\r"),
+                Key::Space => event["text"] = json!(" "),
+                _ => {}
+            }
+        }
+        event
     };
     command(
         client,
@@ -700,8 +712,8 @@ mod tests {
     }
 
     #[test]
-    fn press_key_dispatches_exactly_two_events_with_shift_modifier() {
-        for key in [Key::Escape, Key::Tab, Key::ShiftTab] {
+    fn press_key_dispatches_exactly_two_events_with_native_key_parameters() {
+        for key in [Key::Escape, Key::Tab, Key::ShiftTab, Key::Enter, Key::Space] {
             let chrome = ScriptedChrome::start();
             let input = focus_input(key);
             reply_focus(&chrome, input.focus_anchor.clone(), "d");
@@ -714,12 +726,41 @@ mod tests {
             assert_eq!(events[1]["params"]["type"], "keyUp");
             assert_eq!(
                 events[0]["params"]["key"],
-                if key == Key::Escape { "Escape" } else { "Tab" }
+                match key {
+                    Key::Escape => "Escape",
+                    Key::Tab | Key::ShiftTab => "Tab",
+                    Key::Enter => "Enter",
+                    Key::Space => " ",
+                }
             );
             assert_eq!(
                 events[0]["params"]["modifiers"],
                 if key == Key::ShiftTab { 8 } else { 0 }
             );
+            assert_eq!(
+                events[0]["params"]["code"],
+                match key {
+                    Key::Escape => "Escape",
+                    Key::Tab | Key::ShiftTab => "Tab",
+                    Key::Enter => "Enter",
+                    Key::Space => "Space",
+                }
+            );
+            assert_eq!(
+                events[0]["params"]["windowsVirtualKeyCode"],
+                match key {
+                    Key::Escape => 27,
+                    Key::Tab | Key::ShiftTab => 9,
+                    Key::Enter => 13,
+                    Key::Space => 32,
+                }
+            );
+            match key {
+                Key::Enter => assert_eq!(events[0]["params"]["text"], "\r"),
+                Key::Space => assert_eq!(events[0]["params"]["text"], " "),
+                _ => assert!(events[0]["params"].get("text").is_none()),
+            }
+            assert!(events[1]["params"].get("text").is_none());
         }
     }
 
