@@ -14,6 +14,9 @@ pub enum PreparedOperation {
     SetValue,
     ScrollUp,
     ScrollDown,
+    /// Moves the pointer over a hover region's first hidden control, which is revalidated like a
+    /// click target, to reveal the region's controls.
+    Hover,
 }
 
 #[derive(Debug, Clone)]
@@ -120,8 +123,10 @@ fn dispatch_prepared(
         PreparedOperation::TypeText => type_text(client, input, target, cancellation),
         PreparedOperation::Select => select(client, input, cancellation),
         PreparedOperation::SetValue => set_value(client, input, cancellation),
-        PreparedOperation::ScrollUp => scroll(client, -1, cancellation),
-        PreparedOperation::ScrollDown => scroll(client, 1, cancellation),
+        PreparedOperation::ScrollUp | PreparedOperation::ScrollDown => {
+            scroll(client, input.operation, cancellation)
+        }
+        PreparedOperation::Hover => hover(client, target, cancellation),
     }
 }
 
@@ -191,14 +196,7 @@ fn click(
     target: &Value,
     cancellation: &InputCancellation,
 ) -> Result<PerformFact, PerformError> {
-    let x = target
-        .get("x")
-        .and_then(Value::as_f64)
-        .ok_or_else(|| PerformError::Rejected("missing target geometry".into()))?;
-    let y = target
-        .get("y")
-        .and_then(Value::as_f64)
-        .ok_or_else(|| PerformError::Rejected("missing target geometry".into()))?;
+    let (x, y) = revalidated_point(target)?;
     command(
         client,
         "Input.dispatchMouseEvent",
@@ -216,6 +214,34 @@ fn click(
         readback_matches: None,
         suboperations: vec!["mouse_press".into(), "mouse_release".into()],
     })
+}
+
+/// Moves the pointer once to the revalidated point. The move is the hover's only dispatch, so its
+/// transport outcome is the hover's outcome.
+fn hover(
+    client: &CdpClient,
+    target: &Value,
+    cancellation: &InputCancellation,
+) -> Result<PerformFact, PerformError> {
+    let (x, y) = revalidated_point(target)?;
+    command(
+        client,
+        "Input.dispatchMouseEvent",
+        json!({"type":"mouseMoved","x":x,"y":y}),
+        cancellation,
+    )?;
+    Ok(PerformFact {
+        readback: None,
+        readback_matches: None,
+        suboperations: vec!["mouse_move".into()],
+    })
+}
+
+fn revalidated_point(target: &Value) -> Result<(f64, f64), PerformError> {
+    let coordinate = |axis: &str| target.get(axis).and_then(Value::as_f64);
+    coordinate("x")
+        .zip(coordinate("y"))
+        .ok_or_else(|| PerformError::Rejected("missing target geometry".into()))
 }
 
 fn type_text(
@@ -478,9 +504,14 @@ fn set_value(
 
 fn scroll(
     client: &CdpClient,
-    direction: i8,
+    operation: PreparedOperation,
     cancellation: &InputCancellation,
 ) -> Result<PerformFact, PerformError> {
+    let (direction, suboperation) = if operation == PreparedOperation::ScrollUp {
+        (-1, "scroll_up")
+    } else {
+        (1, "scroll_down")
+    };
     let expression = format!(
         "(() => {{ const before=scrollY; scrollBy(0,{} * Math.max(120,innerHeight*0.75)); return {{before,after:scrollY}}; }})()",
         direction
@@ -494,11 +525,7 @@ fn scroll(
     Ok(PerformFact {
         readback: None,
         readback_matches: None,
-        suboperations: vec![if direction < 0 {
-            "scroll_up".into()
-        } else {
-            "scroll_down".into()
-        }],
+        suboperations: vec![suboperation.into()],
     })
 }
 
@@ -586,6 +613,240 @@ mod tests {
                 suboperations: vec!["mouse_press".into(), "mouse_release".into()]
             }
         );
+    }
+
+    fn revalidated() -> Value {
+        json!({"result":{"value":{"ok":true,"x":12.5,"y":20.25}}})
+    }
+
+    fn mouse_moves(chrome: &ScriptedChrome) -> Vec<Value> {
+        chrome
+            .received()
+            .into_iter()
+            .filter(|(method, params)| {
+                method == "Input.dispatchMouseEvent" && params["type"] == "mouseMoved"
+            })
+            .map(|(_, params)| params)
+            .collect()
+    }
+
+    fn hover_with(chrome: &ScriptedChrome) -> Result<PerformFact, PerformError> {
+        perform(
+            &chrome.connect_raw(),
+            input(PreparedOperation::Hover),
+            &InputCancellation::default(),
+        )
+    }
+
+    #[test]
+    fn hover_revalidates_and_moves_the_pointer_once_to_the_revalidated_point() {
+        let chrome = ScriptedChrome::start();
+        chrome.reply("Runtime.evaluate", revalidated());
+
+        assert_eq!(
+            hover_with(&chrome).unwrap(),
+            PerformFact {
+                readback: None,
+                readback_matches: None,
+                suboperations: vec!["mouse_move".into()]
+            }
+        );
+        let methods: Vec<_> = chrome
+            .received()
+            .into_iter()
+            .map(|(method, _)| method)
+            .collect();
+        assert_eq!(methods, ["Runtime.evaluate", "Input.dispatchMouseEvent"]);
+        assert_eq!(
+            mouse_moves(&chrome),
+            [json!({"type":"mouseMoved","x":12.5,"y":20.25})]
+        );
+    }
+
+    #[test]
+    fn hover_revalidates_its_control_with_the_click_script() {
+        let expression = |operation| {
+            let chrome = ScriptedChrome::start();
+            chrome.reply("Runtime.evaluate", revalidated());
+            perform(
+                &chrome.connect_raw(),
+                input(operation),
+                &InputCancellation::default(),
+            )
+            .unwrap();
+            chrome.received()[0].1["expression"].clone()
+        };
+
+        let hover = expression(PreparedOperation::Hover);
+        assert!(hover.as_str().unwrap().contains("reason:'covered'"));
+        assert_eq!(hover, expression(PreparedOperation::Click));
+    }
+
+    #[test]
+    fn rejected_hover_revalidation_never_moves_the_pointer() {
+        let mut rejections: Vec<_> = [
+            "target_missing",
+            "document_changed",
+            "disabled",
+            "not_in_view",
+            "covered",
+            "cross_origin_frame",
+        ]
+        .into_iter()
+        .map(|reason| {
+            (
+                json!({"result":{"value":{"ok":false,"reason":reason}}}),
+                reason,
+            )
+        })
+        .collect();
+        rejections.push((
+            json!({"result":{"value":{"ok":true}}}),
+            "missing target geometry",
+        ));
+        for (revalidation, reason) in rejections {
+            let chrome = ScriptedChrome::start();
+            chrome.reply("Runtime.evaluate", revalidation);
+            let result = hover_with(&chrome);
+            assert!(
+                matches!(result, Err(PerformError::Rejected(ref actual)) if actual == reason),
+                "{reason}: {result:?}"
+            );
+            assert!(mouse_moves(&chrome).is_empty(), "{reason}");
+        }
+    }
+
+    #[test]
+    fn hover_that_cdp_rejects_is_rejected() {
+        let chrome = ScriptedChrome::start();
+        chrome.reply("Runtime.evaluate", revalidated());
+        chrome.reject("Input.dispatchMouseEvent");
+
+        assert!(matches!(
+            hover_with(&chrome),
+            Err(PerformError::Rejected(_))
+        ));
+        assert_eq!(mouse_moves(&chrome).len(), 1);
+    }
+
+    #[test]
+    fn hover_not_queued_is_not_performed() {
+        let chrome = ScriptedChrome::start();
+        let cancellation = InputCancellation::default();
+        cancellation.cancel();
+        assert!(matches!(
+            perform(
+                &chrome.connect_raw(),
+                input(PreparedOperation::Hover),
+                &cancellation,
+            ),
+            Err(PerformError::NotPerformed(_))
+        ));
+        assert!(chrome.received().is_empty());
+
+        let target = revalidated()["result"]["value"].clone();
+        assert!(matches!(
+            hover(&chrome.connect_raw(), &target, &cancellation),
+            Err(PerformError::NotPerformed(_))
+        ));
+        let disconnected = ScriptedChrome::start();
+        disconnected.reject("Page.enable");
+        let client = disconnected.connect_observation();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !client.is_disconnected() {
+            assert!(Instant::now() < deadline, "connection did not disconnect");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(matches!(
+            hover(&client, &target, &InputCancellation::default()),
+            Err(PerformError::NotPerformed(reason)) if reason == "connection is disconnected"
+        ));
+        assert!(mouse_moves(&chrome).is_empty());
+        assert!(mouse_moves(&disconnected).is_empty());
+    }
+
+    #[test]
+    fn hover_sent_without_an_answer_is_uncertain() {
+        let chrome = ScriptedChrome::start();
+        chrome.reply("Runtime.evaluate", revalidated());
+        chrome.silence("Input.dispatchMouseEvent");
+        let cancellation = InputCancellation::default();
+        let canceller = cancellation.clone();
+        let started = Instant::now();
+        let result = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while mouse_moves(&chrome).is_empty() {
+                    assert!(started.elapsed() < Duration::from_secs(5));
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                canceller.cancel();
+            });
+            perform(
+                &chrome.connect_raw(),
+                input(PreparedOperation::Hover),
+                &cancellation,
+            )
+        });
+
+        assert!(
+            matches!(result, Err(PerformError::Uncertain(ref reason)) if reason.contains("awaiting CDP reply")),
+            "{result:?}"
+        );
+        assert_eq!(mouse_moves(&chrome).len(), 1);
+    }
+
+    #[test]
+    fn hover_interrupted_by_disconnect_after_sending_is_uncertain() {
+        let chrome = ScriptedChrome::start();
+        chrome.reply("Runtime.evaluate", revalidated());
+        chrome.disconnect_on("Input.dispatchMouseEvent");
+
+        let result = hover_with(&chrome);
+        assert!(
+            matches!(result, Err(PerformError::Uncertain(_))),
+            "{result:?}"
+        );
+        assert_eq!(mouse_moves(&chrome).len(), 1);
+    }
+
+    #[test]
+    fn hover_during_journal_overflow_is_uncertain() {
+        let chrome = ScriptedChrome::start();
+        for index in 0..10_100 {
+            chrome.push_event("DOM.attributeModified", json!({"nodeId":index}));
+        }
+        chrome.reply("Runtime.evaluate", revalidated());
+
+        let result = hover_with(&chrome);
+        assert!(
+            matches!(result, Err(PerformError::Uncertain(ref reason)) if reason == "CDP journal overflowed"),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn scrolling_skips_revalidation_and_scrolls_in_its_direction() {
+        for (operation, step, suboperation) in [
+            (PreparedOperation::ScrollUp, "scrollBy(0,-1 *", "scroll_up"),
+            (
+                PreparedOperation::ScrollDown,
+                "scrollBy(0,1 *",
+                "scroll_down",
+            ),
+        ] {
+            let chrome = ScriptedChrome::start();
+            let fact = perform(
+                &chrome.connect_raw(),
+                input(operation),
+                &InputCancellation::default(),
+            )
+            .unwrap();
+            assert_eq!(fact.suboperations, [suboperation]);
+            let received = chrome.received();
+            assert_eq!(received.len(), 1, "{operation:?}");
+            let expression = received[0].1["expression"].as_str().unwrap();
+            assert!(expression.contains(step), "{operation:?}: {expression}");
+        }
     }
 
     #[test]

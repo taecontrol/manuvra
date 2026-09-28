@@ -1,8 +1,8 @@
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use manuvra_chrome::{
-    BrowserConfig, InputCancellation, Observation, OwnedBrowser, PerformError, PreparedInput,
-    PreparedOperation,
+    BrowserConfig, Element, InputCancellation, Observation, OwnedBrowser, PerformError,
+    PreparedInput, PreparedOperation,
 };
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -669,6 +669,103 @@ fn production_snapshot_lists_hover_regions_and_keeps_their_controls_out_of_candi
     assert!(capped.coverage.viewport_complete);
     assert_no_hidden_candidates(&capped);
     eprintln!("real Chrome hover region fixture completed");
+    browser.close().unwrap();
+    #[cfg(target_os = "macos")]
+    lifecycle.assert_cleaned();
+}
+
+fn candidate<'a>(observation: &'a Observation, name: &str) -> Option<&'a Element> {
+    observation
+        .elements
+        .iter()
+        .find(|element| element.name == name)
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn production_hover_reveals_only_its_region_controls_for_a_following_click() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(HOVER_FIXTURE);
+    let mut browser = OwnedBrowser::launch(BrowserConfig {
+        explicit_binary: None,
+        headless: true,
+        width: 1120,
+        height: 1400,
+        inherit_process_group: false,
+    })
+    .unwrap();
+    #[cfg(target_os = "macos")]
+    let lifecycle = BrowserLifecycle::observe(&browser);
+    browser.navigate(&server.url()).unwrap();
+    let cancellation = InputCancellation::default();
+
+    let observed = browser.observe().unwrap();
+    assert_no_hidden_candidates(&observed);
+    let region = observed
+        .hover_regions
+        .iter()
+        .find(|region| region.name == "Groceries")
+        .expect("Groceries hover region");
+    let fact = browser
+        .perform(
+            PreparedInput {
+                document_id: observed.document_id.clone(),
+                node_id: region.node_id,
+                operation: PreparedOperation::Hover,
+                text: None,
+                previous_text: None,
+                option_node_id: None,
+                combobox: false,
+                action_sequence: 1,
+            },
+            &cancellation,
+        )
+        .unwrap();
+    assert_eq!(fact.suboperations, ["mouse_move"]);
+
+    let revealed = browser.observe().unwrap();
+    assert!(
+        candidate(&revealed, "Actions for Groceries").is_some(),
+        "the hovered region's control is a candidate"
+    );
+    assert!(
+        candidate(&revealed, "Actions for Rent").is_none(),
+        "another region's control stays hidden"
+    );
+    browser
+        .perform(
+            prepared(
+                &revealed,
+                "Actions for Groceries",
+                PreparedOperation::Click,
+                None,
+                None,
+                2,
+            ),
+            &cancellation,
+        )
+        .unwrap();
+
+    let opened = browser.observe().unwrap();
+    assert_eq!(
+        candidate(&opened, "Actions for Groceries").and_then(|element| element.expanded),
+        Some(true)
+    );
+    assert!(
+        opened
+            .elements
+            .iter()
+            .any(|element| element.role == "menuitem" && element.name == "Delete category…"),
+        "the Groceries menu is open"
+    );
+    let regions: Vec<_> = opened
+        .hover_regions
+        .iter()
+        .map(|region| region.name.as_str())
+        .collect();
+    assert!(!regions.contains(&"Groceries"), "{regions:?}");
+    assert!(regions.contains(&"Rent"), "{regions:?}");
+    eprintln!("real Chrome hover reveal fixture completed");
     browser.close().unwrap();
     #[cfg(target_os = "macos")]
     lifecycle.assert_cleaned();

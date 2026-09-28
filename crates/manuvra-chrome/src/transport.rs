@@ -831,6 +831,9 @@ pub(crate) mod test_support {
     struct Script {
         replies: HashMap<String, Vec<Value>>,
         reject: HashSet<String>,
+        silent: HashSet<String>,
+        disconnect_on: HashSet<String>,
+        received: Vec<(String, Value)>,
         pending_events: VecDeque<Value>,
         ping_once: bool,
         invalid_json_methods: HashSet<String>,
@@ -892,6 +895,33 @@ pub(crate) mod test_support {
                 .expect("scripted Chrome")
                 .reject
                 .insert(method.to_owned());
+        }
+
+        /// Receives `method` without ever answering it.
+        pub fn silence(&self, method: &str) {
+            self.script
+                .lock()
+                .expect("scripted Chrome")
+                .silent
+                .insert(method.to_owned());
+        }
+
+        /// Closes the connection after receiving `method`, without answering it.
+        pub fn disconnect_on(&self, method: &str) {
+            self.script
+                .lock()
+                .expect("scripted Chrome")
+                .disconnect_on
+                .insert(method.to_owned());
+        }
+
+        /// Every command received so far, in order, as its method and params.
+        pub fn received(&self) -> Vec<(String, Value)> {
+            self.script
+                .lock()
+                .expect("scripted Chrome")
+                .received
+                .clone()
         }
 
         pub fn push_event(&self, method: &str, params: Value) {
@@ -1064,7 +1094,9 @@ pub(crate) mod test_support {
                     let Ok(value) = serde_json::from_str::<Value>(&text) else {
                         continue;
                     };
-                    reply_to_command(&mut socket, &script, value);
+                    if !reply_to_command(&mut socket, &script, value) {
+                        break;
+                    }
                 }
                 Ok(Message::Ping(payload)) => {
                     let _ = socket.send(Message::Pong(payload));
@@ -1103,13 +1135,14 @@ pub(crate) mod test_support {
         }
     }
 
+    /// Answers one command as scripted; returns whether the connection stays open.
     fn reply_to_command(
         socket: &mut tungstenite::WebSocket<TcpStream>,
         script: &Arc<Mutex<Script>>,
         value: Value,
-    ) {
+    ) -> bool {
         let Some(id) = value.get("id").cloned() else {
-            return;
+            return true;
         };
         let method = value
             .get("method")
@@ -1118,6 +1151,14 @@ pub(crate) mod test_support {
             .to_owned();
         let (reply, invalid) = {
             let mut script = script.lock().expect("scripted Chrome");
+            let params = value.get("params").cloned().unwrap_or(Value::Null);
+            script.received.push((method.clone(), params));
+            if script.disconnect_on.contains(&method) {
+                return false;
+            }
+            if script.silent.contains(&method) {
+                return true;
+            }
             let invalid = script.invalid_json_methods.contains(&method);
             let reply = if script.reject.contains(&method) {
                 json!({"id": id, "error": {"message": "rejected"}})
@@ -1139,8 +1180,9 @@ pub(crate) mod test_support {
         };
         if invalid {
             let _ = socket.send(Message::Text("not-json".into()));
-            return;
+            return true;
         }
         let _ = socket.send(Message::Text(reply.to_string().into()));
+        true
     }
 }
