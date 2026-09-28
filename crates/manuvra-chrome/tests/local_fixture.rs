@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 const FIXTURE: &str = include_str!("../../../tests/fixtures/browser-adversarial.html");
 const INPUT_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-input-strategies.html");
+const HOVER_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-hover-reveal.html");
 static REAL_BROWSER: Mutex<()> = Mutex::new(());
 
 #[cfg(target_os = "macos")]
@@ -224,6 +225,8 @@ fn production_snapshot_and_masking_cover_truncation_split_nodes_and_zero_masks()
     assert!(observed.visible_text.len() <= 8000);
     assert!(observed.covered_text.len() <= 8000);
     assert!(observed.dialog_texts["Long dialog"].len() <= 8000);
+    assert!(observed.hover_regions.is_empty());
+    assert!(!observed.hover_regions_truncated);
 
     let plain = browser.capture().unwrap();
     let masked = browser.capture_redacted(&["split-secret".into()]).unwrap();
@@ -532,6 +535,140 @@ fn production_input_strategies_cover_native_and_bounded_fallback_paths() {
         Err(PerformError::Rejected(reason)) if reason == "document_changed" || reason == "target_missing"
     ));
     eprintln!("real Chrome CDP input and readback fixture completed");
+    browser.close().unwrap();
+    #[cfg(target_os = "macos")]
+    lifecycle.assert_cleaned();
+}
+
+fn hover_regions(observation: &Observation) -> Vec<(u64, String, Vec<String>)> {
+    observation
+        .hover_regions
+        .iter()
+        .map(|region| {
+            (
+                region.index,
+                region.name.clone(),
+                region.reveals_on_hover.clone(),
+            )
+        })
+        .collect()
+}
+
+fn assert_no_hidden_candidates(observation: &Observation) {
+    let hidden: Vec<_> = observation
+        .elements
+        .iter()
+        .filter(|element| element.name.starts_with("Actions for"))
+        .map(|element| element.name.as_str())
+        .collect();
+    assert!(
+        hidden.is_empty(),
+        "hidden controls became candidates: {hidden:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn production_snapshot_lists_hover_regions_and_keeps_their_controls_out_of_candidates() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(HOVER_FIXTURE);
+    let mut browser = OwnedBrowser::launch(BrowserConfig {
+        explicit_binary: None,
+        headless: true,
+        width: 1120,
+        height: 1400,
+        inherit_process_group: false,
+    })
+    .unwrap();
+    #[cfg(target_os = "macos")]
+    let lifecycle = BrowserLifecycle::observe(&browser);
+    browser.navigate(&server.url()).unwrap();
+
+    let observed = browser.observe().unwrap();
+    let expected: Vec<_> = [
+        "Essentials",
+        "Groceries",
+        "Rent",
+        "Utilities",
+        "Lifestyle",
+        "Dining out",
+        "Streaming",
+    ]
+    .iter()
+    .zip(1..)
+    .map(|(name, index)| (index, name.to_string(), vec![format!("Actions for {name}")]))
+    .collect();
+    assert_eq!(hover_regions(&observed), expected);
+    assert!(!observed.hover_regions_truncated);
+    let mut identities: Vec<_> = observed
+        .hover_regions
+        .iter()
+        .map(|region| region.node_id)
+        .collect();
+    identities.sort_unstable();
+    identities.dedup();
+    assert_eq!(identities.len(), expected.len());
+    assert!(observed.hover_regions.iter().all(|region| {
+        observed
+            .elements
+            .iter()
+            .all(|element| element.node_id != region.node_id)
+    }));
+    for concealed in ["Gym", "Travel"] {
+        let row_control = format!("View activity for {concealed},");
+        assert!(
+            observed
+                .elements
+                .iter()
+                .any(|element| element.name.starts_with(&row_control)),
+            "{concealed} row is rendered"
+        );
+        assert!(!observed.hover_regions.iter().any(|region| {
+            region.name == concealed
+                || region
+                    .reveals_on_hover
+                    .iter()
+                    .any(|name| name.contains(concealed))
+        }));
+    }
+    assert!(
+        observed
+            .elements
+            .iter()
+            .any(|element| element.name == "Edit assigned amount for Groceries, $400.00")
+    );
+    assert_no_hidden_candidates(&observed);
+
+    browser
+        .navigate(&format!("{}?many=1", server.url()))
+        .unwrap();
+    let capped = browser.observe().unwrap();
+    assert_eq!(capped.hover_regions.len(), 20);
+    assert_eq!(hover_regions(&capped)[..expected.len()], expected[..]);
+    assert_eq!(
+        capped.hover_regions[expected.len()].name,
+        "Subscriptions",
+        "regions continue in document order"
+    );
+    assert!(
+        capped
+            .hover_regions
+            .iter()
+            .zip(1..)
+            .all(|(region, index)| region.index == index)
+    );
+    assert!(capped.hover_regions_truncated);
+    assert!(
+        capped
+            .elements
+            .iter()
+            .any(|element| element.name == "Edit assigned amount for Subscription 16, $9.00"),
+        "the rows beyond the cap are in the viewport"
+    );
+    assert_eq!(capped.coverage, observed.coverage);
+    assert!(capped.coverage.viewport_complete);
+    assert_no_hidden_candidates(&capped);
+    eprintln!("real Chrome hover region fixture completed");
     browser.close().unwrap();
     #[cfg(target_os = "macos")]
     lifecycle.assert_cleaned();

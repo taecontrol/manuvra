@@ -285,6 +285,10 @@ fn is_protocol_collision(value: &str) -> bool {
         "slots",
         "same_origin_frames",
         "gaps",
+        "hover_regions",
+        "hover_regions_truncated",
+        "reveals_on_hover",
+        "hover_target",
         "running",
         "uncertain",
         "passed",
@@ -309,6 +313,7 @@ fn is_protocol_collision(value: &str) -> bool {
         "CLICK",
         "TYPE_TEXT",
         "SELECT",
+        "HOVER",
         "missing_value",
         "unsupported_in_this_build",
         "unsupported_platform",
@@ -1215,6 +1220,28 @@ mod tests {
         assert!(!redactor.redact_export_text(key).contains(key));
         assert!(redactor.contains_sensitive(key));
         assert!(redactor.contains_export_leak(key.as_bytes()));
+    }
+
+    #[test]
+    fn classified_values_equal_to_hover_vocabulary_do_not_trip_the_leak_scan() {
+        let exported = br#"{"hover_regions":[{"index":1,"name":"Groceries","reveals_on_hover":["Actions"]}],"hover_regions_truncated":true,"hover_target":"R1","operation":"HOVER"}"#;
+        for owned in [
+            "hover_regions",
+            "hover_regions_truncated",
+            "reveals_on_hover",
+            "hover_target",
+            "HOVER",
+        ] {
+            let job: Job = serde_json::from_value(json!({"schema_version":1,"target":{"kind":"browser","url":"http://127.0.0.1/"},"context":{"journey":"j","revision":"r","environment":"e","actor":"a","authority":"a"},"values":{"collision":{"value":owned,"description":"protocol collision","secret":true}},"steps":[{"id":"s","goal":"g","done_when":[{"url_contains":"/"}]}]})).unwrap();
+            let redactor = Redactor::for_job(&job).unwrap();
+            assert!(!redactor.contains_export_leak(exported), "{owned}");
+        }
+        let job: Job = serde_json::from_value(json!({"schema_version":1,"target":{"kind":"browser","url":"http://127.0.0.1/"},"context":{"journey":"j","revision":"r","environment":"e","actor":"a","authority":"a"},"values":{"category":{"value":"Groceries","description":"page text","secret":true}},"steps":[{"id":"s","goal":"g","done_when":[{"url_contains":"/"}]}]})).unwrap();
+        assert!(
+            Redactor::for_job(&job)
+                .unwrap()
+                .contains_export_leak(exported)
+        );
     }
 
     fn test_job(secret: bool) -> Job {

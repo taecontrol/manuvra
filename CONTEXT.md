@@ -23,6 +23,10 @@ _Avoid_: session, execution, attempt
 The Chromium page under Manuvra's control.
 _Avoid_: tab, window, device
 
+**Hover region**:
+A visible container on the target, such as a list row, holding controls hidden by opacity until the pointer is over it. An observation lists each region with the names of the controls it reveals; those hidden controls are never candidates until a hover reveals them.
+_Avoid_: hover area, reveal zone, hidden row
+
 **Permit**:
 The single-use authorization minted only by the policy owner after done-first, gate, budget, replay-ledger and origin checks. No mutation is dispatched without one.
 _Avoid_: lock, lease, approval

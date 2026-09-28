@@ -9,7 +9,9 @@ pub mod transport;
 
 pub use endpoint::{Endpoint, EndpointError};
 pub use input::{InputCancellation, PerformError, PerformFact, PreparedInput, PreparedOperation};
-pub use observation::{Coverage, Element, Observation, Rect, SelectOption, ViewportState};
+pub use observation::{
+    Coverage, Element, HoverRegion, Observation, Rect, SelectOption, ViewportState,
+};
 pub use owned::{
     BrowserConfig, BrowserError, BrowserProvenance, CapturedPage, OwnedBrowser, RedactionProof,
 };

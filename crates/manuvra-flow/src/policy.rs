@@ -624,6 +624,8 @@ mod tests {
                 document_height: 100.,
             },
             coverage: Coverage::default(),
+            hover_regions: Vec::new(),
+            hover_regions_truncated: false,
         }
     }
     fn choice(value: &str) -> ChoiceJudgment {

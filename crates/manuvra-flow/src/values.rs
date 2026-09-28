@@ -178,6 +178,8 @@ mod tests {
                 document_height: 1.,
             },
             coverage: Coverage::default(),
+            hover_regions: Vec::new(),
+            hover_regions_truncated: false,
         };
         let serialized = Values::new(&job).model_view(&observation).to_string();
         assert!(!serialized.contains("raw-secret-742"));

@@ -622,6 +622,8 @@ mod tests {
                 document_height: 600.,
             },
             coverage: Coverage::default(),
+            hover_regions: Vec::new(),
+            hover_regions_truncated: false,
         }
     }
 

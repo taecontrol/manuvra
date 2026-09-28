@@ -731,6 +731,8 @@ fn fault_observation() -> manuvra_flow::Observation {
             document_height: 100.0,
         },
         coverage: manuvra_flow::Coverage::default(),
+        hover_regions: Vec::new(),
+        hover_regions_truncated: false,
     }
 }
 

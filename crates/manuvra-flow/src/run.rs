@@ -2716,6 +2716,8 @@ fn empty_observation() -> Observation {
             document_height: 0.0,
         },
         coverage: manuvra_chrome::Coverage::default(),
+        hover_regions: Vec::new(),
+        hover_regions_truncated: false,
     }
 }
 
@@ -2833,7 +2835,7 @@ fn redacted_observation(raw: &Observation, redactor: &Redactor) -> Result<Value,
             })
         })
         .collect::<Vec<_>>();
-    Ok(json!({
+    let mut exported = json!({
         "url":redact(&raw.url),
         "route":redact(&raw.route),
         "title":redact(&raw.title),
@@ -2845,7 +2847,37 @@ fn redacted_observation(raw: &Observation, redactor: &Redactor) -> Result<Value,
         "elements":elements,
         "viewport":raw.viewport,
         "coverage":raw.coverage,
-    }))
+    });
+    if let Value::Object(fields) = &mut exported {
+        fields.extend(exported_hover_regions(raw, redactor));
+    }
+    Ok(exported)
+}
+
+/// Hover regions appear in evidence only when present, with page text redacted and without the
+/// internal dispatch identity.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn exported_hover_regions(raw: &Observation, redactor: &Redactor) -> Vec<(String, Value)> {
+    let redact = |text: &str| redactor.redact_external_text(text);
+    let regions = raw
+        .hover_regions
+        .iter()
+        .map(|region| {
+            json!({
+                "index":region.index,
+                "name":redact(&region.name),
+                "reveals_on_hover":region.reveals_on_hover.iter().map(|name|redact(name)).collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut fields = Vec::new();
+    if !regions.is_empty() {
+        fields.push(("hover_regions".to_owned(), Value::Array(regions)));
+    }
+    if raw.hover_regions_truncated {
+        fields.push(("hover_regions_truncated".to_owned(), Value::Bool(true)));
+    }
+    fields
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3731,6 +3763,8 @@ mod tests {
                 document_height: 780.,
             },
             coverage: Coverage::default(),
+            hover_regions: Vec::new(),
+            hover_regions_truncated: false,
         }
     }
 
@@ -4340,6 +4374,124 @@ mod tests {
         assert!(!text.contains("node_id"));
         assert!(!text.contains("main/shadow"));
         assert!(exported["elements"][0].get("context").is_none());
+    }
+
+    fn richly_observed() -> Observation {
+        let mut observation = text_field("Wanted");
+        observation.visible_text = "Ready Wanted".into();
+        observation.covered_text = "Behind Wanted".into();
+        observation.dialogs = vec!["Confirm Wanted".into()];
+        observation.dialog_texts =
+            BTreeMap::from([("Confirm Wanted".into(), "Keep Wanted?".into())]);
+        observation.focused = Some(1);
+        observation.elements.push(Element {
+            index: 2,
+            node_id: 8,
+            context: "main/frame:3".into(),
+            role: "combobox".into(),
+            name: "Account".into(),
+            input_type: None,
+            value: "wanted-id".into(),
+            checked: Some(false),
+            selected: None,
+            expanded: Some(true),
+            disabled: false,
+            in_dialog: Some("Confirm Wanted".into()),
+            operations: vec!["SELECT".into()],
+            select_options: vec![manuvra_chrome::SelectOption {
+                node_id: 9,
+                label: "Wanted".into(),
+                value: "wanted-id".into(),
+                disabled: false,
+                selected: true,
+            }],
+            rect: Rect {
+                x: 2.5,
+                y: 30.0,
+                width: 120.0,
+                height: 24.0,
+            },
+        });
+        observation.coverage.viewport_complete = false;
+        observation.coverage.gaps = vec!["canvas".into(), "visible_text_truncated".into()];
+        observation
+    }
+
+    #[test]
+    fn exported_observation_without_hover_regions_is_unchanged() {
+        let mut job = mutation_job();
+        job.values.get_mut("name").unwrap().secret = true;
+        let redactor = Redactor::for_job(&job).unwrap();
+
+        let exported = redacted_observation(&richly_observed(), &redactor)
+            .unwrap()
+            .to_string();
+
+        let golden = r#"{"coverage":{"gaps":["canvas","visible_text_truncated"],"open_shadow_roots":true,"same_origin_frames":true,"slots":true,"viewport_complete":false},"covered_text":"Behind {m}","dialog_texts":{"Confirm {m}":"Keep {m}?"},"dialogs":["Confirm {m}"],"elements":[{"checked":null,"disabled":false,"expanded":null,"in_dialog":null,"index":1,"input_type":"text","name":"Name","operations":["TYPE_TEXT"],"rect":{"height":10.0,"width":20.0,"x":1.0,"y":1.0},"role":"textbox","select_options":[],"selected":null,"value":"{m}"},{"checked":false,"disabled":false,"expanded":true,"in_dialog":"Confirm {m}","index":2,"input_type":null,"name":"Account","operations":["SELECT"],"rect":{"height":24.0,"width":120.0,"x":2.5,"y":30.0},"role":"combobox","select_options":[{"disabled":false,"label":"{m}","selected":true,"value":"wanted-id"}],"selected":null,"value":"wanted-id"}],"focused":1,"route":"/","title":"Money · Accounts","url":"http://127.0.0.1:4351/","viewport":{"document_height":780.0,"height":780,"scroll_x":0.0,"scroll_y":0.0,"width":1120},"visible_text":"Ready {m}"}"#;
+        assert_eq!(
+            exported,
+            golden.replace("{m}", "\u{e000}<masked:1>\u{e000}")
+        );
+    }
+
+    #[test]
+    fn persisted_observation_lists_redacted_hover_regions_without_browser_identity() {
+        let mut job = job("Ready");
+        job.values.insert(
+            "category".into(),
+            manuvra_contract::JobValue {
+                value: "Groceries".into(),
+                description: "classified category".into(),
+                formats: None,
+                secret: true,
+            },
+        );
+        let redactor = Redactor::for_job(&job).unwrap();
+        let mut observation = observed("Ready");
+        observation.hover_regions = vec![
+            manuvra_chrome::HoverRegion {
+                index: 1,
+                name: "Groceries".into(),
+                reveals_on_hover: vec!["Actions for Groceries".into()],
+                node_id: 981_723,
+            },
+            manuvra_chrome::HoverRegion {
+                index: 2,
+                name: "Rent".into(),
+                reveals_on_hover: vec!["Actions for Rent".into(), "Pin Rent".into()],
+                node_id: 981_724,
+            },
+        ];
+        observation.hover_regions_truncated = true;
+        let browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::from([observation_page(observation.clone())])),
+            fallback: observation,
+            dispatch_result: None,
+        };
+
+        let artifacts = drive_fake(&job, &redactor, &browser);
+
+        assert!(artifacts.stop.is_none());
+        let persisted = &artifacts.observations[0].1;
+        let masked = "\u{e000}<masked:1>\u{e000}";
+        assert_eq!(
+            persisted["hover_regions"],
+            json!([
+                {"index":1,"name":masked,"reveals_on_hover":[format!("Actions for {masked}")]},
+                {"index":2,"name":"Rent","reveals_on_hover":["Actions for Rent","Pin Rent"]}
+            ])
+        );
+        assert_eq!(persisted["hover_regions_truncated"], true);
+        assert!(
+            persisted["coverage"]["viewport_complete"]
+                .as_bool()
+                .unwrap()
+        );
+        let text = persisted.to_string();
+        assert!(!text.contains("Groceries"));
+        assert!(!text.contains("node_id"));
+        assert!(!text.contains("98172"));
+        assert!(!redactor.contains_export_leak(text.as_bytes()));
     }
 
     #[test]

@@ -505,6 +505,8 @@ mod tests {
                 document_height: 10.,
             },
             coverage: Coverage::default(),
+            hover_regions: Vec::new(),
+            hover_regions_truncated: false,
         }
     }
     fn permit(job: &Job, obs: &Observation) -> Permit {
