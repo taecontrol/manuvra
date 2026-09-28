@@ -652,13 +652,20 @@ fn scroll_replay_key(observation: &Observation, operation: Operation) -> String 
 }
 
 fn key_replay_key(observation: &Observation, candidate: &Candidate) -> String {
-    let anchor = candidate.focus_anchor.as_ref();
+    let focus = candidate.focus_anchor.as_ref().map(|anchor| {
+        serde_json::json!({
+            "role":anchor.role,
+            "name":anchor.name.to_ascii_lowercase(),
+            "dialog":anchor.in_dialog,
+            "active_descendant":anchor.active_descendant,
+            "expanded":anchor.expanded,
+            "selected":anchor.selected,
+            "checked":anchor.checked,
+        })
+    });
     let stable = serde_json::json!({
         "operation":candidate.operation,"key":candidate.key,
-        "target_role":anchor.map(|anchor|anchor.role.as_str()),
-        "target_name":anchor.map(|anchor|anchor.name.to_ascii_lowercase()),
-        "dialog":anchor.and_then(|anchor|anchor.in_dialog.as_deref()),
-        "no_focus":anchor.is_none(),"route":observation.route,
+        "focus":focus,"route":observation.route,
     });
     hex::encode(Sha256::digest(stable.to_string().as_bytes()))
 }
@@ -787,6 +794,10 @@ mod tests {
             in_dialog: None,
             covered: true,
             surface: None,
+            active_descendant: None,
+            expanded: None,
+            selected: None,
+            checked: None,
         });
         observed
     }
@@ -904,6 +915,98 @@ mod tests {
         assert!(matches!(
             decide_not_done(&mut bounded, &step(), &focused("B"), &key, false),
             Next::Stop(PolicyStop::Blocked("budget_exhausted"))
+        ));
+    }
+
+    #[test]
+    fn key_replay_tracks_active_descendant_and_aria_state_without_changing_click_replay() {
+        use manuvra_chrome::ActiveDescendant;
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        let mut step = step();
+        step.mutation_limit = 8;
+        let mut observed = focused("Choose item");
+        observed.focus_anchor.as_mut().unwrap().role = "combobox".into();
+        let mut arrow = judgments("PRESS_KEY");
+        arrow.key = choice("ArrowDown");
+        assert!(matches!(
+            decide_not_done(&mut policy, &step, &observed, &arrow, false),
+            Next::Mutate(_)
+        ));
+        assert!(matches!(
+            decide_not_done(&mut policy, &step, &observed, &arrow, false),
+            Next::Stop(PolicyStop::Uncertain("replay_forbidden"))
+        ));
+        let anchor = observed.focus_anchor.as_mut().unwrap();
+        anchor.active_descendant = Some(ActiveDescendant {
+            id: "alpha".into(),
+            role: "option".into(),
+            name: "Alpha".into(),
+            selected: Some(false),
+            checked: None,
+        });
+        assert!(matches!(
+            decide_not_done(&mut policy, &step, &observed, &arrow, false),
+            Next::Mutate(_)
+        ));
+        observed
+            .focus_anchor
+            .as_mut()
+            .unwrap()
+            .active_descendant
+            .as_mut()
+            .unwrap()
+            .id = "beta".into();
+        observed
+            .focus_anchor
+            .as_mut()
+            .unwrap()
+            .active_descendant
+            .as_mut()
+            .unwrap()
+            .name = "Beta".into();
+        assert!(matches!(
+            decide_not_done(&mut policy, &step, &observed, &arrow, false),
+            Next::Mutate(_)
+        ));
+        assert!(matches!(
+            decide_not_done(&mut policy, &step, &observed, &arrow, false),
+            Next::Stop(PolicyStop::Uncertain("replay_forbidden"))
+        ));
+        observed
+            .focus_anchor
+            .as_mut()
+            .unwrap()
+            .active_descendant
+            .as_mut()
+            .unwrap()
+            .selected = Some(true);
+        assert!(matches!(
+            decide_not_done(&mut policy, &step, &observed, &arrow, false),
+            Next::Mutate(_)
+        ));
+        observed.focus_anchor.as_mut().unwrap().expanded = Some(false);
+        assert!(matches!(
+            decide_not_done(&mut policy, &step, &observed, &arrow, false),
+            Next::Mutate(_)
+        ));
+        observed.focus_anchor.as_mut().unwrap().checked = Some(true);
+        assert!(matches!(
+            decide_not_done(&mut policy, &step, &observed, &arrow, false),
+            Next::Mutate(_)
+        ));
+
+        let mut click = judgments("CLICK");
+        click.click_target = choice("1");
+        let first_click = observation("CLICK", "button");
+        assert!(matches!(
+            decide_not_done(&mut policy, &step, &first_click, &click, false),
+            Next::Mutate(_)
+        ));
+        let mut changed_aria = first_click.clone();
+        changed_aria.focus_anchor = observed.focus_anchor;
+        assert!(matches!(
+            decide_not_done(&mut policy, &step, &changed_aria, &click, false),
+            Next::Stop(PolicyStop::Uncertain("replay_forbidden"))
         ));
     }
 

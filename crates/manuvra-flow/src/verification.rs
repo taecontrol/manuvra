@@ -699,6 +699,10 @@ mod tests {
             in_dialog: Some("Create account".into()),
             covered: true,
             surface: None,
+            active_descendant: None,
+            expanded: None,
+            selected: None,
+            checked: None,
         });
         assert_eq!(focus_matches(&observed, &wanted), DoneResult::Satisfied);
         observed.elements.push(Element {

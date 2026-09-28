@@ -2846,6 +2846,11 @@ fn redacted_observation(raw: &Observation, redactor: &Redactor) -> Result<Value,
             "name":redact(&anchor.name),
             "in_dialog":anchor.in_dialog.as_ref().map(|dialog|redact(dialog)),
             "covered":anchor.covered,
+            "active_descendant":anchor.active_descendant.as_ref().map(|item|json!({
+                "id":redact(&item.id),"role":redact(&item.role),"name":redact(&item.name),
+                "selected":item.selected,"checked":item.checked,
+            })),
+            "expanded":anchor.expanded,"selected":anchor.selected,"checked":anchor.checked,
         })),
         "visible_text":redact(&raw.visible_text),
         "covered_text":redact(&raw.covered_text),
@@ -3832,6 +3837,10 @@ mod tests {
             in_dialog: None,
             covered: true,
             surface: None,
+            active_descendant: None,
+            expanded: None,
+            selected: None,
+            checked: None,
         });
         observation
     }
@@ -4067,6 +4076,107 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn autonomous_arrow_sequence_selects_observed_beta() {
+        struct WidgetProvider(AtomicUsize);
+        impl manuvra_jev::Evaluator for WidgetProvider {
+            fn evaluate(
+                &self,
+                request: &Value,
+                deadline: Instant,
+            ) -> Result<manuvra_jev::Evaluation, manuvra_jev::JevError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                let key = if request
+                    .pointer("/state/page/focus_anchor/active_descendant/id")
+                    .and_then(Value::as_str)
+                    == Some("beta")
+                {
+                    "Enter"
+                } else {
+                    "ArrowDown"
+                };
+                KeyProvider(key, 1.0, AtomicUsize::new(0)).evaluate(request, deadline)
+            }
+        }
+        let job = Job::parse(serde_json::to_vec(&json!({
+            "schema_version":1,"target":{"kind":"browser","url":"http://127.0.0.1:4351/"},
+            "context":{"journey":"widget","revision":"fixture","environment":"fake","actor":"synthetic","authority":"select"},
+            "steps":[{"id":"choose","goal":"Press the arrow keys and Enter to choose Beta","done_when":[{"text_visible":"Selected: Beta"}],"mutation_limit":3}]
+        })).unwrap().as_slice()).unwrap();
+        let redactor = Redactor::for_job(&job).unwrap();
+        let mut before = key_observation("Choose item");
+        before.focus_anchor.as_mut().unwrap().role = "combobox".into();
+        let mut alpha = before.clone();
+        alpha.focus_anchor.as_mut().unwrap().active_descendant =
+            Some(manuvra_chrome::ActiveDescendant {
+                id: "alpha".into(),
+                role: "option".into(),
+                name: "Alpha".into(),
+                selected: Some(false),
+                checked: None,
+            });
+        let mut beta = alpha.clone();
+        beta.focus_anchor
+            .as_mut()
+            .unwrap()
+            .active_descendant
+            .as_mut()
+            .unwrap()
+            .id = "beta".into();
+        beta.focus_anchor
+            .as_mut()
+            .unwrap()
+            .active_descendant
+            .as_mut()
+            .unwrap()
+            .name = "Beta".into();
+        let mut selected = beta.clone();
+        selected.visible_text = "Selected: Beta".into();
+        selected
+            .focus_anchor
+            .as_mut()
+            .unwrap()
+            .active_descendant
+            .as_mut()
+            .unwrap()
+            .selected = Some(true);
+        let browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::from([
+                observation_page(before),
+                observation_page(alpha),
+                observation_page(beta),
+                observation_page(selected.clone()),
+            ])),
+            fallback: selected,
+            dispatch_result: Some(Ok(manuvra_chrome::PerformFact {
+                readback: None,
+                readback_matches: None,
+                suboperations: vec!["key_down".into(), "key_up".into()],
+            })),
+        };
+        let provider = WidgetProvider(AtomicUsize::new(0));
+        let artifacts = drive_steps(
+            &job,
+            &redactor,
+            &browser,
+            &provider,
+            &mut MemoryJournal::default(),
+            &manuvra_chrome::InputCancellation::default(),
+            None,
+            None,
+        );
+        assert!(artifacts.stop.is_none());
+        assert_eq!(artifacts.verdicts[0].result, VerdictResult::Satisfied);
+        assert_eq!(provider.0.load(Ordering::SeqCst), 3);
+        let keys: Vec<_> = artifacts
+            .trace
+            .iter()
+            .filter(|event| event["event"] == "action_prepared")
+            .map(|event| event["key"].as_str().unwrap())
+            .collect();
+        assert_eq!(keys, ["ArrowDown", "ArrowDown", "Enter"]);
     }
 
     #[test]
@@ -4800,6 +4910,10 @@ mod tests {
             in_dialog: None,
             covered: true,
             surface: None,
+            active_descendant: None,
+            expanded: None,
+            selected: None,
+            checked: None,
         });
         let exported = redacted_observation(&observation, &redactor).unwrap();
         let text = exported.to_string();

@@ -221,6 +221,8 @@ fn prepare(
     if candidate.operation == Operation::PressKey {
         evidence["focus_anchor"] = json!(focus_anchor.as_ref().map(|anchor| json!({
             "role":anchor.role,"name":anchor.name,"dialog":anchor.in_dialog,
+            "active_descendant":anchor.active_descendant,
+            "expanded":anchor.expanded,"selected":anchor.selected,"checked":anchor.checked,
         })));
         evidence["key"] = json!(candidate.key);
     }
@@ -640,6 +642,10 @@ mod tests {
             in_dialog: None,
             covered: true,
             surface: None,
+            active_descendant: None,
+            expanded: None,
+            selected: None,
+            checked: None,
         });
         let dispatches = AtomicUsize::new(0);
         let mut before = FakeJournal {
@@ -708,6 +714,16 @@ mod tests {
             in_dialog: None,
             covered: true,
             surface: None,
+            active_descendant: Some(manuvra_chrome::ActiveDescendant {
+                id: secret.into(),
+                role: "option".into(),
+                name: secret.into(),
+                selected: Some(false),
+                checked: None,
+            }),
+            expanded: None,
+            selected: None,
+            checked: None,
         });
         let directory = TempDir::new().unwrap();
         let redactor = crate::evidence::Redactor::for_job(&job).unwrap();

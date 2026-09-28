@@ -35,6 +35,45 @@ pub struct FocusAnchor {
     pub covered: bool,
     #[serde(default)]
     pub surface: Option<FocusSurface>,
+    #[serde(default)]
+    pub active_descendant: Option<ActiveDescendant>,
+    #[serde(default)]
+    pub expanded: Option<bool>,
+    #[serde(default)]
+    pub selected: Option<bool>,
+    #[serde(default)]
+    pub checked: Option<bool>,
+}
+
+impl FocusAnchor {
+    pub(crate) fn same_identity(&self, other: &Self) -> bool {
+        (
+            self.node_id,
+            &self.context,
+            &self.role,
+            &self.name,
+            &self.in_dialog,
+            self.covered,
+            self.surface,
+        ) == (
+            other.node_id,
+            &other.context,
+            &other.role,
+            &other.name,
+            &other.in_dialog,
+            other.covered,
+            other.surface,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveDescendant {
+    pub id: String,
+    pub role: String,
+    pub name: String,
+    pub selected: Option<bool>,
+    pub checked: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -96,7 +96,7 @@ pub fn request(
             "type_target":{"type":"choice","instructions":{"premise":"The operation is TYPE_TEXT","rules":target_rules,"goal":values.mask(&step.goal)},"criteria":target_criteria(observation,"TYPE_TEXT",values)},
             "select_target":{"type":"choice","instructions":{"premise":"The operation is SELECT","rules":target_rules,"goal":values.mask(&step.goal)},"criteria":target_criteria(observation,"SELECT",values)},
             "type_value":{"type":"choice","instructions":{"premise":"The operation is TYPE_TEXT or SELECT into the independently selected field","rules":"Choose the caller-provided value name whose description belongs in that field, or NONE_FITS.","goal":values.mask(&step.goal)},"criteria":value_criteria},
-            "key":{"type":"choice","instructions":{"premise":"The operation is PRESS_KEY","rules":"Choose the single key requested by this step. Other keys are unavailable in this version.","goal":values.mask(&step.goal)},"criteria":{"Escape":"Close the focused overlay with Escape.","Tab":"Move focus forward with Tab.","Shift+Tab":"Move focus backward with Shift+Tab.","Enter":"Activate the focused control with Enter.","Space":"Activate the focused control with Space."}}
+            "key":{"type":"choice","instructions":{"premise":"The operation is PRESS_KEY","rules":"Choose the single key requested by this step. Other keys are unavailable in this version.","goal":values.mask(&step.goal)},"criteria":{"Escape":"Close the focused overlay with Escape.","Tab":"Move focus forward with Tab.","Shift+Tab":"Move focus backward with Shift+Tab.","Enter":"Activate the focused control with Enter.","Space":"Activate the focused control with Space.","ArrowUp":"Move to the previous option with ArrowUp.","ArrowDown":"Move to the next option with ArrowDown.","ArrowLeft":"Move left in a composite widget with ArrowLeft.","ArrowRight":"Move right in a composite widget with ArrowRight.","Home":"Move to the first option with Home.","End":"Move to the last option with End."}}
         }
     })
 }
@@ -297,6 +297,10 @@ mod tests {
                 in_dialog: None,
                 covered: true,
                 surface: None,
+                active_descendant: None,
+                expanded: None,
+                selected: None,
+                checked: None,
             }),
             visible_text: "provider-secret-419".into(),
             covered_text: "".into(),
@@ -497,13 +501,23 @@ mod tests {
             "PRESS_KEY"
         );
         assert_eq!(request["questions"]["key"]["type"], "choice");
-        assert_eq!(
-            request["questions"]["key"]["criteria"]
-                .as_object()
-                .unwrap()
-                .len(),
-            5
-        );
+        let key_criteria = request["questions"]["key"]["criteria"].as_object().unwrap();
+        assert_eq!(key_criteria.len(), 11);
+        for key in [
+            "Escape",
+            "Tab",
+            "Shift+Tab",
+            "Enter",
+            "Space",
+            "ArrowUp",
+            "ArrowDown",
+            "ArrowLeft",
+            "ArrowRight",
+            "Home",
+            "End",
+        ] {
+            assert!(key_criteria.contains_key(key), "missing {key}");
+        }
         assert_eq!(
             operation_hint("Enter account_name in Name", &observation),
             Some("TYPE_TEXT")

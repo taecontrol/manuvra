@@ -27,6 +27,12 @@ pub enum Key {
     ShiftTab,
     Enter,
     Space,
+    ArrowUp,
+    ArrowDown,
+    ArrowLeft,
+    ArrowRight,
+    Home,
+    End,
 }
 
 impl Key {
@@ -185,10 +191,18 @@ fn revalidate_focus(
     if fresh.document_id != input.document_id {
         return Err(PerformError::Rejected("document_changed".into()));
     }
-    if fresh.focus_anchor != input.focus_anchor {
+    if !focus_identity_matches(&fresh.focus_anchor, &input.focus_anchor) {
         return Err(PerformError::Rejected("focus_changed".into()));
     }
     Ok(())
+}
+
+fn focus_identity_matches(fresh: &Option<FocusAnchor>, expected: &Option<FocusAnchor>) -> bool {
+    match (fresh, expected) {
+        (None, None) => true,
+        (Some(fresh), Some(expected)) => fresh.same_identity(expected),
+        _ => false,
+    }
 }
 
 fn press_key(
@@ -196,13 +210,20 @@ fn press_key(
     key: Key,
     cancellation: &InputCancellation,
 ) -> Result<PerformFact, PerformError> {
-    let (name, code, virtual_key, modifiers) = match key {
-        Key::Escape => ("Escape", "Escape", 27, 0),
-        Key::Tab => ("Tab", "Tab", 9, 0),
-        Key::ShiftTab => ("Tab", "Tab", 9, 8),
-        Key::Enter => ("Enter", "Enter", 13, 0),
-        Key::Space => (" ", "Space", 32, 0),
-    };
+    const FIELDS: [(&str, &str, u32, u32); 11] = [
+        ("Escape", "Escape", 27, 0),
+        ("Tab", "Tab", 9, 0),
+        ("Tab", "Tab", 9, 8),
+        ("Enter", "Enter", 13, 0),
+        (" ", "Space", 32, 0),
+        ("ArrowUp", "ArrowUp", 38, 0),
+        ("ArrowDown", "ArrowDown", 40, 0),
+        ("ArrowLeft", "ArrowLeft", 37, 0),
+        ("ArrowRight", "ArrowRight", 39, 0),
+        ("Home", "Home", 36, 0),
+        ("End", "End", 35, 0),
+    ];
+    let (name, code, virtual_key, modifiers) = FIELDS[key as usize];
     let params = |event_type| {
         let mut event = json!({
             "type":event_type,"key":name,"code":code,
@@ -696,6 +717,10 @@ mod tests {
                 in_dialog: None,
                 covered: true,
                 surface: None,
+                active_descendant: None,
+                expanded: None,
+                selected: None,
+                checked: None,
             }),
         }
     }
@@ -712,8 +737,38 @@ mod tests {
     }
 
     #[test]
+    fn focus_revalidation_checks_identity_without_freezing_widget_state() {
+        let chrome = ScriptedChrome::start();
+        let input = focus_input(Key::ArrowDown);
+        let mut changed_state = input.focus_anchor.clone().unwrap();
+        changed_state.expanded = Some(true);
+        changed_state.active_descendant = Some(crate::ActiveDescendant {
+            id: "beta".into(),
+            role: "option".into(),
+            name: "Beta".into(),
+            selected: Some(false),
+            checked: None,
+        });
+        reply_focus(&chrome, Some(changed_state), "d");
+        assert!(perform(&chrome.connect_raw(), input, &InputCancellation::default()).is_ok());
+        assert_eq!(chrome.received("Input.dispatchKeyEvent").len(), 2);
+    }
+
+    #[test]
     fn press_key_dispatches_exactly_two_events_with_native_key_parameters() {
-        for key in [Key::Escape, Key::Tab, Key::ShiftTab, Key::Enter, Key::Space] {
+        for key in [
+            Key::Escape,
+            Key::Tab,
+            Key::ShiftTab,
+            Key::Enter,
+            Key::Space,
+            Key::ArrowUp,
+            Key::ArrowDown,
+            Key::ArrowLeft,
+            Key::ArrowRight,
+            Key::Home,
+            Key::End,
+        ] {
             let chrome = ScriptedChrome::start();
             let input = focus_input(key);
             reply_focus(&chrome, input.focus_anchor.clone(), "d");
@@ -731,6 +786,12 @@ mod tests {
                     Key::Tab | Key::ShiftTab => "Tab",
                     Key::Enter => "Enter",
                     Key::Space => " ",
+                    Key::ArrowUp => "ArrowUp",
+                    Key::ArrowDown => "ArrowDown",
+                    Key::ArrowLeft => "ArrowLeft",
+                    Key::ArrowRight => "ArrowRight",
+                    Key::Home => "Home",
+                    Key::End => "End",
                 }
             );
             assert_eq!(
@@ -744,6 +805,12 @@ mod tests {
                     Key::Tab | Key::ShiftTab => "Tab",
                     Key::Enter => "Enter",
                     Key::Space => "Space",
+                    Key::ArrowUp => "ArrowUp",
+                    Key::ArrowDown => "ArrowDown",
+                    Key::ArrowLeft => "ArrowLeft",
+                    Key::ArrowRight => "ArrowRight",
+                    Key::Home => "Home",
+                    Key::End => "End",
                 }
             );
             assert_eq!(
@@ -753,6 +820,12 @@ mod tests {
                     Key::Tab | Key::ShiftTab => 9,
                     Key::Enter => 13,
                     Key::Space => 32,
+                    Key::ArrowUp => 38,
+                    Key::ArrowDown => 40,
+                    Key::ArrowLeft => 37,
+                    Key::ArrowRight => 39,
+                    Key::Home => 36,
+                    Key::End => 35,
                 }
             );
             match key {

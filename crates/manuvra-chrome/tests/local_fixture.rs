@@ -23,6 +23,7 @@ const FOCUS_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-focus.
 const KEYBOARD_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-keyboard-focus.html");
 const ACTIVATION_FIXTURE: &str =
     include_str!("../../../tests/fixtures/browser-keyboard-activation.html");
+const WIDGET_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-keyboard-widgets.html");
 static REAL_BROWSER: Mutex<()> = Mutex::new(());
 
 #[cfg(target_os = "macos")]
@@ -215,6 +216,115 @@ fn prepared_key(
         action_sequence: sequence,
         focus_anchor: observation.focus_anchor.clone(),
     }
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn arrow_home_end_and_enter_follow_composite_widget_state() {
+    use manuvra_chrome::Key;
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(WIDGET_FIXTURE);
+    let mut browser = OwnedBrowser::launch(BrowserConfig {
+        explicit_binary: None,
+        headless: true,
+        width: 1120,
+        height: 780,
+        inherit_process_group: false,
+    })
+    .unwrap();
+    #[cfg(target_os = "macos")]
+    let lifecycle = BrowserLifecycle::observe(&browser);
+    browser.navigate(&server.url()).unwrap();
+    let mut observed = browser.observe().unwrap();
+    for (key, active_id) in [
+        (Key::Tab, None),
+        (Key::ArrowDown, Some("alpha")),
+        (Key::ArrowDown, Some("beta")),
+        (Key::Home, Some("alpha")),
+        (Key::End, Some("gamma")),
+        (Key::ArrowUp, Some("beta")),
+        (Key::ArrowRight, Some("gamma")),
+        (Key::ArrowLeft, Some("beta")),
+    ] {
+        browser
+            .perform(
+                prepared_key(&observed, key, 1),
+                &InputCancellation::default(),
+            )
+            .unwrap();
+        observed = browser.observe().unwrap();
+        let anchor = observed.focus_anchor.as_ref().unwrap();
+        assert_eq!(anchor.role, "combobox");
+        assert_eq!(
+            anchor
+                .active_descendant
+                .as_ref()
+                .map(|item| item.id.as_str()),
+            active_id
+        );
+    }
+    browser
+        .perform(
+            prepared_key(&observed, Key::Enter, 2),
+            &InputCancellation::default(),
+        )
+        .unwrap();
+    observed = browser.observe().unwrap();
+    assert!(observed.visible_text.contains("Selected: Beta"));
+    assert_eq!(
+        observed
+            .focus_anchor
+            .as_ref()
+            .unwrap()
+            .active_descendant
+            .as_ref()
+            .unwrap()
+            .selected,
+        Some(true)
+    );
+    browser
+        .perform(
+            prepared_key(&observed, Key::Tab, 3),
+            &InputCancellation::default(),
+        )
+        .unwrap();
+    observed = browser.observe().unwrap();
+    assert_eq!(observed.focus_anchor.as_ref().unwrap().name, "First action");
+    browser
+        .perform(
+            prepared_key(&observed, Key::ArrowDown, 4),
+            &InputCancellation::default(),
+        )
+        .unwrap();
+    observed = browser.observe().unwrap();
+    assert_eq!(
+        observed.focus_anchor.as_ref().unwrap().name,
+        "Second action"
+    );
+    browser
+        .perform(
+            prepared_key(&observed, Key::ArrowUp, 5),
+            &InputCancellation::default(),
+        )
+        .unwrap();
+    observed = browser.observe().unwrap();
+    assert_eq!(observed.focus_anchor.as_ref().unwrap().name, "First action");
+    browser
+        .perform(
+            prepared_key(&observed, Key::Tab, 6),
+            &InputCancellation::default(),
+        )
+        .unwrap();
+    observed = browser.observe().unwrap();
+    let shadow_anchor = observed.focus_anchor.as_ref().unwrap();
+    assert_eq!(shadow_anchor.name, "Shadow choice");
+    let descendant = shadow_anchor.active_descendant.as_ref().unwrap();
+    assert_eq!(descendant.id, "gamma");
+    assert_eq!(descendant.name, "");
+    assert_eq!(descendant.role, "");
+    browser.close().unwrap();
+    #[cfg(target_os = "macos")]
+    lifecycle.assert_cleaned();
 }
 
 #[test]
