@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 const FIXTURE: &str = include_str!("../../../tests/fixtures/browser-adversarial.html");
 const INPUT_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-input-strategies.html");
+const FOCUS_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-focus.html");
 static REAL_BROWSER: Mutex<()> = Mutex::new(());
 
 #[cfg(target_os = "macos")]
@@ -242,6 +243,41 @@ fn production_snapshot_and_masking_cover_truncation_split_nodes_and_zero_masks()
     browser.close().unwrap();
     #[cfg(target_os = "macos")]
     lifecycle.assert_cleaned();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn production_snapshot_observes_indexed_dialog_and_body_focus() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(FOCUS_FIXTURE);
+    let mut browser = OwnedBrowser::launch(BrowserConfig {
+        explicit_binary: None,
+        headless: true,
+        width: 1120,
+        height: 780,
+        inherit_process_group: false,
+    })
+    .unwrap();
+    for (query, focused, name, role, indexed) in [
+        ("button", true, "Save", "button", true),
+        ("dialog", true, "Breakdown", "interactive", false),
+        ("native-dialog", true, "Native breakdown", "dialog", false),
+        ("body", false, "", "", false),
+    ] {
+        browser
+            .navigate(&format!("{}?focus={query}", server.url()))
+            .unwrap();
+        let observed = browser.observe().unwrap();
+        assert_eq!(observed.focus_anchor.is_some(), focused, "{query}");
+        assert_eq!(observed.focused.is_some(), indexed, "{query}");
+        if let Some(anchor) = observed.focus_anchor {
+            assert_eq!(anchor.name, name, "{query}");
+            assert_eq!(anchor.role, role, "{query}");
+            assert!(anchor.covered, "{query}");
+            assert!(!anchor.name.contains("Descendant text"));
+        }
+    }
+    browser.close().unwrap();
 }
 
 #[test]

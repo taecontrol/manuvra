@@ -262,6 +262,8 @@ fn is_protocol_collision(value: &str) -> bool {
         "title",
         "dialogs",
         "focused",
+        "focus_anchor",
+        "covered",
         "visible_text",
         "covered_text",
         "dialog_texts",

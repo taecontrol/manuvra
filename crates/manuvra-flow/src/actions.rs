@@ -472,6 +472,7 @@ mod tests {
             title: "x".into(),
             dialogs: vec![],
             focused: None,
+            focus_anchor: None,
             visible_text: "".into(),
             covered_text: "".into(),
             dialog_texts: BTreeMap::new(),

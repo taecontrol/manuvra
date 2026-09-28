@@ -1,0 +1,15 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Focus fixture</title>
+<button id="save">Save</button>
+<section role="dialog" aria-labelledby="dialog-title">
+  <h2 id="dialog-title">Breakdown</h2>
+  <div id="content" tabindex="-1">Descendant text must not name the focus</div>
+</section>
+<dialog id="native-dialog" open tabindex="-1" aria-label="Native breakdown"></dialog>
+<script>
+  const target = new URL(location.href).searchParams.get('focus');
+  if (target === 'button') document.querySelector('#save').focus();
+  if (target === 'dialog') document.querySelector('#content').focus();
+  if (target === 'native-dialog') document.querySelector('#native-dialog').focus();
+</script>

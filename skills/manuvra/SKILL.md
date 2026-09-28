@@ -91,7 +91,7 @@ Start from this shape and replace the illustrative labels and claims with the ap
 Authoring rules:
 
 - Write goals and natural-language conditions in English. Make each step one observable UI transition. Opening a chooser and selecting an option are separate steps.
-- Describe intent in `goal` and the resulting state in `done_when`. A list of assertions is a conjunction. Prefer the structured forms `text_visible`, `text_absent`, `field` + `nonempty`, `field` + `equals_value`, `dialog_open`, `dialog_closed`, and `url_contains`. Use a natural-language string only when those forms cannot express the condition.
+- Describe intent in `goal` and the resulting state in `done_when`. A list of assertions is a conjunction. Prefer the structured forms `text_visible`, `text_absent`, `field` + `nonempty`, `field` + `equals_value`, `focused`, `dialog_open`, `dialog_closed`, and `url_contains`. `{"focused":"Save"}` requires that element to have focus; add `role` or `dialog` to distinguish repeated names. Use a natural-language string only when those forms cannot express the condition.
 - Match field and dialog names to visible accessible labels. Manuvra requires one unambiguous visible match. Use a field's optional `dialog` or `role`, or a text assertion's `scope`, when the page repeats a label.
 - Put every literal to be entered in `values` under a stable semantic name. Refer to that name from `requires_values` and `equals_value`. Keep the literal in `values`. Mark credentials or sensitive values with `"secret": true`, and list other values requiring evidence redaction in `options.redact_values`.
 - Keep jobs containing classified values outside the repository in a caller-owned file with mode `0600`.

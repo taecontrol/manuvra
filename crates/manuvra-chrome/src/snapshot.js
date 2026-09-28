@@ -50,6 +50,7 @@
   };
   const role = (element) => {
     const explicit = element.getAttribute('role'); if (explicit) return explicit;
+    if (element.tagName === 'DIALOG') return 'dialog';
     if (element.tagName === 'BUTTON' || element.tagName === 'SUMMARY') return 'button';
     if (element.tagName === 'A') return 'link'; if (element.tagName === 'SELECT') return 'combobox';
     if (element.tagName === 'TEXTAREA' || element.isContentEditable) return 'textbox';
@@ -106,8 +107,31 @@
       else if (rendered(parent, context)) coveredLength = appendText(coveredText, value, 'covered_text', coveredLength);
     }
   }
-  let focused = null;
+  let focused = null, focusAnchor = null, active = document.activeElement;
   for (const [element, elementIndex] of elementIndices) if (element.matches(':focus')) { focused = elementIndex; break; }
+  while (active) {
+    if (active.shadowRoot?.activeElement) { active = active.shadowRoot.activeElement; continue; }
+    if (active.tagName === 'IFRAME' || active.tagName === 'FRAME') {
+      let child;
+      try { child = active.contentDocument; } catch (_) { child = null; }
+      if (child?.activeElement) { active = child.activeElement; continue; }
+    }
+    break;
+  }
+  if (active && active !== active.ownerDocument.body && active !== active.ownerDocument.documentElement) {
+    const root = active.getRootNode(), context = contexts.find(item => item.root === root);
+    const indexed = elements.find(item => item.index === elementIndices.get(active));
+    const containingDialog = active.closest('dialog,[role="dialog"],[role="alertdialog"]');
+    const dialog = containingDialog ? dialogTitle(containingDialog) : null;
+    const owner = active.ownerDocument;
+    const labelled = (active.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
+      .map(id => owner.getElementById(id)?.textContent?.replace(/\s+/g,' ').trim()).filter(Boolean).join(' ');
+    const ariaName = labelled || active.getAttribute('aria-label') || active.getAttribute('title') || '';
+    const view = owner.defaultView;
+    const closed = Boolean(view?.__manuvraClosedShadowHosts?.has(active));
+    const crossOrigin = (active.tagName === 'IFRAME' || active.tagName === 'FRAME') && !active.contentDocument;
+    focusAnchor = {node_id:nodeId(active),context:context?.context || 'main',role:indexed?.role || role(active),name:indexed?.name || (dialog || ariaName),in_dialog:indexed?.in_dialog || dialog,covered:!closed && !crossOrigin};
+  }
   for (const context of contexts) for (const element of context.root.querySelectorAll('*')) {
     if (element.tagName === 'CANVAS') gaps.push('canvas');
     const view = element.ownerDocument?.defaultView || window;
@@ -124,5 +148,5 @@
     dialogTexts[record.title] = text.slice(0,TEXT_LIMIT);
   }
   const finalGaps = [...new Set(gaps)], truncated = finalGaps.some(gap => gap.endsWith('_truncated'));
-  return {document_id:String(performance.timeOrigin),url:location.href,route:location.pathname+location.search,title:document.title,dialogs,focused,visible_text:visibleText.join('\n'),covered_text:coveredText.join('\n'),dialog_texts:dialogTexts,elements,viewport:{width:innerWidth,height:innerHeight,scroll_x:scrollX,scroll_y:scrollY,document_height:document.documentElement.scrollHeight},coverage:{viewport_complete:!truncated,open_shadow_roots:true,slots:true,same_origin_frames:!finalGaps.includes('cross_origin_frame'),gaps:finalGaps}};
+  return {document_id:String(performance.timeOrigin),url:location.href,route:location.pathname+location.search,title:document.title,dialogs,focused,focus_anchor:focusAnchor,visible_text:visibleText.join('\n'),covered_text:coveredText.join('\n'),dialog_texts:dialogTexts,elements,viewport:{width:innerWidth,height:innerHeight,scroll_x:scrollX,scroll_y:scrollY,document_height:document.documentElement.scrollHeight},coverage:{viewport_complete:!truncated,open_shadow_roots:true,slots:true,same_origin_frames:!finalGaps.includes('cross_origin_frame'),gaps:finalGaps}};
 })()

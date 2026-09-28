@@ -1163,6 +1163,7 @@ fn relevant_state(observation: &Observation) -> Value {
         "dialogs": observation.dialogs,
         "dialog_texts": observation.dialog_texts,
         "focused": observation.focused,
+        "focus_anchor": observation.focus_anchor,
         "visible_text": observation.visible_text,
         "covered_text": observation.covered_text,
         "elements": observation.elements,
@@ -2704,6 +2705,7 @@ fn empty_observation() -> Observation {
         title: String::new(),
         dialogs: Vec::new(),
         focused: None,
+        focus_anchor: None,
         visible_text: String::new(),
         covered_text: String::new(),
         dialog_texts: BTreeMap::new(),
@@ -2839,6 +2841,12 @@ fn redacted_observation(raw: &Observation, redactor: &Redactor) -> Result<Value,
         "title":redact(&raw.title),
         "dialogs":raw.dialogs.iter().map(|dialog|redact(dialog)).collect::<Vec<_>>(),
         "focused":raw.focused,
+        "focus_anchor":raw.focus_anchor.as_ref().map(|anchor|json!({
+            "role":redact(&anchor.role),
+            "name":redact(&anchor.name),
+            "in_dialog":anchor.in_dialog.as_ref().map(|dialog|redact(dialog)),
+            "covered":anchor.covered,
+        })),
         "visible_text":redact(&raw.visible_text),
         "covered_text":redact(&raw.covered_text),
         "dialog_texts":raw.dialog_texts.iter().map(|(name,text)|(redact(name),redact(text))).collect::<BTreeMap<_,_>>(),
@@ -3189,7 +3197,9 @@ fn absolute_text(path: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use manuvra_chrome::{Coverage, Element, Rect, RedactionProof, Screenshot, ViewportState};
+    use manuvra_chrome::{
+        Coverage, Element, FocusAnchor, Rect, RedactionProof, Screenshot, ViewportState,
+    };
     use serde_json::json;
     use std::collections::{BTreeMap, VecDeque};
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3719,6 +3729,7 @@ mod tests {
             title: "Money · Accounts".into(),
             dialogs: Vec::new(),
             focused: None,
+            focus_anchor: None,
             visible_text: text.into(),
             covered_text: String::new(),
             dialog_texts: BTreeMap::new(),
@@ -4323,12 +4334,21 @@ mod tests {
 
     #[test]
     fn exported_observation_keeps_public_indices_but_omits_browser_identity() {
-        let job = mutation_job();
+        let mut job = mutation_job();
+        job.values.get_mut("name").unwrap().secret = true;
         let redactor = Redactor::for_job(&job).unwrap();
         let mut observation = text_field("");
         observation.document_id = "internal-document-token".into();
         observation.elements[0].node_id = 981_723;
         observation.elements[0].context = "main/shadow:981723".into();
+        observation.focus_anchor = Some(FocusAnchor {
+            node_id: 981_723,
+            context: "main/shadow:981723".into(),
+            role: "textbox".into(),
+            name: "Wanted".into(),
+            in_dialog: None,
+            covered: true,
+        });
         let exported = redacted_observation(&observation, &redactor).unwrap();
         let text = exported.to_string();
 
@@ -4339,6 +4359,13 @@ mod tests {
         assert!(!text.contains("document_id"));
         assert!(!text.contains("node_id"));
         assert!(!text.contains("main/shadow"));
+        assert!(!text.contains("Wanted"));
+        assert!(
+            exported["focus_anchor"]["name"]
+                .as_str()
+                .unwrap()
+                .contains("<masked:")
+        );
         assert!(exported["elements"][0].get("context").is_none());
     }
 

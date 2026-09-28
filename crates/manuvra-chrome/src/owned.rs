@@ -49,10 +49,14 @@ const COVERAGE_PROBE: &str = r#"(() => {
   if (window.__manuvraCoverageProbeInstalled) return;
   window.__manuvraCoverageProbeInstalled = true;
   window.__manuvraClosedShadowRoots = 0;
+  window.__manuvraClosedShadowHosts = new WeakSet();
   const original = Element.prototype.attachShadow;
   Element.prototype.attachShadow = function(init) {
     const root = original.call(this, init);
-    if (init?.mode === 'closed') window.__manuvraClosedShadowRoots += 1;
+    if (init?.mode === 'closed') {
+      window.__manuvraClosedShadowRoots += 1;
+      window.__manuvraClosedShadowHosts.add(this);
+    }
     return root;
   };
 })()"#;
@@ -1162,6 +1166,47 @@ mod tests {
             closed: false,
         };
         browser.close().unwrap();
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inherited_browser_ignoring_term_is_killed_without_signalling_host_group() {
+        let mut child = Command::new("sh")
+            .args(["-c", "trap '' TERM; printf 'ready\\n'; exec sleep 30"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "ready\n");
+        let pid = child.id();
+        let mut ownership = platform::ownership_for_test(&child, false);
+        platform::terminate(&mut child, &mut ownership).unwrap();
+        assert!(child.try_wait().unwrap().is_some());
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_browser_group_ignoring_term_is_killed() {
+        let mut child = Command::new("sh")
+            .args(["-c", "trap '' TERM; printf 'ready\\n'; exec sleep 30"])
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "ready\n");
+        let pid = child.id();
+        let mut ownership = platform::ownership_for_test(&child, true);
+        platform::terminate(&mut child, &mut ownership).unwrap();
+        assert!(child.try_wait().unwrap().is_some());
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
     }
 

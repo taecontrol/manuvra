@@ -163,6 +163,7 @@ pub enum Assertion {
     TextAbsent(TextAbsent),
     FieldNonempty(FieldNonempty),
     FieldEqualsValue(FieldEqualsValue),
+    Focused(Focused),
     DialogOpen(DialogOpen),
     DialogClosed(DialogClosed),
     UrlContains(UrlContains),
@@ -219,6 +220,16 @@ pub struct FieldNonempty {
 pub struct FieldEqualsValue {
     pub field: String,
     pub equals_value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialog: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Focused {
+    pub focused: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dialog: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -704,13 +715,22 @@ impl DoneCondition {
 impl Assertion {
     fn validate(&self) -> Result<(), ValidationError> {
         match self {
-            Self::TextVisible(value) => validate_nonempty("text_visible", &value.text_visible),
-            Self::TextAbsent(value) => validate_nonempty("text_absent", &value.text_absent),
             Self::FieldNonempty(value) => value.validate(),
             Self::FieldEqualsValue(value) => value.validate(),
+            Self::Focused(value) => validate_nonempty("focused", &value.focused),
+            _ => self.validate_page_assertion(),
+        }
+    }
+
+    fn validate_page_assertion(&self) -> Result<(), ValidationError> {
+        match self {
+            Self::TextVisible(value) => validate_nonempty("text_visible", &value.text_visible),
+            Self::TextAbsent(value) => validate_nonempty("text_absent", &value.text_absent),
             Self::DialogOpen(value) => validate_nonempty("dialog_open", &value.dialog_open),
             Self::DialogClosed(value) => validate_nonempty("dialog_closed", &value.dialog_closed),
             Self::UrlContains(value) => validate_nonempty("url_contains", &value.url_contains),
+            // Only the non-field variants reach this private branch.
+            _ => unreachable!("field assertions are validated before page assertions"),
         }
     }
 }
@@ -997,6 +1017,7 @@ mod tests {
             {"text_absent": "Error", "scope": {"dialog": "Create"}},
             {"field": "Name", "nonempty": true, "dialog": "Create", "role": "textbox"},
             {"field": "Name", "equals_value": "account_name"},
+            {"focused": "Save", "role": "button", "dialog": "Create"},
             {"dialog_open": "Create"}, {"dialog_closed": "Other"}, {"url_contains": "/accounts"}
         ]);
         let mut value = valid_job();
@@ -1078,6 +1099,10 @@ mod tests {
             }),
             Box::new(|job| {
                 job["steps"][0]["done_when"] = json!([{"field": "Name", "nonempty": false}])
+            }),
+            Box::new(|job| job["steps"][0]["done_when"] = json!([{"focused": " "}])),
+            Box::new(|job| {
+                job["steps"][0]["done_when"] = json!([{"focused": "Save", "extra": true}])
             }),
             Box::new(|job| job["options"]["active_timeout_ms"] = json!(0)),
             Box::new(|job| job["options"]["max_model_calls"] = json!(1001)),

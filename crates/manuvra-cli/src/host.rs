@@ -698,6 +698,7 @@ fn fault_observation() -> manuvra_flow::Observation {
         title: "Fault fixture".into(),
         dialogs: Vec::new(),
         focused: None,
+        focus_anchor: None,
         visible_text: "Submit".into(),
         covered_text: String::new(),
         dialog_texts: BTreeMap::new(),

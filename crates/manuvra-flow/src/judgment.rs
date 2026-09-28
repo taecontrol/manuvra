@@ -220,7 +220,7 @@ pub fn selected_operation(judgments: &Judgments) -> Result<Operation, JevError> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use manuvra_chrome::{Coverage, Element, Rect, SelectOption, ViewportState};
+    use manuvra_chrome::{Coverage, Element, FocusAnchor, Rect, SelectOption, ViewportState};
     use manuvra_contract::Job;
     use manuvra_jev::{Answer, Evaluation};
     use std::sync::Mutex;
@@ -281,6 +281,14 @@ mod tests {
             title: "provider-secret-419".into(),
             dialogs: vec![],
             focused: None,
+            focus_anchor: Some(FocusAnchor {
+                node_id: 1,
+                context: "main".into(),
+                role: "textbox".into(),
+                name: "provider-secret-419".into(),
+                in_dialog: None,
+                covered: true,
+            }),
             visible_text: "provider-secret-419".into(),
             covered_text: "".into(),
             dialog_texts: BTreeMap::new(),

@@ -11,6 +11,8 @@ pub struct Observation {
     pub dialogs: Vec<String>,
     pub focused: Option<u64>,
     #[serde(default)]
+    pub focus_anchor: Option<FocusAnchor>,
+    #[serde(default)]
     pub visible_text: String,
     #[serde(default)]
     pub covered_text: String,
@@ -21,6 +23,16 @@ pub struct Observation {
     pub viewport: ViewportState,
     #[serde(default)]
     pub coverage: Coverage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FocusAnchor {
+    pub node_id: u64,
+    pub context: String,
+    pub role: String,
+    pub name: String,
+    pub in_dialog: Option<String>,
+    pub covered: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
