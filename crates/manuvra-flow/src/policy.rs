@@ -1,11 +1,10 @@
-use crate::judgment::{Judgments, Operation, selected_operation};
+use crate::judgment::{ChoiceJudgment, Judgments, Operation, hover_region_key, selected_operation};
 use crate::verification::DoneResult;
-use manuvra_chrome::{Element, Observation};
+use manuvra_chrome::{Element, HoverRegion, Observation};
 use manuvra_contract::{DoneCondition, JobOptions, Step};
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use url::Url;
 
@@ -22,6 +21,16 @@ pub(crate) struct Candidate {
     pub(crate) target_dialog: Option<String>,
     pub(crate) target_input_type: Option<String>,
     pub(crate) value_name: Option<String>,
+    pub(crate) hover_target: Option<HoverTarget>,
+}
+
+/// The hover region a `HOVER` candidate targets, as recorded in evidence. Its dispatch identity,
+/// the region's first hidden control, stays in the candidate's target identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HoverTarget {
+    pub index: u64,
+    pub name: String,
+    pub reveals_on_hover: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +65,21 @@ impl Candidate {
         })
         .expect("offered candidate is serializable")
     }
+
+    /// The observed hover region this candidate targets, when it is still the same region: same
+    /// document, same hidden control, same name and reveals.
+    pub(crate) fn hover_region<'a>(&self, observation: &'a Observation) -> Option<&'a HoverRegion> {
+        let wanted = self.hover_target.as_ref()?;
+        (observation.document_id == self.target_identity.document_id)
+            .then_some(&observation.hover_regions)?
+            .iter()
+            .find(|region| {
+                region.index == wanted.index
+                    && Some(region.node_id) == self.target_identity.node_id
+                    && region.name == wanted.name
+                    && region.reveals_on_hover == wanted.reveals_on_hover
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +108,10 @@ pub struct Permit {
 }
 
 impl Permit {
+    pub(crate) fn operation(&self) -> Operation {
+        self.candidate.operation
+    }
+
     pub(crate) fn consume(self) -> (Candidate, String, String, u64) {
         (
             self.candidate,
@@ -103,7 +131,8 @@ pub struct Policy {
     model_calls: u16,
     step_mutations: u8,
     fallbacks: u8,
-    replay: HashSet<String>,
+    /// Every minted replay key with the operation it charged, so refunds return exactly that.
+    replay: HashMap<String, Operation>,
     allowed_origins: Vec<String>,
     paused_at: Option<Instant>,
     paused_total: Duration,
@@ -129,7 +158,7 @@ impl Policy {
             model_calls: 0,
             step_mutations: 0,
             fallbacks: 0,
-            replay: HashSet::new(),
+            replay: HashMap::new(),
             allowed_origins,
             paused_at: None,
             paused_total: Duration::ZERO,
@@ -200,16 +229,8 @@ impl Policy {
     ) -> Next {
         match operation {
             Operation::Wait => self.fallback(Next::Wait),
-            Operation::ScrollUp | Operation::ScrollDown => {
-                if let Err(stop) = self.authorize_context(step, observation) {
-                    return Next::Stop(stop);
-                }
-                self.authorize_scroll(observation, operation)
-            }
             Operation::Blocked => Next::Stop(PolicyStop::Blocked("operation_blocked")),
-            Operation::Click | Operation::TypeText | Operation::Select => {
-                self.authorize(step, observation, judgments, operation)
-            }
+            _ => self.authorize(step, observation, judgments, operation),
         }
     }
 
@@ -220,14 +241,20 @@ impl Policy {
         judgments: &Judgments,
         operation: Operation,
     ) -> Next {
-        if let Err(stop) = self.authorize_context(step, observation) {
-            return Next::Stop(stop);
+        let authorized = self
+            .authorize_context(step, observation)
+            .and_then(|()| self.check_fallback_budget(operation))
+            .and_then(|()| self.candidate(observation, judgments, operation));
+        match authorized {
+            Ok(candidate) => self.mint(observation, candidate),
+            Err(stop) => Next::Stop(stop),
         }
-        let candidate = match self.candidate(observation, judgments, operation) {
-            Ok(candidate) => candidate,
-            Err(stop) => return Next::Stop(stop),
-        };
-        self.mint(observation, candidate)
+    }
+
+    fn check_fallback_budget(&self, operation: Operation) -> Result<(), PolicyStop> {
+        (operation.mutates() || self.fallbacks < 8)
+            .then_some(())
+            .ok_or(PolicyStop::Blocked("budget_exhausted"))
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", test))]
@@ -240,13 +267,28 @@ impl Policy {
             .map_err(|_| PolicyStop::Blocked("provider_invalid_response"))?;
         match operation {
             Operation::Click | Operation::TypeText | Operation::Select => {
-                self.candidate(observation, judgments, operation)
+                self.element_candidate(observation, judgments, operation)
             }
             _ => Err(PolicyStop::Blocked("provider_invalid_response")),
         }
     }
 
     fn candidate(
+        &self,
+        observation: &Observation,
+        judgments: &Judgments,
+        operation: Operation,
+    ) -> Result<Candidate, PolicyStop> {
+        match operation {
+            Operation::ScrollUp | Operation::ScrollDown => {
+                self.scroll_candidate(observation, operation)
+            }
+            Operation::Hover => self.hover_candidate(observation, judgments),
+            _ => self.element_candidate(observation, judgments, operation),
+        }
+    }
+
+    fn element_candidate(
         &self,
         observation: &Observation,
         judgments: &Judgments,
@@ -267,13 +309,15 @@ impl Policy {
             target_dialog: target.in_dialog.clone(),
             target_input_type: target.input_type.clone(),
             value_name,
+            hover_target: None,
         })
     }
 
-    fn authorize_scroll(&mut self, observation: &Observation, operation: Operation) -> Next {
-        if self.fallbacks >= 8 {
-            return Next::Stop(PolicyStop::Blocked("budget_exhausted"));
-        }
+    fn scroll_candidate(
+        &self,
+        observation: &Observation,
+        operation: Operation,
+    ) -> Result<Candidate, PolicyStop> {
         let can_scroll = match operation {
             Operation::ScrollUp => observation.viewport.scroll_y > 0.0,
             Operation::ScrollDown => {
@@ -282,10 +326,30 @@ impl Policy {
             }
             _ => false,
         };
-        if !can_scroll {
-            return Next::Stop(PolicyStop::Blocked("operation_blocked"));
-        }
-        let candidate = Candidate {
+        can_scroll
+            .then(|| self.untargeted_candidate(observation, operation))
+            .ok_or(PolicyStop::Blocked("operation_blocked"))
+    }
+
+    fn hover_candidate(
+        &self,
+        observation: &Observation,
+        judgments: &Judgments,
+    ) -> Result<Candidate, PolicyStop> {
+        let region = selected_hover_region(observation, judgments)
+            .ok_or(PolicyStop::Blocked("provider_invalid_response"))?;
+        let mut candidate = self.untargeted_candidate(observation, Operation::Hover);
+        candidate.target_identity.node_id = Some(region.node_id);
+        candidate.hover_target = Some(HoverTarget {
+            index: region.index,
+            name: region.name.clone(),
+            reveals_on_hover: region.reveals_on_hover.clone(),
+        });
+        Ok(candidate)
+    }
+
+    fn untargeted_candidate(&self, observation: &Observation, operation: Operation) -> Candidate {
+        Candidate {
             id: format!("c_{}", self.actions + 1),
             operation,
             target_index: None,
@@ -298,16 +362,17 @@ impl Policy {
             target_dialog: None,
             target_input_type: None,
             value_name: None,
-        };
-        self.mint(observation, candidate)
+            hover_target: None,
+        }
     }
 
     fn fallback(&mut self, next: Next) -> Next {
-        if self.fallbacks >= 8 {
-            Next::Stop(PolicyStop::Blocked("budget_exhausted"))
-        } else {
-            self.fallbacks += 1;
-            next
+        match self.check_fallback_budget(Operation::Wait) {
+            Ok(()) => {
+                self.charge(Operation::Wait);
+                next
+            }
+            Err(stop) => Next::Stop(stop),
         }
     }
 
@@ -337,16 +402,26 @@ impl Policy {
     pub(crate) fn release_unused(&mut self, permit: Box<Permit>) -> Candidate {
         let (candidate, _, replay_key, action_sequence) = permit.consume();
         debug_assert_eq!(action_sequence, u64::from(self.actions));
-        let removed = self.replay.remove(&replay_key);
-        debug_assert!(removed);
+        let charged = self.replay.remove(&replay_key);
+        debug_assert_eq!(charged, Some(candidate.operation));
         self.actions = self.actions.saturating_sub(1);
-        self.step_mutations = self.step_mutations.saturating_sub(1);
+        match charged.map(Operation::mutates) {
+            Some(true) => self.step_mutations = self.step_mutations.saturating_sub(1),
+            Some(false) => self.fallbacks = self.fallbacks.saturating_sub(1),
+            None => {}
+        }
         candidate
     }
 
+    /// Releases the replay key of an operation proven not performed. Only a mutation is refunded;
+    /// a fallback attempt stays counted, so rejected fallbacks remain bounded.
     #[cfg(any(target_os = "linux", target_os = "macos", test))]
     pub(crate) fn release_not_performed(&mut self, replay_key: &str) {
-        if self.replay.remove(replay_key) {
+        if self
+            .replay
+            .remove(replay_key)
+            .is_some_and(Operation::mutates)
+        {
             self.step_mutations = self.step_mutations.saturating_sub(1);
         }
     }
@@ -362,38 +437,32 @@ impl Policy {
     }
 
     fn mint(&mut self, observation: &Observation, candidate: Candidate) -> Next {
-        let replay_key = if let Some(target) = candidate
-            .target_index
-            .and_then(|index| observation.elements.iter().find(|item| item.index == index))
-        {
-            replay_key(observation, target, &candidate)
-        } else if matches!(
-            candidate.operation,
-            Operation::ScrollUp | Operation::ScrollDown
-        ) {
-            scroll_replay_key(observation, candidate.operation)
-        } else {
+        let Some(replay_key) = candidate_replay_key(observation, &candidate) else {
             return Next::Stop(PolicyStop::Uncertain("candidate_revalidation_failed"));
         };
-        if !self.replay.insert(replay_key.clone()) {
+        if self.replay.contains_key(&replay_key) {
             return Next::Stop(PolicyStop::Uncertain("replay_forbidden"));
         }
+        self.replay.insert(replay_key.clone(), candidate.operation);
         self.actions += 1;
-        if matches!(
-            candidate.operation,
-            Operation::ScrollUp | Operation::ScrollDown
-        ) {
-            self.fallbacks += 1;
-        } else {
-            self.step_mutations += 1;
-            self.fallbacks = 0;
-        }
+        self.charge(candidate.operation);
         Next::Mutate(Box::new(Permit {
             candidate,
             document_id: observation.document_id.clone(),
             replay_key,
             action_sequence: u64::from(self.actions),
         }))
+    }
+
+    /// A mutation consumes the step limit and resets the fallback budget; a fallback consumes the
+    /// fallback budget only.
+    fn charge(&mut self, operation: Operation) {
+        if operation.mutates() {
+            self.step_mutations += 1;
+            self.fallbacks = 0;
+        } else {
+            self.fallbacks += 1;
+        }
     }
 
     pub fn active_ms(&self) -> u128 {
@@ -490,14 +559,34 @@ fn selected_target<'a>(
     judgments: &Judgments,
     operation: Operation,
 ) -> Result<&'a Element, PolicyStop> {
-    let answer = match operation {
+    selected_element(observation, judgments, operation)
+        .ok_or(PolicyStop::Blocked("provider_invalid_response"))
+}
+
+fn selected_element<'a>(
+    observation: &'a Observation,
+    judgments: &Judgments,
+    operation: Operation,
+) -> Option<&'a Element> {
+    let answer: &ChoiceJudgment = match operation {
         Operation::Click => &judgments.click_target,
         Operation::TypeText => &judgments.type_target,
         Operation::Select => &judgments.select_target,
-        _ => return Err(PolicyStop::Blocked("provider_invalid_response")),
+        _ => return None,
     };
     parse_target(observation, &answer.choice)
-        .ok_or(PolicyStop::Blocked("provider_invalid_response"))
+}
+
+/// The listed hover region named by the `hover_target` answer, if any.
+fn selected_hover_region<'a>(
+    observation: &'a Observation,
+    judgments: &Judgments,
+) -> Option<&'a HoverRegion> {
+    let choice = &judgments.hover_target.as_ref()?.choice;
+    observation
+        .hover_regions
+        .iter()
+        .find(|region| hover_region_key(region) == *choice)
 }
 
 fn selected_value(
@@ -537,6 +626,39 @@ fn replay_key(observation: &Observation, target: &Element, candidate: &Candidate
     hex::encode(Sha256::digest(stable.to_string().as_bytes()))
 }
 
+fn candidate_replay_key(observation: &Observation, candidate: &Candidate) -> Option<String> {
+    match candidate.operation {
+        Operation::ScrollUp | Operation::ScrollDown => {
+            Some(scroll_replay_key(observation, candidate.operation))
+        }
+        Operation::Hover => candidate
+            .hover_region(observation)
+            .map(|region| hover_replay_key(observation, region)),
+        _ => candidate
+            .target_index
+            .and_then(|index| observation.elements.iter().find(|item| item.index == index))
+            .map(|target| replay_key(observation, target, candidate)),
+    }
+}
+
+/// The same region in an unchanged region list is one hover; any change to the list's names or
+/// reveals makes it a new one.
+fn hover_replay_key(observation: &Observation, region: &HoverRegion) -> String {
+    let listed: Vec<_> = observation
+        .hover_regions
+        .iter()
+        .map(|item| serde_json::json!({"name":item.name,"reveals_on_hover":item.reveals_on_hover}))
+        .collect();
+    let stable = serde_json::json!({
+        "operation":Operation::Hover,
+        "route":observation.route,
+        "region_name":region.name,
+        "reveals_on_hover":region.reveals_on_hover,
+        "hover_regions":hex::encode(Sha256::digest(serde_json::Value::from(listed).to_string().as_bytes())),
+    });
+    hex::encode(Sha256::digest(stable.to_string().as_bytes()))
+}
+
 fn scroll_replay_key(observation: &Observation, operation: Operation) -> String {
     let stable = serde_json::json!({
         "operation":operation,
@@ -547,20 +669,27 @@ fn scroll_replay_key(observation: &Observation, operation: Operation) -> String 
     hex::encode(Sha256::digest(stable.to_string().as_bytes()))
 }
 
+/// A selected element or listed hover region is a target on the observed surface, so a surface
+/// gap elsewhere on the page does not stop it.
 fn unsupported_surface(observation: &Observation, judgments: &Judgments) -> Option<&'static str> {
-    let selected_target = match selected_operation(judgments).ok() {
-        Some(Operation::Click) => parse_target(observation, &judgments.click_target.choice),
-        Some(Operation::TypeText) => parse_target(observation, &judgments.type_target.choice),
-        Some(Operation::Select) => parse_target(observation, &judgments.select_target.choice),
-        _ => None,
-    };
-    if selected_target.is_some_and(|element| element.input_type.as_deref() == Some("file")) {
+    let operation = selected_operation(judgments).ok();
+    let element =
+        operation.and_then(|operation| selected_element(observation, judgments, operation));
+    if element.is_some_and(|element| element.input_type.as_deref() == Some("file")) {
         return Some("file_input");
     }
-    selected_target
-        .is_none()
+    let targeted = element.is_some() || hover_region_selected(observation, judgments, operation);
+    (!targeted)
         .then(|| named_surface_gap(&observation.coverage.gaps))
         .flatten()
+}
+
+fn hover_region_selected(
+    observation: &Observation,
+    judgments: &Judgments,
+    operation: Option<Operation>,
+) -> bool {
+    operation == Some(Operation::Hover) && selected_hover_region(observation, judgments).is_some()
 }
 
 fn named_surface_gap(gaps: &[String]) -> Option<&'static str> {
@@ -642,6 +771,7 @@ mod tests {
             type_target: choice("1"),
             select_target: choice("1"),
             type_value: choice("name"),
+            hover_target: None,
             step_done: 0.5,
             usage: BTreeMap::new(),
             request_id: None,
@@ -1169,5 +1299,403 @@ mod tests {
             decide_not_done(&mut policy, &step(), &page, &judgments("WAIT"), false),
             Next::Stop(PolicyStop::Blocked("budget_exhausted"))
         ));
+    }
+
+    fn region(index: u64, name: &str, node_id: u64) -> HoverRegion {
+        HoverRegion {
+            index,
+            name: name.into(),
+            reveals_on_hover: vec![format!("Actions for {name}")],
+            node_id,
+        }
+    }
+
+    fn hover_page() -> Observation {
+        let mut page = observation("CLICK", "button");
+        page.hover_regions = vec![region(1, "Groceries", 41), region(2, "Rent", 42)];
+        page
+    }
+
+    fn hover(target: Option<&str>) -> Judgments {
+        let mut judgment = judgments("HOVER");
+        judgment.hover_target = target.map(choice);
+        judgment
+    }
+
+    fn one_mutation_step() -> Step {
+        Step {
+            mutation_limit: 1,
+            ..step()
+        }
+    }
+
+    fn minted(next: Next) -> Permit {
+        match next {
+            Next::Mutate(permit) => *permit,
+            other => panic!("expected a permit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hover_on_a_listed_region_mints_a_fallback_permit_naming_the_region() {
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        let permit = minted(decide_not_done(
+            &mut policy,
+            &step(),
+            &hover_page(),
+            &hover(Some("R2")),
+            false,
+        ));
+        assert_eq!(permit.operation(), Operation::Hover);
+        let (candidate, document_id, _, sequence) = permit.consume();
+        assert_eq!(document_id, "d");
+        assert_eq!(sequence, 1);
+        assert_eq!(candidate.target_index, None);
+        assert_eq!(candidate.target_name, None);
+        assert_eq!(
+            candidate.hover_target,
+            Some(HoverTarget {
+                index: 2,
+                name: "Rent".into(),
+                reveals_on_hover: vec!["Actions for Rent".into()],
+            })
+        );
+        assert_eq!(
+            candidate.hover_region(&hover_page()),
+            Some(&region(2, "Rent", 42))
+        );
+        assert_eq!(policy.actions, 1);
+        assert_eq!(policy.fallbacks, 1);
+        assert_eq!(policy.step_mutations(), 0);
+    }
+
+    #[test]
+    fn hover_follows_done_first_and_the_operation_gate_without_a_caller_candidate() {
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        let selected = hover(Some("R1"));
+        let decide = |policy: &mut Policy, done, done_reobserved, judgment: &Judgments, gate| {
+            policy.decide(
+                &natural_step(),
+                &hover_page(),
+                judgment,
+                done,
+                done_reobserved,
+                gate,
+            )
+        };
+        assert!(matches!(
+            decide(&mut policy, DoneResult::Satisfied, false, &selected, false),
+            Next::Complete
+        ));
+        assert!(matches!(
+            decide(&mut policy, DoneResult::Unknown, false, &selected, false),
+            Next::ReobserveDone
+        ));
+        assert!(matches!(
+            decide(&mut policy, DoneResult::Unknown, true, &selected, false),
+            Next::Stop(PolicyStop::Uncertain("done_uncertain"))
+        ));
+        let mut low = selected.clone();
+        low.operation.confidence = 0.69;
+        assert!(matches!(
+            decide(&mut policy, DoneResult::NotSatisfied, false, &low, false),
+            Next::ReobserveOperation
+        ));
+        assert!(matches!(
+            decide(&mut policy, DoneResult::NotSatisfied, false, &low, true),
+            Next::Stop(PolicyStop::Uncertain("operation_below_gate"))
+        ));
+        assert_eq!(
+            policy.caller_candidate(&hover_page(), &low),
+            Err(PolicyStop::Blocked("provider_invalid_response"))
+        );
+        assert_eq!(policy.actions, 0);
+    }
+
+    #[test]
+    fn missing_or_unlisted_hover_target_is_an_invalid_provider_response() {
+        for target in [None, Some("R9"), Some("1"), Some("2")] {
+            let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+            assert!(
+                matches!(
+                    decide_not_done(&mut policy, &step(), &hover_page(), &hover(target), false),
+                    Next::Stop(PolicyStop::Blocked("provider_invalid_response"))
+                ),
+                "{target:?}"
+            );
+            assert_eq!(policy.actions, 0);
+        }
+    }
+
+    #[test]
+    fn hover_is_bounded_by_actions_time_step_mutations_and_fallbacks() {
+        let no_actions = JobOptions {
+            max_actions: Some(0),
+            ..JobOptions::default()
+        };
+        let no_time = JobOptions {
+            active_timeout_ms: Some(0),
+            ..JobOptions::default()
+        };
+        for options in [no_actions, no_time] {
+            let mut policy = Policy::new(&options, "http://example.test/");
+            assert!(matches!(
+                decide_not_done(
+                    &mut policy,
+                    &step(),
+                    &hover_page(),
+                    &hover(Some("R1")),
+                    false
+                ),
+                Next::Stop(PolicyStop::Blocked("budget_exhausted"))
+            ));
+        }
+
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        minted(decide_not_done(
+            &mut policy,
+            &one_mutation_step(),
+            &hover_page(),
+            &judgments("CLICK"),
+            false,
+        ));
+        assert!(matches!(
+            decide_not_done(
+                &mut policy,
+                &one_mutation_step(),
+                &hover_page(),
+                &hover(Some("R1")),
+                false
+            ),
+            Next::Stop(PolicyStop::Blocked("budget_exhausted"))
+        ));
+
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        let mut page = hover_page();
+        for index in 0..8 {
+            page.hover_regions[1].name = format!("Rent {index}");
+            minted(decide_not_done(
+                &mut policy,
+                &step(),
+                &page,
+                &hover(Some("R1")),
+                false,
+            ));
+        }
+        page.hover_regions[1].name = "Rent 8".into();
+        assert!(matches!(
+            decide_not_done(&mut policy, &step(), &page, &hover(Some("R1")), false),
+            Next::Stop(PolicyStop::Blocked("budget_exhausted"))
+        ));
+        assert_eq!(policy.step_mutations(), 0);
+    }
+
+    #[test]
+    fn hover_respects_origin_and_popup_guards() {
+        let options = JobOptions {
+            allowed_origins: Some(vec!["http://allowed.test".into()]),
+            ..JobOptions::default()
+        };
+        let mut policy = Policy::new(&options, "http://allowed.test/");
+        assert!(matches!(
+            decide_not_done(
+                &mut policy,
+                &step(),
+                &hover_page(),
+                &hover(Some("R1")),
+                false
+            ),
+            Next::Stop(PolicyStop::Blocked("origin_not_allowed"))
+        ));
+        let mut popup = hover_page();
+        popup.coverage.gaps = vec!["popup".into()];
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        assert!(matches!(
+            decide_not_done(&mut policy, &step(), &popup, &hover(Some("R1")), false),
+            Next::Stop(PolicyStop::UnsupportedSurface("popup_or_new_tab"))
+        ));
+        assert_eq!(policy.actions, 0);
+    }
+
+    #[test]
+    fn hover_then_click_fits_a_mutation_limit_of_one() {
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        minted(decide_not_done(
+            &mut policy,
+            &one_mutation_step(),
+            &hover_page(),
+            &hover(Some("R1")),
+            false,
+        ));
+        assert_eq!(policy.step_mutations(), 0);
+        minted(decide_not_done(
+            &mut policy,
+            &one_mutation_step(),
+            &hover_page(),
+            &judgments("CLICK"),
+            false,
+        ));
+        assert_eq!(policy.step_mutations(), 1);
+        assert_eq!(policy.fallbacks, 0);
+        assert_eq!(policy.actions, 2);
+    }
+
+    #[test]
+    fn not_performed_fallbacks_after_a_click_refund_no_mutation() {
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        let mut page = hover_page();
+        page.viewport.document_height = 2_000.0;
+        minted(decide_not_done(
+            &mut policy,
+            &step(),
+            &page,
+            &judgments("CLICK"),
+            false,
+        ));
+        assert_eq!(policy.step_mutations(), 1);
+        for fallback in [hover(Some("R1")), judgments("SCROLL_DOWN")] {
+            let (_, _, replay_key, _) = minted(decide_not_done(
+                &mut policy,
+                &step(),
+                &page,
+                &fallback,
+                false,
+            ))
+            .consume();
+            policy.release_not_performed(&replay_key);
+            assert_eq!(policy.step_mutations(), 1);
+            assert!(!policy.replay.contains_key(&replay_key));
+        }
+        assert_eq!(policy.fallbacks, 2);
+        minted(decide_not_done(
+            &mut policy,
+            &step(),
+            &page,
+            &hover(Some("R1")),
+            false,
+        ));
+    }
+
+    #[test]
+    fn unused_hover_permit_refunds_its_action_and_fallback_but_no_mutation() {
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        minted(decide_not_done(
+            &mut policy,
+            &step(),
+            &hover_page(),
+            &judgments("CLICK"),
+            false,
+        ));
+        let permit = minted(decide_not_done(
+            &mut policy,
+            &step(),
+            &hover_page(),
+            &hover(Some("R2")),
+            false,
+        ));
+        let candidate = policy.release_unused(Box::new(permit));
+        assert_eq!(candidate.operation, Operation::Hover);
+        assert_eq!(policy.step_mutations(), 1);
+        assert_eq!(policy.actions, 1);
+        assert_eq!(policy.fallbacks, 0);
+        assert_eq!(policy.replay.len(), 1);
+    }
+
+    #[test]
+    fn hover_replay_is_refused_for_an_unchanged_region_list_even_in_a_later_step() {
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        let later = Step {
+            id: "later".into(),
+            ..step()
+        };
+        minted(decide_not_done(
+            &mut policy,
+            &step(),
+            &hover_page(),
+            &hover(Some("R1")),
+            false,
+        ));
+        assert!(matches!(
+            decide_not_done(
+                &mut policy,
+                &step(),
+                &hover_page(),
+                &hover(Some("R1")),
+                false
+            ),
+            Next::Stop(PolicyStop::Uncertain("replay_forbidden"))
+        ));
+        policy.begin_step();
+        let mut remounted = hover_page();
+        remounted.document_id = "new-document".into();
+        remounted.hover_regions[0].node_id = 99;
+        assert!(matches!(
+            decide_not_done(&mut policy, &later, &remounted, &hover(Some("R1")), false),
+            Next::Stop(PolicyStop::Uncertain("replay_forbidden"))
+        ));
+        let mut changed = hover_page();
+        changed.hover_regions.push(region(3, "Utilities", 43));
+        minted(decide_not_done(
+            &mut policy,
+            &later,
+            &changed,
+            &hover(Some("R1")),
+            false,
+        ));
+    }
+
+    #[test]
+    fn a_listed_hover_target_is_not_stopped_by_a_canvas_gap() {
+        let mut canvas = hover_page();
+        canvas.elements.clear();
+        canvas.coverage.gaps = vec!["canvas".into()];
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        minted(decide_not_done(
+            &mut policy,
+            &step(),
+            &canvas,
+            &hover(Some("R1")),
+            false,
+        ));
+        for unlisted in [None, Some("R9")] {
+            let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+            assert!(matches!(
+                decide_not_done(&mut policy, &step(), &canvas, &hover(unlisted), false),
+                Next::Stop(PolicyStop::UnsupportedSurface("canvas_control"))
+            ));
+        }
+        let mut click = judgments("CLICK");
+        click.hover_target = Some(choice("R1"));
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        assert!(matches!(
+            decide_not_done(&mut policy, &step(), &canvas, &click, false),
+            Next::Stop(PolicyStop::UnsupportedSurface("canvas_control"))
+        ));
+    }
+
+    #[test]
+    fn a_permit_for_a_changed_region_fails_revalidation() {
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        let (candidate, ..) = minted(decide_not_done(
+            &mut policy,
+            &step(),
+            &hover_page(),
+            &hover(Some("R1")),
+            false,
+        ))
+        .consume();
+        let mut remounted = hover_page();
+        remounted.hover_regions[0].node_id = 77;
+        let mut renamed = hover_page();
+        renamed.hover_regions[0].reveals_on_hover = vec!["Rename Groceries".into()];
+        let mut navigated = hover_page();
+        navigated.document_id = "other".into();
+        for changed in [remounted, renamed, navigated] {
+            assert_eq!(candidate.hover_region(&changed), None);
+            assert!(matches!(
+                policy.mint(&changed, candidate.clone()),
+                Next::Stop(PolicyStop::Uncertain("candidate_revalidation_failed"))
+            ));
+        }
     }
 }

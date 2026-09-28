@@ -2209,7 +2209,7 @@ impl StepDriver<'_> {
         next: policy::Next,
     ) -> StepProgress {
         match next {
-            policy::Next::Mutate(permit) if self.force_stop_before_first_mutation() => {
+            policy::Next::Mutate(permit) if self.force_stop_before_first_mutation(&permit) => {
                 let candidate = self.policy.release_unused(permit);
                 StepProgress::Stop(escalate(
                     self.artifacts,
@@ -2241,8 +2241,11 @@ impl StepDriver<'_> {
         }
     }
 
-    fn force_stop_before_first_mutation(&self) -> bool {
-        self.mutations == 0
+    /// The forced debug stop fires on the step's first mutating permit; scrolls and hovers before
+    /// it are performed.
+    fn force_stop_before_first_mutation(&self, permit: &policy::Permit) -> bool {
+        permit.operation().mutates()
+            && self.mutations == 0
             && self
                 .job
                 .options
@@ -2274,10 +2277,7 @@ impl StepDriver<'_> {
             .extend(self.journal.entries()[journal_start..].iter().cloned());
         match result {
             Ok(fact) => {
-                if !matches!(
-                    fact.operation,
-                    judgment::Operation::ScrollUp | judgment::Operation::ScrollDown
-                ) {
+                if fact.operation.mutates() {
                     self.mutations += 1;
                 }
                 self.awaiting_final_done_reobservation = false;
@@ -3255,19 +3255,6 @@ mod tests {
             let start_port = start.local_addr().unwrap().port();
             let foreign_port = foreign.local_addr().unwrap().port();
             let stop = Arc::new(AtomicBool::new(false));
-            let worker = |listener: TcpListener, body: String, stop: Arc<AtomicBool>| {
-                thread::spawn(move || {
-                    while !stop.load(Ordering::Relaxed) {
-                        match listener.accept() {
-                            Ok((mut stream, _)) => serve_origin_fixture(&mut stream, &body),
-                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                                thread::sleep(Duration::from_millis(5));
-                            }
-                            Err(error) => panic!("origin fixture failed: {error}"),
-                        }
-                    }
-                })
-            };
             let start_body = format!(
                 "<!doctype html><title>Origin guard</title><a href=\"http://127.0.0.1:{foreign_port}/landing\">Leave origin</a>"
             );
@@ -3275,8 +3262,8 @@ mod tests {
                 "<!doctype html><title>Foreign origin</title><p>Committed foreign origin</p>"
                     .to_owned();
             let workers = vec![
-                worker(start, start_body, Arc::clone(&stop)),
-                worker(foreign, foreign_body, Arc::clone(&stop)),
+                spawn_page_server(start, start_body, Arc::clone(&stop)),
+                spawn_page_server(foreign, foreign_body, Arc::clone(&stop)),
             ];
             Self {
                 start_port,
@@ -3302,6 +3289,64 @@ mod tests {
             let _ = TcpStream::connect(("127.0.0.1", self.start_port));
             let _ = TcpStream::connect(("127.0.0.1", self.foreign_port));
             for worker in self.workers.drain(..) {
+                worker.join().unwrap();
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn spawn_page_server(
+        listener: TcpListener,
+        body: String,
+        stop: Arc<AtomicBool>,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => serve_origin_fixture(&mut stream, &body),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("origin fixture failed: {error}"),
+                }
+            }
+        })
+    }
+
+    /// Serves the synthetic hover-reveal page on a temporary local origin.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct HoverRevealFixture {
+        port: u16,
+        stop: Arc<AtomicBool>,
+        worker: Option<thread::JoinHandle<()>>,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl HoverRevealFixture {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let stop = Arc::new(AtomicBool::new(false));
+            let body = include_str!("../../../tests/fixtures/browser-hover-reveal.html").to_owned();
+            Self {
+                port,
+                worker: Some(spawn_page_server(listener, body, Arc::clone(&stop))),
+                stop,
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("http://127.0.0.1:{}/plan", self.port)
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl Drop for HoverRevealFixture {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            let _ = TcpStream::connect(("127.0.0.1", self.port));
+            if let Some(worker) = self.worker.take() {
                 worker.join().unwrap();
             }
         }
@@ -3680,6 +3725,267 @@ mod tests {
         let committed = browser.observe().unwrap();
         assert!(committed.url.starts_with(&fixture.foreign_origin()));
         browser.close().unwrap();
+    }
+
+    /// Plays a careful agent on the hover-reveal page: for each step goal it clicks the wanted
+    /// control when it is a visible candidate, otherwise hovers the region that reveals it, and
+    /// judges a natural done condition from the wanted control's expanded state.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct RowActionProvider {
+        wanted: Vec<(&'static str, &'static str)>,
+        choices: Mutex<Vec<(String, String, Value)>>,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl RowActionProvider {
+        fn wanted_control(&self, request: &Value) -> &'static str {
+            let goal = request["state"]["current_step"]["goal"].as_str().unwrap();
+            self.wanted
+                .iter()
+                .find(|(step_goal, _)| *step_goal == goal)
+                .map(|(_, control)| *control)
+                .expect("scripted goal")
+        }
+
+        fn choose(request: &Value, wanted: &str) -> (&'static str, String, String) {
+            let key_where = |question: &str, matches: &dyn Fn(&Value) -> bool| {
+                request["questions"][question]["criteria"]
+                    .as_object()
+                    .and_then(|criteria| {
+                        criteria
+                            .iter()
+                            .find(|(_, criterion)| matches(criterion))
+                            .map(|(key, _)| key.clone())
+                    })
+            };
+            if let Some(key) = key_where("click_target", &|criterion| {
+                criterion["name"] == wanted && criterion["disabled"] == false
+            }) {
+                return ("CLICK", key, "NO_HOVER_TARGET".into());
+            }
+            key_where("hover_target", &|criterion| {
+                criterion["reveals_on_hover"]
+                    .as_array()
+                    .is_some_and(|reveals| reveals.iter().any(|name| name == wanted))
+            })
+            .map_or(("BLOCKED", String::new(), String::new()), |key| {
+                ("HOVER", "NO_CLICK_TARGET".into(), key)
+            })
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl manuvra_jev::Evaluator for RowActionProvider {
+        fn evaluate(
+            &self,
+            request: &Value,
+            _deadline: Instant,
+        ) -> Result<manuvra_jev::Evaluation, manuvra_jev::JevError> {
+            let wanted = self.wanted_control(request);
+            let (operation, click, hover) = Self::choose(request, wanted);
+            let expanded = request["state"]["page"]["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|element| element["name"] == wanted && element["expanded"] == true);
+            let target_name = if operation == "HOVER" { &hover } else { &click };
+            self.choices.lock().unwrap().push((
+                operation.to_owned(),
+                target_name.clone(),
+                request.clone(),
+            ));
+            let choice = |selected: &str| manuvra_jev::Answer::Choice {
+                choice: selected.into(),
+                probabilities: BTreeMap::from([(selected.into(), 0.9)]),
+                confidence: 0.9,
+            };
+            let mut answers = BTreeMap::from([
+                ("operation".into(), choice(operation)),
+                ("click_target".into(), choice(&click)),
+                ("type_target".into(), choice("NO_TYPE_TEXT_TARGET")),
+                ("select_target".into(), choice("NO_SELECT_TARGET")),
+                ("type_value".into(), choice("NONE_FITS")),
+                (
+                    "step_done".into(),
+                    manuvra_jev::Answer::Noul {
+                        noul: if expanded { 0.95 } else { 0.05 },
+                    },
+                ),
+            ]);
+            if request["questions"].get("hover_target").is_some() {
+                answers.insert("hover_target".into(), choice(&hover));
+            }
+            Ok(manuvra_jev::Evaluation {
+                answers,
+                usage: BTreeMap::new(),
+                request_id: Some("row-action-script".into()),
+                model: "jev-1.13.0".into(),
+            })
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn prepared_actions(journal: &[Value]) -> Vec<String> {
+        journal
+            .iter()
+            .filter(|entry| entry["event"] == "action_prepared")
+            .map(|entry| {
+                let target = entry
+                    .get("hover_target")
+                    .unwrap_or(&entry["target"])
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                format!("{} {target}", entry["operation"].as_str().unwrap())
+            })
+            .collect()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    #[ignore = "requires the local Chromium executable"]
+    fn production_driver_hovers_row_actions_into_view_and_never_clicks_another_row() {
+        let fixture = HoverRevealFixture::start();
+        let url = fixture.url();
+        let job = Job::parse(
+            serde_json::to_vec(&json!({
+                "schema_version":1,
+                "target":{"kind":"browser","url":url},
+                "context":{"journey":"hover-revealed row actions","revision":"fixture","environment":"local Chromium","actor":"synthetic","authority":"delete a synthetic category"},
+                "steps":[
+                    {"id":"groceries-menu","goal":"Open the actions menu for the Groceries category.","done_when":[{"text_visible":"Move to group…"}]},
+                    {"id":"rent-menu","goal":"Open the actions menu for the Rent category.","done_when":"The actions menu for Rent is open."},
+                    {"id":"choose-delete","goal":"Choose Delete category… for Rent.","done_when":[{"dialog_open":"Delete category?"}]},
+                    {"id":"confirm","goal":"Confirm the deletion.","done_when":[{"dialog_closed":"Delete category?"},{"text_absent":"Rent"},{"text_visible":"Groceries"}]}
+                ]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap();
+        let redactor = Redactor::for_job(&job).unwrap();
+        let mut browser = OwnedBrowser::launch(BrowserConfig {
+            explicit_binary: None,
+            headless: true,
+            width: 1120,
+            height: 780,
+            inherit_process_group: false,
+        })
+        .unwrap();
+        browser.navigate(&url).unwrap();
+        let provider = RowActionProvider {
+            wanted: vec![
+                (
+                    "Open the actions menu for the Groceries category.",
+                    "Actions for Groceries",
+                ),
+                (
+                    "Open the actions menu for the Rent category.",
+                    "Actions for Rent",
+                ),
+                ("Choose Delete category… for Rent.", "Delete category…"),
+                ("Confirm the deletion.", "Delete"),
+            ],
+            choices: Mutex::new(Vec::new()),
+        };
+        let mut journal = MemoryJournal::default();
+
+        let artifacts = drive_steps(
+            &job,
+            &redactor,
+            &browser,
+            &provider,
+            &mut journal,
+            &manuvra_chrome::InputCancellation::default(),
+            None,
+            None,
+        );
+        let remaining = browser.observe().unwrap();
+        browser.close().unwrap();
+
+        assert!(
+            artifacts.stop.is_none(),
+            "stopped: {:?}",
+            artifacts.stop.map(|stop| (stop.code, stop.details))
+        );
+        assert!(
+            artifacts
+                .verdicts
+                .iter()
+                .all(|verdict| verdict.result == VerdictResult::Satisfied)
+        );
+        assert!(!artifacts.caller_assisted);
+        assert_eq!(
+            prepared_actions(&journal.0),
+            [
+                "HOVER Groceries",
+                "CLICK Actions for Groceries",
+                "HOVER Rent",
+                "CLICK Actions for Rent",
+                "CLICK Delete category…",
+                "CLICK Delete",
+            ]
+        );
+        assert!(
+            journal
+                .0
+                .iter()
+                .filter(|entry| entry["event"] == "action_fact")
+                .all(|entry| entry["fact"]["outcome"] == "observed")
+        );
+        let per_step: Vec<_> = artifacts
+            .steps
+            .iter()
+            .map(|(_, step)| step["mutation_limit_consumed"].as_u64().unwrap())
+            .collect();
+        assert_eq!(per_step, [1, 1, 1, 1]);
+
+        let choices = provider.choices.lock().unwrap();
+        let (_, _, before_rent_hover) = choices
+            .iter()
+            .find(|(operation, target, request)| {
+                operation == "HOVER"
+                    && request["state"]["current_step"]["goal"]
+                        == "Open the actions menu for the Rent category."
+                    && request["state"]["page"]["hover_regions"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|region| region["key"] == *target && region["name"] == "Rent")
+            })
+            .expect("the Rent row was hovered");
+        let visible: Vec<_> = before_rent_hover["state"]["page"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|element| element["name"].as_str().unwrap())
+            .collect();
+        assert!(visible.contains(&"Actions for Groceries"));
+        assert!(!visible.contains(&"Actions for Rent"));
+        let first_request = &choices[0].2;
+        assert!(
+            first_request["state"]["page"]["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|element| element["name"] != "Actions for Groceries")
+        );
+        let from_step_two = journal
+            .0
+            .iter()
+            .filter(|entry| entry["event"] == "action_prepared")
+            .skip(2);
+        for action in from_step_two {
+            let name = action
+                .get("hover_target")
+                .unwrap_or(&action["target"])
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            assert!(!name.contains("Groceries"), "{action}");
+        }
+        assert!(!remaining.visible_text.contains("Rent"));
+        assert!(remaining.visible_text.contains("Groceries"));
     }
 
     #[test]
@@ -4353,6 +4659,717 @@ mod tests {
             artifacts.escalations[0].1["offered_candidate"]["target_name"],
             "Name"
         );
+    }
+
+    /// One scripted provider answer: the chosen operation, its targets, and the done Noul.
+    #[derive(Clone)]
+    struct Turn {
+        operation: &'static str,
+        confidence: f64,
+        click_target: &'static str,
+        hover_target: Option<&'static str>,
+    }
+
+    impl Turn {
+        fn click(target: &'static str) -> Self {
+            Self {
+                operation: "CLICK",
+                confidence: 0.95,
+                click_target: target,
+                hover_target: None,
+            }
+        }
+
+        fn scroll_down() -> Self {
+            Self {
+                operation: "SCROLL_DOWN",
+                ..Self::click("NO_CLICK_TARGET")
+            }
+        }
+    }
+
+    /// Answers each judgment with the next scripted turn and records every request it receives.
+    struct ScriptedProvider {
+        turns: Mutex<VecDeque<Turn>>,
+        requests: Mutex<Vec<Value>>,
+    }
+
+    impl ScriptedProvider {
+        fn new(turns: impl IntoIterator<Item = Turn>) -> Self {
+            Self {
+                turns: Mutex::new(turns.into_iter().collect()),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl manuvra_jev::Evaluator for ScriptedProvider {
+        fn evaluate(
+            &self,
+            request: &Value,
+            _deadline: Instant,
+        ) -> Result<manuvra_jev::Evaluation, manuvra_jev::JevError> {
+            self.requests.lock().unwrap().push(request.clone());
+            let turn = self
+                .turns
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("scripted turn");
+            let choice = |selected: &str, confidence: f64| manuvra_jev::Answer::Choice {
+                choice: selected.into(),
+                probabilities: BTreeMap::from([(selected.into(), confidence)]),
+                confidence,
+            };
+            let mut answers = BTreeMap::from([
+                ("operation".into(), choice(turn.operation, turn.confidence)),
+                ("click_target".into(), choice(turn.click_target, 1.0)),
+                ("type_target".into(), choice("NO_TYPE_TEXT_TARGET", 1.0)),
+                ("select_target".into(), choice("NO_SELECT_TARGET", 1.0)),
+                ("type_value".into(), choice("NONE_FITS", 1.0)),
+                ("step_done".into(), manuvra_jev::Answer::Noul { noul: 0.01 }),
+            ]);
+            if let Some(region) = turn.hover_target {
+                answers.insert("hover_target".into(), choice(region, 1.0));
+            }
+            Ok(manuvra_jev::Evaluation {
+                answers,
+                usage: BTreeMap::new(),
+                request_id: Some("scripted".into()),
+                model: "jev-1.13.0".into(),
+            })
+        }
+    }
+
+    fn button(index: u64, node_id: u64, name: &str) -> Element {
+        Element {
+            index,
+            node_id,
+            context: "main".into(),
+            role: "button".into(),
+            name: name.into(),
+            input_type: None,
+            value: String::new(),
+            checked: None,
+            selected: None,
+            expanded: Some(false),
+            disabled: false,
+            in_dialog: None,
+            operations: vec!["CLICK".into()],
+            select_options: vec![],
+            rect: Rect {
+                x: 10.0,
+                y: 10.0,
+                width: 20.0,
+                height: 10.0,
+            },
+        }
+    }
+
+    fn click_job(force_stop: bool) -> Job {
+        let mut job = Job::parse(
+            serde_json::to_vec(&json!({
+                "schema_version":1,
+                "target":{"kind":"browser","url":"http://127.0.0.1:4351/"},
+                "context":{"journey":"open","revision":"fixture","environment":"fake","actor":"synthetic","authority":"click"},
+                "steps":[{"id":"open","goal":"Open the actions menu for Groceries.","done_when":[{"text_visible":"Move to group"}]}]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap();
+        if force_stop {
+            job.options.debug = Some(manuvra_contract::DebugOptions {
+                force_stop_at_step: "open".into(),
+            });
+        }
+        job
+    }
+
+    fn performed(
+        suboperation: &str,
+    ) -> Option<Result<manuvra_chrome::PerformFact, manuvra_chrome::PerformError>> {
+        Some(Ok(manuvra_chrome::PerformFact {
+            readback: None,
+            readback_matches: None,
+            suboperations: vec![suboperation.into()],
+        }))
+    }
+
+    fn action_operations(trace: &[Value], event: &str) -> Vec<String> {
+        trace
+            .iter()
+            .filter(|entry| entry["event"] == event)
+            .map(|entry| {
+                entry
+                    .get("operation")
+                    .or_else(|| entry["fact"].get("operation"))
+                    .and_then(Value::as_str)
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn debug_force_stop_lets_a_scroll_through_and_fires_on_the_following_click() {
+        let job = click_job(true);
+        let redactor = Redactor::for_job(&job).unwrap();
+        let mut page = observed("Plan");
+        page.elements.push(button(1, 7, "Actions for Groceries"));
+        page.viewport.document_height = 2_000.0;
+        let browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::new()),
+            fallback: page,
+            dispatch_result: performed("scroll_down"),
+        };
+        let provider = ScriptedProvider::new([Turn::scroll_down(), Turn::click("1")]);
+        let mut journal = MemoryJournal::default();
+
+        let artifacts = drive_steps(
+            &job,
+            &redactor,
+            &browser,
+            &provider,
+            &mut journal,
+            &manuvra_chrome::InputCancellation::default(),
+            None,
+            None,
+        );
+
+        assert_eq!(artifacts.stop.unwrap().code, "debug_forced_stop");
+        assert_eq!(
+            action_operations(&journal.0, "action_prepared"),
+            ["SCROLL_DOWN"]
+        );
+        assert_eq!(
+            action_operations(&journal.0, "action_fact"),
+            ["SCROLL_DOWN"]
+        );
+        let escalation = &artifacts.escalations[0].1;
+        assert_eq!(escalation["offered_candidate"]["operation"], "CLICK");
+        assert_eq!(
+            escalation["offered_candidate"]["target_name"],
+            "Actions for Groceries"
+        );
+        assert!(provider.turns.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn step_escalations_permit_only_click_and_type_text_mutations() {
+        let forced = click_job(true);
+        let redactor = Redactor::for_job(&forced).unwrap();
+        let mut page = observed("Plan");
+        page.elements.push(button(1, 7, "Actions for Groceries"));
+        let browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::new()),
+            fallback: page.clone(),
+            dispatch_result: None,
+        };
+        let artifacts = drive_steps(
+            &forced,
+            &redactor,
+            &browser,
+            &ScriptedProvider::new([Turn::click("1")]),
+            &mut MemoryJournal::default(),
+            &manuvra_chrome::InputCancellation::default(),
+            None,
+            None,
+        );
+        assert_eq!(artifacts.stop.as_ref().unwrap().code, "debug_forced_stop");
+        assert_eq!(
+            artifacts.escalations[0].1["permitted_mutations"],
+            json!(["CLICK", "TYPE_TEXT"])
+        );
+
+        let gated = click_job(false);
+        let low = Turn {
+            confidence: 0.5,
+            ..Turn::click("1")
+        };
+        let artifacts = drive_steps(
+            &gated,
+            &redactor,
+            &browser,
+            &ScriptedProvider::new([low.clone(), low]),
+            &mut MemoryJournal::default(),
+            &manuvra_chrome::InputCancellation::default(),
+            None,
+            None,
+        );
+        assert_eq!(
+            artifacts.stop.as_ref().unwrap().code,
+            "operation_below_gate"
+        );
+        assert_eq!(
+            artifacts.escalations[0].1["permitted_mutations"],
+            json!(["CLICK", "TYPE_TEXT"])
+        );
+    }
+
+    /// Serves scripted observations, answers each dispatch with the next scripted outcome, and
+    /// records every prepared input.
+    struct ScriptedBrowser {
+        pages: Mutex<VecDeque<Observation>>,
+        fallback: Observation,
+        outcomes:
+            Mutex<VecDeque<Result<manuvra_chrome::PerformFact, manuvra_chrome::PerformError>>>,
+        inputs: Mutex<Vec<manuvra_chrome::PreparedInput>>,
+    }
+
+    impl ScriptedBrowser {
+        fn new(
+            pages: impl IntoIterator<Item = Observation>,
+            outcomes: impl IntoIterator<
+                Item = Result<manuvra_chrome::PerformFact, manuvra_chrome::PerformError>,
+            >,
+        ) -> Self {
+            let pages: VecDeque<_> = pages.into_iter().collect();
+            Self {
+                fallback: pages.back().cloned().expect("scripted page"),
+                pages: Mutex::new(pages),
+                outcomes: Mutex::new(outcomes.into_iter().collect()),
+                inputs: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn operations(&self) -> Vec<manuvra_chrome::PreparedOperation> {
+            self.inputs
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|input| input.operation)
+                .collect()
+        }
+    }
+
+    impl BrowserPage for ScriptedBrowser {
+        fn capture_redacted_page(
+            &self,
+            sensitive: &[String],
+        ) -> Result<CapturedPage, BrowserError> {
+            let page = self.pages.lock().unwrap().pop_front();
+            observation_page(page.unwrap_or_else(|| self.fallback.clone())).map(|mut page| {
+                page.redaction.sensitive_values_checked = sensitive.len();
+                page
+            })
+        }
+        fn observe_page(&self) -> Result<Observation, BrowserError> {
+            Ok(self.fallback.clone())
+        }
+    }
+
+    impl actions::Performer for ScriptedBrowser {
+        fn dispatch(
+            &self,
+            input: manuvra_chrome::PreparedInput,
+            _cancellation: &manuvra_chrome::InputCancellation,
+        ) -> Result<manuvra_chrome::PerformFact, manuvra_chrome::PerformError> {
+            self.inputs.lock().unwrap().push(input);
+            self.outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("scripted dispatch outcome")
+        }
+    }
+
+    struct FailingJournal {
+        entries: Vec<Value>,
+        fail_at: usize,
+    }
+
+    impl actions::ActionJournal for FailingJournal {
+        fn append(&mut self, value: &Value) -> Result<(), String> {
+            if self.entries.len() == self.fail_at {
+                return Err("injected journal failure".into());
+            }
+            self.entries.push(value.clone());
+            Ok(())
+        }
+        fn entries(&self) -> &[Value] {
+            &self.entries
+        }
+    }
+
+    fn hover_region(index: u64, name: &str, node_id: u64) -> manuvra_chrome::HoverRegion {
+        manuvra_chrome::HoverRegion {
+            index,
+            name: name.into(),
+            reveals_on_hover: vec![format!("Actions for {name}")],
+            node_id,
+        }
+    }
+
+    /// The Groceries and Rent rows before any hover: their action buttons are hidden.
+    fn plan_before_hover() -> Observation {
+        let mut page = observed("Plan Groceries Rent");
+        page.elements
+            .push(button(1, 11, "Edit assigned amount for Groceries, $400.00"));
+        page.hover_regions = vec![
+            hover_region(1, "Groceries", 41),
+            hover_region(2, "Rent", 42),
+        ];
+        page
+    }
+
+    /// After hovering Groceries: its action button is a candidate and its region is gone.
+    fn plan_groceries_revealed() -> Observation {
+        let mut page = plan_before_hover();
+        page.elements.push(button(2, 41, "Actions for Groceries"));
+        page.hover_regions = vec![hover_region(1, "Rent", 42)];
+        page
+    }
+
+    fn plan_menu_open() -> Observation {
+        let mut page = plan_groceries_revealed();
+        page.visible_text = "Plan Groceries Rent Rename Move to group… Delete category…".into();
+        page
+    }
+
+    fn hover_turn(region: &'static str) -> Turn {
+        Turn {
+            operation: "HOVER",
+            hover_target: Some(region),
+            ..Turn::click("NO_CLICK_TARGET")
+        }
+    }
+
+    fn drive_scripted(
+        job: &Job,
+        browser: &ScriptedBrowser,
+        provider: &ScriptedProvider,
+        journal: &mut impl actions::ActionJournal,
+    ) -> RunArtifacts {
+        drive_steps(
+            job,
+            &Redactor::for_job(job).unwrap(),
+            browser,
+            provider,
+            journal,
+            &manuvra_chrome::InputCancellation::default(),
+            None,
+            None,
+        )
+    }
+
+    fn trace_events(artifacts: &RunArtifacts) -> Vec<String> {
+        artifacts
+            .trace
+            .iter()
+            .map(|entry| {
+                let event = entry["event"].as_str().unwrap();
+                let operation = entry
+                    .get("operation")
+                    .or_else(|| entry.get("fact").and_then(|fact| fact.get("operation")));
+                operation.map_or_else(
+                    || event.to_owned(),
+                    |operation| format!("{event}:{}", operation.as_str().unwrap()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hover_then_click_satisfies_the_step_in_two_actions_with_one_mutation() {
+        let job = click_job(false);
+        let browser = ScriptedBrowser::new(
+            [
+                plan_before_hover(),
+                plan_groceries_revealed(),
+                plan_menu_open(),
+            ],
+            [
+                Ok(manuvra_chrome::PerformFact {
+                    readback: None,
+                    readback_matches: None,
+                    suboperations: vec!["mouse_move".into()],
+                }),
+                Ok(manuvra_chrome::PerformFact {
+                    readback: None,
+                    readback_matches: None,
+                    suboperations: vec!["mouse_press".into(), "mouse_release".into()],
+                }),
+            ],
+        );
+        let provider = ScriptedProvider::new([hover_turn("R1"), Turn::click("2")]);
+        let mut journal = MemoryJournal::default();
+
+        let artifacts = drive_scripted(&job, &browser, &provider, &mut journal);
+
+        assert!(
+            artifacts.stop.is_none(),
+            "{:?}",
+            artifacts.stop.map(|stop| stop.code)
+        );
+        assert_eq!(artifacts.verdicts[0].result, VerdictResult::Satisfied);
+        assert_eq!(artifacts.steps[0].1["mutation_limit_consumed"], 1);
+        assert_eq!(
+            trace_events(&artifacts),
+            [
+                "observation",
+                "action_prepared:HOVER",
+                "action_fact:HOVER",
+                "observation",
+                "action_prepared:CLICK",
+                "action_fact:CLICK",
+                "observation",
+                "final_verification_observation",
+            ]
+        );
+        let groceries =
+            json!({"index":1,"name":"Groceries","reveals_on_hover":["Actions for Groceries"]});
+        assert_eq!(artifacts.trace[1]["hover_target"], groceries);
+        assert_eq!(artifacts.trace[2]["fact"]["hover_target"], groceries);
+        assert_eq!(artifacts.trace[2]["fact"]["outcome"], "observed");
+        assert_eq!(
+            artifacts.trace[2]["fact"]["suboperations"],
+            json!(["mouse_move"])
+        );
+        assert_eq!(
+            artifacts.observations[1].1["elements"][1]["name"],
+            "Actions for Groceries"
+        );
+        let inputs = browser.inputs.lock().unwrap();
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(
+            inputs[0].operation,
+            manuvra_chrome::PreparedOperation::Hover
+        );
+        assert_eq!(inputs[0].node_id, 41);
+        assert_eq!(
+            inputs[1].operation,
+            manuvra_chrome::PreparedOperation::Click
+        );
+        assert_eq!(inputs[1].node_id, 41);
+        let requests = provider.requests.lock().unwrap();
+        assert!(requests[0]["questions"]["operation"]["criteria"]["HOVER"].is_string());
+        assert_eq!(
+            requests[1]["questions"]["click_target"]["criteria"]["2"]["name"],
+            "Actions for Groceries"
+        );
+        assert!(
+            requests[1]["state"]["recent_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| action.as_str().unwrap().contains(
+                    r#""hover_target":{"index":1,"name":"Groceries","reveals_on_hover":["Actions for Groceries"]}"#
+                ))
+        );
+    }
+
+    #[test]
+    fn debug_force_stop_performs_the_hover_and_fires_on_the_following_click() {
+        let job = click_job(true);
+        let browser = ScriptedBrowser::new(
+            [plan_before_hover(), plan_groceries_revealed()],
+            [performed("mouse_move").unwrap()],
+        );
+        let provider = ScriptedProvider::new([hover_turn("R1"), Turn::click("2")]);
+        let mut journal = MemoryJournal::default();
+
+        let artifacts = drive_scripted(&job, &browser, &provider, &mut journal);
+
+        assert_eq!(artifacts.stop.as_ref().unwrap().code, "debug_forced_stop");
+        assert_eq!(action_operations(&journal.0, "action_prepared"), ["HOVER"]);
+        assert_eq!(action_operations(&journal.0, "action_fact"), ["HOVER"]);
+        assert_eq!(
+            browser.operations(),
+            [manuvra_chrome::PreparedOperation::Hover]
+        );
+        let escalation = &artifacts.escalations[0].1;
+        assert_eq!(escalation["offered_candidate"]["operation"], "CLICK");
+        assert_eq!(
+            escalation["offered_candidate"]["target_name"],
+            "Actions for Groceries"
+        );
+        assert_eq!(
+            escalation["permitted_mutations"],
+            json!(["CLICK", "TYPE_TEXT"])
+        );
+    }
+
+    #[test]
+    fn hover_below_the_gate_reobserves_once_then_escalates_without_a_candidate() {
+        let job = click_job(false);
+        let browser = ScriptedBrowser::new([plan_before_hover()], []);
+        let low = Turn {
+            confidence: 0.6,
+            ..hover_turn("R1")
+        };
+        let provider = ScriptedProvider::new([low.clone(), low]);
+
+        let artifacts = drive_scripted(&job, &browser, &provider, &mut MemoryJournal::default());
+
+        let stop = artifacts.stop.as_ref().unwrap();
+        assert_eq!(stop.code, "operation_below_gate");
+        assert_eq!(artifacts.observations.len(), 2);
+        assert!(browser.inputs.lock().unwrap().is_empty());
+        let escalation = &artifacts.escalations[0].1;
+        assert_eq!(escalation["offered_candidate"], Value::Null);
+        assert_eq!(escalation["candidates"]["operation"]["choice"], "HOVER");
+        assert_eq!(
+            escalation["permitted_mutations"],
+            json!(["CLICK", "TYPE_TEXT"])
+        );
+        assert!(
+            !artifacts
+                .escalation
+                .as_ref()
+                .unwrap()
+                .dispositions
+                .contains(&DispositionKind::Execute)
+        );
+    }
+
+    #[test]
+    fn rejected_hover_is_not_performed_reobserved_and_retried_without_a_mutation() {
+        let job = click_job(false);
+        let browser = ScriptedBrowser::new(
+            [
+                plan_before_hover(),
+                plan_before_hover(),
+                plan_groceries_revealed(),
+                plan_menu_open(),
+            ],
+            [
+                Err(manuvra_chrome::PerformError::Rejected("covered".into())),
+                performed("mouse_move").unwrap(),
+                performed("mouse_release").unwrap(),
+            ],
+        );
+        let provider =
+            ScriptedProvider::new([hover_turn("R1"), hover_turn("R1"), Turn::click("2")]);
+
+        let artifacts = drive_scripted(&job, &browser, &provider, &mut MemoryJournal::default());
+
+        assert!(
+            artifacts.stop.is_none(),
+            "{:?}",
+            artifacts.stop.map(|stop| stop.code)
+        );
+        let outcomes: Vec<_> = artifacts
+            .trace
+            .iter()
+            .filter(|entry| entry["event"] == "action_fact")
+            .map(|entry| entry["fact"]["outcome"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(outcomes, ["not_performed", "observed", "observed"]);
+        assert_eq!(artifacts.steps[0].1["mutation_limit_consumed"], 1);
+    }
+
+    #[test]
+    fn uncertain_hover_dispatch_escalates_as_an_ambiguous_action() {
+        for failure in [
+            manuvra_chrome::PerformError::NotPerformed("not queued".into()),
+            manuvra_chrome::PerformError::Uncertain("sent without answer".into()),
+        ] {
+            let job = click_job(false);
+            let browser = ScriptedBrowser::new([plan_before_hover()], [Err(failure)]);
+            let provider = ScriptedProvider::new([hover_turn("R1")]);
+
+            let artifacts =
+                drive_scripted(&job, &browser, &provider, &mut MemoryJournal::default());
+
+            assert_eq!(
+                artifacts.stop.as_ref().unwrap().code,
+                "action_outcome_uncertain"
+            );
+            assert_eq!(artifacts.escalations[0].1["offered_candidate"], Value::Null);
+            assert!(artifacts.pending.as_ref().unwrap().ambiguous_mutation);
+            assert_eq!(browser.inputs.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn hover_journal_failures_stop_before_or_after_dispatch_truthfully() {
+        for (fail_at, code, dispatched) in [
+            (0, "evidence_unavailable", 0),
+            (1, "evidence_incomplete_after_dispatch", 1),
+        ] {
+            let job = click_job(false);
+            let browser =
+                ScriptedBrowser::new([plan_before_hover()], [performed("mouse_move").unwrap()]);
+            let provider = ScriptedProvider::new([hover_turn("R1")]);
+            let mut journal = FailingJournal {
+                entries: Vec::new(),
+                fail_at,
+            };
+
+            let artifacts = drive_scripted(&job, &browser, &provider, &mut journal);
+
+            assert_eq!(artifacts.stop.as_ref().unwrap().code, code);
+            assert_eq!(browser.inputs.lock().unwrap().len(), dispatched);
+        }
+    }
+
+    #[test]
+    fn hover_whose_region_is_gone_at_prepare_fails_revalidation_without_dispatch() {
+        let job = click_job(false);
+        let redactor = Redactor::for_job(&job).unwrap();
+        let browser = ScriptedBrowser::new([plan_before_hover()], []);
+        let evaluator = NoProvider;
+        let mut journal = MemoryJournal::default();
+        let values = Values::new(&job);
+        let cancellation = manuvra_chrome::InputCancellation::default();
+        let mut policy = policy::Policy::new(&job.options, "http://127.0.0.1:4351/");
+        let mut artifacts = RunArtifacts::new(&job, &redactor);
+        let judgments = judgment::Judgments {
+            hover_target: Some(judgment::ChoiceJudgment {
+                choice: "R1".into(),
+                probabilities: BTreeMap::from([("R1".into(), 1.0)]),
+                confidence: 1.0,
+            }),
+            ..mutation_judgments("HOVER", 1.0)
+        };
+        let policy::Next::Mutate(permit) = policy.decide(
+            &job.steps[0],
+            &plan_before_hover(),
+            &judgments,
+            DoneResult::NotSatisfied,
+            false,
+            false,
+        ) else {
+            panic!("hover permit");
+        };
+        let mut remounted = plan_before_hover();
+        remounted.hover_regions[0].node_id = 99;
+        let captured = Captured {
+            raw: remounted,
+            artifact: ("observation".into(), Value::Null, None),
+            redaction_verified: true,
+        };
+        let mut driver = StepDriver {
+            job: &job,
+            redactor: &redactor,
+            browser: &browser,
+            evaluator: &evaluator,
+            journal: &mut journal,
+            values: &values,
+            cancellation: &cancellation,
+            policy: &mut policy,
+            index: 0,
+            step: &job.steps[0],
+            artifacts: &mut artifacts,
+            observation_number: 0,
+            done_unknown_reobserved: false,
+            operation_gate_reobserved: false,
+            mutations: 0,
+            awaiting_final_done_reobservation: false,
+        };
+
+        let progress = driver.mutate(DoneResult::NotSatisfied, &captured, &judgments, *permit);
+
+        assert!(matches!(
+            progress,
+            StepProgress::Stop(Stop {
+                code: "candidate_revalidation_failed",
+                ..
+            })
+        ));
+        assert!(browser.inputs.lock().unwrap().is_empty());
+        assert!(journal.0.is_empty());
     }
 
     #[test]
@@ -5072,6 +6089,7 @@ mod tests {
                 probabilities: BTreeMap::from([("name".into(), 1.0)]),
                 confidence: 1.0,
             },
+            hover_target: None,
             step_done: 0.0,
             usage: BTreeMap::new(),
             request_id: None,
@@ -5150,6 +6168,7 @@ mod tests {
             type_target: choice("1"),
             select_target: choice("1"),
             type_value: choice("name"),
+            hover_target: None,
             step_done: 0.0,
             usage: BTreeMap::new(),
             request_id: None,
