@@ -181,14 +181,12 @@ mod tests {
     use super::*;
     use crate::store;
     #[cfg(target_os = "linux")]
-    use std::fs;
+    use std::io::{BufRead, BufReader};
     use std::process::Command;
     #[cfg(target_os = "linux")]
     use std::process::Stdio;
     #[cfg(target_os = "linux")]
     use std::time::{Duration, Instant};
-    #[cfg(target_os = "linux")]
-    use tempfile::TempDir;
 
     #[test]
     #[cfg(target_os = "linux")]
@@ -229,17 +227,15 @@ mod tests {
     fn owned_process_group_signal_cleans_resistant_descendant_after_leader_is_reaped() {
         use std::os::unix::process::CommandExt;
 
-        let temporary = TempDir::new().unwrap();
-        let child_pid_path = temporary.path().join("child.pid");
-        let script = format!(
-            "sh -c 'trap \"\" TERM HUP; while :; do sleep 1; done' & child=$!; printf '%s' \"$child\" > '{}'; exit 0",
-            child_pid_path.display()
-        );
+        // The descendant reports its PID only after it ignores SIGTERM, so it always resists.
         let mut command = Command::new("sh");
         command
-            .args(["-c", &script])
+            .args([
+                "-c",
+                "sh -c 'trap \"\" TERM HUP; echo $$; exec sleep 30' & exit 0",
+            ])
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null());
         unsafe {
             command.pre_exec(|| {
@@ -251,15 +247,11 @@ mod tests {
         }
         let mut child = command.spawn().unwrap();
         let identity = process_identity(child.id()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while !child_pid_path.exists() {
-            assert!(Instant::now() < deadline);
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        let descendant: u32 = fs::read_to_string(&child_pid_path)
-            .unwrap()
-            .parse()
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
             .unwrap();
+        let descendant: u32 = line.trim().parse().unwrap();
         child.wait().unwrap();
         assert!(!process_is_same(&identity));
         assert_eq!(unsafe { libc::kill(descendant as i32, libc::SIGTERM) }, 0);
