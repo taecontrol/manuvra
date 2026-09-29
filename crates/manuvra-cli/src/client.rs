@@ -1572,19 +1572,21 @@ mod tests {
         use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
 
+        // The leader waits for its input to close, so its identity is read while it runs.
         let mut leader = Command::new("sh")
-            .args(["-c", "sleep 30 & echo $!; exit 0"])
+            .args(["-c", "sleep 30 </dev/null & echo $!; read _; exit 0"])
             .process_group(0)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        let identity = crate::process::process_identity(leader.id()).unwrap();
         let mut line = String::new();
         BufReader::new(leader.stdout.take().unwrap())
             .read_line(&mut line)
             .unwrap();
+        let identity = crate::process::process_identity(leader.id()).unwrap();
+        drop(leader.stdin.take());
         leader.wait().unwrap();
         (identity, line.trim().parse().unwrap())
     }
@@ -1632,7 +1634,15 @@ mod tests {
 
         control.watchdog = None;
         store::write_run_control(&root, &control).unwrap();
-        let recovered = read_control(&root, &control.run_id).unwrap().unwrap();
+        // A child forked by a concurrent test briefly shares the dropped lock until it execs.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let recovered = loop {
+            let current = read_control(&root, &control.run_id).unwrap().unwrap();
+            if current.result["state"] != "running" || Instant::now() >= deadline {
+                break current;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
         assert_eq!(recovered.result["state"], "blocked");
         assert_eq!(recovered.result["reason"]["code"], "host_lost");
         assert_eq!(recovered.result["reason"]["current_action"], "none");

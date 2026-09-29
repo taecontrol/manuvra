@@ -258,7 +258,6 @@ mod tests {
         };
         assert!(!process_is_same(&stale));
         assert!(!signal_process_group(&stale, libc::SIGTERM).unwrap());
-        std::thread::sleep(Duration::from_millis(50));
         assert!(child.try_wait().unwrap().is_none());
         assert!(signal_process_group(&current, libc::SIGKILL).unwrap());
         child.wait().unwrap();

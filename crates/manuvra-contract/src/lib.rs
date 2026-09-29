@@ -1010,14 +1010,45 @@ mod tests {
         let DoneCondition::Structured(parsed) = &job.steps[0].done_when else {
             panic!("structured done condition");
         };
-        assert_eq!(
-            parsed[4],
+        let expected = [
+            Assertion::TextVisible(TextVisible {
+                text_visible: "Saved".into(),
+                scope: Some(AssertionScope::Viewport(ViewportScope::Viewport)),
+            }),
+            Assertion::TextAbsent(TextAbsent {
+                text_absent: "Error".into(),
+                scope: Some(AssertionScope::Dialog(DialogScope {
+                    dialog: "Create".into(),
+                })),
+            }),
+            Assertion::FieldNonempty(FieldNonempty {
+                field: "Name".into(),
+                nonempty: RequiredTrue,
+                dialog: Some("Create".into()),
+                role: Some("textbox".into()),
+            }),
+            Assertion::FieldEqualsValue(FieldEqualsValue {
+                field: "Name".into(),
+                equals_value: "account_name".into(),
+                dialog: None,
+                role: None,
+            }),
             Assertion::Focused(Focused {
                 focused: "Save".into(),
                 dialog: Some("Create".into()),
                 role: Some("button".into()),
-            })
-        );
+            }),
+            Assertion::DialogOpen(DialogOpen {
+                dialog_open: "Create".into(),
+            }),
+            Assertion::DialogClosed(DialogClosed {
+                dialog_closed: "Other".into(),
+            }),
+            Assertion::UrlContains(UrlContains {
+                url_contains: "/accounts".into(),
+            }),
+        ];
+        assert_eq!(parsed.as_slice(), expected.as_slice());
     }
 
     #[test]
@@ -1070,7 +1101,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_the_design_brief_job_fixture() {
+    fn accepts_the_create_account_job_fixture() {
         let job = Job::parse(include_bytes!("../tests/fixtures/create-account.json")).unwrap();
         assert_eq!(job.steps.len(), 9);
         assert_eq!(job.expectations.len(), 2);

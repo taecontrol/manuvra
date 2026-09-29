@@ -228,21 +228,25 @@ mod tests {
     fn frame_deadline_rejects_a_slow_incomplete_peer_without_waiting_for_eof() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         client.write_all(b"{").unwrap();
+        // The peer keeps the frame open until the reader hangs up, so only the reader's own
+        // deadline can end the read.
         let trickle = std::thread::spawn(move || {
-            for _ in 0..20 {
-                std::thread::sleep(Duration::from_millis(40));
+            let hang_up = Instant::now() + Duration::from_secs(60);
+            while Instant::now() < hang_up {
+                std::thread::sleep(Duration::from_millis(20));
                 if client.write_all(b" ").is_err() {
-                    break;
+                    return true;
                 }
             }
+            false
         });
         let started = Instant::now();
         let error = read_frame::<serde_json::Value>(&mut server).unwrap_err();
         let elapsed = started.elapsed();
+        assert!(!trickle.is_finished(), "the read outlived its peer");
         drop(server);
-        trickle.join().unwrap();
-        assert!(elapsed >= Duration::from_millis(200));
-        assert!(elapsed < Duration::from_secs(1));
+        assert!(trickle.join().unwrap(), "the peer was still writing");
+        assert!(elapsed >= CONTROL_READ_TIMEOUT);
         assert!(error.contains("control frame read deadline elapsed"));
     }
 
