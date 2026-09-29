@@ -1,7 +1,4 @@
 use crate::Invocation;
-#[cfg(target_os = "macos")]
-#[path = "client/darwin.rs"]
-mod platform;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::process::{IPC_VERSION, now_unix_ms};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -950,14 +947,9 @@ fn request_value(socket: &Path, payload: &Value) -> Result<Value, String> {
     validate_response(response)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn request_host_deadline(control: &RunControl) -> Result<(), String> {
     request_effect_for_control(control, "deadline").map(|_| ())
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn request_host_deadline(control: &crate::store::RunControl) -> Result<(), String> {
-    platform::request_deadline(control, crate::process::IPC_VERSION)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1005,6 +997,7 @@ fn response_identity_matches(response: &Value, run_id: &str, job_digest: &str) -
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn validate_socket(socket: &Path) -> Result<(), String> {
     use std::os::unix::fs::FileTypeExt;
+    crate::runtime::validate_socket_path(socket)?;
     let metadata = std::fs::symlink_metadata(socket)
         .map_err(|error| format!("run host socket is unavailable: {error}"))?;
     (!metadata.file_type().is_symlink() && metadata.file_type().is_socket())
@@ -1648,6 +1641,56 @@ mod tests {
 
         let repeated = read_control(&root, &control.run_id).unwrap().unwrap();
         assert_eq!(repeated.sequence, recovered.sequence);
+    }
+
+    #[test]
+    fn socket_validation_rejects_regular_file_and_symlink_substitution() {
+        let temporary = TempDir::new().unwrap();
+        let regular = temporary.path().join("regular");
+        std::fs::write(&regular, b"unchanged").unwrap();
+        assert!(validate_socket(&regular).is_err());
+        let link = temporary.path().join("link");
+        std::os::unix::fs::symlink(&regular, &link).unwrap();
+        assert!(validate_socket(&link).is_err());
+        assert_eq!(std::fs::read(regular).unwrap(), b"unchanged");
+    }
+
+    #[test]
+    fn deadline_request_requires_an_accepted_matching_identity() {
+        use std::os::unix::net::UnixListener;
+
+        for (version, run_id, accepted, delivered) in [
+            (IPC_VERSION, "r_abort", true, true),
+            (IPC_VERSION, "r_abort", false, false),
+            (IPC_VERSION, "r_other", true, false),
+            (IPC_VERSION + 1, "r_abort", true, false),
+        ] {
+            let temporary = tempfile::Builder::new()
+                .prefix("mcd")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let mut control = test_control(temporary.path(), false);
+            control.socket = temporary.path().join("control.sock");
+            let listener = UnixListener::bind(&control.socket).unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request: Value = crate::control_socket::read_frame(&mut stream).unwrap();
+                assert_eq!(request["kind"], "deadline");
+                assert_eq!(request["run_id"], "r_abort");
+                serde_json::to_writer(
+                    &mut stream,
+                    &json!({
+                        "ipc_version":version,
+                        "run_id":run_id,
+                        "job_digest":"job",
+                        "accepted":accepted
+                    }),
+                )
+                .unwrap();
+            });
+            assert_eq!(request_host_deadline(&control).is_ok(), delivered);
+            server.join().unwrap();
+        }
     }
 
     #[test]

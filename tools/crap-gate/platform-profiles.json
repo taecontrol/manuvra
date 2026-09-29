@@ -5,7 +5,6 @@
       "platform": "linux",
       "target_os": "linux",
       "exclude": [
-        "manuvra-cli/src/client/darwin.rs",
         "manuvra-cli/src/process/darwin.rs",
         "manuvra-cli/src/runtime/darwin.rs",
         "manuvra-cli/src/socket_auth/darwin.rs",
@@ -37,10 +36,6 @@
     {
       "path": "manuvra-cli/src/socket_auth/linux.rs",
       "platform": "linux"
-    },
-    {
-      "path": "manuvra-cli/src/client/darwin.rs",
-      "platform": "darwin"
     },
     {
       "path": "manuvra-cli/src/process/darwin.rs",

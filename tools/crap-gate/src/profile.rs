@@ -291,7 +291,6 @@ mod tests {
         assert_eq!(
             resolve(&document, &rust_root, "linux").unwrap().exclude,
             [
-                "manuvra-cli/src/client/darwin.rs",
                 "manuvra-cli/src/process/darwin.rs",
                 "manuvra-cli/src/runtime/darwin.rs",
                 "manuvra-cli/src/socket_auth/darwin.rs",
