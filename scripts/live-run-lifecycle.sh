@@ -1,25 +1,27 @@
 #!/usr/bin/env bash
+# Follows one forced-pause Run through its lifecycle on Linux: the host and Chromium stay alive
+# while the Run waits, an identical `run` attaches to it, the resume deadline expires it, a retry
+# returns the expired result, and every host, watchdog, and browser process exits.
 set -euo pipefail
 
+source "$(dirname "${BASH_SOURCE[0]}")/live-lib.sh"
+
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-money_dir=${MONEY_DIR:-/home/guetteluis/Work/personal/money}
+preflight_fixture
+require_command cargo
+require_command pgrep
+require_command shasum
+require_provider_key
 stamp=$(date +%Y%m%d-%H%M%S)-$$
 evidence_root="$repo_root/.work/live/run-lifecycle/$stamp"
 state_root="$evidence_root/state"
-runtime_root=${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR is required for the headed Wayland run}
+runtime_root=${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR is required for background runs}
 mkdir -p "$evidence_root" "$state_root"
+trap cleanup_active_fixture EXIT
 
 cargo build --locked --manifest-path "$repo_root/Cargo.toml" --bin manuvra
-active_run="manuvra-run-lifecycle-$stamp"
-cleanup() {
-  (cd "$money_dir" && pnpm verify:app cleanup --run-id "$active_run") >/dev/null || true
-}
-trap cleanup EXIT
-
-launch=$(cd "$money_dir" && pnpm verify:app launch --run-id "$active_run" --port 4351)
-candidate=$(jq -r '.result.candidate' <<<"$launch")
-(cd "$money_dir" && node scripts/app-driver.mjs doctor \
-  --run-id "$active_run" --candidate "$candidate") >"$evidence_root/doctor.json"
+start_fixture "manuvra-run-lifecycle-$stamp" "$evidence_root/money-fixture" \
+  "$evidence_root/launch.json" "$evidence_root/doctor.json"
 
 set +e
 XDG_STATE_HOME="$state_root" XDG_RUNTIME_DIR="$runtime_root" \
@@ -88,17 +90,16 @@ printf '%s\n' "$watchdog_pid" >>"$evidence_root/lifecycle-pids.txt"
 cat "$evidence_root/host-group-pids.txt" >>"$evidence_root/lifecycle-pids.txt"
 sort -n -u -o "$evidence_root/lifecycle-pids.txt" "$evidence_root/lifecycle-pids.txt"
 
-provider_key=${TYPESAFE_API_KEY-}
-if [[ -n "$provider_key" ]]; then
-  while read -r pid; do
-    for proc_field in environ cmdline; do
-      if tr '\0' '\n' <"/proc/$pid/$proc_field" | rg -F -q -- "$provider_key"; then
-        echo "provider key leaked into process $pid $proc_field" >&2
-        exit 1
-      fi
-    done
-  done <"$evidence_root/lifecycle-pids.txt"
-fi
+# A process that exited before its scan cannot hold the key; any other unreadable field counts as
+# a leak because absence is not proved.
+while read -r pid; do
+  for proc_field in environ cmdline; do
+    if provider_key_present "/proc/$pid/$proc_field" >/dev/null 2>&1 && [[ -e "/proc/$pid" ]]; then
+      echo "provider key leaked into process $pid $proc_field" >&2
+      exit 1
+    fi
+  done
+done <"$evidence_root/lifecycle-pids.txt"
 
 deadline=$(( $(date +%s) + 15 ))
 while :; do
@@ -115,12 +116,7 @@ done
 [[ $status_code -eq 5 ]]
 jq -e '.terminal == true and .reason.code == "resume_deadline_elapsed" and .cleanup.browser == "closed"' \
   "$evidence_root/status-expired.json" >/dev/null
-manifest=$(jq -r '.evidence.manifest' "$evidence_root/status-expired.json")
-jq -e '.complete == true and ([.artifacts[].complete] | all)' "$manifest" >/dev/null
-while IFS=$'\t' read -r path expected; do
-  [[ -f "$path" ]]
-  [[ "$(sha256sum "$path" | cut -d' ' -f1)" == "$expected" ]]
-done < <(jq -r '.artifacts[] | [.path,.digest] | @tsv' "$manifest")
+verify_manifest "$evidence_root/status-expired.json"
 
 set +e
 XDG_STATE_HOME="$state_root" XDG_RUNTIME_DIR="$runtime_root" \
@@ -142,14 +138,12 @@ while read -r pid; do
   [[ ! -e "/proc/$pid" ]]
 done <"$evidence_root/lifecycle-pids.txt"
 
-(cd "$money_dir" && node scripts/app-driver.mjs observe \
-  --run-id "$active_run" --feature accounts.create) >"$evidence_root/observe.json"
+observe_fixture accounts.create >"$evidence_root/observe.json"
 jq -e '.result.accounts | length == 0' "$evidence_root/observe.json" >/dev/null
-(cd "$money_dir" && pnpm verify:app cleanup --run-id "$active_run") >"$evidence_root/cleanup.json"
-trap - EXIT
+stop_fixture "$evidence_root/cleanup.json" "$evidence_root/cleanup.stderr"
 rmdir "$runtime_root/manuvra/runs/$run_id"
 
-if [[ -n "$provider_key" ]] && rg -a -l -F -- "$provider_key" "$evidence_root"; then
+if provider_key_present "$evidence_root"; then
   echo "provider key leaked into live evidence" >&2
   exit 1
 fi

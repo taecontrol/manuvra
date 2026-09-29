@@ -1,25 +1,27 @@
 #!/usr/bin/env bash
+# Runs the create-account journey three times with natural-language done conditions and no final
+# expectations. A Run passes autonomously or stops at the step it was working on without having
+# prepared an action the job does not intend.
 set -euo pipefail
 
+source "$(dirname "${BASH_SOURCE[0]}")/live-lib.sh"
+
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-money_dir=${MONEY_DIR:-/home/guetteluis/Work/personal/money}
+preflight_fixture
+require_command cargo
+require_command shasum
+require_provider_key
 stamp=$(date +%Y%m%d-%H%M%S)-$$
 evidence_root="$repo_root/.work/live/natural-done/$stamp"
 state_root="$evidence_root/state"
 report="$evidence_root/matrix.jsonl"
 mkdir -p "$evidence_root" "$state_root"
+trap cleanup_active_fixture EXIT
 
 cargo build --locked --manifest-path "$repo_root/Cargo.toml" --bin manuvra
 cargo test --locked --manifest-path "$repo_root/Cargo.toml" -p manuvra-chrome \
   --test local_fixture -- --ignored
-
-active_run=""
-cleanup() {
-  if [[ -n "$active_run" ]]; then
-    (cd "$money_dir" && pnpm verify:app cleanup --run-id "$active_run") >/dev/null || true
-  fi
-}
-trap cleanup EXIT
+manuvra="$repo_root/target/debug/manuvra"
 
 expected_target() {
   case "$1" in
@@ -43,10 +45,21 @@ expected_operation() {
   esac
 }
 
+# An offered candidate must be the step's intended operation. Without one, the escalation's
+# `candidates` holds Jev's judgments, whose chosen operation and target must still fit the step.
 assert_correct_stop() {
   local output=$1 payload run_dir step operation target_choice snapshot target_name expected
   payload=$(jq -r '.escalation.payload' "$output")
   [[ -f "$payload" ]]
+  jq -e '.phase == "step"' "$payload" >/dev/null
+  if jq -e '.offered_candidate != null' "$payload" >/dev/null; then
+    candidate_is_expected "$payload"
+    return
+  fi
+  jq -e '.candidates | type == "object"' "$payload" >/dev/null
+  if ! jq -e '.candidates.operation.choice != null' "$payload" >/dev/null; then
+    return 0
+  fi
   step=$(jq -r '.step_id' "$payload")
   operation=$(jq -r '.candidates.operation.choice' "$payload")
   [[ "$operation" == "$(expected_operation "$step")" ]]
@@ -57,8 +70,8 @@ assert_correct_stop() {
   fi
   run_dir=$(dirname "$(dirname "$payload")")
   snapshot=$(jq -r '.observation.snapshot' "$payload")
-  target_name=$(jq -r --argjson index "$target_choice" \
-    '.elements[]|select(.index==$index)|.name' "$run_dir/$snapshot")
+  target_name=$(jq -r --arg index "$target_choice" \
+    '.elements[] | select("\(.index)" == $index) | .name' "$run_dir/$snapshot")
   expected=$(expected_target "$step")
   [[ "${target_name,,}" == *"${expected,,}"* ]]
 }
@@ -71,7 +84,7 @@ assert_actions_correct() {
     [[ "$operation" == "$(expected_operation "$step")" ]]
     expected=$(expected_target "$step")
     [[ "${target,,}" == *"${expected,,}"* ]]
-  done < <(jq -rs -r '
+  done < <(jq -rs '
     reduce .[] as $event ({step:null, actions:[]};
       if ($event.event == "observation" or $event.event == "reobservation") then
         .step = $event.step_id
@@ -82,28 +95,15 @@ assert_actions_correct() {
   ' "$trace")
 }
 
-assert_complete_evidence() {
-  local output=$1 manifest path expected actual
-  manifest=$(jq -r '.evidence.manifest' "$output")
-  jq -e '.complete == true and ([.artifacts[].complete] | all)' "$manifest" >/dev/null
-  while IFS=$'\t' read -r path expected; do
-    [[ -f "$path" ]]
-    actual=$(sha256sum "$path" | cut -d' ' -f1)
-    [[ "$actual" == "$expected" ]]
-  done < <(jq -r '.artifacts[] | [.path,.digest] | @tsv' "$manifest")
-}
-
 run_case() {
-  local iteration=$1 label="create-account-nl-$iteration"
-  local launch candidate started finished status state classification output observe accounts units active_ms cleanup_status
-  active_run="manuvra-natural-done-$iteration-$stamp"
-  launch=$(cd "$money_dir" && pnpm verify:app launch --run-id "$active_run" --port 4351)
-  candidate=$(jq -r '.result.candidate' <<<"$launch")
-  (cd "$money_dir" && node scripts/app-driver.mjs doctor \
-    --run-id "$active_run" --candidate "$candidate") >"$evidence_root/$label-doctor.json"
+  local iteration=$1
+  local label="create-account-nl-$iteration"
+  local started finished status state classification output observe accounts units active_ms cleanup_status
+  start_fixture "manuvra-natural-done-$iteration-$stamp" "$evidence_root/$label-fixture" \
+    "$evidence_root/$label-launch.json" "$evidence_root/$label-doctor.json"
   started=$(date +%s%3N)
   set +e
-  XDG_STATE_HOME="$state_root/$label" "$repo_root/target/debug/manuvra" run \
+  XDG_STATE_HOME="$state_root/$label" "$manuvra" run \
     --request-id "natural-done-$label-$stamp" \
     --job "$repo_root/tests/live/create-account-natural-done.json" \
     --evidence "$evidence_root/$label" \
@@ -116,23 +116,22 @@ run_case() {
   state=$(jq -r '.state' "$output")
   [[ "$state" == passed || "$state" == uncertain ]]
   classification=autonomous
-  if [[ "$state" == uncertain ]]; then assert_correct_stop "$output"; fi
-  if [[ "$state" == uncertain ]]; then classification=stopped; fi
+  if [[ "$state" == uncertain ]]; then
+    assert_correct_stop "$output"
+    classification=stopped
+  fi
   assert_actions_correct "$output"
-  assert_complete_evidence "$output"
-  (cd "$money_dir" && node scripts/app-driver.mjs observe \
-    --run-id "$active_run" --feature accounts.create) >"$evidence_root/$label-observe.json"
+  verify_manifest "$output"
   observe="$evidence_root/$label-observe.json"
+  observe_fixture accounts.create >"$observe"
   accounts=$(jq '.result.accounts|length' "$observe")
   units=$(jq '.result.units|length' "$observe")
   [[ $accounts -le 1 && $units -le 1 ]]
   if [[ "$state" == passed ]]; then [[ $accounts -eq 1 && $units -eq 1 ]]; fi
   active_ms=$(jq -s '[.[]|.active_ms // empty]|max // 0' \
     "$evidence_root/$label"/r_*/steps/*.json)
-  (cd "$money_dir" && pnpm verify:app cleanup --run-id "$active_run") \
-    >"$evidence_root/$label-cleanup.json"
+  stop_fixture "$evidence_root/$label-cleanup.json" "$evidence_root/$label-cleanup.stderr"
   cleanup_status=$(jq -r '.status' "$evidence_root/$label-cleanup.json")
-  active_run=""
   jq -cn --argjson iteration "$iteration" --arg state "$state" \
     --arg classification "$classification" \
     --argjson exit_code "$status" --argjson wall_ms "$((finished-started))" \
@@ -144,8 +143,7 @@ run_case() {
 
 for iteration in 1 2 3; do run_case "$iteration"; done
 
-provider_key=${TYPESAFE_API_KEY-}
-if [[ -n "$provider_key" ]] && rg -a -l -F -- "$provider_key" "$evidence_root" "$state_root"; then
+if provider_key_present "$evidence_root"; then
   echo "provider key leaked into live evidence" >&2
   exit 1
 fi

@@ -1,52 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-fail() {
-  echo "$1" >&2
-  exit 1
-}
-
-require_command() {
-  command -v "$1" >/dev/null 2>&1 || fail "$1 is required for the money journey matrix"
-}
+source "$(dirname "${BASH_SOURCE[0]}")/live-lib.sh"
 
 epoch_millis() {
   printf '%s000\n' "$(date +%s)"
-}
-
-sha256_file() {
-  shasum -a 256 "$1" | awk '{print $1}'
-}
-
-# The key reaches grep through a pipe from the printf builtin, never through an argument list.
-# A scan error counts as a leak because absence is not proved.
-provider_key_present() {
-  local status=0
-  grep -r -a -l -F -f <(printf '%s\n' "$TYPESAFE_API_KEY") -- "$1" || status=$?
-  (( status != 1 ))
-}
-
-port_is_open() {
-  nc -z -w 2 127.0.0.1 4351 >/dev/null 2>&1
-}
-
-validate_money_dir() {
-  [[ -n "${MONEY_DIR:-}" ]] || fail "MONEY_DIR is required for the money journey matrix"
-  [[ -d "$MONEY_DIR" ]] || fail "MONEY_DIR is not a directory: $MONEY_DIR"
-  [[ -f "$MONEY_DIR/package.json" ]] || fail "MONEY_DIR has no package.json: $MONEY_DIR"
-  [[ -f "$MONEY_DIR/scripts/app-driver.mjs" ]] ||
-    fail "MONEY_DIR has no scripts/app-driver.mjs: $MONEY_DIR"
-}
-
-preflight_fixture() {
-  validate_money_dir
-  require_command jq
-  require_command nc
-  require_command node
-  require_command pnpm
-  if port_is_open; then
-    fail "port 4351 is already in use"
-  fi
 }
 
 preflight_matrix() {
@@ -59,7 +17,7 @@ preflight_matrix() {
   require_command rg
   require_command rustc
   require_command shasum
-  : "${TYPESAFE_API_KEY:?TYPESAFE_API_KEY is required for the money journey matrix}"
+  require_provider_key
 }
 
 configure_runtime_root() {
@@ -103,9 +61,9 @@ verification_facts_are_visible() {
   local run_root snapshot_relative snapshot
   run_root=$(dirname "$(dirname "$payload")")
   snapshot_relative=$(jq -r '.observation.snapshot // empty' "$payload")
-  [[ "$snapshot_relative" == observations/* && "$snapshot_relative" != *..* ]]
+  [[ "$snapshot_relative" == observations/* && "$snapshot_relative" != *..* ]] || return 1
   snapshot="$run_root/$snapshot_relative"
-  [[ -f "$snapshot" ]]
+  [[ -f "$snapshot" ]] || return 1
   case "$journey" in
     create-unit)
       jq -e --arg name "$expected_name" \
@@ -114,6 +72,13 @@ verification_facts_are_visible() {
     create-account|forced-escalation)
       jq -e --arg name "$expected_name" \
         '.visible_text | contains($name) and contains("12.34")' "$snapshot" >/dev/null
+      ;;
+    create-account-secret)
+      # Evidence masks the classified name, so the snapshot shows its marker instead.
+      jq -e --arg name "$expected_name" '
+        .visible_text | contains("12.34") and (contains($name) | not) and
+        test("<masked:[0-9]+>|<value:account_name>")
+      ' "$snapshot" >/dev/null
       ;;
     record-transaction)
       jq -e --arg name "$expected_name" '
@@ -151,6 +116,27 @@ self_test_portable_helpers() {
     return 1
   fi
 
+  printf '%s\n' '{"visible_text":"<masked:1> 12.34 USD"}' >"$snapshot"
+  verification_facts_are_visible "$payload" create-account-secret "Secret review wallet 7491"
+
+  printf '%s\n' '{"visible_text":"Secret review wallet 7491 12.34 USD"}' >"$snapshot"
+  if verification_facts_are_visible "$payload" create-account-secret "Secret review wallet 7491"; then
+    echo "secret attestation accepted a snapshot that exposes the classified name" >&2
+    return 1
+  fi
+
+  printf '%s\n' '{"step_id":"open","offered_candidate":{"operation":"CLICK","target_name":"+ Create account"}}' \
+    >"$test_root/candidate.json"
+  candidate_is_expected "$test_root/candidate.json"
+  printf '%s\n' '{"step_id":"open","offered_candidate":{"operation":"CLICK","target_name":"Delete account"}}' \
+    >"$test_root/candidate.json"
+  if candidate_is_expected "$test_root/candidate.json"; then
+    echo "candidate check accepted a target the job does not intend" >&2
+    return 1
+  fi
+
+  self_test_provider_key_scan "$test_root/scan"
+
   printf 'portable digest fixture\n' >"$test_root/digest"
   [[ "$(sha256_file "$test_root/digest")" == \
     "91668ee0646c7b6712ff1a925b0a02d9d29037461f936f7999d7ac8cab683c18" ]]
@@ -171,47 +157,33 @@ self_test_portable_helpers() {
   jq -e '.bash_version == "5.2.0(1)-release"' "$linux_report" >/dev/null
 }
 
-active_fixture=
-active_fixture_state=
-fixture_test_root=
-cleanup_active_fixture() {
-  if [[ -n "$active_fixture" ]]; then
-    (cd "$money_dir" && VERIFY_STATE="$active_fixture_state" \
-      pnpm verify:app cleanup --run-id "$active_fixture") >/dev/null || true
-  fi
+# Uses a synthetic key; the real provider key is never read here.
+self_test_provider_key_scan() {
+  local root=$1
+  mkdir -p "$root/clean" "$root/leaked"
+  printf 'redacted <masked-provider>\n' >"$root/clean/evidence.txt"
+  printf 'header manuvra-self-test-key trailer\n' >"$root/leaked/evidence.txt"
+  (
+    export TYPESAFE_API_KEY=manuvra-self-test-key
+    if provider_key_present "$root/clean" >/dev/null; then
+      fail "provider key scan reported a key in clean evidence"
+    fi
+    provider_key_present "$root/clean" "$root/leaked" >/dev/null ||
+      fail "provider key scan missed a leaked key"
+    provider_key_present "$root/missing" >/dev/null 2>&1 ||
+      fail "provider key scan treated an unreadable path as clean"
+    unset TYPESAFE_API_KEY
+    provider_key_present "$root/clean" >/dev/null 2>&1 ||
+      fail "provider key scan treated a missing key as absent"
+  )
 }
 
+fixture_test_root=
 cleanup_fixture_self_test() {
   cleanup_active_fixture
   if [[ -n "$fixture_test_root" ]]; then
     rm -rf -- "$fixture_test_root"
   fi
-}
-
-start_fixture() {
-  local run_id=$1 fixture_state=$2 launch=$3 doctor=$4 candidate
-  active_fixture=$run_id
-  active_fixture_state=$fixture_state
-  (cd "$money_dir" && VERIFY_STATE="$fixture_state" \
-    pnpm verify:app launch --run-id "$run_id" --port 4351) >"$launch"
-  candidate=$(jq -r '.result.candidate // empty' "$launch")
-  [[ -n "$candidate" ]] || fail "fixture launch did not publish a candidate"
-  (cd "$money_dir" && VERIFY_STATE="$fixture_state" node scripts/app-driver.mjs doctor \
-    --run-id "$run_id" --candidate "$candidate") >"$doctor"
-  jq -e '.status == "completed"' "$doctor" >/dev/null || fail "fixture doctor failed"
-}
-
-stop_fixture() {
-  local output=$1 errors=$2 code
-  set +e
-  (cd "$money_dir" && VERIFY_STATE="$active_fixture_state" \
-    pnpm verify:app cleanup --run-id "$active_fixture") >"$output" 2>"$errors"
-  code=$?
-  set -e
-  [[ $code -eq 0 ]] || return "$code"
-  jq -e '.status == "completed" and .result.cleanup == "cleaned"' "$output" >/dev/null || return 1
-  active_fixture=
-  active_fixture_state=
 }
 
 self_test_fixture() {
@@ -255,13 +227,11 @@ if [[ ${1:-} == --runtime-self-test ]]; then
 fi
 
 if [[ ${1:-} == --fixture-self-test ]]; then
-  money_dir=${MONEY_DIR:-}
   self_test_fixture
   exit 0
 fi
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-money_dir=${MONEY_DIR:-}
 preflight_matrix
 configure_runtime_root "$(uname -s)"
 
@@ -290,64 +260,6 @@ jq -n \
     xdg_runtime_dir:(if $xdg_runtime_dir == "" then null else $xdg_runtime_dir end)}' \
   >"$matrix_root/build.json"
 
-wait_checkpoint() {
-  local state_root=$1 run_id=$2 current=$3
-  local state code next
-  state=$(jq -r '.state' "$current")
-  for attempt in $(seq 1 24); do
-    [[ "$state" == running ]] || return 0
-    next="${current%.json}-status-$attempt.json"
-    set +e
-    XDG_STATE_HOME="$state_root" \
-      "$manuvra" status "$run_id" --wait-ms 30000 >"$next" 2>"${next%.json}.stderr"
-    code=$?
-    set -e
-    [[ $code -eq 0 || $code -eq 2 || $code -eq 3 || $code -eq 4 || $code -eq 5 || $code -eq 6 ]]
-    cp "$next" "$current"
-    state=$(jq -r '.state' "$current")
-  done
-  [[ "$state" != running ]]
-}
-
-candidate_is_expected() {
-  local payload=$1
-  jq -e '
-    .offered_candidate as $c |
-    (.step_id == "open" and $c.operation == "CLICK" and $c.target_name == "Create account") or
-    (.step_id == "name" and $c.operation == "TYPE_TEXT" and $c.target_name == "Account name" and $c.value_name == "account_name") or
-    (.step_id == "currency" and $c.operation == "CLICK" and $c.target_name == "Currency or asset") or
-    (.step_id == "new-unit" and $c.operation == "CLICK" and $c.target_name == "+ New currency or asset") or
-    (.step_id == "symbol" and $c.operation == "TYPE_TEXT" and $c.target_name == "Symbol" and $c.value_name == "unit_symbol") or
-    (.step_id == "unit-name" and $c.operation == "TYPE_TEXT" and $c.target_name == "Unit name" and $c.value_name == "unit_name") or
-    (.step_id == "use-unit" and $c.operation == "CLICK" and $c.target_name == "Use unit") or
-    (.step_id == "balance" and $c.operation == "TYPE_TEXT" and $c.target_name == "Opening balance" and $c.value_name == "opening_balance") or
-    (.step_id == "submit" and $c.operation == "CLICK" and $c.target_name == "Create account") or
-    (.step_id == "open-account-dialog" and $c.operation == "CLICK" and $c.target_name == "Create account") or
-    (.step_id == "account-name" and $c.operation == "TYPE_TEXT" and $c.target_name == "Account name" and $c.value_name == "account_name") or
-    (.step_id == "open-unit-list" and $c.operation == "CLICK" and $c.target_name == "Currency or asset") or
-    (.step_id == "open-unit-dialog" and $c.operation == "CLICK" and $c.target_name == "+ New currency or asset") or
-    (.step_id == "unit-symbol" and $c.operation == "TYPE_TEXT" and $c.target_name == "Symbol" and $c.value_name == "unit_symbol") or
-    (.step_id == "unit-name" and $c.operation == "TYPE_TEXT" and $c.target_name == "Unit name" and $c.value_name == "unit_name") or
-    (.step_id == "opening-balance" and $c.operation == "TYPE_TEXT" and $c.target_name == "Opening balance" and $c.value_name == "opening_balance") or
-    (.step_id == "create-account" and $c.operation == "CLICK" and $c.target_name == "Create account") or
-    (.step_id == "open-account" and $c.operation == "CLICK" and $c.target_name == "Transaction wallet") or
-    (.step_id == "open-transaction" and $c.operation == "CLICK" and $c.target_name == "Add transaction") or
-    (.step_id == "transaction-amount" and $c.operation == "TYPE_TEXT" and $c.target_name == "Amount" and $c.value_name == "transaction_amount") or
-    (.step_id == "transaction-note" and $c.operation == "TYPE_TEXT" and $c.target_name == "Note" and $c.value_name == "transaction_note") or
-    (.step_id == "save-transaction" and $c.operation == "CLICK" and $c.target_name == "Save")
-  ' "$payload" >/dev/null
-}
-
-verify_manifest() {
-  local result=$1 manifest
-  manifest=$(jq -r '.evidence.manifest' "$result")
-  jq -e '.complete == true and ([.artifacts[].complete] | all)' "$manifest" >/dev/null
-  while IFS=$'\t' read -r path expected; do
-    [[ -f "$path" ]]
-    [[ "$(sha256_file "$path")" == "$expected" ]]
-  done < <(jq -r '.artifacts[] | [.path,.digest] | @tsv' "$manifest")
-}
-
 verify_persistence() {
   local journey=$1 expected_name=$2 observation=$3
   case "$journey" in
@@ -358,7 +270,7 @@ verify_persistence() {
         (.result.operations | length) == 0
       ' "$observation" >/dev/null
       ;;
-    create-account|forced-escalation)
+    create-account|create-account-secret|forced-escalation)
       jq -e --arg name "$expected_name" '
         ([.result.accounts[] | select(.name == $name and .opening == "12.34")] | length) == 1 and
         (.result.accounts | length) == 1 and (.result.units | length) == 1 and
@@ -376,9 +288,42 @@ verify_persistence() {
   esac
 }
 
+# A job with final expectations publishes one verification Artifact that satisfies every one.
+final_verification_is_satisfied() {
+  local job=$1 result=$2 manifest verification
+  jq -e '.expectations | length > 0' "$job" >/dev/null || return 0
+  manifest=$(jq -r '.evidence.manifest' "$result")
+  jq -e '[.artifacts[] | select(.role == "verification")] | length == 1' "$manifest" >/dev/null ||
+    return 1
+  verification=$(jq -r '.artifacts[] | select(.role == "verification") | .path' "$manifest")
+  jq -e '.phase == "verification" and ([.expectations[].result] | all(. == "satisfied"))' \
+    "$verification" >/dev/null
+}
+
+# The classified account name never reaches Manuvra's results, state, or Evidence. The final
+# verification asks Jev about the named value, and no masked fragment survives as a literal.
+classified_name_is_redacted() {
+  local name=$1 state_root=$2 manifest run_dir verification status=0
+  shift 2
+  manifest=$(jq -r '.evidence.manifest // empty' "$1")
+  [[ -f "$manifest" ]] || return 1
+  run_dir=$(dirname "$manifest")
+  verification=$(jq -r '.artifacts[] | select(.role == "verification") | .path' "$manifest")
+  [[ -f "$verification" ]] || return 1
+  grep -r -a -q -F -- "$name" "$run_dir" "$state_root" "$@" || status=$?
+  [[ $status -eq 1 ]] || return 1
+  jq -e '.provider.request | tostring | contains("<value:account_name>")' "$verification" \
+    >/dev/null || return 1
+  if jq -e --arg marker "${name##* }" '.. | objects | .literal? // empty | select(. == $marker)' \
+    "$verification" "$1" >/dev/null; then
+    return 1
+  fi
+  grep -r -a -q -E '<masked:[0-9]+>|<value:account_name>' "$run_dir"
+}
+
 run_case() {
   local journey=$1 iteration=$2 fixture=$3 expected_name=$4 feature=$5 forced=$6
-  local label="$journey-$iteration" case_root="$matrix_root/$journey/$iteration"
+  local case_root="$matrix_root/$journey/$iteration"
   local state_root="$case_root/state" evidence_root="$case_root/evidence"
   local job="$fixture" current="$case_root/current-result.json"
   local fixture_state="$case_root/money-fixture"
@@ -394,7 +339,7 @@ run_case() {
   fi
 
   local request_id="money-$journey-$iteration-$stamp" code started_ms ended_ms run_id state
-  local assists=0 attestations=0 first_stop= first_stop_payload= forced_stop_seen=false failure=
+  local assists=0 attestations=0 first_stop='' first_stop_payload='' forced_stop_seen=false failure=''
   local manifest_ok=false persistence_ok=false cleanup_ok=false leak_free=false
   started_ms=$(epoch_millis)
   set +e
@@ -510,24 +455,31 @@ run_case() {
   elif [[ -z "$failure" ]]; then
     failure="manifest or artifact digest verification failed"
   fi
+  if [[ -z "$failure" ]] && ! final_verification_is_satisfied "$job" "$current"; then
+    manifest_ok=false
+    failure="final verification Evidence did not satisfy every expectation"
+  fi
   if [[ "$forced" == yes && "$forced_stop_seen" != true && -z "$failure" ]]; then
     failure="forced submit escalation was not observed"
   fi
 
   local observation="$case_root/persistence.json"
-  (cd "$money_dir" && VERIFY_STATE="$fixture_state" node scripts/app-driver.mjs observe \
-    --run-id "$active_fixture" --feature "$feature") >"$observation"
+  observe_fixture "$feature" >"$observation"
   if verify_persistence "$journey" "$expected_name" "$observation"; then
     persistence_ok=true
   elif [[ -z "$failure" ]]; then
     failure="application persistence did not match the journey"
   fi
 
-  local active_ms=0 manifest classification first_stop_json reason
+  local active_ms=0 manifest classification first_stop_json reason step_path step_files=()
   manifest=$(jq -r '.evidence.manifest // empty' "$current")
   if [[ -f "$manifest" ]]; then
-    active_ms=$(jq -s '[.[] | .active_ms // 0] | max // 0' \
-      $(jq -r '.artifacts[] | select(.role == "step") | .path' "$manifest"))
+    while IFS= read -r step_path; do
+      step_files+=("$step_path")
+    done < <(jq -r '.artifacts[] | select(.role == "step") | .path' "$manifest")
+  fi
+  if (( ${#step_files[@]} > 0 )); then
+    active_ms=$(jq -s '[.[] | .active_ms // 0] | max // 0' "${step_files[@]}")
   fi
   classification=autonomous
   (( assists == 0 )) || classification=assisted
@@ -561,10 +513,13 @@ run_case() {
   [[ -z "$run_id" ]] || rmdir "$runtime_root/manuvra/runs/$run_id" 2>/dev/null || true
 
   if ! provider_key_present "$case_root" >/dev/null &&
-    ! rg -a -l '"(document_id|node_id|target_node_id)"' "$case_root" >/dev/null; then
+    ! rg -a -l '"(document_id|node_id|target_node_id)"' "$case_root" >/dev/null &&
+    { [[ "$journey" != create-account-secret ]] ||
+      classified_name_is_redacted "$expected_name" "$state_root" "$current" \
+        "$case_root/initial-result.json"; }; then
     leak_free=true
   elif [[ -z "$failure" ]]; then
-    failure="sensitive provider or browser identity leaked into exported artifacts"
+    failure="sensitive provider, classified value, or browser identity leaked into exported artifacts"
   fi
 
   classification=autonomous
@@ -605,6 +560,8 @@ for iteration in 1 2 3; do
   run_case record-transaction "$iteration" "$repo_root/tests/live/record-transaction.json" \
     "Transaction wallet" history.persistence no
 done
+run_case create-account-secret 1 "$repo_root/tests/live/create-account.secret.json" \
+  "Secret review wallet 7491" accounts.create no
 run_case forced-escalation 1 "$repo_root/tests/live/create-account-forced-pause.json" \
   "Review wallet" accounts.create yes
 

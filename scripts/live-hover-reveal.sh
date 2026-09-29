@@ -5,7 +5,8 @@
 # fails a check.
 set -euo pipefail
 
-: "${TYPESAFE_API_KEY:?TYPESAFE_API_KEY is required for live Jev judgments}"
+source "$(dirname "${BASH_SOURCE[0]}")/live-lib.sh"
+require_provider_key
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 runs=3
@@ -204,7 +205,7 @@ no_internal_identity_in() {
 }
 
 no_provider_key_in() {
-  absent_from -F -- "$TYPESAFE_API_KEY" "$1"
+  ! provider_key_present "$1"
 }
 
 # Waits for the run's host, watchdog, and Chromium to exit, then requires that Manuvra's Chromium

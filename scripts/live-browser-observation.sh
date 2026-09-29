@@ -1,49 +1,50 @@
 #!/usr/bin/env bash
+# Observes a fresh Money fixture with read-only jobs: a passing observation, a failing done
+# condition, classified rendered text, and a provider key stand-in that must never be exported.
 set -euo pipefail
 
+source "$(dirname "${BASH_SOURCE[0]}")/live-lib.sh"
+
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-money_dir=${MONEY_DIR:-/home/guetteluis/Work/personal/money}
+preflight_fixture
+require_command cargo
+require_command rg
+require_provider_key
 stamp=$(date +%Y%m%d-%H%M%S)-$$
 evidence_root="$repo_root/.work/live/browser-observation/$stamp"
 state_root="$evidence_root/state"
 mkdir -p "$evidence_root" "$state_root"
+trap cleanup_active_fixture EXIT
 
 cargo build --locked --manifest-path "$repo_root/Cargo.toml" --bin manuvra
 cargo test --locked --manifest-path "$repo_root/Cargo.toml" -p manuvra-chrome \
   --test local_fixture -- --ignored
+manuvra="$repo_root/target/debug/manuvra"
 
-active_run=""
-cleanup() {
-  if [[ -n "$active_run" ]]; then
-    (cd "$money_dir" && pnpm verify:app cleanup --run-id "$active_run") >/dev/null || true
-  fi
-}
-trap cleanup EXIT
-
+# The optional fifth argument replaces the provider key for this Run with a synthetic marker.
 run_case() {
-  local label=$1 fixture=$2 expected_exit=$3 expected_state=$4
-  local provider_key=${5-${TYPESAFE_API_KEY-}}
-  local request_component=$label
-  if [[ $# -ge 5 ]]; then
-    request_component=$5
-  fi
-  active_run="manuvra-browser-observation-$label-$stamp"
-  local launch candidate output status
-  launch=$(cd "$money_dir" && pnpm verify:app launch --run-id "$active_run" --port 4351)
-  candidate=$(node -e 'const value=JSON.parse(process.argv[1]); process.stdout.write(value.result.candidate)' "$launch")
-  (cd "$money_dir" && node scripts/app-driver.mjs doctor --run-id "$active_run" --candidate "$candidate") >"$evidence_root/$label-doctor.json"
+  local label=$1 fixture=$2 expected_exit=$3 expected_state=$4 marker=${5-}
+  local status
+  start_fixture "manuvra-browser-observation-$label-$stamp" "$evidence_root/$label-fixture" \
+    "$evidence_root/$label-launch.json" "$evidence_root/$label-doctor.json"
   set +e
-  TYPESAFE_API_KEY="$provider_key" XDG_STATE_HOME="$state_root/$label" "$repo_root/target/debug/manuvra" run \
-    --request-id "browser-observation-$request_component-$stamp" --job "$repo_root/tests/live/$fixture" \
-    --evidence "$evidence_root/$label" >"$evidence_root/$label-stdout.json" 2>"$evidence_root/$label-stderr.txt"
+  if [[ -n "$marker" ]]; then
+    TYPESAFE_API_KEY="$marker" XDG_STATE_HOME="$state_root/$label" "$manuvra" run \
+      --request-id "browser-observation-$marker-$stamp" --job "$repo_root/tests/live/$fixture" \
+      --evidence "$evidence_root/$label" >"$evidence_root/$label-stdout.json" \
+      2>"$evidence_root/$label-stderr.txt"
+  else
+    XDG_STATE_HOME="$state_root/$label" "$manuvra" run \
+      --request-id "browser-observation-$label-$stamp" --job "$repo_root/tests/live/$fixture" \
+      --evidence "$evidence_root/$label" >"$evidence_root/$label-stdout.json" \
+      2>"$evidence_root/$label-stderr.txt"
+  fi
   status=$?
   set -e
   [[ $status -eq $expected_exit ]]
-  output=$(node -e 'const fs=require("fs");const value=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));process.stdout.write(value.state)' "$evidence_root/$label-stdout.json")
-  [[ "$output" == "$expected_state" ]]
-  (cd "$money_dir" && node scripts/app-driver.mjs observe --run-id "$active_run" --feature accounts.empty) >"$evidence_root/$label-observe.json"
-  (cd "$money_dir" && pnpm verify:app cleanup --run-id "$active_run") >"$evidence_root/$label-cleanup.json"
-  active_run=""
+  [[ "$(jq -r '.state' "$evidence_root/$label-stdout.json")" == "$expected_state" ]]
+  observe_fixture accounts.empty >"$evidence_root/$label-observe.json"
+  stop_fixture "$evidence_root/$label-cleanup.json" "$evidence_root/$label-cleanup.stderr"
 }
 
 run_case observe observe-money.json 0 passed
@@ -58,15 +59,19 @@ if rg -a -F -- '+ Create account' \
   exit 1
 fi
 
-
 if rg -a -F -- 'live-provider-export-marker' \
   "$evidence_root/provider" "$evidence_root/provider-stdout.json" \
   "$evidence_root/provider-stderr.txt" "$state_root/provider"; then
-  echo "provider key leaked from the provider-redaction run" >&2
+  echo "provider key stand-in leaked from the provider-redaction run" >&2
   exit 1
 fi
 
-secret_manifest=$(node -e 'const fs=require("fs");const value=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));process.stdout.write(value.evidence.manifest)' "$evidence_root/secret-stdout.json")
+if provider_key_present "$evidence_root"; then
+  echo "provider key leaked into live evidence" >&2
+  exit 1
+fi
+
+secret_manifest=$(jq -r '.evidence.manifest' "$evidence_root/secret-stdout.json")
 secret_dir=$(dirname "$secret_manifest")
 diff -u <(jq -S . "$evidence_root/secret-stdout.json") <(jq -S . "$secret_dir/result.json")
 jq -e '
