@@ -119,9 +119,13 @@ fn fixture(temp: &TempDir, job: &Value) -> PathBuf {
 /// A CLI command confined to the temporary directory's private state and runtime roots.
 fn manuvra(temp: &TempDir) -> Command {
     let mut command = Command::new(binary());
-    command
-        .env("XDG_STATE_HOME", temp.path().join("state"))
-        .env("XDG_RUNTIME_DIR", temp.path().join("runtime"));
+    command.env("XDG_STATE_HOME", temp.path().join("state"));
+    // A control socket beneath the per-user macOS temporary directory exceeds Darwin's 104-byte
+    // socket path limit, so macOS runs use Manuvra's own TMPDIR fallback instead.
+    #[cfg(target_os = "macos")]
+    command.env_remove("XDG_RUNTIME_DIR");
+    #[cfg(not(target_os = "macos"))]
+    command.env("XDG_RUNTIME_DIR", temp.path().join("runtime"));
     command
 }
 
