@@ -121,6 +121,7 @@ pub struct Permit {
 }
 
 impl Permit {
+    #[cfg(any(target_os = "linux", target_os = "macos", test))]
     pub(crate) fn operation(&self) -> Operation {
         self.candidate.operation
     }

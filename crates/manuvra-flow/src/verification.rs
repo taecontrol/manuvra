@@ -877,6 +877,30 @@ mod tests {
     }
 
     #[test]
+    fn verification_request_never_lists_hover_regions() {
+        let job = job_without_values();
+        let values = Values::new(&job);
+        let expectations = [Expectation {
+            id: "saved".into(),
+            claim: "The account is saved.".into(),
+            exact_literals: Vec::new(),
+        }];
+        let mut with_regions = observation();
+        with_regions.hover_regions = vec![manuvra_chrome::HoverRegion {
+            index: 1,
+            name: "Groceries".into(),
+            reveals_on_hover: vec!["Actions for Groceries".into()],
+            node_id: 41,
+        }];
+        let request = expectation_request(&expectations, &with_regions, &values);
+        assert_eq!(
+            request,
+            expectation_request(&expectations, &observation(), &values)
+        );
+        assert!(!request.to_string().contains("Groceries"));
+    }
+
+    #[test]
     fn all_seven_assertion_forms_are_checked() {
         let assertions = vec![
             Assertion::TextVisible(TextVisible {

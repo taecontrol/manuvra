@@ -1,4 +1,3 @@
-use crate::judgment::hover_region_key;
 use manuvra_chrome::{HoverRegion, Observation};
 use manuvra_contract::{Job, JobValue};
 use serde_json::{Value, json};
@@ -66,26 +65,14 @@ impl<'a> Values<'a> {
                 })
             })
             .collect();
-        let mut view = json!({
+        json!({
             "url":self.mask(&observation.url),"route":self.mask(&observation.route),
             "title":self.mask(&observation.title),
             "dialogs":observation.dialogs.iter().map(|value|self.mask(value)).collect::<Vec<_>>(),
             "focused":observation.focused,"visible_text":self.mask(&observation.visible_text),
             "covered_text":self.mask(&observation.covered_text),"elements":elements,
             "coverage":observation.coverage
-        });
-        if !observation.hover_regions.is_empty() {
-            view["hover_regions"] = observation
-                .hover_regions
-                .iter()
-                .map(|region| {
-                    let mut listed = self.hover_region_view(region);
-                    listed["key"] = Value::String(hover_region_key(region));
-                    listed
-                })
-                .collect();
-        }
-        view
+        })
     }
 
     /// A hover region as the provider sees it: masked page text, without its dispatch identity.

@@ -1154,9 +1154,12 @@ fn relevant_state_hash(observation: &Observation) -> String {
     hex::encode(Sha256::digest(relevant_state(observation).to_string()))
 }
 
+/// The observed facts an attestation rests on. Hover regions are part of the observation the
+/// escalation publishes and of the provider's view; they are included only when listed, so pages
+/// without them hash exactly as before hover regions existed.
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn relevant_state(observation: &Observation) -> Value {
-    json!({
+    let mut state = json!({
         "url": observation.url,
         "route": observation.route,
         "title": observation.title,
@@ -1167,7 +1170,11 @@ fn relevant_state(observation: &Observation) -> Value {
         "covered_text": observation.covered_text,
         "elements": observation.elements,
         "coverage": observation.coverage,
-    })
+    });
+    if !observation.hover_regions.is_empty() {
+        state["hover_regions"] = json!(observation.hover_regions);
+    }
+    state
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -6609,6 +6616,45 @@ mod tests {
             &structured_unknown,
             "attested"
         ));
+    }
+
+    #[test]
+    fn advance_is_refused_when_only_a_hover_region_changed() {
+        let mut job = job("unused");
+        job.steps[0].done_when = DoneCondition::NaturalLanguage("Groceries is archived".into());
+        let redactor = Redactor::for_job(&job).unwrap();
+        let attested = plan_before_hover();
+        let mut current = attested.clone();
+        current.hover_regions[0].reveals_on_hover = vec!["Unarchive Groceries".into()];
+        assert_eq!(current.visible_text, attested.visible_text);
+        let browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::new()),
+            fallback: current,
+            dispatch_result: None,
+        };
+        let mut machine = HostedMachine::new(&job, &redactor);
+        machine.artifacts.pending = Some(PendingEscalation {
+            done: DoneResult::Unknown,
+            noul: Some(0.5),
+            candidate: None,
+            observation: attested,
+            ambiguous_mutation: false,
+        });
+        machine.apply_advance("caller verified the condition", &browser);
+        assert_eq!(machine.index, 0);
+        assert_eq!(
+            machine.artifacts.stop.as_ref().unwrap().code,
+            "relevant_state_changed"
+        );
+        assert!(!machine.artifacts.caller_assisted);
+    }
+
+    #[test]
+    fn relevant_state_without_hover_regions_hashes_as_before_hover_regions_existed() {
+        assert_eq!(
+            relevant_state_hash(&observed("unchanged")),
+            "1b9170f95c3a6ab892f3eb876ab3e830d82588d036c9f51364b9c5cf8c71ed14"
+        );
     }
 
     #[test]

@@ -112,12 +112,22 @@ pub fn request(
     request
 }
 
-/// Offers `HOVER` only when the observation lists hover regions, adding exactly the operation
-/// criterion and the `hover_target` question; `page.hover_regions` comes from the provider view.
+/// Offers `HOVER` only when the observation lists hover regions, adding exactly
+/// `page.hover_regions`, the operation criterion, and the `hover_target` question. Only the
+/// judgment request offers `HOVER`, so only it lists the regions.
 fn offer_hover(request: &mut Value, step: &Step, observation: &Observation, values: &Values<'_>) {
     if observation.hover_regions.is_empty() {
         return;
     }
+    request["state"]["page"]["hover_regions"] = observation
+        .hover_regions
+        .iter()
+        .map(|region| {
+            let mut listed = values.hover_region_view(region);
+            listed["key"] = Value::String(hover_region_key(region));
+            listed
+        })
+        .collect();
     let criteria: Map<String, Value> = observation
         .hover_regions
         .iter()
