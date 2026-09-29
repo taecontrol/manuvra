@@ -224,6 +224,34 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    fn owned_group_rejects_an_unrepresentable_recorded_pid() {
+        let invalid = ProcessIdentity {
+            pid: u32::MAX,
+            process_group: u32::MAX,
+            start_marker: 1,
+            session_id: 1,
+        };
+        assert!(
+            platform::owned_group_has_member(&invalid)
+                .unwrap_err()
+                .contains("process id does not fit pid_t")
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn owned_group_rejects_a_recorded_group_with_a_different_leader() {
+        let inconsistent = ProcessIdentity {
+            pid: std::process::id(),
+            process_group: 0,
+            start_marker: 1,
+            session_id: 1,
+        };
+        assert!(!platform::owned_group_has_member(&inconsistent).unwrap());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn owned_process_group_signal_cleans_resistant_descendant_after_leader_is_reaped() {
         use std::os::unix::process::CommandExt;
 

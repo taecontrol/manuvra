@@ -91,7 +91,8 @@ Start from this shape and replace the illustrative labels and claims with the ap
 Authoring rules:
 
 - Write goals and natural-language conditions in English. Make each step one observable UI transition. Opening a chooser and selecting an option are separate steps.
-- Describe intent in `goal` and the resulting state in `done_when`. A list of assertions is a conjunction. Prefer the structured forms `text_visible`, `text_absent`, `field` + `nonempty`, `field` + `equals_value`, `dialog_open`, `dialog_closed`, and `url_contains`. Use a natural-language string only when those forms cannot express the condition.
+- Start a keyboard goal with `Press `, such as `Press Escape to close the breakdown popover`, `Press Tab to focus Save`, or `Press Enter to activate Save`. The supported keys are Escape, Tab, Shift+Tab, Enter, Space, ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Home, and End. A key press is a mutation; set the step's `mutation_limit` (default 1, maximum 8) high enough for every press in the step, or split the journey into steps with separate done conditions.
+- Describe intent in `goal` and the resulting state in `done_when`. A list of assertions is a conjunction. Prefer the structured forms `text_visible`, `text_absent`, `field` + `nonempty`, `field` + `equals_value`, `focused`, `dialog_open`, `dialog_closed`, and `url_contains`. `{"focused":"Save"}` requires that element to have focus; add `role` or `dialog` to distinguish repeated names. Use a natural-language string only when those forms cannot express the condition.
 - Match field and dialog names to visible accessible labels. Manuvra requires one unambiguous visible match. Use a field's optional `dialog` or `role`, or a text assertion's `scope`, when the page repeats a label.
 - Put every literal to be entered in `values` under a stable semantic name. Refer to that name from `requires_values` and `equals_value`. Keep the literal in `values`. Mark credentials or sensitive values with `"secret": true`, and list other values requiring evidence redaction in `options.redact_values`.
 - Keep jobs containing classified values outside the repository in a caller-owned file with mode `0600`.
@@ -141,7 +142,7 @@ After lost stdout, recover the existing run with `manuvra status --request-id "$
 
 For an uncertain run, create a disposition matching `manuvra schema disposition`:
 
-- `execute`: use the exact offered `candidate_id` only when its operation, target, and value still express the intended step.
+- `execute`: use the exact offered `candidate_id` only when its operation, target, value, or key and focus anchor still express the intended step. For `PRESS_KEY`, inspect the offered key and focus anchor; Manuvra rechecks the focus before dispatch. An uncertain key outcome offers no `execute` disposition.
 - `advance`: include a concrete `rationale` and use it only when offered for an uncertain natural-language condition or final claim that the evidence visibly establishes.
 - `retry_observation`: use when fresher browser evidence can resolve the uncertainty.
 - `abort`: use when authority, intent, or safe continuation is absent.

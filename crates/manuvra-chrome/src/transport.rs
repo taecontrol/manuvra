@@ -829,14 +829,16 @@ pub(crate) mod test_support {
 
     #[derive(Default)]
     struct Script {
+        received: Vec<Value>,
         replies: HashMap<String, Vec<Value>>,
         reject: HashSet<String>,
         silent: HashSet<String>,
         disconnect_on: HashSet<String>,
-        received: Vec<(String, Value)>,
+        reject_on_call: HashMap<String, usize>,
         pending_events: VecDeque<Value>,
         ping_once: bool,
         invalid_json_methods: HashSet<String>,
+        invalid_json_on_call: HashMap<String, usize>,
         binary_once: bool,
         http_status: Option<u16>,
         http_body: Option<Vec<u8>>,
@@ -889,6 +891,17 @@ pub(crate) mod test_support {
                 .push(result);
         }
 
+        pub fn received(&self, method: &str) -> Vec<Value> {
+            self.script
+                .lock()
+                .expect("scripted Chrome")
+                .received
+                .iter()
+                .filter(|value| value["method"] == method)
+                .cloned()
+                .collect()
+        }
+
         pub fn reject(&self, method: &str) {
             self.script
                 .lock()
@@ -916,12 +929,25 @@ pub(crate) mod test_support {
         }
 
         /// Every command received so far, in order, as its method and params.
-        pub fn received(&self) -> Vec<(String, Value)> {
+        pub fn commands(&self) -> Vec<(String, Value)> {
             self.script
                 .lock()
                 .expect("scripted Chrome")
                 .received
-                .clone()
+                .iter()
+                .map(|value| {
+                    let method = value["method"].as_str().unwrap_or_default().to_owned();
+                    (method, value.get("params").cloned().unwrap_or(Value::Null))
+                })
+                .collect()
+        }
+
+        pub fn reject_on_call(&self, method: &str, call: usize) {
+            self.script
+                .lock()
+                .expect("scripted Chrome")
+                .reject_on_call
+                .insert(method.to_owned(), call);
         }
 
         pub fn push_event(&self, method: &str, params: Value) {
@@ -942,6 +968,14 @@ pub(crate) mod test_support {
                 .expect("scripted Chrome")
                 .invalid_json_methods
                 .insert(method.to_owned());
+        }
+
+        pub fn reply_invalid_json_on_call(&self, method: &str, call: usize) {
+            self.script
+                .lock()
+                .expect("scripted Chrome")
+                .invalid_json_on_call
+                .insert(method.to_owned(), call);
         }
 
         pub fn send_binary_once(&self) {
@@ -1151,16 +1185,23 @@ pub(crate) mod test_support {
             .to_owned();
         let (reply, invalid) = {
             let mut script = script.lock().expect("scripted Chrome");
-            let params = value.get("params").cloned().unwrap_or(Value::Null);
-            script.received.push((method.clone(), params));
+            script.received.push(value.clone());
             if script.disconnect_on.contains(&method) {
                 return false;
             }
             if script.silent.contains(&method) {
                 return true;
             }
-            let invalid = script.invalid_json_methods.contains(&method);
-            let reply = if script.reject.contains(&method) {
+            let call = script
+                .received
+                .iter()
+                .filter(|item| item["method"] == method)
+                .count();
+            let invalid = script.invalid_json_methods.contains(&method)
+                || script.invalid_json_on_call.get(&method) == Some(&call);
+            let reply = if script.reject.contains(&method)
+                || script.reject_on_call.get(&method) == Some(&call)
+            {
                 json!({"id": id, "error": {"message": "rejected"}})
             } else {
                 let result = script

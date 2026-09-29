@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Keyboard widgets fixture</title></head>
+<body>
+  <label id="choice-label" for="choice">Choose item</label>
+  <input id="choice" role="combobox" aria-labelledby="choice-label" aria-controls="choices" aria-expanded="true" autocomplete="off">
+  <div id="choices" role="listbox">
+    <div id="alpha" role="option" aria-selected="false">Alpha</div>
+    <div id="beta" role="option" aria-selected="false">Beta</div>
+    <div id="gamma" role="option" aria-selected="false">Gamma</div>
+  </div>
+  <p id="selected">Selected: none</p>
+  <div role="menu" aria-label="Actions">
+    <button id="first" role="menuitem" tabindex="0">First action</button>
+    <button id="second" role="menuitem" tabindex="-1">Second action</button>
+  </div>
+  <div id="shadow-host"></div>
+  <div role="tree" aria-label="Folders">
+    <div role="treeitem" tabindex="0">Documents</div>
+    <div role="treeitem" tabindex="-1">Music</div>
+    <div role="treeitem" tabindex="-1">Photos</div>
+  </div>
+  <div role="tree" aria-label="Recent">
+    <div role="treeitem" tabindex="0" aria-posinset="7" aria-setsize="20">Report</div>
+    <div role="treeitem" tabindex="-1" aria-posinset="8" aria-setsize="20">Budget</div>
+  </div>
+  <script>
+    document.getElementById('shadow-host').attachShadow({mode: 'open'}).innerHTML =
+      '<input role="combobox" aria-label="Shadow choice" aria-activedescendant="gamma">';
+    const choice = document.getElementById('choice');
+    const options = [...document.querySelectorAll('[role="option"]')];
+    let active = -1;
+    choice.addEventListener('keydown', event => {
+      const keys = {ArrowDown: Math.min(active + 1, options.length - 1), ArrowUp: Math.max(active - 1, 0), ArrowRight: Math.min(active + 1, options.length - 1), ArrowLeft: Math.max(active - 1, 0), Home: 0, End: options.length - 1};
+      if (Object.hasOwn(keys, event.key)) {
+        event.preventDefault();
+        active = keys[event.key];
+        choice.setAttribute('aria-activedescendant', options[active].id);
+      } else if (event.key === 'Enter' && active >= 0) {
+        event.preventDefault();
+        options.forEach((option, index) => option.setAttribute('aria-selected', String(index === active)));
+        document.getElementById('selected').textContent = `Selected: ${options[active].textContent}`;
+      }
+    });
+    const roving = items => items.forEach((item, index) => item.addEventListener('keydown', event => {
+      if (!['ArrowUp', 'ArrowDown'].includes(event.key)) return;
+      event.preventDefault();
+      item.tabIndex = -1;
+      const next = items[(index + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length];
+      next.tabIndex = 0;
+      next.focus();
+    }));
+    roving([...document.querySelectorAll('[role="menuitem"]')]);
+    for (const tree of document.querySelectorAll('[role="tree"]')) roving([...tree.querySelectorAll('[role="treeitem"]')]);
+  </script>
+</body>
+</html>

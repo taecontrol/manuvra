@@ -13,6 +13,7 @@ pub enum Operation {
     Click,
     TypeText,
     Select,
+    PressKey,
     ScrollUp,
     ScrollDown,
     Hover,
@@ -22,10 +23,13 @@ pub enum Operation {
 
 impl Operation {
     /// Whether a performed operation counts against the step mutation limit and the run's
-    /// mutations. Scrolling and hovering are bounded non-mutating fallbacks; waiting and blocking
-    /// never dispatch.
+    /// mutations. Every key press is a mutation. Scrolling and hovering are bounded non-mutating
+    /// fallbacks; waiting and blocking never dispatch.
     pub fn mutates(self) -> bool {
-        matches!(self, Self::Click | Self::TypeText | Self::Select)
+        matches!(
+            self,
+            Self::Click | Self::TypeText | Self::Select | Self::PressKey
+        )
     }
 }
 
@@ -43,6 +47,7 @@ pub struct Judgments {
     pub type_target: ChoiceJudgment,
     pub select_target: ChoiceJudgment,
     pub type_value: ChoiceJudgment,
+    pub key: ChoiceJudgment,
     /// The hover region choice, asked only when the observation lists hover regions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hover_target: Option<ChoiceJudgment>,
@@ -97,6 +102,7 @@ pub fn request(
                 "CLICK":"Click a visible control or visible option that directly advances this step. Use this for goals that say open, choose, confirm, use, or submit.",
                 "TYPE_TEXT":"Replace a visible editable field only when this step's goal explicitly asks to fill, enter, or type a caller-provided value and code facts show the field is not already equal to that value. Never choose this for an open, choose, confirm, use, or submit goal.",
                 "SELECT":"Choose a caller-provided value from a visible native select whose observed options contain it.",
+                "PRESS_KEY":"Press one supported key at the currently focused element when the goal explicitly asks for a key press. If the goal starts with Press, keep choosing PRESS_KEY for each key needed to complete it, even when a click could produce the same effect.",
                 "SCROLL_UP":"Scroll upward only when the needed target is outside the visible viewport above.",
                 "SCROLL_DOWN":"Scroll downward only when the needed target is outside the visible viewport below.",
                 "WAIT":"Wait briefly only because the page is visibly still updating.",
@@ -105,7 +111,8 @@ pub fn request(
             "click_target":{"type":"choice","instructions":{"premise":"The operation is CLICK","rules":target_rules,"goal":values.mask(&step.goal)},"criteria":target_criteria(observation,"CLICK",values)},
             "type_target":{"type":"choice","instructions":{"premise":"The operation is TYPE_TEXT","rules":target_rules,"goal":values.mask(&step.goal)},"criteria":target_criteria(observation,"TYPE_TEXT",values)},
             "select_target":{"type":"choice","instructions":{"premise":"The operation is SELECT","rules":target_rules,"goal":values.mask(&step.goal)},"criteria":target_criteria(observation,"SELECT",values)},
-            "type_value":{"type":"choice","instructions":{"premise":"The operation is TYPE_TEXT or SELECT into the independently selected field","rules":"Choose the caller-provided value name whose description belongs in that field, or NONE_FITS.","goal":values.mask(&step.goal)},"criteria":value_criteria}
+            "type_value":{"type":"choice","instructions":{"premise":"The operation is TYPE_TEXT or SELECT into the independently selected field","rules":"Choose the caller-provided value name whose description belongs in that field, or NONE_FITS.","goal":values.mask(&step.goal)},"criteria":value_criteria},
+            "key":{"type":"choice","instructions":{"premise":"The operation is PRESS_KEY","rules":"Choose one key for the current observation, not the whole step. For a goal that asks for arrows and Enter to choose an option, inspect the focused element's active_descendant: use an arrow to reach the named option, then use Enter when that option is active.","goal":values.mask(&step.goal)},"criteria":{"Escape":"Close the focused overlay with Escape.","Tab":"Move focus forward with Tab.","Shift+Tab":"Move focus backward with Shift+Tab.","Enter":"Activate the focused control or its active descendant with Enter.","Space":"Activate the focused control with Space.","ArrowUp":"Move to the previous option with ArrowUp.","ArrowDown":"Move to the next option with ArrowDown.","ArrowLeft":"Move left in a composite widget with ArrowLeft.","ArrowRight":"Move right in a composite widget with ArrowRight.","Home":"Move to the first option with Home.","End":"Move to the last option with End."}}
         }
     });
     offer_hover(&mut request, step, observation, values);
@@ -167,7 +174,9 @@ fn step_done_question(step: &Step, values: &Values<'_>) -> Value {
 
 fn operation_hint(goal: &str, observation: &Observation) -> Option<&'static str> {
     let goal = goal.trim().to_ascii_lowercase();
-    if goal.starts_with("fill ") || goal.starts_with("enter ") || goal.starts_with("type ") {
+    if goal.starts_with("press ") {
+        Some("PRESS_KEY")
+    } else if goal.starts_with("fill ") || goal.starts_with("enter ") || goal.starts_with("type ") {
         Some("TYPE_TEXT")
     } else if goal.starts_with("choose ") && native_select_matches_goal(&goal, observation) {
         Some("SELECT")
@@ -219,12 +228,15 @@ fn target_description(element: &Element, values: &Values<'_>) -> Value {
 }
 
 fn consume(request: Value, evaluation: Evaluation) -> Result<Judgments, JevError> {
+    let operation = choice(&evaluation, "operation")?;
+    let (click_target, type_target, select_target) = target_choices(&evaluation)?;
     Ok(Judgments {
-        operation: choice(&evaluation, "operation")?,
-        click_target: choice(&evaluation, "click_target")?,
-        type_target: choice(&evaluation, "type_target")?,
-        select_target: choice(&evaluation, "select_target")?,
+        operation,
+        click_target,
+        type_target,
+        select_target,
         type_value: choice(&evaluation, "type_value")?,
+        key: choice(&evaluation, "key")?,
         hover_target: optional_choice(&evaluation, "hover_target")?,
         step_done: noul(&evaluation, "step_done")?,
         usage: evaluation.usage,
@@ -232,6 +244,16 @@ fn consume(request: Value, evaluation: Evaluation) -> Result<Judgments, JevError
         model: evaluation.model,
         request,
     })
+}
+
+fn target_choices(
+    evaluation: &Evaluation,
+) -> Result<(ChoiceJudgment, ChoiceJudgment, ChoiceJudgment), JevError> {
+    Ok((
+        choice(evaluation, "click_target")?,
+        choice(evaluation, "type_target")?,
+        choice(evaluation, "select_target")?,
+    ))
 }
 
 fn choice(evaluation: &Evaluation, id: &str) -> Result<ChoiceJudgment, JevError> {
@@ -276,16 +298,18 @@ pub fn selected_operation(judgments: &Judgments) -> Result<Operation, JevError> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use manuvra_chrome::{Coverage, Element, HoverRegion, Rect, SelectOption, ViewportState};
+    use manuvra_chrome::{
+        Coverage, Element, FocusAnchor, HoverRegion, Rect, SelectOption, ViewportState,
+    };
     use manuvra_contract::Job;
     use manuvra_jev::{Answer, Evaluation};
     use std::sync::Mutex;
 
     #[derive(Default)]
-    struct Capture(Mutex<Option<Value>>);
+    struct Capture(Mutex<Vec<Value>>);
     impl Evaluator for Capture {
         fn evaluate(&self, request: &Value, _deadline: Instant) -> Result<Evaluation, JevError> {
-            *self.0.lock().unwrap() = Some(request.clone());
+            self.0.lock().unwrap().push(request.clone());
             let criteria = |id: &str| {
                 request
                     .pointer(&format!("/questions/{id}/criteria"))
@@ -318,6 +342,7 @@ mod tests {
                     ("type_target".into(), choice("type_target")),
                     ("select_target".into(), choice("select_target")),
                     ("type_value".into(), choice("type_value")),
+                    ("key".into(), choice("key")),
                     ("step_done".into(), Answer::Noul { noul: 0.1 }),
                 ]),
                 usage: BTreeMap::new(),
@@ -337,6 +362,20 @@ mod tests {
             title: "provider-secret-419".into(),
             dialogs: vec![],
             focused: None,
+            focus_anchor: Some(FocusAnchor {
+                node_id: 1,
+                context: "main".into(),
+                role: "textbox".into(),
+                name: "provider-secret-419".into(),
+                in_dialog: None,
+                covered: true,
+                surface: None,
+                active_descendant: None,
+                expanded: None,
+                selected: None,
+                checked: None,
+                position: None,
+            }),
             visible_text: "provider-secret-419".into(),
             covered_text: "".into(),
             dialog_texts: BTreeMap::new(),
@@ -383,7 +422,7 @@ mod tests {
             Instant::now() + std::time::Duration::from_secs(1),
         )
         .unwrap();
-        let body = capture.0.lock().unwrap().clone().unwrap().to_string();
+        let body = capture.0.lock().unwrap()[0].to_string();
         assert!(!body.contains("provider-secret-419"));
         assert!(body.contains("equals_value_names"));
         assert!(body.contains("account_name"));
@@ -455,6 +494,7 @@ mod tests {
             title: "Plan · Savings 4417".into(),
             dialogs: vec!["Edit Savings 4417".into()],
             focused: Some(2),
+            focus_anchor: None,
             visible_text: "Savings 4417 Groceries $400.00".into(),
             covered_text: "Rent".into(),
             dialog_texts: BTreeMap::new(),
@@ -586,6 +626,7 @@ mod tests {
             ("type_target".into(), choice("NO_TYPE_TEXT_TARGET")),
             ("select_target".into(), choice("NO_SELECT_TARGET")),
             ("type_value".into(), choice("NONE_FITS")),
+            ("key".into(), choice("Escape")),
             ("step_done".into(), Answer::Noul { noul: 0.1 }),
         ]);
         if let Some((id, answer)) = extra {
@@ -635,11 +676,12 @@ mod tests {
     }
 
     #[test]
-    fn only_click_type_text_and_select_mutate() {
+    fn only_click_type_text_select_and_press_key_mutate() {
         for (operation, mutates) in [
             (Operation::Click, true),
             (Operation::TypeText, true),
             (Operation::Select, true),
+            (Operation::PressKey, true),
             (Operation::ScrollUp, false),
             (Operation::ScrollDown, false),
             (Operation::Hover, false),
@@ -700,6 +742,11 @@ mod tests {
                 probabilities: BTreeMap::new(),
                 confidence: 1.0,
             },
+            key: ChoiceJudgment {
+                choice: "Escape".into(),
+                probabilities: BTreeMap::new(),
+                confidence: 1.0,
+            },
             hover_target: None,
             step_done: 0.0,
             usage: BTreeMap::new(),
@@ -711,6 +758,7 @@ mod tests {
             ("CLICK", Operation::Click),
             ("TYPE_TEXT", Operation::TypeText),
             ("SELECT", Operation::Select),
+            ("PRESS_KEY", Operation::PressKey),
             ("SCROLL_UP", Operation::ScrollUp),
             ("SCROLL_DOWN", Operation::ScrollDown),
             ("WAIT", Operation::Wait),
@@ -772,6 +820,74 @@ mod tests {
         observation.elements = vec![target];
         assert_eq!(
             operation_hint("Choose Country", &observation),
+            Some("CLICK")
+        );
+    }
+
+    #[test]
+    fn key_question_shares_the_operation_request_and_hints_preserve_existing_goals() {
+        let job = Job::parse(serde_json::to_vec(&json!({
+            "schema_version":1,"target":{"kind":"browser","url":"http://example.test"},
+            "context":{"journey":"x","revision":"x","environment":"x","actor":"x","authority":"x"},
+            "steps":[{"id":"key","goal":"Press Escape to close the popover","done_when":[{"dialog_closed":"Popover"}]}]
+        })).unwrap().as_slice()).unwrap();
+        let observation: Observation = serde_json::from_value(json!({
+            "document_id":"d","url":"http://example.test/","route":"/","title":"x",
+            "elements":[],"viewport":{"width":1,"height":1,"scroll_x":0.0,"scroll_y":0.0,"document_height":1.0}
+        })).unwrap();
+        let capture = Capture::default();
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        let judgments = judge(
+            &capture,
+            &job.steps[0],
+            &observation,
+            &[],
+            &Values::new(&job),
+            deadline,
+        )
+        .unwrap();
+        assert_eq!(capture.0.lock().unwrap().len(), 1);
+        let request = capture.0.lock().unwrap()[0].clone();
+        assert_eq!(
+            request["state"]["code_facts"]["operation_hint_from_atomic_goal"],
+            "PRESS_KEY"
+        );
+        assert_eq!(request["questions"]["key"]["type"], "choice");
+        let key_criteria = request["questions"]["key"]["criteria"].as_object().unwrap();
+        assert_eq!(key_criteria.len(), 11);
+        for key in [
+            "Escape",
+            "Tab",
+            "Shift+Tab",
+            "Enter",
+            "Space",
+            "ArrowUp",
+            "ArrowDown",
+            "ArrowLeft",
+            "ArrowRight",
+            "Home",
+            "End",
+        ] {
+            assert!(key_criteria.contains_key(key), "missing {key}");
+        }
+        assert!(key_criteria.contains_key(&judgments.key.choice));
+        assert!(manuvra_chrome::Key::from_choice(&judgments.key.choice).is_some());
+        let mut missing_key = capture.evaluate(&request, deadline).unwrap();
+        missing_key.answers.remove("key");
+        assert!(matches!(
+            consume(request.clone(), missing_key),
+            Err(JevError::InvalidResponse(_))
+        ));
+        assert_eq!(
+            operation_hint("Enter account_name in Name", &observation),
+            Some("TYPE_TEXT")
+        );
+        assert_eq!(
+            operation_hint("Open the Home tab", &observation),
+            Some("CLICK")
+        );
+        assert_eq!(
+            operation_hint("Choose End date", &observation),
             Some("CLICK")
         );
     }

@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Keyboard submit fixture</title></head>
+<body>
+  <form method="post" action="/submitted">
+    <input name="note" aria-label="Note" value="ready">
+    <button id="plain" type="submit">Submit</button>
+    <button id="validated" type="submit">Validate and submit</button>
+  </form>
+  <script>
+    if (location.pathname === '/submitted') {
+      document.title = 'Submitted';
+      document.body.replaceChildren(Object.assign(document.createElement('p'), {textContent: 'Submitted page'}));
+    } else {
+      const form = document.querySelector('form');
+      document.getElementById('validated').addEventListener('click', event => {
+        event.preventDefault();
+        setTimeout(() => form.submit(), 60);
+      });
+      document.getElementById(new URL(location.href).searchParams.get('focus') || 'plain').focus();
+    }
+  </script>
+</body>
+</html>

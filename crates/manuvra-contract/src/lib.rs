@@ -163,6 +163,7 @@ pub enum Assertion {
     TextAbsent(TextAbsent),
     FieldNonempty(FieldNonempty),
     FieldEqualsValue(FieldEqualsValue),
+    Focused(Focused),
     DialogOpen(DialogOpen),
     DialogClosed(DialogClosed),
     UrlContains(UrlContains),
@@ -219,6 +220,16 @@ pub struct FieldNonempty {
 pub struct FieldEqualsValue {
     pub field: String,
     pub equals_value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialog: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Focused {
+    pub focused: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dialog: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -703,28 +714,25 @@ impl DoneCondition {
 
 impl Assertion {
     fn validate(&self) -> Result<(), ValidationError> {
-        match self {
-            Self::TextVisible(value) => validate_nonempty("text_visible", &value.text_visible),
-            Self::TextAbsent(value) => validate_nonempty("text_absent", &value.text_absent),
-            Self::FieldNonempty(value) => value.validate(),
-            Self::FieldEqualsValue(value) => value.validate(),
-            Self::DialogOpen(value) => validate_nonempty("dialog_open", &value.dialog_open),
-            Self::DialogClosed(value) => validate_nonempty("dialog_closed", &value.dialog_closed),
-            Self::UrlContains(value) => validate_nonempty("url_contains", &value.url_contains),
+        let (name, subject) = self.subject();
+        validate_nonempty(name, subject)?;
+        if let Self::FieldEqualsValue(value) = self {
+            validate_nonempty("equals_value", &value.equals_value)?;
         }
+        Ok(())
     }
-}
 
-impl FieldNonempty {
-    fn validate(&self) -> Result<(), ValidationError> {
-        validate_nonempty("field", &self.field)
-    }
-}
-
-impl FieldEqualsValue {
-    fn validate(&self) -> Result<(), ValidationError> {
-        validate_nonempty("field", &self.field)?;
-        validate_nonempty("equals_value", &self.equals_value)
+    fn subject(&self) -> (&'static str, &str) {
+        match self {
+            Self::TextVisible(value) => ("text_visible", &value.text_visible),
+            Self::TextAbsent(value) => ("text_absent", &value.text_absent),
+            Self::FieldNonempty(FieldNonempty { field, .. })
+            | Self::FieldEqualsValue(FieldEqualsValue { field, .. }) => ("field", field),
+            Self::Focused(value) => ("focused", &value.focused),
+            Self::DialogOpen(value) => ("dialog_open", &value.dialog_open),
+            Self::DialogClosed(value) => ("dialog_closed", &value.dialog_closed),
+            Self::UrlContains(value) => ("url_contains", &value.url_contains),
+        }
     }
 }
 
@@ -997,11 +1005,23 @@ mod tests {
             {"text_absent": "Error", "scope": {"dialog": "Create"}},
             {"field": "Name", "nonempty": true, "dialog": "Create", "role": "textbox"},
             {"field": "Name", "equals_value": "account_name"},
+            {"focused": "Save", "role": "button", "dialog": "Create"},
             {"dialog_open": "Create"}, {"dialog_closed": "Other"}, {"url_contains": "/accounts"}
         ]);
         let mut value = valid_job();
         value["steps"][0]["done_when"] = assertions;
-        assert!(parse(&value).is_ok());
+        let job = parse(&value).unwrap();
+        let DoneCondition::Structured(parsed) = &job.steps[0].done_when else {
+            panic!("structured done condition");
+        };
+        assert_eq!(
+            parsed[4],
+            Assertion::Focused(Focused {
+                focused: "Save".into(),
+                dialog: Some("Create".into()),
+                role: Some("button".into()),
+            })
+        );
     }
 
     #[test]
@@ -1078,6 +1098,10 @@ mod tests {
             }),
             Box::new(|job| {
                 job["steps"][0]["done_when"] = json!([{"field": "Name", "nonempty": false}])
+            }),
+            Box::new(|job| job["steps"][0]["done_when"] = json!([{"focused": " "}])),
+            Box::new(|job| {
+                job["steps"][0]["done_when"] = json!([{"focused": "Save", "extra": true}])
             }),
             Box::new(|job| job["options"]["active_timeout_ms"] = json!(0)),
             Box::new(|job| job["options"]["max_model_calls"] = json!(1001)),
