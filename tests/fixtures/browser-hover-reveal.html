@@ -10,7 +10,10 @@
   .row { display: grid; grid-template-columns: 2rem 1fr 8rem 8rem 2.5rem; align-items: center; min-height: 36px; border-top: 1px solid #ddd; padding: 0 8px; cursor: grab; }
   .group-row { background: #f2f2f2; font-weight: 600; }
   .reveal { opacity: 0; transition: opacity 150ms; }
-  .row:hover .reveal, .row:focus-within .reveal { opacity: 1; }
+  .row:not(.group\/catalog-row):hover .reveal, .row:focus-within .reveal { opacity: 1; }
+  @media (hover:hover) {
+    .group-hover\/catalog-row\:opacity-100:is(:where(.group\/catalog-row):hover *) { opacity: 1; }
+  }
   button { font: inherit; background: none; border: 0; padding: 4px 6px; cursor: pointer; }
   .cell { display: flex; width: 40px; height: 36px; align-items: center; justify-content: center; }
   [role="menu"] { position: fixed; background: #fff; border: 1px solid #999; padding: 4px; display: flex; flex-direction: column; min-width: 180px; }
@@ -23,7 +26,8 @@
 <header><h1>Plan</h1><button type="button">Previous month</button> September 2026 <button type="button">Next month</button> <button type="button">+ Add group</button></header>
 <main id="catalog"></main>
 <script>
-  // Reproduces a budget plan whose row actions are revealed only by :hover or :focus-within.
+  // Row actions use plain :hover, except Rent's Tailwind-shaped hover media query.
+  // Like the app, :focus-within reveals controls independently of the media query.
   // ?many=1 adds enough revealing rows to exceed the snapshot's hover region cap.
   const groups = [
     ['Essentials', [['Groceries', '$400.00', '$312.50'], ['Rent', '$1,500.00', '$1,500.00'], ['Utilities', '$180.00', '$96.20']]],
@@ -99,7 +103,7 @@
     const cell = document.createElement('div');
     cell.className = 'cell';
     const wrapper = document.createElement('div');
-    wrapper.className = 'reveal';
+    wrapper.className = label === 'Rent' ? 'reveal group-hover/catalog-row:opacity-100' : 'reveal';
     if (concealment === 'aria-hidden') wrapper.setAttribute('aria-hidden', 'true');
     if (concealment === 'inert') wrapper.inert = true;
     const trigger = document.createElement('button');
@@ -125,7 +129,7 @@
     list.appendChild(head);
     for (const [name, assigned, activity, concealment] of categories) {
       const row = document.createElement('li');
-      row.className = 'row';
+      row.className = name === 'Rent' ? 'row group/catalog-row' : 'row';
       row.setAttribute('aria-label', name);
       row.draggable = true;
       row.innerHTML = `<span></span><span>${name}</span>` +
