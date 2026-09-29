@@ -5190,15 +5190,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn hover_below_the_gate_reobserves_once_then_escalates_without_a_candidate() {
-        let job = click_job(false);
-        let browser = ScriptedBrowser::new([plan_before_hover()], []);
-        let low = Turn {
+    fn low_hover_turn() -> Turn {
+        Turn {
             confidence: 0.59,
             ..hover_turn("R1")
-        };
-        let provider = ScriptedProvider::new([low.clone(), low]);
+        }
+    }
+
+    #[test]
+    fn hover_below_the_gate_reobserves_once_then_offers_one_hover_candidate() {
+        let job = click_job(false);
+        let browser = ScriptedBrowser::new([plan_before_hover()], []);
+        let provider = ScriptedProvider::new([low_hover_turn(), low_hover_turn()]);
 
         let artifacts = drive_scripted(&job, &browser, &provider, &mut MemoryJournal::default());
 
@@ -5207,20 +5210,570 @@ mod tests {
         assert_eq!(artifacts.observations.len(), 2);
         assert!(browser.inputs.lock().unwrap().is_empty());
         let escalation = &artifacts.escalations[0].1;
-        assert_eq!(escalation["offered_candidate"], Value::Null);
-        assert_eq!(escalation["candidates"]["operation"]["choice"], "HOVER");
+        let offered = json!({
+            "id":"c_1","operation":"HOVER","target_name":null,"target_role":null,
+            "target_dialog":null,"target_input_type":null,"value_name":null,
+            "hover_target":{"name":"Groceries","reveals_on_hover":["Actions for Groceries"]}
+        });
+        assert_eq!(escalation["offered_candidate"], offered);
+        assert_eq!(escalation["candidates"], json!([offered]));
         assert_eq!(
             escalation["permitted_mutations"],
             json!(["CLICK", "TYPE_TEXT"])
         );
+        let exported = escalation.to_string();
+        for identity in ["node_id", "document_id", "target_index", "\"index\""] {
+            assert!(!exported.contains(identity), "{identity}");
+        }
+        assert_eq!(
+            artifacts.escalation.as_ref().unwrap().dispositions,
+            [
+                DispositionKind::Execute,
+                DispositionKind::RetryObservation,
+                DispositionKind::Abort,
+            ]
+        );
+    }
+
+    #[test]
+    fn offered_hover_region_text_is_redacted_in_the_escalation() {
+        let mut job = click_job(false);
+        job.values.insert(
+            "category".into(),
+            manuvra_contract::JobValue {
+                value: "Groceries".into(),
+                description: "classified category".into(),
+                formats: None,
+                secret: true,
+            },
+        );
+        let redactor = Redactor::for_job(&job).unwrap();
+        let machine = hover_escalation(&job, &redactor);
+
+        let payload = &machine.artifacts.escalations[0].1;
+        assert_eq!(payload["offered_candidate"]["operation"], "HOVER");
+        let exported = payload.to_string();
+        assert!(!exported.contains("Groceries"));
+        assert!(!redactor.contains_export_leak(exported.as_bytes()));
+    }
+
+    /// A run paused on a below-gate `HOVER` escalation offering the Groceries region.
+    fn hover_escalation<'a>(job: &'a Job, redactor: &'a Redactor) -> HostedMachine<'a> {
+        let browser = ScriptedBrowser::new([plan_before_hover()], []);
+        let provider = ScriptedProvider::new([low_hover_turn(), low_hover_turn()]);
+        let mut machine = HostedMachine::new(job, redactor);
+        machine.drive(
+            &browser,
+            &provider,
+            &mut MemoryJournal::default(),
+            &manuvra_chrome::InputCancellation::default(),
+            None,
+            &RecordingHostedControl::default(),
+        );
+        assert_eq!(
+            machine.artifacts.stop.as_ref().unwrap().code,
+            "operation_below_gate"
+        );
+        machine
+    }
+
+    fn offered_hover(machine: &HostedMachine<'_>) -> policy::Candidate {
+        let candidate = machine
+            .artifacts
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.candidate.clone())
+            .unwrap();
+        assert_eq!(candidate.operation, judgment::Operation::Hover);
+        candidate
+    }
+
+    fn execute_request(candidate_id: &str) -> DispositionRequest {
+        DispositionRequest {
+            schema_version: SchemaVersion,
+            escalation_id: "e_1".into(),
+            disposition: Disposition::Execute(manuvra_contract::ExecuteDisposition {
+                kind: manuvra_contract::ExecuteKind::Execute,
+                candidate_id: candidate_id.into(),
+            }),
+        }
+    }
+
+    fn execute_on(
+        machine: &mut HostedMachine<'_>,
+        candidate_id: &str,
+        browser: &impl DriveBrowser,
+        evaluator: &impl manuvra_jev::Evaluator,
+        journal: &mut impl actions::ActionJournal,
+    ) {
+        machine.apply(
+            execute_request(candidate_id),
+            browser,
+            evaluator,
+            journal,
+            &manuvra_chrome::InputCancellation::default(),
+        );
+    }
+
+    /// The code and state of the run's stop, and whether the reissued escalation still offers a
+    /// candidate.
+    fn paused(machine: &HostedMachine<'_>) -> (&'static str, RunState, bool) {
+        let stop = machine.artifacts.stop.as_ref().unwrap();
+        let offered = machine
+            .artifacts
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.candidate.is_some());
+        (stop.code, stop.state, offered)
+    }
+
+    #[test]
+    fn executed_hover_runs_under_caller_authority_and_the_step_continues_autonomously() {
+        let job = click_job(false);
+        let redactor = Redactor::for_job(&job).unwrap();
+        let mut machine = hover_escalation(&job, &redactor);
+        let candidate = offered_hover(&machine);
+        let browser = ScriptedBrowser::new(
+            [
+                plan_before_hover(),
+                plan_groceries_revealed(),
+                plan_menu_open(),
+            ],
+            [
+                performed("mouse_move").unwrap(),
+                performed("mouse_release").unwrap(),
+            ],
+        );
+        let provider = ScriptedProvider::new([Turn::click("2")]);
+        let mut journal = MemoryJournal::default();
+
+        execute_on(
+            &mut machine,
+            &candidate.id,
+            &browser,
+            &provider,
+            &mut journal,
+        );
+
+        assert!(machine.artifacts.stop.is_none());
+        assert!(machine.artifacts.caller_assisted);
+        assert_eq!(machine.policy.step_mutations(), 0);
+        machine.drive(
+            &browser,
+            &provider,
+            &mut journal,
+            &manuvra_chrome::InputCancellation::default(),
+            None,
+            &RecordingHostedControl::default(),
+        );
+
         assert!(
-            !artifacts
+            machine.artifacts.stop.is_none(),
+            "{:?}",
+            machine.artifacts.stop.as_ref().map(|stop| stop.code)
+        );
+        assert_eq!(machine.index, 1);
+        assert_eq!(
+            machine.artifacts.verdicts[0].result,
+            VerdictResult::Satisfied
+        );
+        assert_eq!(machine.artifacts.steps[0].1["mutation_limit_consumed"], 1);
+        let prepared: Vec<_> = journal
+            .0
+            .iter()
+            .filter(|event| event["event"] == "action_prepared")
+            .map(|event| (event["operation"].clone(), event["basis"].clone()))
+            .collect();
+        assert_eq!(
+            prepared,
+            [
+                (json!("HOVER"), json!("caller_authority")),
+                (json!("CLICK"), json!("autonomous")),
+            ]
+        );
+        assert_eq!(
+            journal.0[0]["hover_target"],
+            json!({"index":1,"name":"Groceries","reveals_on_hover":["Actions for Groceries"]})
+        );
+        let inputs = browser.inputs.lock().unwrap();
+        assert_eq!(
+            inputs
+                .iter()
+                .map(|input| (input.operation, input.node_id))
+                .collect::<Vec<_>>(),
+            [
+                (manuvra_chrome::PreparedOperation::Hover, 41),
+                (manuvra_chrome::PreparedOperation::Click, 41),
+            ]
+        );
+        assert_eq!(
+            provider.requests.lock().unwrap().len(),
+            1,
+            "an executed hover is not re-asked through the operation gate"
+        );
+        assert!(
+            machine
+                .artifacts
+                .trace
+                .iter()
+                .any(|event| event["event"] == "action_fact"
+                    && event["fact"]["operation"] == "HOVER"
+                    && event["fact"]["outcome"] == "observed")
+        );
+    }
+
+    #[test]
+    fn an_executed_hover_leaves_the_forced_debug_stop_for_the_first_click() {
+        let job = click_job(true);
+        let redactor = Redactor::for_job(&job).unwrap();
+        let mut machine = hover_escalation(&job, &redactor);
+        let candidate = offered_hover(&machine);
+        let browser = ScriptedBrowser::new(
+            [plan_before_hover(), plan_groceries_revealed()],
+            [performed("mouse_move").unwrap()],
+        );
+        let provider = ScriptedProvider::new([Turn::click("2")]);
+        let mut journal = MemoryJournal::default();
+
+        execute_on(
+            &mut machine,
+            &candidate.id,
+            &browser,
+            &provider,
+            &mut journal,
+        );
+        assert!(machine.artifacts.stop.is_none());
+        machine.drive(
+            &browser,
+            &provider,
+            &mut journal,
+            &manuvra_chrome::InputCancellation::default(),
+            None,
+            &RecordingHostedControl::default(),
+        );
+
+        assert_eq!(
+            paused(&machine),
+            ("debug_forced_stop", RunState::Uncertain, true)
+        );
+        assert_eq!(
+            browser.operations(),
+            [manuvra_chrome::PreparedOperation::Hover]
+        );
+        let escalation = &machine.artifacts.escalations.last().unwrap().1;
+        assert_eq!(escalation["offered_candidate"]["operation"], "CLICK");
+        assert_eq!(
+            escalation["offered_candidate"]["target_name"],
+            "Actions for Groceries"
+        );
+    }
+
+    #[test]
+    fn executing_a_hover_requires_the_pending_escalation_and_its_offered_candidate() {
+        let job = click_job(false);
+        let redactor = Redactor::for_job(&job).unwrap();
+        let mut machine = hover_escalation(&job, &redactor);
+        let candidate = offered_hover(&machine);
+        let browser =
+            ScriptedBrowser::new([plan_before_hover()], [performed("mouse_move").unwrap()]);
+        let mut journal = MemoryJournal::default();
+
+        execute_on(&mut machine, "c_9", &browser, &NoProvider, &mut journal);
+        assert_eq!(
+            paused(&machine),
+            ("candidate_not_offered", RunState::Uncertain, true)
+        );
+        assert!(
+            machine
+                .artifacts
                 .escalation
                 .as_ref()
                 .unwrap()
                 .dispositions
                 .contains(&DispositionKind::Execute)
         );
+
+        execute_on(
+            &mut machine,
+            &candidate.id,
+            &browser,
+            &NoProvider,
+            &mut journal,
+        );
+        assert!(machine.artifacts.stop.is_none());
+        execute_on(
+            &mut machine,
+            &candidate.id,
+            &browser,
+            &NoProvider,
+            &mut journal,
+        );
+        assert_eq!(
+            paused(&machine),
+            ("stale_escalation", RunState::Uncertain, false)
+        );
+        assert_eq!(
+            browser.operations(),
+            [manuvra_chrome::PreparedOperation::Hover]
+        );
+    }
+
+    #[test]
+    fn executing_a_hover_stops_when_the_resume_observation_or_model_budget_fails() {
+        let job = click_job(false);
+        let redactor = Redactor::for_job(&job).unwrap();
+        let mut machine = hover_escalation(&job, &redactor);
+        let candidate = offered_hover(&machine);
+        let unobservable = FakeBrowser {
+            captures: Mutex::new(VecDeque::from([Err(BrowserError::Control(
+                "target closed".into(),
+            ))])),
+            fallback: plan_before_hover(),
+            dispatch_result: None,
+        };
+        execute_on(
+            &mut machine,
+            &candidate.id,
+            &unobservable,
+            &NoProvider,
+            &mut MemoryJournal::default(),
+        );
+        let stop = machine.artifacts.stop.as_ref().unwrap();
+        assert_eq!(
+            (stop.code, stop.state),
+            ("browser_control_failed", RunState::Blocked)
+        );
+
+        let mut natural = click_job(false);
+        natural.steps[0].done_when =
+            DoneCondition::NaturalLanguage("The actions menu for Groceries is open".into());
+        natural.options.max_model_calls = Some(2);
+        let redactor = Redactor::for_job(&natural).unwrap();
+        let mut machine = hover_escalation(&natural, &redactor);
+        let candidate = offered_hover(&machine);
+        let browser = ScriptedBrowser::new([plan_before_hover()], []);
+        execute_on(
+            &mut machine,
+            &candidate.id,
+            &browser,
+            &NoProvider,
+            &mut MemoryJournal::default(),
+        );
+        let stop = machine.artifacts.stop.as_ref().unwrap();
+        assert_eq!(
+            (stop.code, stop.state),
+            ("budget_exhausted", RunState::Blocked)
+        );
+        assert!(browser.inputs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn executing_a_hover_completes_or_reissues_on_the_fresh_done_result() {
+        let job = click_job(false);
+        let redactor = Redactor::for_job(&job).unwrap();
+        let mut machine = hover_escalation(&job, &redactor);
+        let candidate = offered_hover(&machine);
+        let done = ScriptedBrowser::new([plan_menu_open()], []);
+        execute_on(
+            &mut machine,
+            &candidate.id,
+            &done,
+            &NoProvider,
+            &mut MemoryJournal::default(),
+        );
+        assert_eq!(machine.index, 1);
+        assert!(machine.artifacts.stop.is_none());
+        assert!(machine.artifacts.caller_assisted);
+        assert_eq!(machine.artifacts.steps[0].1["done"], "satisfied");
+        assert!(done.inputs.lock().unwrap().is_empty());
+
+        let mut machine = hover_escalation(&job, &redactor);
+        let mut partial = plan_before_hover();
+        partial.coverage.viewport_complete = false;
+        let unknown = ScriptedBrowser::new([partial], []);
+        execute_on(
+            &mut machine,
+            &candidate.id,
+            &unknown,
+            &NoProvider,
+            &mut MemoryJournal::default(),
+        );
+        assert_eq!(
+            paused(&machine),
+            ("done_unknown", RunState::Uncertain, false)
+        );
+        assert_eq!(machine.index, 0);
+        assert!(unknown.inputs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn executing_a_changed_or_replayed_hover_reissues_without_a_candidate() {
+        let job = click_job(false);
+        let redactor = Redactor::for_job(&job).unwrap();
+        let mut remounted = plan_before_hover();
+        remounted.hover_regions[0].node_id = 99;
+        let mut renamed = plan_before_hover();
+        renamed.hover_regions[0].name = "Groceries and dining".into();
+        let mut revealing_other = plan_before_hover();
+        revealing_other.hover_regions[0].reveals_on_hover = vec!["Rename Groceries".into()];
+        let mut navigated = plan_before_hover();
+        navigated.document_id = "another-document".into();
+        for changed in [
+            plan_groceries_revealed(),
+            remounted,
+            renamed,
+            revealing_other,
+            navigated,
+        ] {
+            let mut machine = hover_escalation(&job, &redactor);
+            let candidate = offered_hover(&machine);
+            let browser = ScriptedBrowser::new([changed], []);
+            execute_on(
+                &mut machine,
+                &candidate.id,
+                &browser,
+                &NoProvider,
+                &mut MemoryJournal::default(),
+            );
+            assert_eq!(
+                paused(&machine),
+                ("candidate_revalidation_failed", RunState::Uncertain, false)
+            );
+            assert!(
+                !machine
+                    .artifacts
+                    .escalation
+                    .as_ref()
+                    .unwrap()
+                    .dispositions
+                    .contains(&DispositionKind::Execute)
+            );
+            assert!(!machine.artifacts.caller_assisted);
+            assert!(browser.inputs.lock().unwrap().is_empty());
+        }
+
+        let mut machine = hover_escalation(&job, &redactor);
+        let candidate = offered_hover(&machine);
+        let _reserved = machine
+            .policy
+            .authorize_caller(&job.steps[0], &plan_before_hover(), &candidate)
+            .unwrap();
+        let browser = ScriptedBrowser::new([plan_before_hover()], []);
+        execute_on(
+            &mut machine,
+            &candidate.id,
+            &browser,
+            &NoProvider,
+            &mut MemoryJournal::default(),
+        );
+        assert_eq!(
+            paused(&machine),
+            ("replay_forbidden", RunState::Uncertain, false)
+        );
+        assert!(browser.inputs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn executing_a_hover_stops_terminally_on_exhausted_budget_or_foreign_origin() {
+        let mut exhausted = click_job(false);
+        exhausted.options.max_actions = Some(0);
+        let mut foreign = plan_before_hover();
+        foreign.url = "http://foreign.test/".into();
+        for (job, page, code) in [
+            (exhausted, plan_before_hover(), "budget_exhausted"),
+            (click_job(false), foreign, "origin_not_allowed"),
+        ] {
+            let redactor = Redactor::for_job(&job).unwrap();
+            let mut machine = hover_escalation(&job, &redactor);
+            let candidate = offered_hover(&machine);
+            let browser = ScriptedBrowser::new([page], []);
+            execute_on(
+                &mut machine,
+                &candidate.id,
+                &browser,
+                &NoProvider,
+                &mut MemoryJournal::default(),
+            );
+            let stop = machine.artifacts.stop.as_ref().unwrap();
+            assert_eq!((stop.code, stop.state), (code, RunState::Blocked));
+            assert!(browser.inputs.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn executed_hover_journal_failures_stop_before_or_after_dispatch_truthfully() {
+        let job = click_job(false);
+        let redactor = Redactor::for_job(&job).unwrap();
+        for (fail_at, code, state, dispatched) in [
+            (0, "evidence_unavailable", RunState::Blocked, 0),
+            (
+                1,
+                "evidence_incomplete_after_dispatch",
+                RunState::Uncertain,
+                1,
+            ),
+        ] {
+            let mut machine = hover_escalation(&job, &redactor);
+            let candidate = offered_hover(&machine);
+            let browser =
+                ScriptedBrowser::new([plan_before_hover()], [performed("mouse_move").unwrap()]);
+            let mut journal = FailingJournal {
+                entries: Vec::new(),
+                fail_at,
+            };
+            execute_on(
+                &mut machine,
+                &candidate.id,
+                &browser,
+                &NoProvider,
+                &mut journal,
+            );
+            let stop = machine.artifacts.stop.as_ref().unwrap();
+            assert_eq!((stop.code, stop.state), (code, state));
+            assert_eq!(browser.inputs.lock().unwrap().len(), dispatched);
+        }
+    }
+
+    #[test]
+    fn executed_hover_dispatch_failures_reissue_an_ambiguous_action_and_keep_the_replay_key() {
+        let job = click_job(false);
+        let redactor = Redactor::for_job(&job).unwrap();
+        for failure in [
+            manuvra_chrome::PerformError::Rejected("covered".into()),
+            manuvra_chrome::PerformError::NotPerformed("not queued".into()),
+            manuvra_chrome::PerformError::Uncertain("sent without answer".into()),
+        ] {
+            let mut machine = hover_escalation(&job, &redactor);
+            let candidate = offered_hover(&machine);
+            let browser = ScriptedBrowser::new([plan_before_hover()], [Err(failure)]);
+            execute_on(
+                &mut machine,
+                &candidate.id,
+                &browser,
+                &NoProvider,
+                &mut MemoryJournal::default(),
+            );
+            assert_eq!(
+                paused(&machine),
+                ("action_outcome_uncertain", RunState::Uncertain, false)
+            );
+            assert!(
+                machine
+                    .artifacts
+                    .pending
+                    .as_ref()
+                    .unwrap()
+                    .ambiguous_mutation
+            );
+            assert!(machine.artifacts.caller_assisted);
+            assert_eq!(browser.inputs.lock().unwrap().len(), 1);
+            assert!(matches!(
+                machine
+                    .policy
+                    .authorize_caller(&job.steps[0], &plan_before_hover(), &candidate),
+                Err(policy::PolicyStop::Uncertain("replay_forbidden"))
+            ));
+        }
     }
 
     #[test]

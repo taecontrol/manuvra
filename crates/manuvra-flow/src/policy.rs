@@ -47,6 +47,17 @@ struct OfferedCandidate<'a> {
     target_dialog: Option<&'a str>,
     target_input_type: Option<&'a str>,
     value_name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hover_target: Option<OfferedHoverTarget<'a>>,
+}
+
+/// The hover region a caller is offered: its name and the controls it reveals, never its index
+/// or dispatch identity.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[derive(Serialize)]
+struct OfferedHoverTarget<'a> {
+    name: &'a str,
+    reveals_on_hover: &'a [String],
 }
 
 impl Candidate {
@@ -60,6 +71,10 @@ impl Candidate {
             target_dialog: self.target_dialog.as_deref(),
             target_input_type: self.target_input_type.as_deref(),
             value_name: self.value_name.as_deref(),
+            hover_target: self.hover_target.as_ref().map(|region| OfferedHoverTarget {
+                name: &region.name,
+                reveals_on_hover: &region.reveals_on_hover,
+            }),
         })
         .expect("offered candidate is serializable")
     }
@@ -264,8 +279,8 @@ impl Policy {
         let operation = selected_operation(judgments)
             .map_err(|_| PolicyStop::Blocked("provider_invalid_response"))?;
         match operation {
-            Operation::Click | Operation::TypeText | Operation::Select => {
-                self.element_candidate(observation, judgments, operation)
+            Operation::Click | Operation::TypeText | Operation::Select | Operation::Hover => {
+                self.candidate(observation, judgments, operation)
             }
             _ => Err(PolicyStop::Blocked("provider_invalid_response")),
         }
@@ -382,13 +397,9 @@ impl Policy {
         candidate: &Candidate,
     ) -> Result<Permit, PolicyStop> {
         self.authorize_context(step, observation)?;
-        let target = candidate
-            .target_index
-            .and_then(|index| observation.elements.iter().find(|item| item.index == index))
-            .filter(|target| candidate_matches(observation, target, candidate))
+        self.check_fallback_budget(candidate.operation)?;
+        let current = revalidated_candidate(observation, candidate)
             .ok_or(PolicyStop::Uncertain("candidate_revalidation_failed"))?;
-        let mut current = candidate.clone();
-        current.target_name = Some(target.name.clone());
         match self.mint(observation, current) {
             Next::Mutate(permit) => Ok(*permit),
             Next::Stop(stop) => Err(stop),
@@ -489,6 +500,24 @@ impl Policy {
             .elapsed()
             .saturating_sub(self.paused_total.saturating_add(current_pause))
     }
+}
+
+/// The offered candidate, when the fresh observation still shows the same target: for a `HOVER`
+/// the same region (document, hidden control, name, and reveals), otherwise the same element.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn revalidated_candidate(observation: &Observation, candidate: &Candidate) -> Option<Candidate> {
+    if candidate.operation == Operation::Hover {
+        return candidate
+            .hover_region(observation)
+            .map(|_| candidate.clone());
+    }
+    let target = candidate
+        .target_index
+        .and_then(|index| observation.elements.iter().find(|item| item.index == index))
+        .filter(|target| candidate_matches(observation, target, candidate))?;
+    let mut current = candidate.clone();
+    current.target_name = Some(target.name.clone());
+    Some(current)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
@@ -1382,7 +1411,7 @@ mod tests {
     }
 
     #[test]
-    fn hover_follows_done_first_and_the_operation_gate_without_a_caller_candidate() {
+    fn hover_follows_done_first_and_the_operation_gate() {
         let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
         let selected = hover(Some("R1"));
         let decide = |policy: &mut Policy, done, done_reobserved, judgment: &Judgments, gate| {
@@ -1417,11 +1446,105 @@ mod tests {
             decide(&mut policy, DoneResult::NotSatisfied, false, &low, true),
             Next::Stop(PolicyStop::Uncertain("operation_below_gate"))
         ));
-        assert_eq!(
-            policy.caller_candidate(&hover_page(), &low),
-            Err(PolicyStop::Blocked("provider_invalid_response"))
-        );
         assert_eq!(policy.actions, 0);
+    }
+
+    #[test]
+    fn a_hover_below_the_gate_is_offered_by_region_name_and_reveals_only() {
+        let policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        let candidate = policy
+            .caller_candidate(&hover_page(), &hover(Some("R2")))
+            .unwrap();
+        assert_eq!(candidate.operation, Operation::Hover);
+        assert_eq!(
+            candidate.hover_region(&hover_page()),
+            Some(&region(2, "Rent", 42))
+        );
+        assert_eq!(
+            candidate.offered(),
+            serde_json::json!({
+                "id":"c_1","operation":"HOVER","target_name":null,"target_role":null,
+                "target_dialog":null,"target_input_type":null,"value_name":null,
+                "hover_target":{"name":"Rent","reveals_on_hover":["Actions for Rent"]}
+            })
+        );
+        for unlisted in [None, Some("R9")] {
+            assert_eq!(
+                policy.caller_candidate(&hover_page(), &hover(unlisted)),
+                Err(PolicyStop::Blocked("provider_invalid_response"))
+            );
+        }
+        for fallback in ["SCROLL_DOWN", "WAIT", "BLOCKED"] {
+            assert_eq!(
+                policy.caller_candidate(&hover_page(), &judgments(fallback)),
+                Err(PolicyStop::Blocked("provider_invalid_response"))
+            );
+        }
+        let element = policy
+            .caller_candidate(&hover_page(), &judgments("CLICK"))
+            .unwrap()
+            .offered();
+        assert!(element.get("hover_target").is_none());
+    }
+
+    #[test]
+    fn caller_hover_authority_revalidates_region_identity_budgets_origin_and_replay() {
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        let candidate = policy
+            .caller_candidate(&hover_page(), &hover(Some("R1")))
+            .unwrap();
+        let mut remounted = hover_page();
+        remounted.hover_regions[0].node_id = 77;
+        let mut renamed = hover_page();
+        renamed.hover_regions[0].name = "Groceries and more".into();
+        let mut revealing_other = hover_page();
+        revealing_other.hover_regions[0].reveals_on_hover = vec!["Rename Groceries".into()];
+        let mut navigated = hover_page();
+        navigated.document_id = "other".into();
+        let mut revealed = hover_page();
+        revealed.hover_regions.remove(0);
+        for changed in [remounted, renamed, revealing_other, navigated, revealed] {
+            assert!(matches!(
+                policy.authorize_caller(&one_mutation_step(), &changed, &candidate),
+                Err(PolicyStop::Uncertain("candidate_revalidation_failed"))
+            ));
+        }
+        assert_eq!(policy.actions, 0);
+
+        let permit = policy
+            .authorize_caller(&one_mutation_step(), &hover_page(), &candidate)
+            .expect("unchanged region receives caller authority");
+        assert_eq!(permit.operation(), Operation::Hover);
+        assert_eq!(permit.consume().0.hover_target, candidate.hover_target);
+        assert_eq!((policy.actions, policy.fallbacks), (1, 1));
+        assert_eq!(policy.step_mutations(), 0);
+        assert!(matches!(
+            policy.authorize_caller(&one_mutation_step(), &hover_page(), &candidate),
+            Err(PolicyStop::Uncertain("replay_forbidden"))
+        ));
+        minted(decide_not_done(
+            &mut policy,
+            &one_mutation_step(),
+            &hover_page(),
+            &judgments("CLICK"),
+            false,
+        ));
+
+        let mut exhausted = Policy::new(&JobOptions::default(), "http://example.test/");
+        exhausted.fallbacks = 8;
+        assert!(matches!(
+            exhausted.authorize_caller(&step(), &hover_page(), &candidate),
+            Err(PolicyStop::Blocked("budget_exhausted"))
+        ));
+        let foreign = JobOptions {
+            allowed_origins: Some(vec!["http://allowed.test".into()]),
+            ..JobOptions::default()
+        };
+        let mut foreign = Policy::new(&foreign, "http://allowed.test/");
+        assert!(matches!(
+            foreign.authorize_caller(&step(), &hover_page(), &candidate),
+            Err(PolicyStop::Blocked("origin_not_allowed"))
+        ));
     }
 
     #[test]
