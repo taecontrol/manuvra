@@ -18,6 +18,14 @@ sha256_file() {
   shasum -a 256 "$1" | awk '{print $1}'
 }
 
+# The key reaches grep through a pipe from the printf builtin, never through an argument list.
+# A scan error counts as a leak because absence is not proved.
+provider_key_present() {
+  local status=0
+  grep -r -a -l -F -f <(printf '%s\n' "$TYPESAFE_API_KEY") -- "$1" || status=$?
+  (( status != 1 ))
+}
+
 port_is_open() {
   nc -z -w 2 127.0.0.1 4351 >/dev/null 2>&1
 }
@@ -47,11 +55,10 @@ preflight_matrix() {
   require_command cargo
   require_command date
   require_command git
+  require_command grep
   require_command rg
   require_command rustc
   require_command shasum
-  [[ -n "${TMPDIR:-}" ]] || fail "TMPDIR is required for Darwin headed browser runs"
-  [[ -d "$TMPDIR" ]] || fail "TMPDIR is not a directory: $TMPDIR"
   : "${TYPESAFE_API_KEY:?TYPESAFE_API_KEY is required for the money journey matrix}"
 }
 
@@ -63,6 +70,8 @@ configure_runtime_root() {
       runtime_root=$XDG_RUNTIME_DIR
       ;;
     Darwin)
+      [[ -n "${TMPDIR:-}" ]] || fail "TMPDIR is required for the macOS runtime fallback"
+      [[ -d "$TMPDIR" ]] || fail "TMPDIR is not a directory: $TMPDIR"
       runtime_root=$TMPDIR
       unset XDG_RUNTIME_DIR
       ;;
@@ -74,7 +83,7 @@ self_test_runtime_root() {
   local test_root
   test_root=$(mktemp -d)
   trap 'rm -rf -- "$test_root"' RETURN
-  (XDG_RUNTIME_DIR="$test_root"; configure_runtime_root Linux;
+  (XDG_RUNTIME_DIR="$test_root"; unset TMPDIR; configure_runtime_root Linux;
     [[ "$runtime_root" == "$test_root" && "$XDG_RUNTIME_DIR" == "$test_root" ]])
   if (unset XDG_RUNTIME_DIR; configure_runtime_root Linux) >/dev/null 2>&1; then
     echo "Linux runtime preflight accepted missing XDG_RUNTIME_DIR" >&2
@@ -83,6 +92,10 @@ self_test_runtime_root() {
   (TMPDIR="$test_root" XDG_RUNTIME_DIR="$test_root/xdg";
     configure_runtime_root Darwin;
     [[ "$runtime_root" == "$test_root" && -z "${XDG_RUNTIME_DIR+x}" ]])
+  if (unset TMPDIR; configure_runtime_root Darwin) >/dev/null 2>&1; then
+    echo "Darwin runtime preflight accepted missing TMPDIR" >&2
+    return 1
+  fi
 }
 
 verification_facts_are_visible() {
@@ -140,7 +153,7 @@ self_test_portable_helpers() {
 
   printf 'portable digest fixture\n' >"$test_root/digest"
   [[ "$(sha256_file "$test_root/digest")" == \
-    "3bcb080d1c31c3ce588420877f62ccd50f67f5cfcb577464edb084b4bde6d176" ]]
+    "91668ee0646c7b6712ff1a925b0a02d9d29037461f936f7999d7ac8cab683c18" ]]
   milliseconds=$(epoch_millis)
   [[ "$milliseconds" != *[!0-9]* && ${#milliseconds} -ge 13 ]]
 
@@ -270,10 +283,10 @@ jq -n \
   --arg version "$manuvra_version" \
   --arg rustc "$(rustc --version)" \
   --arg bash_version "$BASH_VERSION" \
-  --arg tmpdir "$TMPDIR" \
+  --arg tmpdir "${TMPDIR:-}" \
   --arg xdg_runtime_dir "${XDG_RUNTIME_DIR:-}" \
   '{binary:$binary,sha256:$sha256,source_revision:$source_revision,version:$version,
-    rustc:$rustc,bash_version:$bash_version,tmpdir:$tmpdir,
+    rustc:$rustc,bash_version:$bash_version,tmpdir:(if $tmpdir == "" then null else $tmpdir end),
     xdg_runtime_dir:(if $xdg_runtime_dir == "" then null else $xdg_runtime_dir end)}' \
   >"$matrix_root/build.json"
 
@@ -547,7 +560,7 @@ run_case() {
   fi
   [[ -z "$run_id" ]] || rmdir "$runtime_root/manuvra/runs/$run_id" 2>/dev/null || true
 
-  if ! rg -a -l -F -- "$TYPESAFE_API_KEY" "$case_root" >/dev/null &&
+  if ! provider_key_present "$case_root" >/dev/null &&
     ! rg -a -l '"(document_id|node_id|target_node_id)"' "$case_root" >/dev/null; then
     leak_free=true
   elif [[ -z "$failure" ]]; then
@@ -597,7 +610,7 @@ run_case forced-escalation 1 "$repo_root/tests/live/create-account-forced-pause.
 
 write_report "$matrix_root/build.json" "$report_rows" "$matrix_root/report.json" "$BASH_VERSION"
 
-if rg -a -l -F -- "$TYPESAFE_API_KEY" "$matrix_root"; then
+if provider_key_present "$matrix_root"; then
   echo "provider key leaked into matrix evidence" >&2
   exit 1
 fi

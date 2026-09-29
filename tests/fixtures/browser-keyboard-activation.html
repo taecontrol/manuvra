@@ -2,6 +2,8 @@
 <html lang="en">
 <head><meta charset="utf-8"><title>Keyboard activation fixture</title></head>
 <body>
+  <button id="before" type="button">Before</button>
+  <button id="previous" type="button">Previous</button>
   <button id="save" type="button">Save</button>
   <p id="count">Activations: 0</p>
   <script>
@@ -9,6 +11,8 @@
     document.getElementById('save').addEventListener('click', () => {
       document.getElementById('count').textContent = `Activations: ${++activations}`;
     });
+    // Focus starts on the control immediately before Save, so one Tab reaches it.
+    document.getElementById('previous').focus();
   </script>
 </body>
 </html>

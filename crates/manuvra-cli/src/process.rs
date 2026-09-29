@@ -259,13 +259,15 @@ mod tests {
 
         let temporary = TempDir::new().unwrap();
         let child_pid_path = temporary.path().join("child.pid");
-        let script = format!(
-            "sh -c 'trap \"\" TERM HUP; while :; do sleep 1; done' & child=$!; printf '%s' \"$child\" > '{}'; exit 0",
-            child_pid_path.display()
-        );
+        // The descendant publishes its own pid only after installing the trap, and the
+        // leader exits only after that pid is visible, so SIGTERM cannot race the trap.
         let mut command = Command::new("sh");
         command
-            .args(["-c", &script])
+            .args([
+                "-c",
+                "sh -c 'trap \"\" TERM HUP; printf \"%s\" \"$$\" > \"$CHILD_PID_PATH\"; while :; do sleep 1; done' & while [ ! -s \"$CHILD_PID_PATH\" ]; do sleep 0.01; done; exit 0",
+            ])
+            .env("CHILD_PID_PATH", &child_pid_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -279,9 +281,9 @@ mod tests {
         }
         let mut child = command.spawn().unwrap();
         let identity = process_identity(child.id()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while !child_pid_path.exists() {
-            assert!(Instant::now() < deadline);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while fs::metadata(&child_pid_path).map_or(true, |metadata| metadata.len() == 0) {
+            assert!(Instant::now() < deadline, "descendant pid did not appear");
             std::thread::sleep(Duration::from_millis(5));
         }
         let descendant: u32 = fs::read_to_string(&child_pid_path)
