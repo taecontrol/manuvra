@@ -5195,7 +5195,7 @@ mod tests {
         let job = click_job(false);
         let browser = ScriptedBrowser::new([plan_before_hover()], []);
         let low = Turn {
-            confidence: 0.6,
+            confidence: 0.59,
             ..hover_turn("R1")
         };
         let provider = ScriptedProvider::new([low.clone(), low]);

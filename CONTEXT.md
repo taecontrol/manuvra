@@ -28,7 +28,7 @@ A visible container on the target, such as a list row, holding controls hidden b
 _Avoid_: hover area, reveal zone, hidden row
 
 **Permit**:
-The single-use authorization minted only by the policy owner after done-first, gate, budget, replay-ledger and origin checks. No mutation is dispatched without one.
+The single-use authorization minted only by the policy owner after done-first, per-operation confidence gate, budget, replay-ledger and origin checks. No mutation is dispatched without one.
 _Avoid_: lock, lease, approval
 
 **Escalation**:

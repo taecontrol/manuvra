@@ -8,8 +8,6 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use url::Url;
 
-const GATE: f64 = 0.70;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Candidate {
     pub(crate) id: String,
@@ -214,7 +212,7 @@ impl Policy {
         let Ok(operation) = selected_operation(judgments) else {
             return Next::Stop(PolicyStop::Blocked("provider_invalid_response"));
         };
-        if let Some(next) = operation_gate(judgments, operation_reobserved) {
+        if let Some(next) = operation_gate(judgments, operation, operation_reobserved) {
             return next;
         }
         self.decide_operation(step, observation, judgments, operation)
@@ -529,8 +527,22 @@ fn candidate_operation_supported(target: &Element, operation: Operation) -> bool
     target.operations.iter().any(|item| item == expected)
 }
 
-fn operation_gate(judgments: &Judgments, already_reobserved: bool) -> Option<Next> {
-    (judgments.operation.confidence < GATE).then_some({
+/// The operation confidence the chosen operation must reach, proportional to the cost of a wrong
+/// choice. `HOVER` is non-mutating, bounded by the fallback budget and the run-wide replay ledger,
+/// and revalidated before dispatch, while acting on the control it reveals still needs 0.70.
+fn gate(operation: Operation) -> f64 {
+    match operation {
+        Operation::Hover => 0.60,
+        _ => 0.70,
+    }
+}
+
+fn operation_gate(
+    judgments: &Judgments,
+    operation: Operation,
+    already_reobserved: bool,
+) -> Option<Next> {
+    (judgments.operation.confidence < gate(operation)).then_some({
         if already_reobserved {
             Next::Stop(PolicyStop::Uncertain("operation_below_gate"))
         } else {
@@ -1396,7 +1408,7 @@ mod tests {
             Next::Stop(PolicyStop::Uncertain("done_uncertain"))
         ));
         let mut low = selected.clone();
-        low.operation.confidence = 0.69;
+        low.operation.confidence = 0.59;
         assert!(matches!(
             decide(&mut policy, DoneResult::NotSatisfied, false, &low, false),
             Next::ReobserveOperation
@@ -1410,6 +1422,51 @@ mod tests {
             Err(PolicyStop::Blocked("provider_invalid_response"))
         );
         assert_eq!(policy.actions, 0);
+    }
+
+    #[test]
+    fn hover_clears_a_lower_operation_gate_than_every_other_operation() {
+        let gated = |operation: &str, confidence: f64, page: &Observation| {
+            let mut judgment = judgments(operation);
+            judgment.hover_target = Some(choice("R1"));
+            judgment.operation.confidence = confidence;
+            let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+            [false, true].map(|reobserved| {
+                decide_not_done(&mut policy, &step(), page, &judgment, reobserved)
+            })
+        };
+        for confidence in [0.60, 0.65] {
+            let [first, _] = gated("HOVER", confidence, &hover_page());
+            assert_eq!(minted(first).operation(), Operation::Hover, "{confidence}");
+        }
+        let [first, second] = gated("HOVER", 0.59, &hover_page());
+        assert!(matches!(first, Next::ReobserveOperation));
+        assert!(matches!(
+            second,
+            Next::Stop(PolicyStop::Uncertain("operation_below_gate"))
+        ));
+        let others = [
+            "CLICK",
+            "TYPE_TEXT",
+            "SELECT",
+            "SCROLL_UP",
+            "SCROLL_DOWN",
+            "WAIT",
+            "BLOCKED",
+        ];
+        for operation in others {
+            let [first, second] = gated(operation, 0.65, &hover_page());
+            assert!(matches!(first, Next::ReobserveOperation), "{operation}");
+            assert!(
+                matches!(
+                    second,
+                    Next::Stop(PolicyStop::Uncertain("operation_below_gate"))
+                ),
+                "{operation}"
+            );
+        }
+        let [first, _] = gated("CLICK", 0.70, &observation("CLICK", "button"));
+        assert_eq!(minted(first).operation(), Operation::Click);
     }
 
     #[test]
