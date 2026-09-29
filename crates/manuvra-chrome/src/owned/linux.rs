@@ -1,7 +1,9 @@
+use super::process::{
+    FORCED_TIMEOUT, GRACEFUL_TIMEOUT, find_on_path, pid_t, signal_group, signal_pid, usable_binary,
+    wait_for_process_exit,
+};
 use super::{BrowserError, safe_error};
-use std::env;
-use std::ffi::{OsStr, OsString};
-use std::fs;
+use std::ffi::OsString;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -44,14 +46,6 @@ pub(super) fn discover_binary(
     environment: Option<PathBuf>,
     search_path: Option<OsString>,
 ) -> Result<PathBuf, BrowserError> {
-    discover_binary_from(explicit, environment, search_path)
-}
-
-pub(super) fn discover_binary_from(
-    explicit: Option<&Path>,
-    environment: Option<PathBuf>,
-    search_path: Option<OsString>,
-) -> Result<PathBuf, BrowserError> {
     let configured = explicit.map(Path::to_path_buf).or(environment);
     if let Some(path) = configured {
         return usable_binary(&path).ok_or(BrowserError::Unavailable);
@@ -77,33 +71,19 @@ pub(super) fn discover_binary_from(
     Err(BrowserError::Unavailable)
 }
 
-fn find_on_path(name: &str, search_path: Option<&OsStr>) -> Option<PathBuf> {
-    env::split_paths(search_path?).find_map(|directory| usable_binary(&directory.join(name)))
-}
-
-fn usable_binary(path: &Path) -> Option<PathBuf> {
-    let metadata = path.metadata().ok()?;
-    if !metadata.is_file() {
-        return None;
-    }
-    use std::os::unix::fs::PermissionsExt;
-    (metadata.permissions().mode() & 0o111 != 0)
-        .then(|| fs::canonicalize(path).ok())
-        .flatten()
-}
-
 pub(super) fn terminate(child: &mut Child, ownership: &mut BrowserOwnership) -> Result<(), String> {
     if !ownership.owns_process_group {
         return terminate_process(child);
     }
-    let process_group = child_pid(child)?;
-    signal_process_group(process_group, libc::SIGTERM)?;
-    if wait_for_process_group_exit(child, process_group, Duration::from_secs(2)) {
+    // A group id stays reserved while any member lives, even after its leader is reaped.
+    let process_group = child.id();
+    signal_group(process_group, libc::SIGTERM)?;
+    if wait_for_process_group_exit(child, process_group, GRACEFUL_TIMEOUT)? {
         return Ok(());
     }
-    signal_process_group(process_group, libc::SIGKILL)?;
+    signal_group(process_group, libc::SIGKILL)?;
     let _ = child.wait();
-    wait_for_process_group_exit(child, process_group, Duration::from_secs(1))
+    wait_for_process_group_exit(child, process_group, FORCED_TIMEOUT)?
         .then_some(())
         .ok_or_else(|| "Chromium process group remained alive after SIGKILL".into())
 }
@@ -117,8 +97,8 @@ fn terminate_process(child: &mut Child) -> Result<(), String> {
     {
         return Ok(());
     }
-    signal_process(child_pid(child)?, libc::SIGTERM)?;
-    if wait_for_process_exit(child, Duration::from_secs(2))? {
+    signal_pid(child.id(), libc::SIGTERM)?;
+    if wait_for_process_exit(child, GRACEFUL_TIMEOUT)? {
         return Ok(());
     }
     child
@@ -130,30 +110,16 @@ fn terminate_process(child: &mut Child) -> Result<(), String> {
         .map_err(|error| safe_error(&error.to_string()))
 }
 
-fn child_pid(child: &Child) -> Result<i32, String> {
-    child
-        .id()
-        .try_into()
-        .map_err(|_| "Chromium process id does not fit pid_t".to_owned())
-}
-
-fn signal_process(pid: i32, signal: i32) -> Result<(), String> {
-    let result = unsafe { libc::kill(pid, signal) };
-    if result == -1 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
-        Err(safe_error(&std::io::Error::last_os_error().to_string()))
-    } else {
-        Ok(())
-    }
-}
-
-fn wait_for_process_exit(child: &mut Child, timeout: Duration) -> Result<bool, String> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if child
-            .try_wait()
-            .map_err(|error| safe_error(&error.to_string()))?
-            .is_some()
-        {
+fn wait_for_process_group_exit(
+    child: &mut Child,
+    process_group: u32,
+    timeout: Duration,
+) -> Result<bool, String> {
+    let end = Instant::now() + timeout;
+    while Instant::now() < end {
+        let _ = child.try_wait();
+        if !process_group_exists(process_group)? {
+            let _ = child.wait();
             return Ok(true);
         }
         thread::sleep(Duration::from_millis(20));
@@ -161,31 +127,9 @@ fn wait_for_process_exit(child: &mut Child, timeout: Duration) -> Result<bool, S
     Ok(false)
 }
 
-fn wait_for_process_group_exit(child: &mut Child, process_group: i32, timeout: Duration) -> bool {
-    let end = Instant::now() + timeout;
-    while Instant::now() < end {
-        let _ = child.try_wait();
-        if !process_group_exists(process_group) {
-            let _ = child.wait();
-            return true;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    false
-}
-
-fn signal_process_group(process_group: i32, signal: i32) -> Result<(), String> {
-    let result = unsafe { libc::kill(-process_group, signal) };
-    if result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-        Ok(())
-    } else {
-        Err(safe_error(&std::io::Error::last_os_error().to_string()))
-    }
-}
-
-fn process_group_exists(process_group: i32) -> bool {
-    let result = unsafe { libc::kill(-process_group, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+fn process_group_exists(process_group: u32) -> Result<bool, String> {
+    let result = unsafe { libc::kill(-pid_t(process_group)?, 0) };
+    Ok(result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
 }
 
 #[cfg(test)]
@@ -196,11 +140,61 @@ pub(super) fn ownership_for_test(_child: &Child, owns_process_group: bool) -> Br
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::{BufRead, BufReader};
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::ExitStatusExt;
     use std::process::Stdio;
 
-    const GRACEFUL_TIMEOUT: Duration = Duration::from_secs(2);
+    fn executable(path: &Path, mode: u32) {
+        fs::write(path, b"").unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn discovery_prefers_explicit_then_environment_then_path() {
+        let temporary = tempfile::tempdir().unwrap();
+        let explicit = temporary.path().join("explicit");
+        let environment = temporary.path().join("environment");
+        let path_dir = temporary.path().join("bin");
+        fs::create_dir(&path_dir).unwrap();
+        let path_binary = path_dir.join("chromium");
+        for binary in [&explicit, &environment, &path_binary] {
+            executable(binary, 0o700);
+        }
+        let search = || Some(path_dir.clone().into_os_string());
+        assert_eq!(
+            discover_binary(Some(&explicit), Some(environment.clone()), search()).unwrap(),
+            fs::canonicalize(&explicit).unwrap()
+        );
+        assert_eq!(
+            discover_binary(None, Some(environment.clone()), search()).unwrap(),
+            fs::canonicalize(&environment).unwrap()
+        );
+        assert_eq!(
+            discover_binary(None, None, search()).unwrap(),
+            fs::canonicalize(&path_binary).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_configured_non_executable_file_never_falls_back_to_path() {
+        let temporary = tempfile::tempdir().unwrap();
+        let configured = temporary.path().join("chromium");
+        let path_dir = temporary.path().join("bin");
+        fs::create_dir(&path_dir).unwrap();
+        executable(&configured, 0o600);
+        executable(&path_dir.join("chromium"), 0o700);
+        let search = || Some(path_dir.clone().into_os_string());
+        assert!(matches!(
+            discover_binary(Some(&configured), None, search()),
+            Err(BrowserError::Unavailable)
+        ));
+        assert!(matches!(
+            discover_binary(None, Some(configured.clone()), search()),
+            Err(BrowserError::Unavailable)
+        ));
+    }
 
     fn spawn_reporting(
         script: &str,
@@ -251,7 +245,7 @@ mod tests {
     fn inherited_group_term_resistance_kills_only_the_exact_child() {
         let (mut child, mut ownership, pid) =
             spawn_reporting("trap '' TERM; echo $$; exec sleep 30", true);
-        assert_eq!(pid, child_pid(&child).unwrap());
+        assert_eq!(u32::try_from(pid).unwrap(), child.id());
         let started = Instant::now();
         terminate(&mut child, &mut ownership).unwrap();
         assert!(started.elapsed() >= GRACEFUL_TIMEOUT);

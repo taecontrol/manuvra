@@ -1,16 +1,16 @@
+use super::process::{
+    FORCED_TIMEOUT, GRACEFUL_TIMEOUT, find_on_path, pid_t, signal_group, signal_pid, usable_binary,
+    wait_for_process_exit,
+};
 use super::{BrowserError, safe_error};
 use std::env;
-use std::ffi::{OsStr, OsString};
-use std::fs;
+use std::ffi::OsString;
 use std::mem::{MaybeUninit, size_of};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
-
-const GRACEFUL_TIMEOUT: Duration = Duration::from_secs(2);
-const FORCED_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub(super) struct BrowserOwnership {
     identity: ProcessIdentity,
@@ -94,9 +94,7 @@ fn reap_failed_spawn(child: &mut Child) {
 fn spawn_liveness_monitor(
     process_group: u32,
 ) -> Result<(Child, ProcessIdentity, ChildStdin), String> {
-    let process_group_i32: i32 = process_group
-        .try_into()
-        .map_err(|_| "Chromium process group does not fit pid_t".to_owned())?;
+    let process_group_i32 = pid_t(process_group)?;
     let mut command = Command::new("/bin/sh");
     command
         .args([
@@ -174,21 +172,6 @@ fn application_roots(system_roots: &[PathBuf], home: Option<&Path>) -> Vec<PathB
         roots.push(home.join("Applications"));
     }
     roots
-}
-
-fn find_on_path(name: &str, search_path: Option<&OsStr>) -> Option<PathBuf> {
-    env::split_paths(search_path?).find_map(|directory| usable_binary(&directory.join(name)))
-}
-
-fn usable_binary(path: &Path) -> Option<PathBuf> {
-    let metadata = path.metadata().ok()?;
-    if !metadata.is_file() {
-        return None;
-    }
-    use std::os::unix::fs::PermissionsExt;
-    (metadata.permissions().mode() & 0o111 != 0)
-        .then(|| fs::canonicalize(path).ok())
-        .flatten()
 }
 
 pub(super) fn terminate(child: &mut Child, ownership: &mut BrowserOwnership) -> Result<(), String> {
@@ -321,21 +304,6 @@ fn record_owned_group(ownership: &BrowserOwnership) -> Result<Vec<ProcessIdentit
         .collect())
 }
 
-fn wait_for_process_exit(child: &mut Child, timeout: Duration) -> Result<bool, String> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if child
-            .try_wait()
-            .map_err(|error| safe_error(&error.to_string()))?
-            .is_some()
-        {
-            return Ok(true);
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    Ok(false)
-}
-
 fn wait_for_owned_group_exit(
     child: &mut Child,
     identity: &ProcessIdentity,
@@ -383,9 +351,7 @@ fn owned_group_has_member(identity: &ProcessIdentity) -> Result<bool, String> {
 }
 
 fn process_exists(pid: u32) -> Result<bool, String> {
-    let pid: i32 = pid
-        .try_into()
-        .map_err(|_| "process id does not fit pid_t".to_owned())?;
+    let pid = pid_t(pid)?;
     if unsafe { libc::kill(pid, 0) } == 0 {
         return Ok(true);
     }
@@ -433,10 +399,7 @@ fn start_time(pid: u32, fields: &libc::proc_bsdinfo) -> Result<u64, String> {
 }
 
 fn process_session(pid: u32) -> Result<u32, String> {
-    let pid_t: i32 = pid
-        .try_into()
-        .map_err(|_| "process id does not fit pid_t".to_owned())?;
-    let session = unsafe { libc::getsid(pid_t) };
+    let session = unsafe { libc::getsid(pid_t(pid)?) };
     if session == -1 {
         return Err(format!(
             "cannot inspect process {pid} session: {}",
@@ -449,16 +412,14 @@ fn process_session(pid: u32) -> Result<u32, String> {
 }
 
 fn bsd_info(pid: u32) -> Result<libc::proc_bsdinfo, String> {
-    let pid_t: i32 = pid
-        .try_into()
-        .map_err(|_| "process id does not fit pid_t".to_owned())?;
+    let raw_pid = pid_t(pid)?;
     let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
     let expected: i32 = size_of::<libc::proc_bsdinfo>()
         .try_into()
         .map_err(|_| "proc_bsdinfo size does not fit c_int".to_owned())?;
     let result = unsafe {
         libc::proc_pidinfo(
-            pid_t,
+            raw_pid,
             libc::PROC_PIDTBSDINFO,
             0,
             info.as_mut_ptr().cast(),
@@ -479,9 +440,7 @@ fn bsd_info(pid: u32) -> Result<libc::proc_bsdinfo, String> {
 }
 
 fn process_group_members(process_group: u32) -> Result<Vec<u32>, String> {
-    let process_group: i32 = process_group
-        .try_into()
-        .map_err(|_| "process group does not fit pid_t".to_owned())?;
+    let process_group = pid_t(process_group)?;
     let mut capacity = 64_usize;
     loop {
         let pids = query_process_group(process_group, capacity)?;
@@ -517,30 +476,6 @@ fn query_process_group(process_group: i32, capacity: usize) -> Result<Vec<u32>, 
         .collect())
 }
 
-fn signal_pid(pid: u32, signal: i32) -> Result<(), String> {
-    let pid: i32 = pid
-        .try_into()
-        .map_err(|_| "process id does not fit pid_t".to_owned())?;
-    let result = unsafe { libc::kill(pid, signal) };
-    if result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-        Ok(())
-    } else {
-        Err(safe_error(&std::io::Error::last_os_error().to_string()))
-    }
-}
-
-fn signal_group(process_group: u32, signal: i32) -> Result<(), String> {
-    let process_group: i32 = process_group
-        .try_into()
-        .map_err(|_| "process group does not fit pid_t".to_owned())?;
-    let result = unsafe { libc::kill(-process_group, signal) };
-    if result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-        Ok(())
-    } else {
-        Err(safe_error(&std::io::Error::last_os_error().to_string()))
-    }
-}
-
 #[cfg(test)]
 pub(super) fn ownership_for_test(child: &Child, owns_process_group: bool) -> BrowserOwnership {
     BrowserOwnership {
@@ -555,6 +490,7 @@ pub(super) fn ownership_for_test(child: &Child, owns_process_group: bool) -> Bro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::{BufRead, BufReader};
     use std::os::unix::process::ExitStatusExt;
 

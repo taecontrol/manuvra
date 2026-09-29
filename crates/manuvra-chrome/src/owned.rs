@@ -31,6 +31,83 @@ mod platform;
 #[path = "owned/linux.rs"]
 mod platform;
 
+/// Executable and signal mechanics that are identical on every supported
+/// platform. Process identity and group ownership stay in the siblings.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod process {
+    use super::safe_error;
+    use std::env;
+    use std::ffi::OsStr;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::process::Child;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    pub(super) const GRACEFUL_TIMEOUT: Duration = Duration::from_secs(2);
+    pub(super) const FORCED_TIMEOUT: Duration = Duration::from_secs(1);
+
+    pub(super) fn find_on_path(name: &str, search_path: Option<&OsStr>) -> Option<PathBuf> {
+        env::split_paths(search_path?).find_map(|directory| usable_binary(&directory.join(name)))
+    }
+
+    pub(super) fn usable_binary(path: &Path) -> Option<PathBuf> {
+        let metadata = path.metadata().ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        (metadata.permissions().mode() & 0o111 != 0)
+            .then(|| fs::canonicalize(path).ok())
+            .flatten()
+    }
+
+    pub(super) fn wait_for_process_exit(
+        child: &mut Child,
+        timeout: Duration,
+    ) -> Result<bool, String> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if child
+                .try_wait()
+                .map_err(|error| safe_error(&error.to_string()))?
+                .is_some()
+            {
+                return Ok(true);
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        Ok(false)
+    }
+
+    pub(super) fn pid_t(id: u32) -> Result<i32, String> {
+        id.try_into()
+            .map_err(|_| "process id does not fit pid_t".to_owned())
+    }
+
+    /// Signals one process; a process that no longer exists is not an error.
+    pub(super) fn signal_pid(pid: u32, signal: i32) -> Result<(), String> {
+        send_signal(pid_t(pid)?, signal)
+    }
+
+    /// Signals every member of a process group; an empty group is not an error.
+    pub(super) fn signal_group(process_group: u32, signal: i32) -> Result<(), String> {
+        send_signal(-pid_t(process_group)?, signal)
+    }
+
+    fn send_signal(target: i32, signal: i32) -> Result<(), String> {
+        if unsafe { libc::kill(target, signal) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(safe_error(&error.to_string()))
+        }
+    }
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod platform {
     use std::process::Child;
@@ -891,75 +968,10 @@ fn mask_provider_key(message: &str, key: Option<&str>) -> String {
 mod tests {
     use super::*;
     use crate::transport::test_support::ScriptedChrome;
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::io::{BufRead, BufReader, Write};
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::net::TcpListener;
-    #[cfg(target_os = "linux")]
-    use std::os::unix::process::CommandExt;
     use std::process::Command;
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn discovery_prefers_explicit_then_environment_then_path() {
-        let temporary = tempfile::tempdir().unwrap();
-        let explicit = temporary.path().join("explicit");
-        let environment = temporary.path().join("environment");
-        let path_dir = temporary.path().join("bin");
-        fs::create_dir(&path_dir).unwrap();
-        let path_binary = path_dir.join("chromium");
-        use std::os::unix::fs::PermissionsExt;
-        for binary in [&explicit, &environment, &path_binary] {
-            fs::write(binary, b"").unwrap();
-            fs::set_permissions(binary, fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        assert_eq!(
-            platform::discover_binary_from(
-                Some(&explicit),
-                Some(environment.clone()),
-                Some(path_dir.clone().into_os_string())
-            )
-            .unwrap(),
-            fs::canonicalize(&explicit).unwrap()
-        );
-        assert_eq!(
-            platform::discover_binary_from(
-                None,
-                Some(environment.clone()),
-                Some(path_dir.clone().into_os_string())
-            )
-            .unwrap(),
-            fs::canonicalize(&environment).unwrap()
-        );
-        assert_eq!(
-            platform::discover_binary_from(None, None, Some(path_dir.into_os_string())).unwrap(),
-            fs::canonicalize(&path_binary).unwrap()
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn discovery_rejects_a_non_executable_file() {
-        let temporary = tempfile::tempdir().unwrap();
-        let binary = temporary.path().join("chromium");
-        let path_dir = temporary.path().join("bin");
-        fs::create_dir(&path_dir).unwrap();
-        let fallback = path_dir.join("chromium");
-        fs::write(&binary, b"").unwrap();
-        fs::write(&fallback, b"").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&fallback, fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(matches!(
-            platform::discover_binary(Some(&binary), None, None),
-            Err(BrowserError::Unavailable)
-        ));
-        assert!(matches!(
-            platform::discover_binary_from(None, Some(binary), Some(path_dir.into_os_string())),
-            Err(BrowserError::Unavailable)
-        ));
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn prepared_spawn_cleans_its_profile_on_success_and_failure() {
         let config = BrowserConfig {
@@ -1488,134 +1500,44 @@ mod tests {
         assert_eq!(page.0, "ws://127.0.0.1/devtools/page/1");
     }
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn private_profile_and_close_remove_only_owned_process_and_directory() {
-        let profile = private_profile().unwrap();
-        assert!(profile.is_dir());
-        let chrome = ScriptedChrome::start();
-        let client = chrome.connect_raw();
-        let mut command = Command::new("sleep");
-        command.arg("30").process_group(0);
-        let child = command.spawn().unwrap();
-        let ownership = platform::ownership_for_test(&child, true);
-        let mut browser = OwnedBrowser {
-            child,
-            profile: profile.clone(),
-            client,
-            provenance: BrowserProvenance {
-                browser_path: "fake".into(),
-                browser_version: "fake".into(),
-                viewport: ProvenanceViewport {
-                    width: 1,
-                    height: 1,
-                },
-                display_mode: "headless".into(),
-            },
-            ownership,
-            lifecycle: Lifecycle::Running,
-        };
-        browser.close().unwrap();
-        assert!(!profile.exists());
-        browser.close().unwrap();
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn close_terminates_only_the_browser_when_it_inherits_the_host_group() {
-        let profile = private_profile().unwrap();
-        let chrome = ScriptedChrome::start();
-        let client = chrome.connect_raw();
-        let child = Command::new("sleep").arg("30").spawn().unwrap();
-        let pid = child.id();
-        let ownership = platform::ownership_for_test(&child, false);
-        let mut browser = OwnedBrowser {
-            child,
-            profile,
-            client,
-            provenance: BrowserProvenance {
-                browser_path: "fake".into(),
-                browser_version: "fake".into(),
-                viewport: ProvenanceViewport {
-                    width: 1,
-                    height: 1,
-                },
-                display_mode: "headless".into(),
-            },
-            ownership,
-            lifecycle: Lifecycle::Running,
-        };
-        browser.close().unwrap();
-        assert!(!Path::new(&format!("/proc/{pid}")).exists());
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn inherited_browser_ignoring_term_is_killed_without_signalling_host_group() {
-        let mut child = Command::new("sh")
-            .args(["-c", "trap '' TERM; printf 'ready\\n'; exec sleep 30"])
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut ready = String::new();
-        BufReader::new(child.stdout.take().unwrap())
-            .read_line(&mut ready)
-            .unwrap();
-        assert_eq!(ready, "ready\n");
-        let pid = child.id();
-        let mut ownership = platform::ownership_for_test(&child, false);
-        platform::terminate(&mut child, &mut ownership).unwrap();
-        assert!(child.try_wait().unwrap().is_some());
-        assert!(!Path::new(&format!("/proc/{pid}")).exists());
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn close_terminates_the_entire_owned_process_group() {
-        let profile = private_profile().unwrap();
-        let chrome = ScriptedChrome::start();
-        let client = chrome.connect_raw();
-        let mut command = Command::new("sh");
-        command
-            .args([
-                "-c",
-                "sh -c 'trap \"\" TERM; echo $$; exec sleep 30' & wait",
-            ])
-            .process_group(0)
-            .stdout(Stdio::piped());
-        let mut child = command.spawn().unwrap();
-        let mut descendant = String::new();
-        BufReader::new(child.stdout.take().unwrap())
-            .read_line(&mut descendant)
-            .unwrap();
-        let descendant: i32 = descendant.trim().parse().unwrap();
-        let ownership = platform::ownership_for_test(&child, true);
-        let mut browser = OwnedBrowser {
-            child,
-            profile,
-            client,
-            provenance: BrowserProvenance {
-                browser_path: "fake".into(),
-                browser_version: "fake".into(),
-                viewport: ProvenanceViewport {
-                    width: 1,
-                    height: 1,
-                },
-                display_mode: "headless".into(),
-            },
-            ownership,
-            lifecycle: Lifecycle::Running,
-        };
-        browser.close().unwrap();
-        assert_eq!(
-            unsafe { libc::kill(descendant, 0) },
-            -1,
-            "signal-ignoring descendant survived owned cleanup"
-        );
+    fn assert_exits(pid: u32) {
+        let pid = process::pid_t(pid).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(Instant::now() < deadline, "process {pid} survived close");
+            thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ESRCH)
         );
+    }
+
+    #[test]
+    fn close_ends_the_owned_process_group_and_removes_only_its_profile() {
+        let profile = private_profile().unwrap();
+        let unrelated = private_profile().unwrap();
+        let chrome = ScriptedChrome::start();
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 30 & echo $!; wait"])
+            .stdout(Stdio::piped());
+        let (mut child, ownership) = platform::spawn(command, false).unwrap();
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let descendant: u32 = line.trim().parse().unwrap();
+        let leader = child.id();
+        let mut browser = owned_browser(child, ownership, profile.clone(), chrome.connect_raw());
+
+        browser.close().unwrap();
+        assert_exits(leader);
+        assert_exits(descendant);
+        assert!(!profile.exists());
+        assert!(unrelated.is_dir(), "another profile is never removed");
+        browser.close().unwrap();
+        fs::remove_dir(unrelated).unwrap();
     }
 
     fn snapshot_value() -> Value {
@@ -1626,6 +1548,15 @@ mod tests {
         let profile = tempfile::tempdir().unwrap().keep();
         let child = Command::new("sleep").arg("30").spawn().unwrap();
         let ownership = platform::ownership_for_test(&child, false);
+        owned_browser(child, ownership, profile, client)
+    }
+
+    fn owned_browser(
+        child: Child,
+        ownership: platform::BrowserOwnership,
+        profile: PathBuf,
+        client: Arc<CdpClient>,
+    ) -> OwnedBrowser {
         OwnedBrowser {
             child,
             profile,
