@@ -2119,7 +2119,7 @@ mod tests {
     #[test]
     fn recorded_spanish_done_judgments_stop_instead_of_advancing() {
         let fixture: Value = serde_json::from_str(include_str!(
-            "../../../tests/fixtures/iteration2-spanish-done-records.json"
+            "../tests/fixtures/recorded-spanish-done-judgments.json"
         ))
         .unwrap();
         for record in fixture["records"].as_array().unwrap() {
@@ -2167,7 +2167,7 @@ mod tests {
     #[test]
     fn recorded_money_decisions_replay_done_first_and_gate_consumption() {
         let fixture: Value = serde_json::from_str(include_str!(
-            "../../../tests/fixtures/iteration2-policy-records.json"
+            "../tests/fixtures/recorded-policy-decisions.json"
         ))
         .unwrap();
         let records = fixture["records"].as_array().unwrap();

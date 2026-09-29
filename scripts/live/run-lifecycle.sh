@@ -4,9 +4,9 @@
 # returns the expired result, and every host, watchdog, and browser process exits.
 set -euo pipefail
 
-source "$(dirname "${BASH_SOURCE[0]}")/live-lib.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 preflight_fixture
 require_command cargo
 require_command pgrep
@@ -27,7 +27,7 @@ set +e
 XDG_STATE_HOME="$state_root" XDG_RUNTIME_DIR="$runtime_root" \
   "$repo_root/target/debug/manuvra" run \
   --request-id "run-lifecycle-$stamp" \
-  --job "$repo_root/tests/live/create-account-forced-pause.json" \
+  --job "$repo_root/tests/live/money/create-account-forced-pause.json" \
   --evidence "$evidence_root/run" >"$evidence_root/run.json"
 run_status=$?
 set -e
@@ -62,7 +62,7 @@ set +e
 XDG_STATE_HOME="$state_root" XDG_RUNTIME_DIR="$runtime_root" \
   "$repo_root/target/debug/manuvra" run \
   --request-id "run-lifecycle-$stamp" \
-  --job "$repo_root/tests/live/create-account-forced-pause.json" \
+  --job "$repo_root/tests/live/money/create-account-forced-pause.json" \
   --evidence "$evidence_root/run" \
   --wait-ms 0 >"$evidence_root/attach-identical.json"
 attach_status=$?
@@ -122,7 +122,7 @@ set +e
 XDG_STATE_HOME="$state_root" XDG_RUNTIME_DIR="$runtime_root" \
   "$repo_root/target/debug/manuvra" run \
   --request-id "run-lifecycle-$stamp" \
-  --job "$repo_root/tests/live/create-account-forced-pause.json" \
+  --job "$repo_root/tests/live/money/create-account-forced-pause.json" \
   --evidence "$evidence_root/run" >"$evidence_root/retry-after-expiry.json"
 retry_status=$?
 set -e

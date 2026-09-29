@@ -4,9 +4,9 @@
 # request id is reused with a different disposition.
 set -euo pipefail
 
-source "$(dirname "${BASH_SOURCE[0]}")/live-lib.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 preflight_fixture
 require_command cargo
 require_command rg
@@ -31,7 +31,7 @@ mkdir -p "$case_root" "$state_root" "$evidence_root"
 start_fixture "manuvra-resume-dispositions-$label-$stamp" "$case_root/money-fixture" \
   "$case_root/launch.json" "$case_root/doctor.json"
 jq '.options.pause_timeout_ms=120000 | .options.lifetime_ms=300000' \
-  "$repo_root/tests/live/create-account-forced-pause.json" >"$job"
+  "$repo_root/tests/live/money/create-account-forced-pause.json" >"$job"
 
 result="$case_root/result.json"
 set +e

@@ -3,9 +3,9 @@
 # condition, classified rendered text, and a provider key stand-in that must never be exported.
 set -euo pipefail
 
-source "$(dirname "${BASH_SOURCE[0]}")/live-lib.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 preflight_fixture
 require_command cargo
 require_command rg
@@ -30,12 +30,12 @@ run_case() {
   set +e
   if [[ -n "$marker" ]]; then
     TYPESAFE_API_KEY="$marker" XDG_STATE_HOME="$state_root/$label" "$manuvra" run \
-      --request-id "browser-observation-$marker-$stamp" --job "$repo_root/tests/live/$fixture" \
+      --request-id "browser-observation-$marker-$stamp" --job "$repo_root/tests/live/money/$fixture" \
       --evidence "$evidence_root/$label" >"$evidence_root/$label-stdout.json" \
       2>"$evidence_root/$label-stderr.txt"
   else
     XDG_STATE_HOME="$state_root/$label" "$manuvra" run \
-      --request-id "browser-observation-$label-$stamp" --job "$repo_root/tests/live/$fixture" \
+      --request-id "browser-observation-$label-$stamp" --job "$repo_root/tests/live/money/$fixture" \
       --evidence "$evidence_root/$label" >"$evidence_root/$label-stdout.json" \
       2>"$evidence_root/$label-stderr.txt"
   fi
@@ -47,10 +47,10 @@ run_case() {
   stop_fixture "$evidence_root/$label-cleanup.json" "$evidence_root/$label-cleanup.stderr"
 }
 
-run_case observe observe-money.json 0 passed
-run_case dialog dialog-closed-money.json 4 failed
-run_case secret secret-money.json 0 passed
-run_case provider provider-redaction-money.json 0 passed live-provider-export-marker
+run_case observe observe.json 0 passed
+run_case dialog dialog-closed.json 4 failed
+run_case secret secret-redaction.json 0 passed
+run_case provider provider-redaction.json 0 passed live-provider-export-marker
 
 if rg -a -F -- '+ Create account' \
   "$evidence_root/secret" "$evidence_root/secret-stdout.json" \

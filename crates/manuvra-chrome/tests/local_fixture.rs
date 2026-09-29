@@ -14,18 +14,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const FIXTURE: &str = include_str!("../../../tests/fixtures/browser-adversarial.html");
-const INPUT_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-input-strategies.html");
-const HOVER_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-hover-reveal.html");
-const FOCUS_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-focus.html");
-const KEYBOARD_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-keyboard-focus.html");
-const ACTIVATION_FIXTURE: &str =
-    include_str!("../../../tests/fixtures/browser-keyboard-activation.html");
-const WIDGET_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-keyboard-widgets.html");
-const SUBMIT_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-keyboard-submit.html");
+const FIXTURE: &str = include_str!("../../../tests/browser/adversarial.html");
+const INPUT_FIXTURE: &str = include_str!("../../../tests/browser/input-strategies.html");
+const HOVER_FIXTURE: &str = include_str!("../../../tests/browser/hover-reveal.html");
+const FOCUS_FIXTURE: &str = include_str!("../../../tests/browser/focus.html");
+const KEYBOARD_FIXTURE: &str = include_str!("../../../tests/browser/keyboard-focus.html");
+const ACTIVATION_FIXTURE: &str = include_str!("../../../tests/browser/keyboard-activation.html");
+const WIDGET_FIXTURE: &str = include_str!("../../../tests/browser/keyboard-widgets.html");
+const SUBMIT_FIXTURE: &str = include_str!("../../../tests/browser/keyboard-submit.html");
 const REVALIDATION_FIXTURE: &str =
-    include_str!("../../../tests/fixtures/browser-keyboard-revalidation.html");
-const EDITING_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-keyboard-editing.html");
+    include_str!("../../../tests/browser/keyboard-revalidation.html");
+const EDITING_FIXTURE: &str = include_str!("../../../tests/browser/keyboard-editing.html");
 static REAL_BROWSER: Mutex<()> = Mutex::new(());
 
 /// The owned browser's process group and profile, observed from outside the crate.

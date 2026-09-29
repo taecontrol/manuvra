@@ -46,8 +46,8 @@ jobs:
           version=$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)
           first=$(mktemp -d)
           second=$(mktemp -d)
-          scripts/create-source-archive.sh --version "$version" --output "$first"
-          scripts/create-source-archive.sh --version "$version" --output "$second"
+          scripts/release/create-source-archive.sh --version "$version" --output "$first"
+          scripts/release/create-source-archive.sh --version "$version" --output "$second"
           cmp "$first/manuvra-$version.tar.gz" "$second/manuvra-$version.tar.gz"
 
           source_dir=$(mktemp -d)
@@ -199,8 +199,8 @@ jobs:
           version=$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)
           first=$(mktemp -d)
           second=$(mktemp -d)
-          scripts/create-linux-binary-archive.sh --version "$version" --arch "$ARCH" --output "$first"
-          scripts/create-linux-binary-archive.sh --version "$version" --arch "$ARCH" --output "$second"
+          scripts/release/create-linux-binary-archive.sh --version "$version" --arch "$ARCH" --output "$first"
+          scripts/release/create-linux-binary-archive.sh --version "$version" --arch "$ARCH" --output "$second"
 
           archive="manuvra-$version-linux-$ARCH.tar.gz"
           cmp "$first/$archive" "$second/$archive"
@@ -253,8 +253,8 @@ jobs:
           version=$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)
           first=$(mktemp -d)
           second=$(mktemp -d)
-          scripts/create-darwin-binary-archive.sh --version "$version" --arch "$ARCH" --output "$first"
-          scripts/create-darwin-binary-archive.sh --version "$version" --arch "$ARCH" --output "$second"
+          scripts/release/create-darwin-binary-archive.sh --version "$version" --arch "$ARCH" --output "$first"
+          scripts/release/create-darwin-binary-archive.sh --version "$version" --arch "$ARCH" --output "$second"
 
           archive="manuvra-$version-darwin-$ARCH.tar.gz"
           cmp "$first/$archive" "$second/$archive"

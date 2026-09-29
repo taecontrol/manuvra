@@ -1102,7 +1102,10 @@ mod tests {
 
     #[test]
     fn accepts_the_create_account_job_fixture() {
-        let job = Job::parse(include_bytes!("../tests/fixtures/create-account.json")).unwrap();
+        let job = Job::parse(include_bytes!(
+            "../../../tests/live/money/create-account.json"
+        ))
+        .unwrap();
         assert_eq!(job.steps.len(), 9);
         assert_eq!(job.expectations.len(), 2);
         assert_eq!(job.first_missing_value(), None);

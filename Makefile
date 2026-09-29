@@ -21,30 +21,30 @@ crap:
 
 # Deterministic checks of the live-suite harnesses; they need no provider key, browser, or Money.
 live-self-test:
-	/bin/bash scripts/live-money-journey-matrix.sh --self-test
-	/bin/bash scripts/live-money-journey-matrix.sh --runtime-self-test
-	python3 scripts/live-keyboard-matrix.py --self-test-detectors
+	/bin/bash scripts/live/money-journey-matrix.sh --self-test
+	/bin/bash scripts/live/money-journey-matrix.sh --runtime-self-test
+	python3 scripts/live/keyboard-matrix.py --self-test-detectors
 
 live:
-	/bin/bash scripts/live-money-journey-matrix.sh
+	/bin/bash scripts/live/money-journey-matrix.sh
 
 live-hover:
-	bash scripts/live-hover-reveal.sh
+	bash scripts/live/hover-reveal.sh
 
 live-keyboard:
-	python3 scripts/live-keyboard-matrix.py
+	python3 scripts/live/keyboard-matrix.py
 
 live-natural-done:
-	bash scripts/live-natural-done.sh
+	bash scripts/live/natural-done.sh
 
 live-observation:
-	bash scripts/live-browser-observation.sh
+	bash scripts/live/browser-observation.sh
 
 live-resume-dispositions:
-	bash scripts/live-resume-dispositions.sh
+	bash scripts/live/resume-dispositions.sh
 
 live-run-lifecycle:
-	bash scripts/live-run-lifecycle.sh
+	bash scripts/live/run-lifecycle.sh
 
 # Sequential even under -j: the Money suites share fixture port 4351.
 live-all:

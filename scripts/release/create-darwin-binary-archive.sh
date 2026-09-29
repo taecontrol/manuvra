@@ -50,7 +50,7 @@ esac
   exit 4
 }
 
-repository=$(cd "$(dirname "$0")/.." && pwd -P)
+repository=$(cd "$(dirname "$0")/../.." && pwd -P)
 head_version=$(git -C "$repository" show HEAD:Cargo.toml | awk -F '"' '/^version = / { print $2; exit }')
 [[ "$head_version" == "$version" ]] || {
   echo "requested version differs from the Cargo workspace version at HEAD" >&2

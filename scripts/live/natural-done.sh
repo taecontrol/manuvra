@@ -4,9 +4,9 @@
 # prepared an action the job does not intend.
 set -euo pipefail
 
-source "$(dirname "${BASH_SOURCE[0]}")/live-lib.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 preflight_fixture
 require_command cargo
 require_command shasum
@@ -105,7 +105,7 @@ run_case() {
   set +e
   XDG_STATE_HOME="$state_root/$label" "$manuvra" run \
     --request-id "natural-done-$label-$stamp" \
-    --job "$repo_root/tests/live/create-account-natural-done.json" \
+    --job "$repo_root/tests/live/money/create-account-natural-done.json" \
     --evidence "$evidence_root/$label" \
     >"$evidence_root/$label-stdout.json" 2>"$evidence_root/$label-stderr.txt"
   status=$?

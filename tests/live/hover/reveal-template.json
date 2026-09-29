@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "target": {"kind": "browser", "url": "{{fixture_origin}}/browser-hover-reveal.html"},
+  "target": {"kind": "browser", "url": "{{fixture_origin}}/hover-reveal.html"},
   "context": {
     "journey": "Delete a category whose row actions appear only on hover",
     "revision": "{{revision}}",

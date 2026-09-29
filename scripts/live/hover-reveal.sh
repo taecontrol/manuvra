@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Release gate for hover-revealed controls: the synthetic row-action journey runs three times with
-# Jev against tests/fixtures/browser-hover-reveal.html. Every run counts. A failed or stopped run is
+# Jev against tests/browser/hover-reveal.html. Every run counts. A failed or stopped run is
 # recorded with its evidence and is never retried or discarded; the script exits nonzero if any run
 # fails a check.
 set -euo pipefail
 
-source "$(dirname "${BASH_SOURCE[0]}")/live-lib.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 require_provider_key
 
-repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 runs=3
 stamp=$(date +%Y%m%d-%H%M%S)-$$
 live_root="$repo_root/.work/live/hover-reveal/$stamp"
@@ -72,7 +72,7 @@ jq -n --arg revision "$revision" \
   '{revision:$revision,binary:$binary,binary_sha256:$binary_sha256,version:$version,browser:$browser,headless:true}' \
   >"$live_root/environment.json"
 
-python3 -u -m http.server 0 --bind 127.0.0.1 --directory "$repo_root/tests/fixtures" \
+python3 -u -m http.server 0 --bind 127.0.0.1 --directory "$repo_root/tests/browser" \
   >"$live_root/fixture-server.log" 2>&1 &
 server_pid=$!
 port=
@@ -84,14 +84,14 @@ for _ in $(seq 1 100); do
 done
 [[ -n "$port" ]]
 origin="http://127.0.0.1:$port"
-curl -fsS -o /dev/null "$origin/browser-hover-reveal.html"
+curl -fsS -o /dev/null "$origin/hover-reveal.html"
 
 job="$live_root/job.json"
 jq --arg origin "$origin" --arg revision "$revision" '
-  .target.url = ($origin + "/browser-hover-reveal.html") |
+  .target.url = ($origin + "/hover-reveal.html") |
   .context.revision = $revision |
   .options.allowed_origins = [$origin]
-' "$repo_root/tests/live/hover-reveal.template.json" >"$job"
+' "$repo_root/tests/live/hover/reveal-template.json" >"$job"
 if grep -q -F '{{' "$job"; then
   echo "job template placeholder left unresolved" >&2
   exit 1
@@ -354,7 +354,7 @@ done
 kill "$server_pid" 2>/dev/null || true
 wait "$server_pid" 2>/dev/null || true
 server_stopped=true
-if kill -0 "$server_pid" 2>/dev/null || curl -fsS -o /dev/null "$origin/browser-hover-reveal.html" 2>/dev/null; then
+if kill -0 "$server_pid" 2>/dev/null || curl -fsS -o /dev/null "$origin/hover-reveal.html" 2>/dev/null; then
   server_stopped=false
 fi
 server_pid=

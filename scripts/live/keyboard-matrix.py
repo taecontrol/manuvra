@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[2]
 PORT = 4352
 ITERATIONS = 5
 REPORT_SCHEMA_VERSION = 2
@@ -39,9 +39,9 @@ def navigation_then_enter(keys, complete):
     return moves_then_enter or (not complete and all(key in NAVIGATION_KEYS for key in keys))
 
 
-FOCUS_FIXTURE = ROOT / "tests/fixtures/browser-keyboard-focus.html"
-ACTIVATION_FIXTURE = ROOT / "tests/fixtures/browser-keyboard-activation.html"
-WIDGET_FIXTURE = ROOT / "tests/fixtures/browser-keyboard-widgets.html"
+FOCUS_FIXTURE = ROOT / "tests/browser/keyboard-focus.html"
+ACTIVATION_FIXTURE = ROOT / "tests/browser/keyboard-activation.html"
+WIDGET_FIXTURE = ROOT / "tests/browser/keyboard-widgets.html"
 # Focus anchor names map to fixture element ids; no focus is the document body.
 FOCUS_ANCHORS = {"Before": "before", "Open breakdown": "trigger", "After": "after",
                  "First item": "first", "Last item": "last"}
@@ -504,7 +504,7 @@ def run_case(binary, server, matrix, journey, iteration, double_activation):
     env = os.environ.copy()
     env["XDG_STATE_HOME"] = str(case / "state")
     request = f"keyboard-{journey}-{iteration}-{matrix.name}"
-    job = ROOT / "tests/live" / f"keyboard-{journey}.json"
+    job = ROOT / "tests/live/keyboard" / f"{journey}.json"
     _, result = invoke(binary, ["run", "--request-id", request, "--job", str(job),
                                 "--evidence", str(case / "evidence")], env, case / "initial.json")
     result = settled(binary, result, env, case)

@@ -80,7 +80,7 @@ jobs:
         env:
           ARCH: ${{ matrix.arch }}
           VERSION: ${{ inputs.version }}
-        run: scripts/create-linux-binary-archive.sh --version "$VERSION" --arch "$ARCH" --output release-assets
+        run: scripts/release/create-linux-binary-archive.sh --version "$VERSION" --arch "$ARCH" --output release-assets
       - name: Upload the Linux binary archive
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -124,7 +124,7 @@ jobs:
           ARCH: ${{ matrix.arch }}
           VERSION: ${{ inputs.version }}
         shell: /bin/bash --noprofile --norc -eo pipefail {0}
-        run: scripts/create-darwin-binary-archive.sh --version "$VERSION" --arch "$ARCH" --output release-assets
+        run: scripts/release/create-darwin-binary-archive.sh --version "$VERSION" --arch "$ARCH" --output release-assets
       - name: Upload the Darwin binary archive
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -167,8 +167,8 @@ jobs:
         run: |
           first=$(mktemp -d)
           second=$(mktemp -d)
-          scripts/create-source-archive.sh --version "$VERSION" --output "$first"
-          scripts/create-source-archive.sh --version "$VERSION" --output "$second"
+          scripts/release/create-source-archive.sh --version "$VERSION" --output "$first"
+          scripts/release/create-source-archive.sh --version "$VERSION" --output "$second"
           cmp "$first/manuvra-$VERSION.tar.gz" "$second/manuvra-$VERSION.tar.gz"
           cp "$first/manuvra-$VERSION.tar.gz" "$first/manuvra-$VERSION.tar.gz.sha256" release-assets/
           (cd release-assets && shasum -a 256 -c "manuvra-$VERSION-linux-x64.tar.gz.sha256")

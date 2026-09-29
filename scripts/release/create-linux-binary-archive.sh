@@ -29,7 +29,7 @@ done
 
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$arch" =~ ^(x64|arm64)$ && -n "$output" ]] || usage
 
-repository=$(cd "$(dirname "$0")/.." && pwd -P)
+repository=$(cd "$(dirname "$0")/../.." && pwd -P)
 head_version=$(git -C "$repository" show HEAD:Cargo.toml | awk -F '"' '/^version = / { print $2; exit }')
 [[ "$head_version" == "$version" ]] || {
   echo "requested version differs from the Cargo workspace version at HEAD" >&2

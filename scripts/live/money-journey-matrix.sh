@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-source "$(dirname "${BASH_SOURCE[0]}")/live-lib.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 epoch_millis() {
   printf '%s000\n' "$(date +%s)"
@@ -231,7 +231,7 @@ if [[ ${1:-} == --fixture-self-test ]]; then
   exit 0
 fi
 
-repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 preflight_matrix
 configure_runtime_root "$(uname -s)"
 
@@ -549,20 +549,20 @@ run_case() {
 }
 
 for iteration in 1 2 3; do
-  run_case create-unit "$iteration" "$repo_root/tests/live/create-unit.json" \
+  run_case create-unit "$iteration" "$repo_root/tests/live/money/create-unit.json" \
     "Unit seed wallet" accounts.create no
 done
 for iteration in 1 2 3; do
-  run_case create-account "$iteration" "$repo_root/tests/live/create-account.json" \
+  run_case create-account "$iteration" "$repo_root/tests/live/money/create-account.json" \
     "Review wallet" accounts.create no
 done
 for iteration in 1 2 3; do
-  run_case record-transaction "$iteration" "$repo_root/tests/live/record-transaction.json" \
+  run_case record-transaction "$iteration" "$repo_root/tests/live/money/record-transaction.json" \
     "Transaction wallet" history.persistence no
 done
-run_case create-account-secret 1 "$repo_root/tests/live/create-account.secret.json" \
+run_case create-account-secret 1 "$repo_root/tests/live/money/create-account-secret.json" \
   "Secret review wallet 7491" accounts.create no
-run_case forced-escalation 1 "$repo_root/tests/live/create-account-forced-pause.json" \
+run_case forced-escalation 1 "$repo_root/tests/live/money/create-account-forced-pause.json" \
   "Review wallet" accounts.create yes
 
 write_report "$matrix_root/build.json" "$report_rows" "$matrix_root/report.json" "$BASH_VERSION"

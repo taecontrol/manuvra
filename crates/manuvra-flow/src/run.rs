@@ -3277,7 +3277,7 @@ mod tests {
             listener.set_nonblocking(true).unwrap();
             let port = listener.local_addr().unwrap().port();
             let stop = Arc::new(AtomicBool::new(false));
-            let body = include_str!("../../../tests/fixtures/browser-hover-reveal.html").to_owned();
+            let body = include_str!("../../../tests/browser/hover-reveal.html").to_owned();
             Self {
                 port,
                 worker: Some(spawn_page_server(listener, body, Arc::clone(&stop))),

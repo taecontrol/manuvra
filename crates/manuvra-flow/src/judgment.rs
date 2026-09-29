@@ -533,7 +533,7 @@ mod tests {
         );
         assert_eq!(
             request.to_string(),
-            include_str!("../../../tests/fixtures/judgment-request-without-hover-regions.json")
+            include_str!("../tests/fixtures/judgment-request-without-hover-regions.json")
                 .trim_end()
         );
     }

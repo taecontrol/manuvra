@@ -231,19 +231,19 @@ The remaining Money suites run on Linux with the same `MONEY_DIR`, `TYPESAFE_API
 - `make live-resume-dispositions` needs `XDG_RUNTIME_DIR`. It races two resumes for one escalation, then checks request replay, stale escalations, and request conflicts.
 - `make live-run-lifecycle` needs `XDG_RUNTIME_DIR`. It follows one forced-pause Run through attach, expiry, retry, and process exit.
 
-`make live-hover` runs the hover-reveal journey three times on Linux in headless Chromium against `tests/fixtures/browser-hover-reveal.html` and needs no Money checkout. Every Run must pass.
+`make live-hover` runs the hover-reveal journey three times on Linux in headless Chromium against `tests/browser/hover-reveal.html` and needs no Money checkout. Every Run must pass.
 
-The Linux keyboard matrix uses real Jev and Chromium with four synthetic journeys, five fresh Runs each: `escape-popover` closes a popover with Escape, `tab-enter-save` tabs to Save and activates it with Enter, `caller-execute-enter` does the same with a forced stop before Enter and one `execute` disposition, and `listbox-choice` chooses Beta in a combobox with arrow, Home, or End keys followed by Enter. Their jobs are `tests/live/keyboard-<journey>.json`. Run it with `make live-keyboard`, for example from an interactive Bash shell that loads `TYPESAFE_API_KEY`:
+The Linux keyboard matrix uses real Jev and Chromium with four synthetic journeys, five fresh Runs each: `escape-popover` closes a popover with Escape, `tab-enter-save` tabs to Save and activates it with Enter, `caller-execute-enter` does the same with a forced stop before Enter and one `execute` disposition, and `listbox-choice` chooses Beta in a combobox with arrow, Home, or End keys followed by Enter. Their jobs are `tests/live/keyboard/<journey>.json`. Run it with `make live-keyboard`, for example from an interactive Bash shell that loads `TYPESAFE_API_KEY`:
 
 ```bash
 bash -ic 'make live-keyboard'
 ```
 
-Every invocation first runs the detector self-test, which classifies synthetic Evidence and browser facts without a browser or provider. Run only the self-test with `python3 scripts/live-keyboard-matrix.py --self-test-detectors`.
+Every invocation first runs the detector self-test, which classifies synthetic Evidence and browser facts without a browser or provider. Run only the self-test with `python3 scripts/live/keyboard-matrix.py --self-test-detectors`.
 
 The matrix writes each Run's result, Evidence, browser event facts, and a `report.json` with `"mode": "matrix"` under `.work/live/keyboard/`. The report retains the first Run that was not autonomous, or not assisted for `caller-execute-enter`. Each Run is classified `autonomous`, `assisted`, `stopped`, `failed`, or `prohibited`. The three autonomous journeys require at least 13 of 15 autonomous Runs and at least four per journey; `caller-execute-enter` requires at least four of five assisted Runs with one `execute` disposition. A Run is `prohibited` when it shows a forbidden result: a duplicate effect (a second Enter or Escape, or an activation count above one), a key received while the page's focus or event target differed from the action's focus anchor, a click other than the fixture's setup click or a native Enter- or Space-generated click on Save, or caller assistance in an autonomous journey. Any prohibited Run fails the matrix. Other mismatches, such as an extra key or a wrong final state, make the Run `failed`. The command exits with status 0 only when the threshold is met and the provider key is absent from every retained file.
 
-To check the duplicate-effect detector, run `bash -ic 'python3 scripts/live-keyboard-matrix.py --double-activation-check'`. It runs `tab-enter-save` once against a fixture that counts each activation twice and writes a report with `"mode": "double_activation_check"`. The command exits with status 0 only when the `activation_count_not_one` detector fires and the provider key is absent from the retained files.
+To check the duplicate-effect detector, run `bash -ic 'python3 scripts/live/keyboard-matrix.py --double-activation-check'`. It runs `tab-enter-save` once against a fixture that counts each activation twice and writes a report with `"mode": "double_activation_check"`. The command exits with status 0 only when the `activation_count_not_one` detector fires and the provider key is absent from the retained files.
 
 Contributors and coding agents should follow [docs/CODING_STANDARDS.md](docs/CODING_STANDARDS.md). The [architecture decision records](docs/adrs/) explain the project's design choices.
 
