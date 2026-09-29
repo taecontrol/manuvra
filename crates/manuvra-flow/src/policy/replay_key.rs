@@ -1,0 +1,517 @@
+//! Replay keys: the stable identity of an operation on an observation, so the ledger refuses the
+//! same mutation twice and the same key press on an unsettled focus identity.
+
+use super::{Candidate, Policy};
+use crate::judgment::Operation;
+use manuvra_chrome::{Element, FocusAnchor, HoverRegion, Observation};
+use sha2::{Digest, Sha256};
+
+impl Policy {
+    pub(super) fn candidate_replay_key(
+        &self,
+        observation: &Observation,
+        candidate: &Candidate,
+    ) -> Option<String> {
+        match candidate.operation {
+            Operation::ScrollUp | Operation::ScrollDown => {
+                Some(scroll_replay_key(observation, candidate.operation))
+            }
+            Operation::Hover => candidate
+                .hover_region(observation)
+                .map(|region| hover_replay_key(observation, region)),
+            Operation::PressKey => {
+                let state = candidate.focus_anchor.as_ref().map(focus_state);
+                Some(self.key_digest(observation, candidate, state))
+            }
+            _ => candidate
+                .target_index
+                .and_then(|index| observation.elements.iter().find(|item| item.index == index))
+                .map(|target| replay_key(observation, target, candidate)),
+        }
+    }
+
+    /// The focus identity of a key press, without the anchor state: while a press with this
+    /// identity is unsettled, the same key on the same focus is refused.
+    pub(super) fn key_identity(
+        &self,
+        observation: &Observation,
+        candidate: &Candidate,
+    ) -> Option<String> {
+        (candidate.operation == Operation::PressKey)
+            .then(|| self.key_digest(observation, candidate, None))
+    }
+
+    /// Key press replay keys carry the step ordinal, so the same key on the same focus is
+    /// refused only within one step.
+    fn key_digest(
+        &self,
+        observation: &Observation,
+        candidate: &Candidate,
+        state: Option<serde_json::Value>,
+    ) -> String {
+        let stable = serde_json::json!({
+            "operation":candidate.operation,"key":candidate.key,"route":observation.route,
+            "step":self.step,"focus":candidate.focus_anchor.as_ref().map(focus_identity),
+            "state":state,
+        });
+        hex::encode(Sha256::digest(stable.to_string().as_bytes()))
+    }
+}
+
+fn replay_key(observation: &Observation, target: &Element, candidate: &Candidate) -> String {
+    let stable = serde_json::json!({
+        "operation":candidate.operation,"target_role":target.role,
+        "target_name":target.name.to_ascii_lowercase(),"dialog":target.in_dialog,
+        "input_type":target.input_type,"value_name":candidate.value_name,
+        "route":observation.route,
+    });
+    hex::encode(Sha256::digest(stable.to_string().as_bytes()))
+}
+
+/// The same region in an unchanged region list is one hover; any change to the list's names or
+/// reveals makes it a new one.
+fn hover_replay_key(observation: &Observation, region: &HoverRegion) -> String {
+    let listed: Vec<_> = observation
+        .hover_regions
+        .iter()
+        .map(|item| serde_json::json!({"name":item.name,"reveals_on_hover":item.reveals_on_hover}))
+        .collect();
+    let stable = serde_json::json!({
+        "operation":Operation::Hover,
+        "route":observation.route,
+        "region_name":region.name,
+        "reveals_on_hover":region.reveals_on_hover,
+        "hover_regions":hex::encode(Sha256::digest(serde_json::Value::from(listed).to_string().as_bytes())),
+    });
+    hex::encode(Sha256::digest(stable.to_string().as_bytes()))
+}
+
+fn scroll_replay_key(observation: &Observation, operation: Operation) -> String {
+    let stable = serde_json::json!({
+        "operation":operation,
+        "route":observation.route,
+        "scroll_y":observation.viewport.scroll_y,
+        "document_height":observation.viewport.document_height,
+    });
+    hex::encode(Sha256::digest(stable.to_string().as_bytes()))
+}
+
+fn focus_identity(anchor: &FocusAnchor) -> serde_json::Value {
+    serde_json::json!({
+        "role":anchor.role,
+        "name":anchor.name.to_ascii_lowercase(),
+        "dialog":anchor.in_dialog,
+        "position":anchor.position,
+    })
+}
+
+/// Anchor state a legitimate repeated key press changes, such as the active option of a
+/// listbox. It distinguishes repeated presses only while no earlier press on the same focus
+/// identity is unsettled.
+fn focus_state(anchor: &FocusAnchor) -> serde_json::Value {
+    serde_json::json!({
+        "active_descendant":anchor.active_descendant,
+        "expanded":anchor.expanded,
+        "selected":anchor.selected,
+        "checked":anchor.checked,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::judgment::Judgments;
+    use crate::policy::tests::support::*;
+    use crate::policy::{Next, PolicyStop};
+    use crate::test_support::hover_region as region;
+    use manuvra_contract::{JobOptions, Step};
+
+    /// How a minted key permit settles before the next beat.
+    enum Settle {
+        Observed,
+        Unsettled,
+        NotPerformed,
+        Unused,
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Expect {
+        Minted,
+        Forbidden,
+        Exhausted,
+    }
+
+    /// One beat of a replay script.
+    enum Beat {
+        Press(Observation, &'static str, Settle, Expect),
+        Caller(Observation, &'static str, Settle, Expect),
+        Click(Observation, Expect),
+        Wait(Observation),
+        /// Releases the replay key of the permit minted at this position as not performed.
+        Release(usize),
+        BeginStep,
+    }
+
+    struct KeyScript {
+        name: &'static str,
+        options: JobOptions,
+        mutation_limit: u8,
+        beats: Vec<Beat>,
+        actions: u16,
+    }
+
+    fn pressed(key: &str) -> Judgments {
+        let mut press = judgments("PRESS_KEY");
+        press.key = choice(key);
+        press
+    }
+
+    fn settle(
+        policy: &mut Policy,
+        next: Next,
+        settle: Settle,
+        minted: &mut Vec<String>,
+        label: &str,
+    ) -> Expect {
+        match next {
+            Next::Mutate(permit) => {
+                minted.push(permit.replay_key.clone());
+                match settle {
+                    Settle::Observed => policy.record_observed(&permit.replay_key),
+                    Settle::Unsettled => {}
+                    Settle::NotPerformed => policy.release_not_performed(&permit.replay_key),
+                    Settle::Unused => {
+                        policy.release_unused(permit);
+                    }
+                }
+                Expect::Minted
+            }
+            Next::Stop(PolicyStop::Uncertain("replay_forbidden")) => Expect::Forbidden,
+            Next::Stop(PolicyStop::Blocked("budget_exhausted")) => Expect::Exhausted,
+            other => panic!("{label}: {other:?}"),
+        }
+    }
+
+    fn play(script: KeyScript) {
+        let mut policy = Policy::new(&script.options, "http://example.test/");
+        let step = Step {
+            mutation_limit: script.mutation_limit,
+            ..step()
+        };
+        let mut minted: Vec<String> = Vec::new();
+        for (position, beat) in script.beats.into_iter().enumerate() {
+            let label = format!("{} beat {position}", script.name);
+            let (next, how, expect) = match beat {
+                Beat::Press(page, key, how, expect) => (
+                    decide_not_done(&mut policy, &step, &page, &pressed(key), false),
+                    how,
+                    expect,
+                ),
+                Beat::Caller(page, key, how, expect) => {
+                    let candidate = policy.caller_candidate(&page, &pressed(key)).unwrap();
+                    let next = policy
+                        .authorize_caller(&step, &page, &candidate)
+                        .map_or_else(Next::Stop, |permit| Next::Mutate(Box::new(permit)));
+                    (next, how, expect)
+                }
+                Beat::Click(page, expect) => (
+                    decide_not_done(&mut policy, &step, &page, &judgments("CLICK"), false),
+                    Settle::Observed,
+                    expect,
+                ),
+                Beat::Wait(page) => {
+                    let next =
+                        decide_not_done(&mut policy, &step, &page, &judgments("WAIT"), false);
+                    assert!(matches!(next, Next::Wait), "{label}");
+                    continue;
+                }
+                Beat::Release(position) => {
+                    policy.release_not_performed(&minted[position]);
+                    continue;
+                }
+                Beat::BeginStep => {
+                    policy.begin_step();
+                    continue;
+                }
+            };
+            assert_eq!(
+                settle(&mut policy, next, how, &mut minted, &label),
+                expect,
+                "{label}"
+            );
+        }
+        assert_eq!(policy.actions, script.actions, "{}", script.name);
+    }
+
+    fn anchored(name: &str, change: impl FnOnce(&mut FocusAnchor)) -> Observation {
+        let mut page = focused(name);
+        change(page.focus_anchor.as_mut().unwrap());
+        page
+    }
+
+    fn listbox(active: Option<(&str, &str)>, change: impl FnOnce(&mut FocusAnchor)) -> Observation {
+        anchored("Choose item", |anchor| {
+            anchor.role = "combobox".into();
+            anchor.active_descendant = active.map(|(id, name)| manuvra_chrome::ActiveDescendant {
+                id: id.into(),
+                role: "option".into(),
+                name: name.into(),
+                selected: Some(false),
+                checked: None,
+            });
+            change(anchor);
+        })
+    }
+
+    #[test]
+    fn key_replay_follows_focus_identity_state_settlement_and_step() {
+        use Beat::{BeginStep, Caller, Click, Press, Release, Wait};
+        use Expect::{Exhausted, Forbidden, Minted};
+        use Settle::{NotPerformed, Observed, Unsettled, Unused};
+        let a = || focused("A");
+        let beta = || Some(("beta", "Beta"));
+        let checkbox = |checked: bool, expanded: Option<bool>| {
+            anchored("Accept terms", |anchor| {
+                anchor.role = "checkbox".into();
+                anchor.checked = Some(checked);
+                anchor.expanded = expanded;
+            })
+        };
+        let roving = |position| {
+            anchored("", |anchor| {
+                anchor.role = "treeitem".into();
+                anchor.position = Some(position);
+            })
+        };
+        let menu = |expanded| anchored("Menu", |anchor| anchor.expanded = Some(expanded));
+        let popover = || focused("Breakdown");
+        let opened_popover = || anchored("Breakdown", |anchor| anchor.expanded = Some(true));
+        let mut aria_click = observation("CLICK", "button");
+        aria_click.focus_anchor = listbox(beta(), |anchor| {
+            anchor.expanded = Some(false);
+            anchor.checked = Some(true);
+        })
+        .focus_anchor;
+        let scripts = [
+            KeyScript {
+                name: "caller authority shares the replay ledger",
+                options: JobOptions::default(),
+                mutation_limit: 2,
+                beats: vec![
+                    Caller(a(), "Escape", Observed, Minted),
+                    Caller(a(), "Escape", Observed, Forbidden),
+                    Press(a(), "Escape", Observed, Forbidden),
+                ],
+                actions: 1,
+            },
+            KeyScript {
+                name: "presses consume the step limit and a release refunds it",
+                options: JobOptions::default(),
+                mutation_limit: 2,
+                beats: vec![
+                    Wait(a()),
+                    Press(a(), "Escape", Unsettled, Minted),
+                    Press(a(), "Escape", Unsettled, Forbidden),
+                    Press(focused("B"), "Escape", Unsettled, Minted),
+                    Press(focused("C"), "Escape", Unsettled, Exhausted),
+                    Release(0),
+                    Press(a(), "Escape", Unsettled, Minted),
+                ],
+                actions: 3,
+            },
+            KeyScript {
+                name: "presses are bounded by the run's actions",
+                options: JobOptions {
+                    max_actions: Some(1),
+                    ..JobOptions::default()
+                },
+                mutation_limit: 2,
+                beats: vec![
+                    Press(a(), "Escape", Unsettled, Minted),
+                    Press(focused("B"), "Escape", Unsettled, Exhausted),
+                ],
+                actions: 1,
+            },
+            KeyScript {
+                name: "active descendant and ARIA state distinguish presses, not clicks",
+                options: JobOptions::default(),
+                mutation_limit: 8,
+                beats: vec![
+                    Press(listbox(None, |_| {}), "ArrowDown", Observed, Minted),
+                    Press(listbox(None, |_| {}), "ArrowDown", Observed, Forbidden),
+                    Press(
+                        listbox(Some(("alpha", "Alpha")), |_| {}),
+                        "ArrowDown",
+                        Observed,
+                        Minted,
+                    ),
+                    Press(listbox(beta(), |_| {}), "ArrowDown", Observed, Minted),
+                    Press(listbox(beta(), |_| {}), "ArrowDown", Observed, Forbidden),
+                    Press(
+                        listbox(beta(), |anchor| {
+                            anchor.active_descendant.as_mut().unwrap().selected = Some(true)
+                        }),
+                        "ArrowDown",
+                        Observed,
+                        Minted,
+                    ),
+                    Press(
+                        listbox(beta(), |anchor| anchor.expanded = Some(false)),
+                        "ArrowDown",
+                        Observed,
+                        Minted,
+                    ),
+                    Press(
+                        listbox(beta(), |anchor| {
+                            anchor.expanded = Some(false);
+                            anchor.checked = Some(true);
+                        }),
+                        "ArrowDown",
+                        Observed,
+                        Minted,
+                    ),
+                    Click(observation("CLICK", "button"), Minted),
+                    Click(aria_click, Forbidden),
+                ],
+                actions: 7,
+            },
+            KeyScript {
+                name: "unnamed roving items are distinguished by position",
+                options: JobOptions::default(),
+                mutation_limit: 8,
+                beats: vec![
+                    Press(roving(1), "ArrowDown", Observed, Minted),
+                    Press(roving(2), "ArrowDown", Observed, Minted),
+                    Press(roving(2), "ArrowDown", Observed, Forbidden),
+                ],
+                actions: 2,
+            },
+            KeyScript {
+                name: "an unsettled press forbids the same key on the same focus whatever its state",
+                options: JobOptions::default(),
+                mutation_limit: 8,
+                beats: vec![
+                    Press(checkbox(false, None), "Space", Unsettled, Minted),
+                    Press(checkbox(true, Some(true)), "Space", Unsettled, Forbidden),
+                    Caller(checkbox(true, Some(true)), "Space", Unsettled, Forbidden),
+                    Press(checkbox(true, Some(true)), "Tab", Observed, Minted),
+                    Press(
+                        anchored("Subscribe", |anchor| {
+                            anchor.role = "checkbox".into();
+                            anchor.checked = Some(true);
+                            anchor.expanded = Some(true);
+                        }),
+                        "Space",
+                        Observed,
+                        Minted,
+                    ),
+                ],
+                actions: 3,
+            },
+            KeyScript {
+                name: "a press proven not performed releases its unsettled focus identity",
+                options: JobOptions::default(),
+                mutation_limit: 2,
+                beats: vec![
+                    Press(menu(false), "Enter", NotPerformed, Minted),
+                    Press(menu(true), "Enter", Unused, Minted),
+                    Press(menu(false), "Enter", Unsettled, Minted),
+                ],
+                actions: 2,
+            },
+            KeyScript {
+                name: "key replay is scoped to the step",
+                options: JobOptions::default(),
+                mutation_limit: 8,
+                beats: vec![
+                    BeginStep,
+                    Press(popover(), "Escape", Observed, Minted),
+                    Press(popover(), "Escape", Observed, Forbidden),
+                    Press(popover(), "Space", Unsettled, Minted),
+                    Press(opened_popover(), "Space", Unsettled, Forbidden),
+                    BeginStep,
+                    Press(popover(), "Escape", Observed, Minted),
+                    Press(opened_popover(), "Space", Observed, Minted),
+                    Press(popover(), "Escape", Observed, Forbidden),
+                ],
+                actions: 4,
+            },
+        ];
+        for script in scripts {
+            play(script);
+        }
+    }
+
+    #[test]
+    fn replay_ledger_is_global_across_steps_for_the_same_submit_semantics() {
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        let first_step = step();
+        let mut later_step = step();
+        later_step.id = "confirm-again".into();
+        let first = decide_not_done(
+            &mut policy,
+            &first_step,
+            &observation("CLICK", "button"),
+            &judgments("CLICK"),
+            false,
+        );
+        assert!(matches!(first, Next::Mutate(_)));
+        policy.begin_step();
+        let mut remounted = observation("CLICK", "button");
+        remounted.document_id = "new-document-token".into();
+        remounted.elements[0].node_id = 999;
+        assert!(matches!(
+            decide_not_done(
+                &mut policy,
+                &later_step,
+                &remounted,
+                &judgments("CLICK"),
+                false
+            ),
+            Next::Stop(PolicyStop::Uncertain("replay_forbidden"))
+        ));
+    }
+
+    #[test]
+    fn hover_replay_is_refused_for_an_unchanged_region_list_even_in_a_later_step() {
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        let later = Step {
+            id: "later".into(),
+            ..step()
+        };
+        minted(decide_not_done(
+            &mut policy,
+            &step(),
+            &hover_page(),
+            &hover(Some("R1")),
+            false,
+        ));
+        assert!(matches!(
+            decide_not_done(
+                &mut policy,
+                &step(),
+                &hover_page(),
+                &hover(Some("R1")),
+                false
+            ),
+            Next::Stop(PolicyStop::Uncertain("replay_forbidden"))
+        ));
+        policy.begin_step();
+        let mut remounted = hover_page();
+        remounted.document_id = "new-document".into();
+        remounted.hover_regions[0].node_id = 99;
+        assert!(matches!(
+            decide_not_done(&mut policy, &later, &remounted, &hover(Some("R1")), false),
+            Next::Stop(PolicyStop::Uncertain("replay_forbidden"))
+        ));
+        let mut changed = hover_page();
+        changed.hover_regions.push(region(3, "Utilities", 43));
+        minted(decide_not_done(
+            &mut policy,
+            &later,
+            &changed,
+            &hover(Some("R1")),
+            false,
+        ));
+    }
+}
