@@ -63,6 +63,8 @@ struct Response<'a> {
     error_code: Option<&'a str>,
 }
 
+/// Lock order: `publication`, then `resume`, then `run`. `run` guards only in-memory state and is
+/// never held across a durable write, so control replies never wait on fsync.
 struct Control {
     state_root: std::path::PathBuf,
     run: Mutex<RunControl>,
@@ -72,6 +74,14 @@ struct Control {
     watchdog_lost: AtomicBool,
     resume: Mutex<ResumeAdmission>,
     pause_timeout_ms: u64,
+    /// Serializes durable control publication so snapshots reach disk in mutation order.
+    publication: Mutex<()>,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[derive(Default)]
@@ -118,15 +128,16 @@ impl HostedControl for Control {
     }
 
     fn publish_checkpoint(&self, result: &Value) -> Result<(), String> {
-        let mut run = self
-            .run
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        run.sequence = run.sequence.saturating_add(1);
-        run.result = result.clone();
-        update_pause_deadline(&mut run, result, self.pause_timeout_ms);
-        publish_resume_response(self, &run, result)?;
-        store::write_run_control(&self.state_root, &run)
+        let _publication = lock(&self.publication);
+        let snapshot = {
+            let mut run = lock(&self.run);
+            run.sequence = run.sequence.saturating_add(1);
+            run.result = result.clone();
+            update_pause_deadline(&mut run, result, self.pause_timeout_ms);
+            run.clone()
+        };
+        publish_resume_response(self, &snapshot, result)?;
+        store::write_run_control(&self.state_root, &snapshot)
     }
 
     fn wait_while_paused(&self, escalation_id: &str) -> HostedEvent {
@@ -956,6 +967,7 @@ fn make_control(
         watchdog_lost: AtomicBool::new(false),
         resume: Mutex::new(ResumeAdmission::default()),
         pause_timeout_ms: bootstrap.pause_timeout_ms,
+        publication: Mutex::new(()),
     }))
 }
 
@@ -1084,16 +1096,20 @@ fn serve_until_stopped(
 fn handle(mut stream: UnixStream, control: &Control) {
     let request = read_frame(&mut stream);
     let effect = apply_request(control, &request);
-    let run = control
-        .run
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (run_id, job_digest, result) = {
+        let run = lock(&control.run);
+        (
+            run.run_id.clone(),
+            run.job_digest.clone(),
+            effect.accepted.then(|| run.result.clone()),
+        )
+    };
     let response = Response {
         ipc_version: IPC_VERSION,
-        run_id: &run.run_id,
-        job_digest: &run.job_digest,
+        run_id: &run_id,
+        job_digest: &job_digest,
         accepted: effect.accepted,
-        result: effect.accepted.then_some(&run.result),
+        result: result.as_ref(),
         error_code: effect.error_code,
     };
     if send_response(&mut stream, &response) && effect.readiness && effect.accepted {
@@ -1186,28 +1202,16 @@ fn admit_disposition(
     request_digest: &str,
     request: DispositionRequest,
 ) -> Result<(), &'static str> {
-    let mut run = control
-        .run
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut admission = control
-        .resume
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _publication = lock(&control.publication);
+    let mut admission = lock(&control.resume);
     if let Some(repeated) = repeated_resume(&admission, request_id, request_digest, &request) {
         return repeated;
-    }
-    let current_id = run.result.pointer("/escalation/id").and_then(Value::as_str);
-    let paused = run.result.get("state").and_then(Value::as_str) == Some("uncertain")
-        && run.result.get("terminal").and_then(Value::as_bool) == Some(false);
-    if !paused || current_id != Some(request.escalation_id.as_str()) {
-        return Err("stale_escalation");
     }
     if admission.pending.is_some() {
         return Err("stale_escalation");
     }
-    run.pause_deadline_unix_ms = None;
-    if store::write_run_control(&control.state_root, &run).is_err() {
+    let snapshot = suspend_pause_deadline(control, &request.escalation_id)?;
+    if store::write_run_control(&control.state_root, &snapshot).is_err() {
         return Err("resume_state_unavailable");
     }
     let receipt = ResumeReceipt {
@@ -1219,6 +1223,23 @@ fn admit_disposition(
         .insert(request.escalation_id.clone(), receipt.clone());
     admission.pending = Some(PendingResume { request, receipt });
     Ok(())
+}
+
+/// Clears the pause deadline of the run paused at `escalation_id` and returns the control state
+/// to persist, or rejects the disposition as stale.
+fn suspend_pause_deadline(
+    control: &Control,
+    escalation_id: &str,
+) -> Result<RunControl, &'static str> {
+    let mut run = lock(&control.run);
+    let current_id = run.result.pointer("/escalation/id").and_then(Value::as_str);
+    let paused = run.result.get("state").and_then(Value::as_str) == Some("uncertain")
+        && run.result.get("terminal").and_then(Value::as_bool) == Some(false);
+    if !paused || current_id != Some(escalation_id) {
+        return Err("stale_escalation");
+    }
+    run.pause_deadline_unix_ms = None;
+    Ok(run.clone())
 }
 
 fn repeated_resume(
@@ -1320,6 +1341,7 @@ mod tests {
             watchdog_lost: AtomicBool::new(false),
             resume: Mutex::new(ResumeAdmission::default()),
             pause_timeout_ms: 1_000,
+            publication: Mutex::new(()),
         };
 
         assert!(
@@ -1392,7 +1414,31 @@ mod tests {
             watchdog_lost: AtomicBool::new(false),
             resume: Mutex::new(ResumeAdmission::default()),
             pause_timeout_ms: 1_000,
+            publication: Mutex::new(()),
         }
+    }
+
+    #[test]
+    fn control_replies_do_not_wait_for_an_in_flight_durable_publication() {
+        let temporary = TempDir::new().unwrap();
+        let control = Arc::new(running_control(&temporary));
+        let publication = lock(&control.publication);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let replier = Arc::clone(&control);
+        let reply = std::thread::spawn(move || {
+            let status = send_test_request(&replier, "status");
+            let abort = send_test_request(&replier, "abort");
+            sender.send((status, abort)).unwrap();
+        });
+        let (status, abort) = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("status and abort must not queue behind a durable publication");
+        drop(publication);
+        reply.join().unwrap();
+        assert_eq!(status["accepted"], true);
+        assert_eq!(status["result"]["state"], "running");
+        assert_eq!(abort["accepted"], true);
+        assert!(control.abort.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -1459,6 +1505,7 @@ mod tests {
             watchdog_lost: AtomicBool::new(false),
             resume: Mutex::new(ResumeAdmission::default()),
             pause_timeout_ms: 1_000,
+            publication: Mutex::new(()),
         };
         let wrong = send_test_value(
             &control,
@@ -1527,6 +1574,7 @@ mod tests {
             watchdog_lost: AtomicBool::new(false),
             resume: Mutex::new(ResumeAdmission::default()),
             pause_timeout_ms: 1_000,
+            publication: Mutex::new(()),
         });
         let request = DispositionRequest {
             schema_version: SchemaVersion,
@@ -1704,6 +1752,7 @@ mod tests {
                 consumed,
             }),
             pause_timeout_ms: 1_000,
+            publication: Mutex::new(()),
         };
         let first = json!({
             "schema_version":1,
@@ -1952,6 +2001,7 @@ mod tests {
             watchdog_lost: AtomicBool::new(false),
             resume: Mutex::new(ResumeAdmission::default()),
             pause_timeout_ms: 1_000,
+            publication: Mutex::new(()),
         });
         monitor_watchdog(Some(reader.into_raw_fd()), control.clone());
         drop(writer);

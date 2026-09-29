@@ -914,6 +914,14 @@ fn run_invocation(control: RunControl) -> Invocation {
     }
 }
 
+/// Bounds one control exchange. The host answers from memory, but admitting a resume first
+/// persists the paused control state and may queue behind one checkpoint publication; both wait
+/// on fsync, which takes seconds under I/O contention. Treating an accepted request as failed
+/// would report exit 70 for a resume or abort the host already applied. The bound stays below
+/// the watchdog's shutdown grace, which follows its deadline request.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn request(socket: &Path, kind: &str) -> Result<Value, String> {
     request_value(socket, &json!({"kind":kind,"ipc_version":IPC_VERSION}))
@@ -924,15 +932,11 @@ fn request_value(socket: &Path, payload: &Value) -> Result<Value, String> {
     use std::net::Shutdown;
     use std::os::unix::net::UnixStream;
 
-    #[cfg(test)]
-    let io_timeout = Duration::from_secs(5);
-    #[cfg(not(test))]
-    let io_timeout = Duration::from_millis(250);
     validate_socket(socket)?;
     let mut stream = UnixStream::connect(socket).map_err(|error| error.to_string())?;
     stream
-        .set_read_timeout(Some(io_timeout))
-        .and_then(|()| stream.set_write_timeout(Some(io_timeout)))
+        .set_read_timeout(Some(CONTROL_REPLY_TIMEOUT))
+        .and_then(|()| stream.set_write_timeout(Some(CONTROL_REPLY_TIMEOUT)))
         .map_err(|error| error.to_string())?;
     crate::control_socket::write_frame(&mut stream, payload)?;
     stream
