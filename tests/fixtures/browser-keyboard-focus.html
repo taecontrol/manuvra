@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Keyboard focus fixture</title></head>
+<body>
+  <button id="before">Before</button>
+  <button id="trigger" aria-haspopup="dialog">Open breakdown</button>
+  <button id="after">After</button>
+  <div id="portal"></div>
+  <script>
+    const trigger = document.getElementById('trigger');
+    const portal = document.getElementById('portal');
+    trigger.addEventListener('click', () => {
+      portal.innerHTML = '<div role="dialog" aria-label="Breakdown"><button id="first">First item</button><button id="last">Last item</button></div>';
+      document.getElementById('first').focus();
+    });
+    document.addEventListener('keydown', event => {
+      const dialog = portal.querySelector('[role="dialog"]');
+      if (!dialog) return;
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        portal.replaceChildren();
+        trigger.focus();
+      } else if (event.key === 'Tab') {
+        const first = document.getElementById('first');
+        const last = document.getElementById('last');
+        if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault(); last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault(); first.focus();
+        }
+      }
+    });
+  </script>
+</body>
+</html>

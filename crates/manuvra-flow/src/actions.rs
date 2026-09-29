@@ -24,6 +24,8 @@ pub struct ActionFact {
     pub operation: Operation,
     pub target_name: Option<String>,
     pub value_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<manuvra_chrome::Key>,
     pub outcome: Outcome,
     pub readback_matches: Option<bool>,
     pub suboperations: Vec<String>,
@@ -214,8 +216,17 @@ fn prepare(
     let target = prepared_target(&candidate, observation)?;
     let text = resolved_text(&candidate, values)?;
     let option_node_id = selected_option_identity(&candidate, target, text)?;
-    let evidence = json!({"event":"action_prepared","action_sequence":action_sequence,"candidate_id":candidate.id,"operation":candidate.operation,"target":target.map(|target|json!({"role":target.role,"name":target.name,"dialog":target.in_dialog})),"value_name":candidate.value_name,"replay_key":replay_key,"outcome":"not_performed","basis":basis});
-    let operation = prepared_operation(candidate.operation, target)?;
+    let focus_anchor = candidate.focus_anchor.clone();
+    let mut evidence = json!({"event":"action_prepared","action_sequence":action_sequence,"candidate_id":candidate.id,"operation":candidate.operation,"target":target.map(|target|json!({"role":target.role,"name":target.name,"dialog":target.in_dialog})),"value_name":candidate.value_name,"replay_key":replay_key,"outcome":"not_performed","basis":basis});
+    if candidate.operation == Operation::PressKey {
+        evidence["focus_anchor"] = json!(focus_anchor.as_ref().map(|anchor| json!({
+            "role":anchor.role,"name":anchor.name,"dialog":anchor.in_dialog,
+            "active_descendant":anchor.active_descendant,
+            "expanded":anchor.expanded,"selected":anchor.selected,"checked":anchor.checked,
+        })));
+        evidence["key"] = json!(candidate.key);
+    }
+    let operation = prepared_operation(candidate.operation, candidate.key, target)?;
     let input = PreparedInput {
         document_id,
         node_id: target.map_or(0, |target| target.node_id),
@@ -227,6 +238,7 @@ fn prepare(
             target.role == "combobox" && candidate.operation == Operation::TypeText
         }),
         action_sequence,
+        focus_anchor,
     };
     Ok(PreparedAction {
         input,
@@ -250,7 +262,7 @@ fn prepared_target<'a>(
     });
     let target_optional = matches!(
         candidate.operation,
-        Operation::ScrollUp | Operation::ScrollDown
+        Operation::ScrollUp | Operation::ScrollDown | Operation::PressKey
     );
     (target.is_some() || target_optional)
         .then_some(target)
@@ -289,12 +301,16 @@ fn selected_option_identity(
 
 fn prepared_operation(
     operation: Operation,
+    key: Option<manuvra_chrome::Key>,
     target: Option<&manuvra_chrome::Element>,
 ) -> Result<PreparedOperation, ActionStop> {
     match operation {
         Operation::Click => Ok(PreparedOperation::Click),
         Operation::TypeText => Ok(text_operation(target)),
         Operation::Select => Ok(PreparedOperation::Select),
+        Operation::PressKey => key
+            .map(PreparedOperation::PressKey)
+            .ok_or(ActionStop::InvalidPermit),
         other => prepared_fallback(other),
     }
 }
@@ -304,7 +320,7 @@ fn prepared_fallback(operation: Operation) -> Result<PreparedOperation, ActionSt
         Operation::ScrollUp => Ok(PreparedOperation::ScrollUp),
         Operation::ScrollDown => Ok(PreparedOperation::ScrollDown),
         Operation::Wait | Operation::Blocked => Err(ActionStop::InvalidPermit),
-        Operation::Click | Operation::TypeText | Operation::Select => {
+        Operation::Click | Operation::TypeText | Operation::Select | Operation::PressKey => {
             unreachable!("input operation")
         }
     }
@@ -361,6 +377,7 @@ fn action_fact(
         operation: prepared.candidate.operation,
         target_name: prepared.candidate.target_name,
         value_name: prepared.candidate.value_name,
+        key: prepared.candidate.key,
         outcome,
         readback_matches,
         suboperations,
@@ -472,6 +489,7 @@ mod tests {
             title: "x".into(),
             dialogs: vec![],
             focused: None,
+            focus_anchor: None,
             visible_text: "".into(),
             covered_text: "".into(),
             dialog_texts: BTreeMap::new(),
@@ -522,6 +540,7 @@ mod tests {
             type_target: c("1"),
             select_target: c("1"),
             type_value: c("name"),
+            key: c("Escape"),
             step_done: 0.,
             usage: BTreeMap::new(),
             request_id: None,
@@ -609,6 +628,75 @@ mod tests {
             prepared_fallback(Operation::Blocked),
             Err(ActionStop::InvalidPermit)
         );
+    }
+
+    #[test]
+    fn key_journal_records_anchor_and_preserves_flush_boundaries() {
+        let job = job();
+        let mut obs = observation();
+        obs.focus_anchor = Some(manuvra_chrome::FocusAnchor {
+            node_id: 1,
+            context: "main".into(),
+            role: "textbox".into(),
+            name: "Name".into(),
+            in_dialog: None,
+            covered: true,
+            surface: None,
+            active_descendant: None,
+            expanded: None,
+            selected: None,
+            checked: None,
+            position: None,
+        });
+        let dispatches = AtomicUsize::new(0);
+        let mut before = FakeJournal {
+            entries: vec![],
+            fail_at: Some(0),
+        };
+        assert_eq!(
+            perform(
+                permit_for(&job, &obs, "PRESS_KEY"),
+                &CountingPerformer(&dispatches),
+                &obs,
+                &Values::new(&job),
+                &mut before,
+                &InputCancellation::default()
+            ),
+            Err(ActionStop::EvidenceUnavailable)
+        );
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+        let mut after = FakeJournal {
+            entries: vec![],
+            fail_at: Some(1),
+        };
+        assert_eq!(
+            perform(
+                permit_for(&job, &obs, "PRESS_KEY"),
+                &CountingPerformer(&dispatches),
+                &obs,
+                &Values::new(&job),
+                &mut after,
+                &InputCancellation::default()
+            ),
+            Err(ActionStop::IncompleteEvidence)
+        );
+        assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+        assert_eq!(after.entries[0]["key"], "Escape");
+        assert_eq!(after.entries[0]["focus_anchor"]["name"], "Name");
+        assert!(after.entries[0]["focus_anchor"].get("node_id").is_none());
+        let mut complete = FakeJournal::default();
+        let fact = perform(
+            permit_for(&job, &obs, "PRESS_KEY"),
+            &CountingPerformer(&dispatches),
+            &obs,
+            &Values::new(&job),
+            &mut complete,
+            &InputCancellation::default(),
+        )
+        .unwrap();
+        assert_eq!(fact.key, Some(manuvra_chrome::Key::Escape));
+        assert_eq!(fact.outcome, Outcome::Observed);
+        assert_eq!(complete.entries[1]["fact"]["key"], "Escape");
     }
 
     #[test]

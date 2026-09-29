@@ -226,18 +226,48 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    fn owned_group_rejects_an_unrepresentable_recorded_pid() {
+        let invalid = ProcessIdentity {
+            pid: u32::MAX,
+            process_group: u32::MAX,
+            start_marker: 1,
+            session_id: 1,
+        };
+        assert!(
+            platform::owned_group_has_member(&invalid)
+                .unwrap_err()
+                .contains("process id does not fit pid_t")
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn owned_group_rejects_a_recorded_group_with_a_different_leader() {
+        let inconsistent = ProcessIdentity {
+            pid: std::process::id(),
+            process_group: 0,
+            start_marker: 1,
+            session_id: 1,
+        };
+        assert!(!platform::owned_group_has_member(&inconsistent).unwrap());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn owned_process_group_signal_cleans_resistant_descendant_after_leader_is_reaped() {
         use std::os::unix::process::CommandExt;
 
         let temporary = TempDir::new().unwrap();
         let child_pid_path = temporary.path().join("child.pid");
-        let script = format!(
-            "sh -c 'trap \"\" TERM HUP; while :; do sleep 1; done' & child=$!; printf '%s' \"$child\" > '{}'; exit 0",
-            child_pid_path.display()
-        );
+        // The descendant publishes its own pid only after installing the trap, and the
+        // leader exits only after that pid is visible, so SIGTERM cannot race the trap.
         let mut command = Command::new("sh");
         command
-            .args(["-c", &script])
+            .args([
+                "-c",
+                "sh -c 'trap \"\" TERM HUP; printf \"%s\" \"$$\" > \"$CHILD_PID_PATH\"; while :; do sleep 1; done' & while [ ! -s \"$CHILD_PID_PATH\" ]; do sleep 0.01; done; exit 0",
+            ])
+            .env("CHILD_PID_PATH", &child_pid_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -251,9 +281,9 @@ mod tests {
         }
         let mut child = command.spawn().unwrap();
         let identity = process_identity(child.id()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while !child_pid_path.exists() {
-            assert!(Instant::now() < deadline);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while fs::metadata(&child_pid_path).map_or(true, |metadata| metadata.len() == 0) {
+            assert!(Instant::now() < deadline, "descendant pid did not appear");
             std::thread::sleep(Duration::from_millis(5));
         }
         let descendant: u32 = fs::read_to_string(&child_pid_path)

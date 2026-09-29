@@ -69,7 +69,18 @@ impl<'a> Values<'a> {
             "url":self.mask(&observation.url),"route":self.mask(&observation.route),
             "title":self.mask(&observation.title),
             "dialogs":observation.dialogs.iter().map(|value|self.mask(value)).collect::<Vec<_>>(),
-            "focused":observation.focused,"visible_text":self.mask(&observation.visible_text),
+            "focused":observation.focused,
+            "focus_anchor":observation.focus_anchor.as_ref().map(|anchor| json!({
+                "role":anchor.role,"name":self.mask(&anchor.name),
+                "in_dialog":anchor.in_dialog.as_ref().map(|dialog|self.mask(dialog)),
+                "covered":anchor.covered,
+                "active_descendant":anchor.active_descendant.as_ref().map(|item|json!({
+                    "id":self.mask(&item.id),"role":item.role,"name":self.mask(&item.name),
+                    "selected":item.selected,"checked":item.checked,
+                })),
+                "expanded":anchor.expanded,"selected":anchor.selected,"checked":anchor.checked,
+            })),
+            "visible_text":self.mask(&observation.visible_text),
             "covered_text":self.mask(&observation.covered_text),"elements":elements,
             "coverage":observation.coverage
         })
@@ -131,7 +142,7 @@ fn value_renderings(value: &JobValue) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use manuvra_chrome::{Coverage, Element, Rect, SelectOption, ViewportState};
+    use manuvra_chrome::{Coverage, Element, FocusAnchor, Rect, SelectOption, ViewportState};
     use manuvra_contract::{Job, ValueFormats};
     use serde_json::json;
 
@@ -145,6 +156,26 @@ mod tests {
             title: "raw-secret-742".into(),
             dialogs: vec![],
             focused: None,
+            focus_anchor: Some(FocusAnchor {
+                node_id: 981_723,
+                context: "main".into(),
+                role: "textbox".into(),
+                name: "raw-secret-742".into(),
+                in_dialog: None,
+                covered: true,
+                surface: None,
+                active_descendant: Some(manuvra_chrome::ActiveDescendant {
+                    id: "raw-secret-742".into(),
+                    role: "option".into(),
+                    name: "RAW SECRET".into(),
+                    selected: Some(false),
+                    checked: None,
+                }),
+                expanded: None,
+                selected: None,
+                checked: None,
+                position: None,
+            }),
             visible_text: "raw-secret-742".into(),
             covered_text: "RAW SECRET".into(),
             dialog_texts: BTreeMap::new(),
@@ -179,7 +210,9 @@ mod tests {
             },
             coverage: Coverage::default(),
         };
-        let serialized = Values::new(&job).model_view(&observation).to_string();
+        let view = Values::new(&job).model_view(&observation);
+        assert_eq!(view["focus_anchor"]["name"], "<value:secret_name>");
+        let serialized = view.to_string();
         assert!(!serialized.contains("raw-secret-742"));
         assert!(!serialized.contains("RAW SECRET"));
         assert!(!serialized.contains("internal-document-token"));

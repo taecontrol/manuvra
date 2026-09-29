@@ -8,6 +8,7 @@ use crate::page::{self, Screenshot};
 use crate::transport::{CdpClient, CommandFailure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -49,10 +50,14 @@ const COVERAGE_PROBE: &str = r#"(() => {
   if (window.__manuvraCoverageProbeInstalled) return;
   window.__manuvraCoverageProbeInstalled = true;
   window.__manuvraClosedShadowRoots = 0;
+  window.__manuvraClosedShadowHosts = new WeakSet();
   const original = Element.prototype.attachShadow;
   Element.prototype.attachShadow = function(init) {
     const root = original.call(this, init);
-    if (init?.mode === 'closed') window.__manuvraClosedShadowRoots += 1;
+    if (init?.mode === 'closed') {
+      window.__manuvraClosedShadowRoots += 1;
+      window.__manuvraClosedShadowHosts.add(this);
+    }
     return root;
   };
 })()"#;
@@ -152,6 +157,9 @@ impl OwnedBrowser {
         let value = evaluate(&self.client, SNAPSHOT)?;
         let mut observation: Observation = serde_json::from_value(value)
             .map_err(|error| BrowserError::InvalidObservation(error.to_string()))?;
+        crate::observation::mark_closed_shadow_focus(&mut observation, |method, params| {
+            command(&self.client, method, params)
+        })?;
         if self.client.snapshot_since(0).events.iter().any(|event| {
             matches!(
                 event.message.get("method").and_then(Value::as_str),
@@ -170,11 +178,14 @@ impl OwnedBrowser {
         input: PreparedInput,
         cancellation: &InputCancellation,
     ) -> Result<PerformFact, PerformError> {
-        let settle_navigation = input.operation == PreparedOperation::Click;
+        let settle_navigation = matches!(
+            input.operation,
+            PreparedOperation::Click | PreparedOperation::PressKey(_)
+        );
         let fence = self.client.cursor();
         let fact = crate::input::perform(&self.client, input, cancellation)?;
         if settle_navigation {
-            settle_click_navigation(&self.client, fence)
+            settle_input_navigation(&self.client, fence)
                 .map_err(|error| PerformError::Uncertain(error.to_string()))?;
         }
         Ok(fact)
@@ -621,14 +632,15 @@ fn wait_for_document(client: &CdpClient, mut cursor: u64) -> Result<(), BrowserE
     }
 }
 
-fn settle_click_navigation(client: &CdpClient, fence: u64) -> Result<(), BrowserError> {
+/// A navigation started by the input may commit long after the input returns,
+/// so any navigation signal holds the next observation until loading stops.
+fn settle_input_navigation(client: &CdpClient, fence: u64) -> Result<(), BrowserError> {
     let end = Instant::now() + QUIET_WINDOW;
     loop {
         let snapshot = client.snapshot_since(fence);
         require_navigation_journal(&snapshot)?;
-        if snapshot.events.iter().any(|event| {
-            event.message.get("method").and_then(Value::as_str) == Some("Page.frameNavigated")
-        }) {
+        if snapshot.events.iter().any(starts_navigation) {
+            wait_for_loading(client, fence)?;
             return wait_for_document(client, fence);
         }
         if Instant::now() >= end {
@@ -636,6 +648,60 @@ fn settle_click_navigation(client: &CdpClient, fence: u64) -> Result<(), Browser
         }
         client.wait_for_journal_change(snapshot.last_cursor, Duration::from_millis(25));
     }
+}
+
+fn starts_navigation(event: &crate::JournalEvent) -> bool {
+    matches!(
+        crate::transport::event_method(event),
+        Some(
+            "Page.frameRequestedNavigation"
+                | "Page.frameStartedNavigating"
+                | "Page.frameStartedLoading"
+                | "Page.frameNavigated"
+        )
+    )
+}
+
+fn wait_for_loading(client: &CdpClient, fence: u64) -> Result<(), BrowserError> {
+    let end = Instant::now() + START_TIMEOUT;
+    let mut idle_since = None;
+    loop {
+        let snapshot = client.snapshot_since(fence);
+        require_navigation_journal(&snapshot)?;
+        if loading_frames(&snapshot.events).is_empty() {
+            idle_since.get_or_insert_with(Instant::now);
+        } else {
+            idle_since = None;
+        }
+        if idle_since.is_some_and(|since| since.elapsed() >= QUIET_WINDOW) {
+            return Ok(());
+        }
+        if Instant::now() >= end {
+            return Err(BrowserError::Control(
+                "navigation did not finish loading".into(),
+            ));
+        }
+        client.wait_for_journal_change(snapshot.last_cursor, Duration::from_millis(25));
+    }
+}
+
+fn loading_frames(events: &[crate::JournalEvent]) -> HashSet<&str> {
+    let mut loading = HashSet::new();
+    for event in events {
+        let frame = crate::transport::event_params(event)
+            .get("frameId")
+            .and_then(Value::as_str);
+        match (crate::transport::event_method(event), frame) {
+            (Some("Page.frameStartedLoading"), Some(frame)) => {
+                loading.insert(frame);
+            }
+            (Some("Page.frameStoppedLoading"), Some(frame)) => {
+                loading.remove(frame);
+            }
+            _ => {}
+        }
+    }
+    loading
 }
 
 fn update_quiet_since(
@@ -942,6 +1008,38 @@ mod tests {
     }
 
     #[test]
+    fn observation_reports_popups_and_focus_inside_a_closed_shadow_host() {
+        let chrome = ScriptedChrome::start();
+        let mut snapshot = snapshot_value();
+        snapshot["focus_anchor"] = json!({
+            "node_id":7,"context":"main","role":"interactive","name":"",
+            "in_dialog":null,"covered":true
+        });
+        chrome.reply("Runtime.evaluate", json!({"result":{"value":snapshot}}));
+        chrome.reply(
+            "Runtime.evaluate",
+            json!({"result":{"type":"object","objectId":"focus-7"}}),
+        );
+        chrome.reply(
+            "DOM.describeNode",
+            json!({"node":{"shadowRoots":[{"shadowRootType":"closed"}]}}),
+        );
+        chrome.push_event(
+            "Page.windowOpen",
+            json!({"url":"http://example.test/popup"}),
+        );
+        let client = chrome.connect_raw();
+        command(&client, "Page.enable", json!({})).unwrap();
+        command(&client, "Page.enable", json!({})).unwrap();
+        let observed = browser_with_client(client).observe().unwrap();
+        let anchor = observed.focus_anchor.unwrap();
+        assert!(!anchor.covered);
+        assert_eq!(anchor.surface, Some(crate::FocusSurface::ClosedShadowRoot));
+        assert_eq!(observed.coverage.gaps, ["popup"]);
+        assert_eq!(chrome.received("Runtime.releaseObjectGroup").len(), 1);
+    }
+
+    #[test]
     fn cdp_observation_capture_and_navigation_helpers_are_scriptable() {
         let chrome = ScriptedChrome::start();
         chrome.reply(
@@ -987,7 +1085,74 @@ mod tests {
         chrome.push_event("Page.frameNavigated", json!({"frame":{"id":"main"}}));
         command(&client, "Page.enable", json!({})).unwrap();
 
-        settle_click_navigation(&client, fence).unwrap();
+        settle_input_navigation(&client, fence).unwrap();
+    }
+
+    #[test]
+    fn input_navigation_waits_until_every_started_frame_stops_loading() {
+        let chrome = Arc::new(ScriptedChrome::start());
+        chrome.reply("Runtime.evaluate", json!({"result":{"value":"complete"}}));
+        let client = chrome.connect_raw();
+        let fence = client.cursor();
+        for (method, frame) in [
+            ("Page.frameRequestedNavigation", "main"),
+            ("Page.frameStartedLoading", "main"),
+            ("Page.frameStartedLoading", "child"),
+            ("Page.frameStoppedLoading", "child"),
+        ] {
+            chrome.push_event(method, json!({"frameId":frame}));
+        }
+        let delay = Duration::from_millis(400);
+        let stopper = {
+            let chrome = Arc::clone(&chrome);
+            thread::spawn(move || {
+                thread::sleep(delay);
+                chrome.push_event("Page.frameStoppedLoading", json!({"frameId":"main"}));
+            })
+        };
+        let started = Instant::now();
+        settle_input_navigation(&client, fence).unwrap();
+        assert!(started.elapsed() >= delay);
+        stopper.join().unwrap();
+        let events = client.snapshot_since(fence).events;
+        assert!(starts_navigation(&events[0]));
+        assert!(!starts_navigation(&events[3]));
+        assert_eq!(loading_frames(&events[..4]), HashSet::from(["main"]));
+        assert!(loading_frames(&events).is_empty());
+    }
+
+    #[test]
+    fn owned_perform_settles_navigation_after_a_key_press() {
+        let chrome = ScriptedChrome::start();
+        chrome.reply(
+            "Runtime.evaluate",
+            json!({"result":{"value":{
+                "document_id":"d","url":"http://example.test/","route":"/","title":"x",
+                "focused":null,"focus_anchor":null,"elements":[],
+                "viewport":{"width":10,"height":10,"scroll_x":0,"scroll_y":0,"document_height":10}
+            }}}),
+        );
+        let mut browser = browser_with_client(chrome.connect_raw());
+        let started = Instant::now();
+        let fact = browser
+            .perform(
+                PreparedInput {
+                    document_id: "d".into(),
+                    node_id: 0,
+                    operation: PreparedOperation::PressKey(crate::Key::Enter),
+                    text: None,
+                    previous_text: None,
+                    option_node_id: None,
+                    combobox: false,
+                    action_sequence: 1,
+                    focus_anchor: None,
+                },
+                &InputCancellation::default(),
+            )
+            .unwrap();
+        assert_eq!(fact.suboperations, ["key_down", "key_up"]);
+        assert!(started.elapsed() >= QUIET_WINDOW);
+        browser.close().unwrap();
     }
 
     #[test]
@@ -1010,6 +1175,7 @@ mod tests {
                     option_node_id: None,
                     combobox: false,
                     action_sequence: 1,
+                    focus_anchor: None,
                 },
                 &InputCancellation::default(),
             )
@@ -1167,6 +1333,26 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn inherited_browser_ignoring_term_is_killed_without_signalling_host_group() {
+        let mut child = Command::new("sh")
+            .args(["-c", "trap '' TERM; printf 'ready\\n'; exec sleep 30"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "ready\n");
+        let pid = child.id();
+        let mut ownership = platform::ownership_for_test(&child, false);
+        platform::terminate(&mut child, &mut ownership).unwrap();
+        assert!(child.try_wait().unwrap().is_some());
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn close_terminates_the_entire_owned_process_group() {
         let profile = private_profile().unwrap();
         let chrome = ScriptedChrome::start();
@@ -1175,7 +1361,7 @@ mod tests {
         command
             .args([
                 "-c",
-                "sh -c 'trap \"\" TERM; exec sleep 30' & echo $!; wait",
+                "sh -c 'trap \"\" TERM; echo $$; exec sleep 30' & wait",
             ])
             .process_group(0)
             .stdout(Stdio::piped());

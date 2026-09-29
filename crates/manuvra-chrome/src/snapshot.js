@@ -33,16 +33,17 @@
     }
     return values;
   };
+  const nearestDialog = (element) => ancestors(element).find(node => node.matches?.('dialog,[role="dialog"],[role="alertdialog"]')) || null;
   const inViewport = (element, context) => {
     const r = element.getBoundingClientRect(), x = r.x + context.offsetX, y = r.y + context.offsetY;
     return r.width > 0 && r.height > 0 && y + r.height > 0 && x + r.width > 0 && y < innerHeight && x < innerWidth;
   };
   const rendered = (element, context) => Boolean(element) && element.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}) && inViewport(element, context);
   const visible = (element, context) => rendered(element, context) && !ancestors(element).some(node => node.matches?.('[aria-hidden="true"],[inert]'));
+  const referencedById = (element, id) => element.getRootNode().getElementById?.(id);
   const name = (element, seen = new Set()) => {
     if (!element || seen.has(element)) return ''; seen.add(element);
-    const owner = element.ownerDocument || document;
-    const labelled = (element.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean).map(id => name(owner.getElementById(id), seen)).filter(Boolean).join(' ');
+    const labelled = (element.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean).map(id => name(referencedById(element, id), seen)).filter(Boolean).join(' ');
     return labelled || element.getAttribute('aria-label') || [...(element.labels || [])].map(label => name(label, seen)).filter(Boolean).join(' ') ||
       (['button','submit','reset'].includes(element.type) ? element.value : '') || element.getAttribute('alt') ||
       (element.tagName === 'INPUT' ? '' : [...element.childNodes].map(child => child.nodeType === 3 ? child.textContent : child.nodeType === 1 && child.getAttribute('aria-hidden') !== 'true' ? name(child, seen) : '').join(' ').replace(/\s+/g,' ').trim()) ||
@@ -50,6 +51,9 @@
   };
   const role = (element) => {
     const explicit = element.getAttribute('role'); if (explicit) return explicit;
+    if (element.tagName === 'IFRAME' || element.tagName === 'FRAME') return 'iframe';
+    if (element.tagName === 'CANVAS') return 'canvas';
+    if (element.tagName === 'DIALOG') return 'dialog';
     if (element.tagName === 'BUTTON' || element.tagName === 'SUMMARY') return 'button';
     if (element.tagName === 'A') return 'link'; if (element.tagName === 'SELECT') return 'combobox';
     if (element.tagName === 'TEXTAREA' || element.isContentEditable) return 'textbox';
@@ -61,8 +65,7 @@
     return 'interactive';
   };
   const dialogTitle = (dialog) => {
-    const owner = dialog.ownerDocument || document;
-    const labelled = (dialog.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean).map(id => owner.getElementById(id)?.innerText?.replace(/\s+/g,' ').trim()).filter(Boolean).join(' ');
+    const labelled = (dialog.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean).map(id => referencedById(dialog, id)?.innerText?.replace(/\s+/g,' ').trim()).filter(Boolean).join(' ');
     return labelled || dialog.getAttribute('aria-label') || dialog.querySelector('h1,h2,h3,[role="heading"]')?.innerText?.replace(/\s+/g,' ').trim() || 'Untitled dialog';
   };
 
@@ -78,7 +81,7 @@
     const elementRole = role(element);
     const editable = !element.readOnly && element.getAttribute('aria-readonly') !== 'true' && (['textbox','searchbox','spinbutton'].includes(elementRole) || element.isContentEditable || (elementRole === 'combobox' && ['INPUT','TEXTAREA'].includes(element.tagName)));
     const operations = []; if (element.tagName === 'SELECT') operations.push('SELECT'); else if (editable) operations.push('TYPE_TEXT'); else operations.push('CLICK');
-    const rect = element.getBoundingClientRect(), containingDialog = element.closest('dialog,[role="dialog"],[role="alertdialog"]'), current = index++;
+    const rect = element.getBoundingClientRect(), containingDialog = nearestDialog(element), current = index++;
     elementIndices.set(element, current); const boolAttr = key => element.hasAttribute(key) ? element.getAttribute(key) !== 'false' : null;
     const selectOptions = element.tagName === 'SELECT' ? [...element.options].map(option => ({node_id:nodeId(option),label:option.label||option.textContent.trim(),value:String(option.value),disabled:Boolean(option.disabled),selected:Boolean(option.selected)})) : [];
     elements.push({index:current,node_id:nodeId(element),context:context.context,role:elementRole,name:name(element)||elementRole,input_type:element.tagName==='INPUT'?element.type:null,value:'value' in element?String(element.value):(element.isContentEditable?element.innerText.trim():''),checked:'checked' in element?Boolean(element.checked):boolAttr('aria-checked'),selected:'selected' in element?Boolean(element.selected):boolAttr('aria-selected'),expanded:boolAttr('aria-expanded'),disabled:Boolean(element.disabled)||element.getAttribute('aria-disabled')==='true',in_dialog:containingDialog?dialogTitle(containingDialog):null,operations,select_options:selectOptions,rect:{x:rect.x+context.offsetX,y:rect.y+context.offsetY,width:rect.width,height:rect.height}});
@@ -106,8 +109,41 @@
       else if (rendered(parent, context)) coveredLength = appendText(coveredText, value, 'covered_text', coveredLength);
     }
   }
-  let focused = null;
+  let focused = null, focusAnchor = null, active = document.activeElement;
   for (const [element, elementIndex] of elementIndices) if (element.matches(':focus')) { focused = elementIndex; break; }
+  while (active) {
+    if (active.shadowRoot?.activeElement) { active = active.shadowRoot.activeElement; continue; }
+    if (active.tagName === 'IFRAME' || active.tagName === 'FRAME') {
+      let child;
+      try { child = active.contentDocument; } catch (_) { child = null; }
+      if (child?.activeElement) { active = child.activeElement; continue; }
+    }
+    break;
+  }
+  if (active && active !== active.ownerDocument.body && active !== active.ownerDocument.documentElement) {
+    const root = active.getRootNode(), context = contexts.find(item => item.root === root);
+    const indexed = elements.find(item => item.index === elementIndices.get(active));
+    const containingDialog = nearestDialog(active);
+    const dialog = containingDialog ? dialogTitle(containingDialog) : null;
+    const owner = active.ownerDocument;
+    const labelled = (active.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
+      .map(id => referencedById(active, id)?.textContent?.replace(/\s+/g,' ').trim()).filter(Boolean).join(' ');
+    const ariaName = labelled || active.getAttribute('aria-label') || active.getAttribute('title') || '';
+    const view = owner.defaultView;
+    const closed = Boolean(view?.__manuvraClosedShadowHosts?.has(active));
+    const crossOrigin = (active.tagName === 'IFRAME' || active.tagName === 'FRAME') && !active.contentDocument;
+    const boolAttr = key => active.hasAttribute(key) ? active.getAttribute(key) !== 'false' : null;
+    const activeId = active.getAttribute('aria-activedescendant');
+    const descendant = activeId && root.getElementById?.(activeId);
+    const descendantBool = (element, key) => element?.hasAttribute(key) ? element.getAttribute(key) !== 'false' : null;
+    const activeDescendant = activeId ? {id:activeId,role:descendant?role(descendant):'',name:descendant?name(descendant):'',selected:descendant && 'selected' in descendant ? Boolean(descendant.selected) : descendantBool(descendant,'aria-selected'),checked:descendant && 'checked' in descendant ? Boolean(descendant.checked) : descendantBool(descendant,'aria-checked')} : null;
+    const anchorRole = indexed?.role || role(active);
+    const posinset = Number.parseInt(active.getAttribute('aria-posinset'), 10);
+    const container = active.parentElement?.closest('[role="tree"],[role="treegrid"],[role="grid"],[role="listbox"],[role="menu"],[role="menubar"],[role="tablist"],[role="radiogroup"],[role="toolbar"]') || active.parentElement;
+    const siblingIndex = container ? [...container.querySelectorAll('*')].filter(element => role(element) === anchorRole).indexOf(active) + 1 : 0;
+    const position = indexed ? null : posinset > 0 ? posinset : siblingIndex || null;
+    focusAnchor = {active_descendant:activeDescendant,expanded:boolAttr('aria-expanded'),selected:'selected' in active ? Boolean(active.selected) : boolAttr('aria-selected'),checked:'checked' in active ? Boolean(active.checked) : boolAttr('aria-checked'),position,node_id:nodeId(active),context:context?.context || 'main',role:anchorRole,name:indexed?.name || (active === containingDialog ? dialog : ariaName),in_dialog:indexed?.in_dialog || dialog,covered:!closed && !crossOrigin,surface:crossOrigin?'cross_origin_frame':closed?'closed_shadow_root':active.tagName==='CANVAS'?'canvas':null};
+  }
   for (const context of contexts) for (const element of context.root.querySelectorAll('*')) {
     if (element.tagName === 'CANVAS') gaps.push('canvas');
     const view = element.ownerDocument?.defaultView || window;
@@ -124,5 +160,5 @@
     dialogTexts[record.title] = text.slice(0,TEXT_LIMIT);
   }
   const finalGaps = [...new Set(gaps)], truncated = finalGaps.some(gap => gap.endsWith('_truncated'));
-  return {document_id:String(performance.timeOrigin),url:location.href,route:location.pathname+location.search,title:document.title,dialogs,focused,visible_text:visibleText.join('\n'),covered_text:coveredText.join('\n'),dialog_texts:dialogTexts,elements,viewport:{width:innerWidth,height:innerHeight,scroll_x:scrollX,scroll_y:scrollY,document_height:document.documentElement.scrollHeight},coverage:{viewport_complete:!truncated,open_shadow_roots:true,slots:true,same_origin_frames:!finalGaps.includes('cross_origin_frame'),gaps:finalGaps}};
+  return {document_id:String(performance.timeOrigin),url:location.href,route:location.pathname+location.search,title:document.title,dialogs,focused,focus_anchor:focusAnchor,visible_text:visibleText.join('\n'),covered_text:coveredText.join('\n'),dialog_texts:dialogTexts,elements,viewport:{width:innerWidth,height:innerHeight,scroll_x:scrollX,scroll_y:scrollY,document_height:document.documentElement.scrollHeight},coverage:{viewport_complete:!truncated,open_shadow_roots:true,slots:true,same_origin_frames:!finalGaps.includes('cross_origin_frame'),gaps:finalGaps}};
 })()

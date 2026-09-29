@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Keyboard editing fixture</title></head>
+<body>
+  <label for="line">Line</label>
+  <input id="line" value="abc">
+  <label for="lines">Lines</label>
+  <textarea id="lines" cols="20" rows="3"></textarea>
+  <p id="caret">Caret: none</p>
+  <script>
+    const lines = document.getElementById('lines');
+    lines.value = 'ab\ncd';
+    for (const field of document.querySelectorAll('input, textarea')) {
+      field.addEventListener('keyup', () => {
+        document.getElementById('caret').textContent = `Caret: ${field.selectionStart}`;
+      });
+    }
+    const field = new URL(location.href).searchParams.get('field') === 'lines' ? lines : document.getElementById('line');
+    field.focus();
+    field.setSelectionRange(field === lines ? 0 : 3, field === lines ? 0 : 3);
+  </script>
+</body>
+</html>

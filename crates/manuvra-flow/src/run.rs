@@ -1024,10 +1024,7 @@ impl<'a> HostedMachine<'a> {
         {
             Ok(permit) => permit,
             Err(policy::PolicyStop::Uncertain(reason)) => {
-                let mut stale = pending;
-                stale.candidate = None;
-                stale.observation = captured.raw;
-                self.reissue(reason, Some(stale));
+                self.reissue_without_candidate(reason, pending, captured.raw);
                 return;
             }
             Err(stop) => {
@@ -1050,9 +1047,29 @@ impl<'a> HostedMachine<'a> {
             .extend(journal.entries()[journal_start..].iter().cloned());
         self.artifacts.caller_assisted = true;
         self.clear_pause();
-        if let Err(stop) = performed {
-            self.record_resumed_action_stop(stop, done, captured.raw);
+        match performed {
+            Ok(fact) => self.policy.record_observed(&fact.replay_key),
+            Err(actions::ActionStop::Reobserve(replay_key)) => {
+                self.policy.release_not_performed(&replay_key);
+                self.reissue_without_candidate(
+                    "candidate_revalidation_failed",
+                    pending,
+                    captured.raw,
+                );
+            }
+            Err(stop) => self.record_resumed_action_stop(stop, done, captured.raw),
         }
+    }
+
+    fn reissue_without_candidate(
+        &mut self,
+        reason: &'static str,
+        mut pending: PendingEscalation,
+        observation: Observation,
+    ) {
+        pending.candidate = None;
+        pending.observation = observation;
+        self.reissue(reason, Some(pending));
     }
 
     fn record_resumed_action_stop(
@@ -1163,6 +1180,7 @@ fn relevant_state(observation: &Observation) -> Value {
         "dialogs": observation.dialogs,
         "dialog_texts": observation.dialog_texts,
         "focused": observation.focused,
+        "focus_anchor": observation.focus_anchor,
         "visible_text": observation.visible_text,
         "covered_text": observation.covered_text,
         "elements": observation.elements,
@@ -2274,6 +2292,7 @@ impl StepDriver<'_> {
             .extend(self.journal.entries()[journal_start..].iter().cloned());
         match result {
             Ok(fact) => {
+                self.policy.record_observed(&fact.replay_key);
                 if !matches!(
                     fact.operation,
                     judgment::Operation::ScrollUp | judgment::Operation::ScrollDown
@@ -2375,7 +2394,7 @@ impl StepDriver<'_> {
     ) -> Stop {
         match stop {
             policy::PolicyStop::Uncertain(reason) => {
-                let candidate = (reason == "operation_below_gate")
+                let candidate = (reason == "operation_below_gate" || reason == "key_below_gate")
                     .then(|| self.policy.caller_candidate(&captured.raw, judgments).ok())
                     .flatten();
                 escalate(
@@ -2555,7 +2574,7 @@ fn escalate(
         .to_string();
     let offered_candidate = pending.candidate.as_ref().map(policy::Candidate::offered);
     let candidates = offered_candidate.as_ref().map_or_else(
-        || judgments.map(|value|json!({"operation":value.operation,"click_target":value.click_target,"type_target":value.type_target,"select_target":value.select_target,"type_value":value.type_value})).unwrap_or_else(||json!({})),
+        || judgments.map(|value|json!({"operation":value.operation,"click_target":value.click_target,"type_target":value.type_target,"select_target":value.select_target,"type_value":value.type_value,"key":value.key})).unwrap_or_else(||json!({})),
         |candidate| json!([candidate]),
     );
     let latest=artifacts.observations.last().map(|(name,_,png)|json!({"snapshot":format!("observations/{name}.json"),"screenshot":png.as_ref().map(|_|format!("observations/{name}.png"))})).unwrap_or(Value::Null);
@@ -2566,7 +2585,7 @@ fn escalate(
             .map(|(name, _)| format!("decisions/{name}.json"))
     });
     let payload = redacted_value(
-        &json!({"id":id,"phase":"step","step_id":step.id,"step":{"goal":step.goal,"done_when":step.done_when},"done":done,"observation":latest,"decision":decision,"gate_reason":reason,"candidates":candidates,"offered_candidate":offered_candidate,"permitted_mutations":["CLICK","TYPE_TEXT"],"recent_actions":artifacts.trace.iter().rev().filter(|event|event.get("event").and_then(Value::as_str).is_some_and(|event|event.starts_with("action_"))).take(8).collect::<Vec<_>>(),"stopped_at":stopped}),
+        &json!({"id":id,"phase":"step","step_id":step.id,"step":{"goal":step.goal,"done_when":step.done_when},"done":done,"observation":latest,"decision":decision,"gate_reason":reason,"candidates":candidates,"offered_candidate":offered_candidate,"permitted_mutations":["CLICK","TYPE_TEXT","PRESS_KEY"],"recent_actions":artifacts.trace.iter().rev().filter(|event|event.get("event").and_then(Value::as_str).is_some_and(|event|event.starts_with("action_"))).take(8).collect::<Vec<_>>(),"stopped_at":stopped}),
         redactor,
     );
     artifacts.escalations.push((id.clone(), payload));
@@ -2704,6 +2723,7 @@ fn empty_observation() -> Observation {
         title: String::new(),
         dialogs: Vec::new(),
         focused: None,
+        focus_anchor: None,
         visible_text: String::new(),
         covered_text: String::new(),
         dialog_texts: BTreeMap::new(),
@@ -2839,6 +2859,17 @@ fn redacted_observation(raw: &Observation, redactor: &Redactor) -> Result<Value,
         "title":redact(&raw.title),
         "dialogs":raw.dialogs.iter().map(|dialog|redact(dialog)).collect::<Vec<_>>(),
         "focused":raw.focused,
+        "focus_anchor":raw.focus_anchor.as_ref().map(|anchor|json!({
+            "role":redact(&anchor.role),
+            "name":redact(&anchor.name),
+            "in_dialog":anchor.in_dialog.as_ref().map(|dialog|redact(dialog)),
+            "covered":anchor.covered,
+            "active_descendant":anchor.active_descendant.as_ref().map(|item|json!({
+                "id":redact(&item.id),"role":redact(&item.role),"name":redact(&item.name),
+                "selected":item.selected,"checked":item.checked,
+            })),
+            "expanded":anchor.expanded,"selected":anchor.selected,"checked":anchor.checked,
+        })),
         "visible_text":redact(&raw.visible_text),
         "covered_text":redact(&raw.covered_text),
         "dialog_texts":raw.dialog_texts.iter().map(|(name,text)|(redact(name),redact(text))).collect::<BTreeMap<_,_>>(),
@@ -3189,7 +3220,9 @@ fn absolute_text(path: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use manuvra_chrome::{Coverage, Element, Rect, RedactionProof, Screenshot, ViewportState};
+    use manuvra_chrome::{
+        Coverage, Element, FocusAnchor, Rect, RedactionProof, Screenshot, ViewportState,
+    };
     use serde_json::json;
     use std::collections::{BTreeMap, VecDeque};
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3358,6 +3391,43 @@ mod tests {
 
     struct TypeTextProvider(std::sync::atomic::AtomicUsize);
 
+    struct KeyProvider(&'static str, f64, AtomicUsize);
+
+    impl manuvra_jev::Evaluator for KeyProvider {
+        fn evaluate(
+            &self,
+            _request: &Value,
+            _deadline: Instant,
+        ) -> Result<manuvra_jev::Evaluation, manuvra_jev::JevError> {
+            self.2.fetch_add(1, Ordering::SeqCst);
+            let choice = |selected: &str, confidence| {
+                let mut probabilities = BTreeMap::from([(selected.into(), confidence)]);
+                if confidence < 1.0 {
+                    probabilities.insert("Escape".into(), 1.0 - confidence);
+                }
+                manuvra_jev::Answer::Choice {
+                    choice: selected.into(),
+                    probabilities,
+                    confidence,
+                }
+            };
+            Ok(manuvra_jev::Evaluation {
+                answers: BTreeMap::from([
+                    ("operation".into(), choice("PRESS_KEY", 1.0)),
+                    ("click_target".into(), choice("NO_CLICK_TARGET", 1.0)),
+                    ("type_target".into(), choice("NO_TYPE_TEXT_TARGET", 1.0)),
+                    ("select_target".into(), choice("NO_SELECT_TARGET", 1.0)),
+                    ("type_value".into(), choice("NONE_FITS", 1.0)),
+                    ("key".into(), choice(self.0, self.1)),
+                    ("step_done".into(), manuvra_jev::Answer::Noul { noul: 0.01 }),
+                ]),
+                usage: BTreeMap::new(),
+                request_id: Some("key-fixture".into()),
+                model: "jev-test".into(),
+            })
+        }
+    }
+
     impl manuvra_jev::Evaluator for TypeTextProvider {
         fn evaluate(
             &self,
@@ -3377,6 +3447,7 @@ mod tests {
                     ("type_target".into(), choice("1")),
                     ("select_target".into(), choice("NO_SELECT_TARGET")),
                     ("type_value".into(), choice("name")),
+                    ("key".into(), choice("Escape")),
                     ("step_done".into(), manuvra_jev::Answer::Noul { noul: 0.01 }),
                 ]),
                 usage: BTreeMap::new(),
@@ -3418,6 +3489,7 @@ mod tests {
                     ("type_target".into(), choice(first("type_target"))),
                     ("select_target".into(), choice(first("select_target"))),
                     ("type_value".into(), choice(first("type_value"))),
+                    ("key".into(), choice(first("key"))),
                     ("step_done".into(), manuvra_jev::Answer::Noul { noul: 0.01 }),
                 ]),
                 usage: BTreeMap::new(),
@@ -3448,6 +3520,7 @@ mod tests {
                     ("type_target".into(), choice("1", 1.0)),
                     ("select_target".into(), choice("NO_SELECT_TARGET", 1.0)),
                     ("type_value".into(), choice("name", 1.0)),
+                    ("key".into(), choice("Escape", 1.0)),
                     ("step_done".into(), manuvra_jev::Answer::Noul { noul: 0.01 }),
                 ]),
                 usage: BTreeMap::new(),
@@ -3478,6 +3551,7 @@ mod tests {
                     ("type_target".into(), choice("1")),
                     ("select_target".into(), choice("NO_SELECT_TARGET")),
                     ("type_value".into(), choice("name")),
+                    ("key".into(), choice("Escape")),
                     ("step_done".into(), manuvra_jev::Answer::Noul { noul }),
                 ]),
                 usage: BTreeMap::new(),
@@ -3719,6 +3793,7 @@ mod tests {
             title: "Money · Accounts".into(),
             dialogs: Vec::new(),
             focused: None,
+            focus_anchor: None,
             visible_text: text.into(),
             covered_text: String::new(),
             dialog_texts: BTreeMap::new(),
@@ -3764,6 +3839,730 @@ mod tests {
                 mask_count: 0,
             },
         })
+    }
+
+    fn key_observation(name: &str) -> Observation {
+        let mut observation = observed("");
+        observation.focus_anchor = Some(manuvra_chrome::FocusAnchor {
+            node_id: match name {
+                "First" => 1,
+                "Second" => 2,
+                _ => 3,
+            },
+            context: "main".into(),
+            role: "button".into(),
+            name: name.into(),
+            in_dialog: None,
+            covered: true,
+            surface: None,
+            active_descendant: None,
+            expanded: None,
+            selected: None,
+            checked: None,
+            position: None,
+        });
+        observation
+    }
+
+    fn key_activation_job(force_stop: bool) -> Job {
+        let mut job = job("Activations: 1");
+        job.steps[0].goal = "Press Enter to activate Save".into();
+        job.steps[0].mutation_limit = 2;
+        if force_stop {
+            job.options.debug = Some(manuvra_contract::DebugOptions {
+                force_stop_at_step: "ready".into(),
+            });
+        }
+        job
+    }
+
+    #[test]
+    fn caller_execute_press_key_offers_anchor_and_dispatches_once() {
+        let job = key_activation_job(true);
+        let redactor = Redactor::for_job(&job).unwrap();
+        let focused = key_observation("Save");
+        let mut activated = focused.clone();
+        activated.visible_text = "Activations: 1".into();
+        let browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::from([
+                observation_page(focused.clone()),
+                observation_page(focused.clone()),
+                observation_page(activated.clone()),
+            ])),
+            fallback: activated,
+            dispatch_result: Some(Ok(manuvra_chrome::PerformFact {
+                readback: None,
+                readback_matches: None,
+                suboperations: vec!["key_down".into(), "key_up".into()],
+            })),
+        };
+        let provider = KeyProvider("Enter", 1.0, AtomicUsize::new(0));
+        let mut machine = HostedMachine::new(&job, &redactor);
+        let mut journal = MemoryJournal::default();
+        let cancellation = manuvra_chrome::InputCancellation::default();
+        let control = RecordingHostedControl::default();
+        machine.drive(
+            &browser,
+            &provider,
+            &mut journal,
+            &cancellation,
+            None,
+            &control,
+        );
+        let offered = &machine.artifacts.escalations[0].1["offered_candidate"];
+        assert_eq!(offered["operation"], "PRESS_KEY");
+        assert_eq!(offered["key"], "Enter");
+        assert_eq!(offered["focus_anchor"]["name"], "Save");
+        assert!(
+            machine.artifacts.escalations[0].1["permitted_mutations"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("PRESS_KEY"))
+        );
+        let candidate_id = offered["id"].as_str().unwrap().to_owned();
+        machine.apply_execute(
+            &candidate_id,
+            &browser,
+            &provider,
+            &mut journal,
+            &cancellation,
+        );
+        machine.drive(
+            &browser,
+            &provider,
+            &mut journal,
+            &cancellation,
+            None,
+            &control,
+        );
+        assert_eq!(machine.index, 1);
+        assert_eq!(
+            machine.artifacts.verdicts[0].result,
+            VerdictResult::Satisfied
+        );
+        assert_eq!(
+            journal
+                .0
+                .iter()
+                .filter(|event| event["event"] == "action_prepared")
+                .count(),
+            1
+        );
+        assert_eq!(
+            journal
+                .0
+                .iter()
+                .find(|event| event["event"] == "action_prepared")
+                .unwrap()["key"],
+            "Enter"
+        );
+        assert_eq!(provider.2.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn caller_execute_press_key_rejects_changed_focus_without_dispatch() {
+        let job = key_activation_job(true);
+        let redactor = Redactor::for_job(&job).unwrap();
+        let focused = key_observation("Save");
+        let browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::from([
+                observation_page(focused.clone()),
+                observation_page(key_observation("Other")),
+            ])),
+            fallback: focused,
+            dispatch_result: None,
+        };
+        let provider = KeyProvider("Enter", 1.0, AtomicUsize::new(0));
+        let mut machine = HostedMachine::new(&job, &redactor);
+        let mut journal = MemoryJournal::default();
+        let cancellation = manuvra_chrome::InputCancellation::default();
+        let control = RecordingHostedControl::default();
+        machine.drive(
+            &browser,
+            &provider,
+            &mut journal,
+            &cancellation,
+            None,
+            &control,
+        );
+        let candidate_id = machine
+            .artifacts
+            .pending
+            .as_ref()
+            .unwrap()
+            .candidate
+            .as_ref()
+            .unwrap()
+            .id
+            .clone();
+        machine.apply_execute(
+            &candidate_id,
+            &browser,
+            &provider,
+            &mut journal,
+            &cancellation,
+        );
+        assert_eq!(
+            machine.artifacts.stop.as_ref().unwrap().code,
+            "candidate_revalidation_failed"
+        );
+        assert!(journal.0.is_empty());
+    }
+
+    struct ClickSaveProvider(AtomicUsize);
+
+    impl manuvra_jev::Evaluator for ClickSaveProvider {
+        fn evaluate(
+            &self,
+            request: &Value,
+            deadline: Instant,
+        ) -> Result<manuvra_jev::Evaluation, manuvra_jev::JevError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let mut evaluation =
+                KeyProvider("Enter", 1.0, AtomicUsize::new(0)).evaluate(request, deadline)?;
+            for (question, selected) in [("operation", "CLICK"), ("click_target", "1")] {
+                evaluation.answers.insert(
+                    question.into(),
+                    manuvra_jev::Answer::Choice {
+                        choice: selected.into(),
+                        probabilities: BTreeMap::from([(selected.into(), 1.0)]),
+                        confidence: 1.0,
+                    },
+                );
+            }
+            Ok(evaluation)
+        }
+    }
+
+    fn save_button_focus() -> Observation {
+        let mut observation = key_observation("Save");
+        observation.elements.push(Element {
+            index: 1,
+            node_id: 3,
+            context: "main".into(),
+            role: "button".into(),
+            name: "Save".into(),
+            input_type: None,
+            value: String::new(),
+            checked: None,
+            selected: None,
+            expanded: None,
+            disabled: false,
+            in_dialog: None,
+            operations: vec!["CLICK".into()],
+            select_options: vec![],
+            rect: Rect {
+                x: 1.0,
+                y: 1.0,
+                width: 20.0,
+                height: 10.0,
+            },
+        });
+        observation
+    }
+
+    fn assert_rejected_execute_reissues_revalidation_failure(
+        operation: &str,
+        evaluator: &impl manuvra_jev::Evaluator,
+        evaluations: &AtomicUsize,
+    ) {
+        let job = key_activation_job(true);
+        let redactor = Redactor::for_job(&job).unwrap();
+        let focused = save_button_focus();
+        let browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::from([
+                observation_page(focused.clone()),
+                observation_page(focused.clone()),
+            ])),
+            fallback: focused.clone(),
+            dispatch_result: Some(Err(manuvra_chrome::PerformError::Rejected(
+                "focus_changed".into(),
+            ))),
+        };
+        let mut machine = HostedMachine::new(&job, &redactor);
+        let mut journal = MemoryJournal::default();
+        let cancellation = manuvra_chrome::InputCancellation::default();
+        machine.drive(
+            &browser,
+            evaluator,
+            &mut journal,
+            &cancellation,
+            None,
+            &RecordingHostedControl::default(),
+        );
+        let candidate = machine
+            .artifacts
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.candidate.clone())
+            .unwrap();
+        assert_eq!(
+            machine.artifacts.escalations[0].1["offered_candidate"]["operation"],
+            operation
+        );
+        machine.apply_execute(
+            &candidate.id,
+            &browser,
+            evaluator,
+            &mut journal,
+            &cancellation,
+        );
+
+        let stop = machine.artifacts.stop.as_ref().unwrap();
+        assert_eq!(stop.state, RunState::Uncertain, "{operation}");
+        assert_eq!(stop.code, "candidate_revalidation_failed", "{operation}");
+        assert_eq!(machine.artifacts.escalations.len(), 2);
+        let reissued = &machine.artifacts.escalations[1].1;
+        assert_eq!(reissued["gate_reason"], "candidate_revalidation_failed");
+        assert!(reissued["offered_candidate"].is_null());
+        assert!(
+            !machine
+                .artifacts
+                .escalation
+                .as_ref()
+                .unwrap()
+                .dispositions
+                .contains(&DispositionKind::Execute)
+        );
+        assert!(
+            machine
+                .artifacts
+                .pending
+                .as_ref()
+                .unwrap()
+                .candidate
+                .is_none()
+        );
+        let prepared: Vec<_> = journal
+            .0
+            .iter()
+            .filter(|event| event["event"] == "action_prepared")
+            .collect();
+        assert_eq!(prepared.len(), 1, "{operation}");
+        assert_eq!(prepared[0]["operation"], operation);
+        assert_eq!(prepared[0]["basis"], "caller_authority");
+        let fact = journal
+            .0
+            .iter()
+            .find(|event| event["event"] == "action_fact")
+            .unwrap();
+        assert_eq!(fact["fact"]["outcome"], "not_performed");
+        assert_eq!(machine.index, 0);
+        assert_eq!(
+            machine.artifacts.verdicts[0].result,
+            VerdictResult::Unresolved
+        );
+        assert_eq!(evaluations.load(Ordering::SeqCst), 1, "{operation}");
+        assert_eq!(machine.policy.step_mutations(), 0);
+        let permit = machine
+            .policy
+            .authorize_caller(&job.steps[0], &focused, &candidate)
+            .expect("a rejected dispatch releases its replay entry");
+        machine.policy.release_unused(Box::new(permit));
+    }
+
+    #[test]
+    fn caller_execute_rejected_at_dispatch_releases_replay_and_reissues_revalidation_failure() {
+        let click = ClickSaveProvider(AtomicUsize::new(0));
+        assert_rejected_execute_reissues_revalidation_failure("CLICK", &click, &click.0);
+        let key = KeyProvider("Enter", 1.0, AtomicUsize::new(0));
+        assert_rejected_execute_reissues_revalidation_failure("PRESS_KEY", &key, &key.2);
+    }
+
+    fn anchor_state(role: &str, expanded: Option<bool>, checked: Option<bool>) -> Observation {
+        let mut observation = key_observation("Save");
+        let anchor = observation.focus_anchor.as_mut().unwrap();
+        anchor.role = role.into();
+        anchor.expanded = expanded;
+        anchor.checked = checked;
+        observation
+    }
+
+    #[test]
+    fn uncertain_key_press_cannot_be_executed_or_replayed_after_retry_observation() {
+        let lost_key_up = || manuvra_chrome::PerformError::Uncertain("lost key response".into());
+        let unsent_key_down =
+            || manuvra_chrome::PerformError::NotPerformed("key down not sent".into());
+        for (key, before, after, failure) in [
+            (
+                "Enter",
+                key_observation("Save"),
+                key_observation("Save"),
+                lost_key_up(),
+            ),
+            (
+                "Enter",
+                anchor_state("button", Some(false), None),
+                anchor_state("button", Some(true), None),
+                lost_key_up(),
+            ),
+            (
+                "Space",
+                anchor_state("checkbox", None, Some(false)),
+                anchor_state("checkbox", None, Some(true)),
+                unsent_key_down(),
+            ),
+        ] {
+            let job = key_activation_job(false);
+            let redactor = Redactor::for_job(&job).unwrap();
+            let browser = FakeBrowser {
+                captures: Mutex::new(VecDeque::from([
+                    observation_page(before),
+                    observation_page(after.clone()),
+                ])),
+                fallback: after,
+                dispatch_result: Some(Err(failure)),
+            };
+            let provider = KeyProvider(key, 1.0, AtomicUsize::new(0));
+            let mut machine = HostedMachine::new(&job, &redactor);
+            let mut journal = MemoryJournal::default();
+            let cancellation = manuvra_chrome::InputCancellation::default();
+            let control = RecordingHostedControl::default();
+            machine.drive(
+                &browser,
+                &provider,
+                &mut journal,
+                &cancellation,
+                None,
+                &control,
+            );
+            assert_eq!(
+                machine.artifacts.stop.as_ref().unwrap().code,
+                "action_outcome_uncertain"
+            );
+            assert!(
+                machine
+                    .artifacts
+                    .pending
+                    .as_ref()
+                    .unwrap()
+                    .candidate
+                    .is_none()
+            );
+            assert!(
+                !machine
+                    .artifacts
+                    .escalation
+                    .as_ref()
+                    .unwrap()
+                    .dispositions
+                    .contains(&DispositionKind::Execute)
+            );
+            let escalation_id = machine.artifacts.escalation.as_ref().unwrap().id.clone();
+            machine.apply(
+                DispositionRequest {
+                    schema_version: SchemaVersion,
+                    escalation_id,
+                    disposition: Disposition::RetryObservation(
+                        manuvra_contract::RetryObservationDisposition {
+                            kind: manuvra_contract::RetryObservationKind::RetryObservation,
+                        },
+                    ),
+                },
+                &browser,
+                &provider,
+                &mut journal,
+                &cancellation,
+            );
+            machine.drive(
+                &browser,
+                &provider,
+                &mut journal,
+                &cancellation,
+                None,
+                &control,
+            );
+            assert_eq!(
+                machine.artifacts.stop.as_ref().unwrap().code,
+                "replay_forbidden",
+                "{key}"
+            );
+            assert_eq!(provider.2.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                journal
+                    .0
+                    .iter()
+                    .filter(|event| event["event"] == "action_prepared")
+                    .count(),
+                1,
+                "{key}"
+            );
+            let refused = &machine.artifacts.escalations[1].1;
+            assert_eq!(refused["gate_reason"], "replay_forbidden");
+            assert_eq!(refused["candidates"]["operation"]["choice"], "PRESS_KEY");
+            assert_eq!(refused["candidates"]["key"]["choice"], key);
+            let prepared = refused["recent_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|event| event["event"] == "action_prepared")
+                .unwrap();
+            assert_eq!(prepared["operation"], "PRESS_KEY");
+            assert_eq!(prepared["key"], key);
+            assert_eq!(prepared["focus_anchor"]["name"], "Save");
+        }
+    }
+
+    #[test]
+    fn autonomous_arrow_sequence_selects_observed_beta() {
+        struct WidgetProvider(AtomicUsize);
+        impl manuvra_jev::Evaluator for WidgetProvider {
+            fn evaluate(
+                &self,
+                request: &Value,
+                deadline: Instant,
+            ) -> Result<manuvra_jev::Evaluation, manuvra_jev::JevError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                let key = if request
+                    .pointer("/state/page/focus_anchor/active_descendant/id")
+                    .and_then(Value::as_str)
+                    == Some("beta")
+                {
+                    "Enter"
+                } else {
+                    "ArrowDown"
+                };
+                KeyProvider(key, 1.0, AtomicUsize::new(0)).evaluate(request, deadline)
+            }
+        }
+        let job = Job::parse(serde_json::to_vec(&json!({
+            "schema_version":1,"target":{"kind":"browser","url":"http://127.0.0.1:4351/"},
+            "context":{"journey":"widget","revision":"fixture","environment":"fake","actor":"synthetic","authority":"select"},
+            "steps":[{"id":"choose","goal":"Press the arrow keys and Enter to choose Beta","done_when":[{"text_visible":"Selected: Beta"}],"mutation_limit":3}]
+        })).unwrap().as_slice()).unwrap();
+        let redactor = Redactor::for_job(&job).unwrap();
+        let mut before = key_observation("Choose item");
+        before.focus_anchor.as_mut().unwrap().role = "combobox".into();
+        let mut alpha = before.clone();
+        alpha.focus_anchor.as_mut().unwrap().active_descendant =
+            Some(manuvra_chrome::ActiveDescendant {
+                id: "alpha".into(),
+                role: "option".into(),
+                name: "Alpha".into(),
+                selected: Some(false),
+                checked: None,
+            });
+        let mut beta = alpha.clone();
+        beta.focus_anchor
+            .as_mut()
+            .unwrap()
+            .active_descendant
+            .as_mut()
+            .unwrap()
+            .id = "beta".into();
+        beta.focus_anchor
+            .as_mut()
+            .unwrap()
+            .active_descendant
+            .as_mut()
+            .unwrap()
+            .name = "Beta".into();
+        let mut selected = beta.clone();
+        selected.visible_text = "Selected: Beta".into();
+        selected
+            .focus_anchor
+            .as_mut()
+            .unwrap()
+            .active_descendant
+            .as_mut()
+            .unwrap()
+            .selected = Some(true);
+        let browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::from([
+                observation_page(before),
+                observation_page(alpha),
+                observation_page(beta),
+                observation_page(selected.clone()),
+            ])),
+            fallback: selected,
+            dispatch_result: Some(Ok(manuvra_chrome::PerformFact {
+                readback: None,
+                readback_matches: None,
+                suboperations: vec!["key_down".into(), "key_up".into()],
+            })),
+        };
+        let provider = WidgetProvider(AtomicUsize::new(0));
+        let artifacts = drive_steps(
+            &job,
+            &redactor,
+            &browser,
+            &provider,
+            &mut MemoryJournal::default(),
+            &manuvra_chrome::InputCancellation::default(),
+            None,
+            None,
+        );
+        assert!(artifacts.stop.is_none());
+        assert_eq!(artifacts.verdicts[0].result, VerdictResult::Satisfied);
+        assert_eq!(provider.0.load(Ordering::SeqCst), 3);
+        let keys: Vec<_> = artifacts
+            .trace
+            .iter()
+            .filter(|event| event["event"] == "action_prepared")
+            .map(|event| event["key"].as_str().unwrap())
+            .collect();
+        assert_eq!(keys, ["ArrowDown", "ArrowDown", "Enter"]);
+    }
+
+    #[test]
+    fn autonomous_escape_records_anchor_and_observes_restored_focus() {
+        let job = Job::parse(serde_json::to_vec(&json!({
+            "schema_version":1,"target":{"kind":"browser","url":"http://127.0.0.1:4351/"},
+            "context":{"journey":"key","revision":"fixture","environment":"fake","actor":"synthetic","authority":"close"},
+            "steps":[{"id":"close","goal":"Press Escape to close the breakdown popover","done_when":[{"dialog_closed":"Breakdown"}],"mutation_limit":1}]
+        })).unwrap().as_slice()).unwrap();
+        let redactor = Redactor::for_job(&job).unwrap();
+        let mut before = key_observation("First");
+        before.dialogs.push("Breakdown".into());
+        before.focus_anchor.as_mut().unwrap().in_dialog = Some("Breakdown".into());
+        let after = key_observation("Open breakdown");
+        let browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::from([
+                observation_page(before),
+                observation_page(after.clone()),
+            ])),
+            fallback: after,
+            dispatch_result: Some(Ok(manuvra_chrome::PerformFact {
+                readback: None,
+                readback_matches: None,
+                suboperations: vec!["key_down".into(), "key_up".into()],
+            })),
+        };
+        let provider = KeyProvider("Escape", 1.0, AtomicUsize::new(0));
+        let mut journal = MemoryJournal::default();
+        let artifacts = drive_steps(
+            &job,
+            &redactor,
+            &browser,
+            &provider,
+            &mut journal,
+            &manuvra_chrome::InputCancellation::default(),
+            None,
+            None,
+        );
+        assert!(artifacts.stop.is_none());
+        assert_eq!(artifacts.verdicts[0].result, VerdictResult::Satisfied);
+        assert_eq!(provider.2.load(Ordering::SeqCst), 1);
+        let prepared = artifacts
+            .trace
+            .iter()
+            .find(|value| value["event"] == "action_prepared")
+            .unwrap();
+        let fact = artifacts
+            .trace
+            .iter()
+            .find(|value| value["event"] == "action_fact")
+            .unwrap();
+        assert_eq!(prepared["operation"], "PRESS_KEY");
+        assert_eq!(prepared["key"], "Escape");
+        assert_eq!(prepared["focus_anchor"]["name"], "First");
+        assert_eq!(fact["fact"]["key"], "Escape");
+        assert!(
+            artifacts
+                .observations
+                .iter()
+                .any(|(_, value, _)| value["focus_anchor"]["name"] == "Open breakdown")
+        );
+    }
+
+    #[test]
+    fn autonomous_tab_reaches_focus_condition_within_mutation_limit() {
+        let job = Job::parse(serde_json::to_vec(&json!({
+            "schema_version":1,"target":{"kind":"browser","url":"http://127.0.0.1:4351/"},
+            "context":{"journey":"key","revision":"fixture","environment":"fake","actor":"synthetic","authority":"focus"},
+            "steps":[{"id":"move","goal":"Press Tab to focus Third","done_when":[{"focused":"Third"}],"mutation_limit":2}]
+        })).unwrap().as_slice()).unwrap();
+        let redactor = Redactor::for_job(&job).unwrap();
+        let third = key_observation("Third");
+        let browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::from([
+                observation_page(key_observation("First")),
+                observation_page(key_observation("Second")),
+                observation_page(third.clone()),
+            ])),
+            fallback: third,
+            dispatch_result: Some(Ok(manuvra_chrome::PerformFact {
+                readback: None,
+                readback_matches: None,
+                suboperations: vec!["key_down".into(), "key_up".into()],
+            })),
+        };
+        let provider = KeyProvider("Tab", 1.0, AtomicUsize::new(0));
+        let mut journal = MemoryJournal::default();
+        let artifacts = drive_steps(
+            &job,
+            &redactor,
+            &browser,
+            &provider,
+            &mut journal,
+            &manuvra_chrome::InputCancellation::default(),
+            None,
+            None,
+        );
+        assert!(artifacts.stop.is_none());
+        assert_eq!(artifacts.verdicts[0].result, VerdictResult::Satisfied);
+        assert_eq!(provider.2.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            artifacts
+                .trace
+                .iter()
+                .filter(|value| value["event"] == "action_fact")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn low_key_confidence_offers_a_focus_bound_candidate_without_dispatch() {
+        let job = Job::parse(serde_json::to_vec(&json!({
+            "schema_version":1,"target":{"kind":"browser","url":"http://127.0.0.1:4351/"},
+            "context":{"journey":"key","revision":"fixture","environment":"fake","actor":"synthetic","authority":"focus"},
+            "steps":[{"id":"move","goal":"Press Tab to focus Second","done_when":[{"focused":"Second"}],"mutation_limit":1}]
+        })).unwrap().as_slice()).unwrap();
+        let redactor = Redactor::for_job(&job).unwrap();
+        let first = key_observation("First");
+        let browser = FakeBrowser {
+            captures: Mutex::new(VecDeque::from([
+                observation_page(first.clone()),
+                observation_page(first.clone()),
+            ])),
+            fallback: first,
+            dispatch_result: None,
+        };
+        let provider = KeyProvider("Tab", 0.69, AtomicUsize::new(0));
+        let mut journal = MemoryJournal::default();
+        let artifacts = drive_steps(
+            &job,
+            &redactor,
+            &browser,
+            &provider,
+            &mut journal,
+            &manuvra_chrome::InputCancellation::default(),
+            None,
+            None,
+        );
+        assert_eq!(artifacts.stop.as_ref().unwrap().code, "key_below_gate");
+        assert_eq!(provider.2.load(Ordering::SeqCst), 2);
+        assert!(
+            artifacts
+                .trace
+                .iter()
+                .all(|event| event["event"] != "action_prepared")
+        );
+        assert_eq!(
+            artifacts.escalations[0].1["offered_candidate"]["operation"],
+            "PRESS_KEY"
+        );
+        assert_eq!(
+            artifacts.escalations[0].1["offered_candidate"]["key"],
+            "Tab"
+        );
+        let offered = &artifacts.escalations[0].1["offered_candidate"];
+        assert_eq!(offered["focus_anchor"]["name"], "First");
+        assert_eq!(offered["focus_anchor"]["role"], "button");
+        let exported = offered.to_string();
+        assert!(!exported.contains("node_id"));
+        assert!(!exported.contains("context"));
     }
 
     fn job(wanted: &str) -> Job {
@@ -4323,12 +5122,27 @@ mod tests {
 
     #[test]
     fn exported_observation_keeps_public_indices_but_omits_browser_identity() {
-        let job = mutation_job();
+        let mut job = mutation_job();
+        job.values.get_mut("name").unwrap().secret = true;
         let redactor = Redactor::for_job(&job).unwrap();
         let mut observation = text_field("");
         observation.document_id = "internal-document-token".into();
         observation.elements[0].node_id = 981_723;
         observation.elements[0].context = "main/shadow:981723".into();
+        observation.focus_anchor = Some(FocusAnchor {
+            node_id: 981_723,
+            context: "main/shadow:981723".into(),
+            role: "textbox".into(),
+            name: "Wanted".into(),
+            in_dialog: None,
+            covered: true,
+            surface: None,
+            active_descendant: None,
+            expanded: None,
+            selected: None,
+            checked: None,
+            position: None,
+        });
         let exported = redacted_observation(&observation, &redactor).unwrap();
         let text = exported.to_string();
 
@@ -4339,6 +5153,13 @@ mod tests {
         assert!(!text.contains("document_id"));
         assert!(!text.contains("node_id"));
         assert!(!text.contains("main/shadow"));
+        assert!(!text.contains("Wanted"));
+        assert!(
+            exported["focus_anchor"]["name"]
+                .as_str()
+                .unwrap()
+                .contains("<masked:")
+        );
         assert!(exported["elements"][0].get("context").is_none());
     }
 
@@ -4920,6 +5741,11 @@ mod tests {
                 probabilities: BTreeMap::from([("name".into(), 1.0)]),
                 confidence: 1.0,
             },
+            key: judgment::ChoiceJudgment {
+                choice: "Escape".into(),
+                probabilities: BTreeMap::from([("Escape".into(), 1.0)]),
+                confidence: 1.0,
+            },
             step_done: 0.0,
             usage: BTreeMap::new(),
             request_id: None,
@@ -4998,6 +5824,7 @@ mod tests {
             type_target: choice("1"),
             select_target: choice("1"),
             type_value: choice("name"),
+            key: choice("Escape"),
             step_done: 0.0,
             usage: BTreeMap::new(),
             request_id: None,
