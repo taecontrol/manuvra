@@ -15,6 +15,7 @@
   .cell { display: flex; width: 40px; height: 36px; align-items: center; justify-content: center; }
   [role="menu"] { position: fixed; background: #fff; border: 1px solid #999; padding: 4px; display: flex; flex-direction: column; min-width: 180px; }
   [role="menuitem"] { padding: 4px 8px; cursor: default; }
+  .menu-label { padding: 4px 8px; font-weight: 600; color: #555; }
   [role="alertdialog"] { position: fixed; top: 120px; left: 200px; width: 360px; background: #fff; border: 1px solid #333; padding: 16px; }
 </style>
 </head>
@@ -74,6 +75,12 @@
     // Non-modal and portalled beside the list, so it never covers another row's controls.
     menu.style.left = `${main.getBoundingClientRect().right + 24}px`;
     menu.style.top = `${row.getBoundingClientRect().top}px`;
+    // A visible, non-interactive label names the row, so a structured done condition can tell
+    // one row's open menu from another's.
+    const heading = document.createElement('div');
+    heading.className = 'menu-label';
+    heading.textContent = `Actions menu for ${label}`;
+    menu.appendChild(heading);
     for (const item of items) {
       const entry = document.createElement('div');
       entry.setAttribute('role', 'menuitem');
