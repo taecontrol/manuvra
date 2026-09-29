@@ -249,7 +249,7 @@ Contributors and coding agents should follow [docs/CODING_STANDARDS.md](docs/COD
 
 ## Release
 
-Releases start from the `release` workflow on `main`. Enter the workspace version from `Cargo.toml` without the leading `v`. The workflow requires a successful CI run for that exact commit, then:
+Releases start from the `release` workflow on `main`; a dispatch from any other ref fails before building anything. Enter the workspace version from `Cargo.toml` without the leading `v`. The workflow requires a successful CI run for that exact commit, then:
 
 1. Builds deterministic Linux and macOS x64 and ARM64 archives and publishes their SHA-256 checksums.
 2. Creates GitHub build-provenance attestations for all four native binary archives.
@@ -257,7 +257,7 @@ Releases start from the `release` workflow on `main`. Enter the workspace versio
 4. Verifies each published archive and attestation, then installs it through `mise` on the matching native Linux or macOS runner and checks `version` and `schema job`.
 5. Builds the rendered Homebrew formula from the source archive on macOS and opens an auto-merge pull request in [`taecontrol/homebrew-tap`](https://github.com/taecontrol/homebrew-tap). The formula remains source-only and does not use bottles.
 
-Repository secret `HOMEBREW_TAP_TOKEN` provides write access to the tap. The release workflow does not modify Omarchy; Omarchy consumes the ordinary GitHub release through `mise`.
+The workflow needs two repository secrets. `RELEASE_TAG_DEPLOY_KEY` is the private SSH key of a deploy key with write access to this repository; the workflow pushes the release tag with it. `HOMEBREW_TAP_TOKEN` provides write access to the tap. The release workflow does not modify Omarchy; Omarchy consumes the ordinary GitHub release through `mise`.
 
 ## License
 
