@@ -239,7 +239,7 @@ fn finish_terminal_host(
     bootstrap: &WatchdogBootstrap,
 ) -> Result<(), String> {
     terminate_owned_group(child, host, shutdown_grace())?;
-    crate::runtime::remove_dead_socket(&bootstrap.runtime_dir.join("control.sock"))
+    crate::runtime::sweep_dead_run(&bootstrap.runtime_dir)
 }
 
 fn terminate_owned_group(
@@ -302,12 +302,11 @@ fn reconcile_dead_host(
     state: Option<&'static str>,
     host: Option<&store::ProcessIdentity>,
 ) -> Result<(), String> {
-    let socket = bootstrap.runtime_dir.join("control.sock");
     let _publication_lock = wait_for_publication_lock(bootstrap)?;
     if let Some(host) = host {
         let _ = process::signal_process_group(host, libc::SIGKILL)?;
     }
-    crate::runtime::remove_dead_socket(&socket)?;
+    crate::runtime::sweep_dead_run(&bootstrap.runtime_dir)?;
     let mut control = store::read_run_control(&bootstrap.state_root, &bootstrap.intent.run_id)?
         .unwrap_or_else(|| lost_control(bootstrap));
     if control.result.get("terminal").and_then(Value::as_bool) == Some(true) {
@@ -611,6 +610,10 @@ mod tests {
         run_watchdog_with_spawn(&bootstrap, &mut bootstrap_bytes, lock, spawn_synthetic_host)
             .unwrap();
         assert!(bootstrap_bytes.iter().all(|byte| *byte == 0));
+        assert!(
+            !bootstrap.runtime_dir.exists(),
+            "the dead run directory is swept"
+        );
         let first = store::read_run_control(&bootstrap.state_root, &bootstrap.intent.run_id)
             .unwrap()
             .unwrap();
@@ -644,6 +647,10 @@ mod tests {
             .unwrap();
         assert_eq!(preserved.sequence, control.sequence);
         assert_eq!(preserved.result["state"], "blocked");
+        assert!(
+            !bootstrap.runtime_dir.exists(),
+            "the dead run directory is swept"
+        );
     }
 
     #[test]

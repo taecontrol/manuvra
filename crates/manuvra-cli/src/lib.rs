@@ -752,7 +752,7 @@ fn remove_dead_host_socket(
     control: &store::RunControl,
     lock: store::RunLock,
 ) -> Result<(), Invocation> {
-    runtime::remove_dead_socket(&control.socket)
+    runtime::sweep_recorded_run(&control.socket, &control.run_id)
         .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))?;
     drop(lock);
     Ok(())

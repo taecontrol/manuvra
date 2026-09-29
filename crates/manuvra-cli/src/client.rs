@@ -848,7 +848,7 @@ fn publish_host_loss(
     host: &store::ProcessIdentity,
 ) -> Result<RunControl, Invocation> {
     crate::process::signal_process_group(host, libc::SIGKILL).map_err(internal_error)?;
-    crate::runtime::remove_dead_socket(&control.socket).map_err(internal_error)?;
+    crate::runtime::sweep_recorded_run(&control.socket, &control.run_id).map_err(internal_error)?;
     let current_action = current_action(root, &control);
     control.sequence = control.sequence.saturating_add(1);
     control.pause_deadline_unix_ms = None;
