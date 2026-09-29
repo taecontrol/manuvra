@@ -364,7 +364,6 @@ fn is_protocol_collision(value: &str) -> bool {
         "Home",
         "End",
         "missing_value",
-        "unsupported_in_this_build",
         "unsupported_platform",
         "browser_unavailable",
         "browser_launch_failed",
