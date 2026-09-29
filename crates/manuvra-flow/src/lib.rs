@@ -14,4 +14,6 @@ pub use manuvra_chrome::{
     Coverage, Element, Observation, PerformError, PerformFact, PreparedInput, Rect, SelectOption,
     ViewportState,
 };
-pub use run::{FlowConfig, FlowOutcome, run};
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub use run::run;
+pub use run::{FlowConfig, FlowOutcome};

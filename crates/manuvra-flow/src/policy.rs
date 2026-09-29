@@ -1,10 +1,12 @@
 use crate::judgment::{ChoiceJudgment, Judgments, Operation, hover_region_key, selected_operation};
 use crate::verification::DoneResult;
-use manuvra_chrome::{Element, FocusAnchor, FocusSurface, HoverRegion, Key, Observation};
-use manuvra_contract::{DoneCondition, JobOptions, Step};
+use manuvra_chrome::{
+    Element, FocusAnchor, FocusSurface, HoverRegion, Key, Observation, SelectOption,
+};
+use manuvra_contract::{DoneCondition, JobOptions, JobValue, Step};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 use url::Url;
 
@@ -166,6 +168,8 @@ pub struct Policy {
     /// state now shows.
     unsettled_keys: HashMap<String, String>,
     allowed_origins: Vec<String>,
+    /// Caller-provided value texts by name, so a `SELECT` is authorized only for an offered option.
+    provided_values: HashMap<String, String>,
     paused_at: Option<Instant>,
     paused_total: Duration,
 }
@@ -194,9 +198,18 @@ impl Policy {
             replay: HashMap::new(),
             unsettled_keys: HashMap::new(),
             allowed_origins,
+            provided_values: HashMap::new(),
             paused_at: None,
             paused_total: Duration::ZERO,
         }
+    }
+
+    pub fn with_provided_values(mut self, values: &BTreeMap<String, JobValue>) -> Self {
+        self.provided_values = values
+            .iter()
+            .map(|(name, value)| (name.clone(), value.value.clone()))
+            .collect();
+        self
     }
 
     pub fn begin_step(&mut self) {
@@ -274,7 +287,11 @@ impl Policy {
         let authorized = self
             .authorize_context(step, observation)
             .and_then(|()| self.check_fallback_budget(operation))
-            .and_then(|()| self.candidate(observation, judgments, operation));
+            .and_then(|()| self.candidate(observation, judgments, operation))
+            .and_then(|candidate| {
+                self.check_select_value(observation, &candidate)
+                    .map(|()| candidate)
+            });
         match authorized {
             Ok(candidate) => self.mint(observation, candidate),
             Err(stop) => Next::Stop(stop),
@@ -449,12 +466,23 @@ impl Policy {
     ) -> Result<Permit, PolicyStop> {
         self.authorize_context(step, observation)?;
         self.check_fallback_budget(candidate.operation)?;
-        let current = revalidate_caller_candidate(observation, candidate)?;
+        let current = self.revalidated_caller_candidate(observation, candidate)?;
         match self.mint(observation, current) {
             Next::Mutate(permit) => Ok(*permit),
             Next::Stop(stop) => Err(stop),
             _ => unreachable!("caller authorization only mints or stops"),
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", test))]
+    fn revalidated_caller_candidate(
+        &self,
+        observation: &Observation,
+        candidate: &Candidate,
+    ) -> Result<Candidate, PolicyStop> {
+        let current = revalidate_caller_candidate(observation, candidate)?;
+        self.check_select_value(observation, &current)
+            .map(|()| current)
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", test))]
@@ -490,6 +518,29 @@ impl Policy {
     #[cfg(any(target_os = "linux", target_os = "macos", test))]
     pub(crate) fn record_observed(&mut self, replay_key: &str) {
         self.unsettled_keys.remove(replay_key);
+    }
+
+    /// A `SELECT` names a caller-provided value that its observed target offers as an enabled
+    /// option; dispatch needs that option, so a page without it stops before a permit is minted.
+    fn check_select_value(
+        &self,
+        observation: &Observation,
+        candidate: &Candidate,
+    ) -> Result<(), PolicyStop> {
+        if candidate.operation != Operation::Select {
+            return Ok(());
+        }
+        let expected = candidate
+            .value_name
+            .as_ref()
+            .and_then(|name| self.provided_values.get(name))
+            .ok_or(PolicyStop::Blocked("value_not_provided"))?;
+        candidate
+            .target_index
+            .and_then(|index| observation.elements.iter().find(|item| item.index == index))
+            .and_then(|target| offered_select_option(target, expected))
+            .map(|_| ())
+            .ok_or(PolicyStop::Uncertain("select_option_unavailable"))
     }
 
     fn authorize_context(&self, step: &Step, observation: &Observation) -> Result<(), PolicyStop> {
@@ -839,6 +890,17 @@ fn selected_value(
     Ok(Some(judgments.type_value.choice.clone()))
 }
 
+/// The enabled option of a native select whose value or label is the expected text.
+pub(crate) fn offered_select_option<'a>(
+    target: &'a Element,
+    expected: &str,
+) -> Option<&'a SelectOption> {
+    target
+        .select_options
+        .iter()
+        .find(|option| !option.disabled && (option.value == expected || option.label == expected))
+}
+
 fn origin(url: &str) -> Option<String> {
     let url = Url::parse(url).ok()?;
     let origin = url.origin().ascii_serialization();
@@ -976,8 +1038,9 @@ fn named_surface_gap(gaps: &[String]) -> Option<&'static str> {
 mod tests {
     use super::*;
     use crate::judgment::ChoiceJudgment;
+    use manuvra_chrome::SelectOption;
     use manuvra_chrome::{Coverage, FocusAnchor, Rect, ViewportState};
-    use manuvra_contract::{DoneCondition, JobOptions};
+    use manuvra_contract::{DoneCondition, JobOptions, JobValue};
     use serde_json::Value;
     use std::collections::BTreeMap;
 
@@ -1880,21 +1943,87 @@ mod tests {
         }
     }
 
+    fn provided(value: &str) -> BTreeMap<String, JobValue> {
+        BTreeMap::from([(
+            "name".to_owned(),
+            JobValue {
+                value: value.into(),
+                description: "account".into(),
+                formats: None,
+                secret: false,
+            },
+        )])
+    }
+
+    fn native_select(options: &[(&str, &str, bool)]) -> Observation {
+        let mut page = observation("SELECT", "combobox");
+        page.elements[0].select_options = options
+            .iter()
+            .enumerate()
+            .map(|(position, (label, value, disabled))| SelectOption {
+                node_id: 20 + position as u64,
+                label: (*label).into(),
+                value: (*value).into(),
+                disabled: *disabled,
+                selected: false,
+            })
+            .collect();
+        page
+    }
+
     #[test]
-    fn native_select_is_authorized_by_the_observed_select_target() {
-        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
-        let mut answer = judgments("SELECT");
-        answer.select_target = choice("1");
+    fn native_select_is_authorized_only_for_an_offered_caller_value() {
+        let offered = native_select(&[("Savings", "savings-id", false)]);
+        for value in ["Savings", "savings-id"] {
+            let mut policy = Policy::new(&JobOptions::default(), "http://example.test/")
+                .with_provided_values(&provided(value));
+            assert!(
+                matches!(
+                    decide_not_done(&mut policy, &step(), &offered, &judgments("SELECT"), false),
+                    Next::Mutate(_)
+                ),
+                "{value}"
+            );
+        }
+        for page in [
+            native_select(&[("Checking", "checking-id", false)]),
+            native_select(&[("Savings", "savings-id", true)]),
+            observation("SELECT", "combobox"),
+        ] {
+            let mut policy = Policy::new(&JobOptions::default(), "http://example.test/")
+                .with_provided_values(&provided("Savings"));
+            assert!(matches!(
+                decide_not_done(&mut policy, &step(), &page, &judgments("SELECT"), false),
+                Next::Stop(PolicyStop::Uncertain("select_option_unavailable"))
+            ));
+            assert_eq!(policy.actions, 0);
+        }
+        let mut unknown = Policy::new(&JobOptions::default(), "http://example.test/");
         assert!(matches!(
-            decide_not_done(
-                &mut policy,
-                &step(),
-                &observation("SELECT", "combobox"),
-                &answer,
-                false
-            ),
-            Next::Mutate(_)
+            decide_not_done(&mut unknown, &step(), &offered, &judgments("SELECT"), false),
+            Next::Stop(PolicyStop::Blocked("value_not_provided"))
         ));
+    }
+
+    #[test]
+    fn caller_select_authority_revalidates_the_offered_option() {
+        let offered = native_select(&[("Savings", "savings-id", false)]);
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/")
+            .with_provided_values(&provided("Savings"));
+        let candidate = policy
+            .caller_candidate(&offered, &judgments("SELECT"))
+            .unwrap();
+        let removed = native_select(&[("Checking", "checking-id", false)]);
+        assert!(matches!(
+            policy.authorize_caller(&step(), &removed, &candidate),
+            Err(PolicyStop::Uncertain("select_option_unavailable"))
+        ));
+        assert_eq!(policy.actions, 0);
+        assert!(
+            policy
+                .authorize_caller(&step(), &offered, &candidate)
+                .is_ok()
+        );
     }
 
     #[test]
