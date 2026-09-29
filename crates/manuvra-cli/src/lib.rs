@@ -229,14 +229,7 @@ fn try_run(
     headless: bool,
     wait_ms: Option<u64>,
 ) -> Result<Invocation, Invocation> {
-    #[cfg(target_os = "macos")]
-    if runtime::runtime_root().is_err() {
-        return Err(Invocation::error(
-            "runtime_directory_unavailable",
-            "neither XDG_RUNTIME_DIR nor TMPDIR is set",
-            EXIT_BLOCKED,
-        ));
-    }
+    let runtime_root = admitted_runtime_root()?;
     if evidence_root.to_str().is_none() {
         return Err(Invocation::error(
             "invalid_input",
@@ -244,10 +237,41 @@ fn try_run(
             EXIT_INVALID,
         ));
     }
-    match prepare_run(request_id, job_path, evidence_root, browser, headless)? {
+    let request = RunRequest {
+        request_id,
+        job_path,
+        evidence_root,
+        runtime_root: runtime_root.as_deref(),
+        browser,
+        headless,
+    };
+    match prepare_run(&request)? {
         PreparedRun::Existing(invocation) => Ok(invocation),
         PreparedRun::New(prepared) => publish_new_run(prepared, wait_ms),
     }
+}
+
+struct RunRequest<'a> {
+    request_id: &'a str,
+    job_path: &'a Path,
+    evidence_root: &'a Path,
+    runtime_root: Option<&'a Path>,
+    browser: Option<&'a Path>,
+    headless: bool,
+}
+
+/// Resolves the private runtime directory before any state, evidence, or child exists, so a
+/// caller can fix its environment and retry the same request id.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn admitted_runtime_root() -> Result<Option<PathBuf>, Invocation> {
+    runtime::runtime_root().map(Some).map_err(|message| {
+        Invocation::error("runtime_directory_unavailable", message, EXIT_BLOCKED)
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn admitted_runtime_root() -> Result<Option<PathBuf>, Invocation> {
+    Ok(None)
 }
 
 enum PreparedRun {
@@ -268,42 +292,43 @@ struct Prepared {
     existing_intent: bool,
 }
 
-fn prepare_run(
-    request_id: &str,
-    job_path: &Path,
-    evidence_root: &Path,
-    browser: Option<&Path>,
-    headless: bool,
-) -> Result<PreparedRun, Invocation> {
-    validate_request_id(request_id)
+fn prepare_run(request: &RunRequest<'_>) -> Result<PreparedRun, Invocation> {
+    validate_request_id(request.request_id)
         .map_err(|message| Invocation::error("invalid_request_id", message, EXIT_INVALID))?;
-    let job = load_job(job_path)?;
-    let (admission, existing, browser) = admit_run(request_id, browser, headless, job)?;
+    let job = load_job(request.job_path)?;
+    let (admission, existing, browser) = admit_run(request, job)?;
     finish_preparation(
-        request_id,
-        evidence_root,
+        request.request_id,
+        request.evidence_root,
         admission,
         existing,
         browser.as_deref(),
-        headless,
+        request.headless,
     )
 }
 
 fn admit_run(
-    request_id: &str,
-    browser: Option<&Path>,
-    headless: bool,
+    request: &RunRequest<'_>,
     job: Job,
 ) -> Result<(Admission, RequestLookup, Option<PathBuf>), Invocation> {
     let redactor = evidence::Redactor::for_job(&job).map_err(internal_error)?;
     let state_root =
         store::state_root().map_err(|error| internal_error(redactor.redact_text(&error)))?;
     reject_sensitive_internal_path(&state_root, &redactor, "state")?;
-    let request_lock = store::lock_request(&state_root, request_id)
+    request.runtime_root.map_or(Ok(()), |root| {
+        reject_sensitive_internal_path(root, &redactor, "runtime")
+    })?;
+    let request_lock = store::lock_request(&state_root, request.request_id)
         .map_err(|error| internal_error(redactor.redact_text(&error)))?;
-    let browser = effective_browser_selection(browser);
-    let digest = canonical_digest(&state_root, &job, browser.as_deref(), headless, &redactor)?;
-    let existing = lookup_request(&state_root, request_id, &digest, &redactor)?;
+    let browser = effective_browser_selection(request.browser);
+    let digest = canonical_digest(
+        &state_root,
+        &job,
+        browser.as_deref(),
+        request.headless,
+        &redactor,
+    )?;
+    let existing = lookup_request(&state_root, request.request_id, &digest, &redactor)?;
     Ok((
         Admission {
             job,
@@ -861,9 +886,6 @@ fn caller_bootstrap_fault(_: &Prepared, _: &Path) -> Result<(), Invocation> {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn validated_runtime_run_dir(prepared: &Prepared) -> Result<PathBuf, Invocation> {
-    let runtime_root = runtime::runtime_root()
-        .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))?;
-    reject_sensitive_internal_path(&runtime_root, &prepared.redactor, "runtime")?;
     process::runtime_run_dir(&prepared.intent.run_id)
         .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))
 }
