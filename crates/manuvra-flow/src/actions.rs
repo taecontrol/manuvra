@@ -122,10 +122,8 @@ fn sync_parent(parent: Option<&Path>) -> Result<(), String> {
 
 impl ActionJournal for DurableJournal {
     fn append(&mut self, value: &Value) -> Result<(), String> {
-        let serialized = serde_json::to_string(value).map_err(|error| error.to_string())?;
-        let redacted = self.redactor.redact_export_text(&serialized);
-        let persisted: Value =
-            serde_json::from_str(&redacted).map_err(|error| error.to_string())?;
+        let mut persisted = value.clone();
+        self.redactor.redact_export_value(&mut persisted);
         let mut bytes = serde_json::to_vec(&persisted).map_err(|error| error.to_string())?;
         bytes.push(b'\n');
         self.file
@@ -885,16 +883,19 @@ mod tests {
     fn durable_journal_flushes_redacted_json_and_removes_itself() {
         let mut job = job();
         job.values.get_mut("name").unwrap().secret = true;
+        job.values.get_mut("name").unwrap().value = r#"Se"cr\et"#.into();
         let root = TempDir::new().unwrap();
         let path = root.path().join(".journal-test.action-journal.jsonl");
         let redactor = crate::evidence::Redactor::for_job(&job).unwrap();
         let mut journal = DurableJournal::open(root.path(), "journal-test", &redactor).unwrap();
         journal
-            .append(&json!({"event":"action_prepared","value":"Wanted"}))
+            .append(&json!({"event":"action_prepared","value":r#"typed Se"cr\et"#}))
             .unwrap();
         let persisted = std::fs::read_to_string(&path).unwrap();
         assert!(persisted.contains("action_prepared"));
-        assert!(!persisted.contains("Wanted"));
+        assert!(!persisted.contains("Se"), "{persisted}");
+        assert!(!redactor.contains_export_leak(persisted.as_bytes()));
+        assert!(!journal.entries()[0].to_string().contains("Se"));
         assert_eq!(journal.entries().len(), 1);
         journal.remove().unwrap();
         assert!(!path.exists());

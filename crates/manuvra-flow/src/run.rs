@@ -2750,8 +2750,9 @@ fn empty_observation() -> Observation {
 
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn redacted_value(value: &impl serde::Serialize, redactor: &Redactor) -> Value {
-    let text = serde_json::to_string(value).unwrap_or_else(|_| "null".into());
-    serde_json::from_str(&redactor.redact_export_text(&text)).unwrap_or(Value::Null)
+    let mut value = serde_json::to_value(value).unwrap_or(Value::Null);
+    redactor.redact_export_value(&mut value);
+    value
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
@@ -8045,6 +8046,32 @@ mod tests {
         assert_eq!(
             drive_fake(&job, &redactor, &broken).stop.unwrap().code,
             "browser_control_failed"
+        );
+    }
+
+    #[test]
+    fn classified_values_with_json_escapes_are_redacted_before_persistence() {
+        let mut job = mutation_job();
+        job.values.insert(
+            "escaped".into(),
+            manuvra_contract::JobValue {
+                value: r#"Se"cr\et"#.into(),
+                description: "classified value with JSON escapes".into(),
+                formats: None,
+                secret: true,
+            },
+        );
+        let redactor = Redactor::for_job(&job).unwrap();
+        let value = redacted_value(
+            &json!({"rationale":r#"typed Se"cr\et"#,"nested":[{r#"Se"cr\et"#:true}]}),
+            &redactor,
+        );
+        let exported = value.to_string();
+        assert!(!exported.contains(r#"Se\"cr\\et"#), "{exported}");
+        assert!(!redactor.contains_export_leak(exported.as_bytes()));
+        assert!(value["rationale"].as_str().unwrap().starts_with("typed "));
+        assert!(
+            redactor.contains_export_leak(json!({"leaked":r#"Se"cr\et"#}).to_string().as_bytes())
         );
     }
 

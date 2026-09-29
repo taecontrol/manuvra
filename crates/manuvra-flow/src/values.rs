@@ -60,7 +60,8 @@ impl<'a> Values<'a> {
                     "index":element.index,"role":element.role,"name":self.mask(&element.name),
                     "input_type":element.input_type,"nonempty":!element.value.trim().is_empty(),
                     "equals_value_names":matches,"checked":element.checked,"selected":element.selected,
-                    "expanded":element.expanded,"disabled":element.disabled,"in_dialog":element.in_dialog,
+                    "expanded":element.expanded,"disabled":element.disabled,
+                    "in_dialog":element.in_dialog.as_ref().map(|dialog| self.mask(dialog)),
                     "operations":element.operations,"select_options":select_options
                 })
             })
@@ -199,7 +200,7 @@ mod tests {
                 selected: None,
                 expanded: None,
                 disabled: false,
-                in_dialog: None,
+                in_dialog: Some("Edit raw-secret-742".into()),
                 operations: vec!["TYPE_TEXT".into()],
                 select_options: vec![],
                 rect: Rect {
@@ -222,6 +223,7 @@ mod tests {
         };
         let view = Values::new(&job).model_view(&observation);
         assert_eq!(view["focus_anchor"]["name"], "<value:secret_name>");
+        assert_eq!(view["elements"][0]["in_dialog"], "Edit <value:secret_name>");
         let serialized = view.to_string();
         assert!(!serialized.contains("raw-secret-742"));
         assert!(!serialized.contains("RAW SECRET"));
