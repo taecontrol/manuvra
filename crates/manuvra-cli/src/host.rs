@@ -210,7 +210,7 @@ fn publish_resume_response_with(
         return Ok(());
     };
     let frozen = publication.response.get_or_insert_with(|| result.clone());
-    let exit_code = crate::result_exit_code(frozen)?;
+    let exit_code = crate::recovery::result_exit_code(frozen)?;
     let record = seal(&publication.receipt, frozen.clone(), exit_code)?;
     finalize(&publication.receipt, &record)?;
     admission.awaiting_checkpoint = None;

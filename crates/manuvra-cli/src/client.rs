@@ -2,9 +2,11 @@ use crate::Invocation;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::process::{IPC_VERSION, now_unix_ms};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::recovery::result_exit_code;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::store::{self, RunControl};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use crate::{EXIT_INTERNAL, internal_error, result_exit_code};
+use crate::{EXIT_INTERNAL, internal_error};
 use crate::{validate_request_id, validate_run_id};
 use manuvra_contract::DispositionRequest;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -574,7 +576,7 @@ fn validate_terminal_resume_evidence(
         .get("request_id")
         .and_then(Value::as_str)
         .ok_or_else(|| internal_error("completed resume result has no request id".into()))?;
-    crate::validate_published_result(
+    crate::recovery::validate_published_result(
         Path::new(manifest),
         &record.run_id,
         result_request_id,
