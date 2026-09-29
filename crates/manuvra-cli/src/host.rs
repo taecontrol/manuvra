@@ -1,6 +1,6 @@
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
-use crate::control_socket::{AuthenticatedListener, read_frame};
+use crate::control_socket::{AcceptFailure, AuthenticatedListener, read_frame};
 use crate::process::{HostBootstrap, IPC_VERSION, now_unix_ms, process_identity};
 use crate::store::{self, RunControl};
 use manuvra_contract::{DispositionRequest, SchemaVersion, VerdictResult};
@@ -1053,18 +1053,32 @@ fn bind_private_socket(path: &Path) -> Result<AuthenticatedListener, String> {
     Ok(listener)
 }
 
+const IDLE_ACCEPT_POLL: Duration = Duration::from_millis(10);
+const FAILED_ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
 fn serve(listener: AuthenticatedListener, control: Arc<Control>, stop: Arc<AtomicBool>) {
-    std::thread::spawn(move || {
-        while !stop.load(Ordering::SeqCst) {
-            match listener.try_accept() {
-                Ok(Some(stream)) => handle(stream, &control),
-                Ok(None) => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(_) => break,
+    std::thread::spawn(move || serve_until_stopped(|| listener.try_accept(), &control, &stop));
+}
+
+/// Serves control connections until the host stops the socket. A rejected peer or a failed
+/// accept never ends service, because abort, resume, and deadline delivery depend on it.
+fn serve_until_stopped(
+    mut accept: impl FnMut() -> Result<Option<UnixStream>, AcceptFailure>,
+    control: &Control,
+    stop: &AtomicBool,
+) {
+    while !stop.load(Ordering::SeqCst) {
+        let pause = match accept() {
+            Ok(Some(stream)) => {
+                handle(stream, control);
+                Duration::ZERO
             }
-        }
-    });
+            Ok(None) => IDLE_ACCEPT_POLL,
+            Err(AcceptFailure::Rejected) => Duration::ZERO,
+            Err(AcceptFailure::Unavailable) => FAILED_ACCEPT_BACKOFF,
+        };
+        std::thread::sleep(pause);
+    }
 }
 
 fn handle(mut stream: UnixStream, control: &Control) {
@@ -1274,7 +1288,7 @@ mod tests {
             0o600
         );
         let client = UnixStream::connect(&socket).unwrap();
-        assert!(listener.accept().is_ok());
+        assert!(listener.try_accept().unwrap().is_some());
         drop(client);
     }
 
@@ -1351,6 +1365,70 @@ mod tests {
         crate::control_socket::write_frame(&mut client, &request).unwrap();
         handle(server, control);
         serde_json::from_reader(client).unwrap()
+    }
+
+    fn running_control(temporary: &TempDir) -> Control {
+        Control {
+            state_root: temporary.path().join("state"),
+            run: Mutex::new(RunControl {
+                schema_version: SchemaVersion,
+                ipc_version: IPC_VERSION,
+                sequence: 1,
+                run_id: "r".into(),
+                request_id: "q".into(),
+                job_digest: "d".into(),
+                evidence_root: temporary.path().join("evidence"),
+                started_unix_ms: 0,
+                lifetime_deadline_unix_ms: u64::MAX,
+                pause_deadline_unix_ms: None,
+                host: None,
+                watchdog: None,
+                socket: temporary.path().join("socket"),
+                result: json!({"state":"running","terminal":false}),
+            }),
+            cancellation: InputCancellation::default(),
+            abort: AtomicBool::new(false),
+            ready: AtomicBool::new(true),
+            watchdog_lost: AtomicBool::new(false),
+            resume: Mutex::new(ResumeAdmission::default()),
+            pause_timeout_ms: 1_000,
+        }
+    }
+
+    #[test]
+    fn serving_continues_after_rejected_peers_and_failed_accepts() {
+        let temporary = TempDir::new().unwrap();
+        let control = running_control(&temporary);
+        let stop = AtomicBool::new(false);
+        let (mut client, server) = UnixStream::pair().unwrap();
+        crate::control_socket::write_frame(
+            &mut client,
+            &json!({"kind":"status","ipc_version":IPC_VERSION}),
+        )
+        .unwrap();
+        let mut outcomes = vec![
+            Err(AcceptFailure::Rejected),
+            Err(AcceptFailure::Unavailable),
+            Ok(None),
+            Ok(Some(server)),
+        ]
+        .into_iter();
+        let mut accepts = 0;
+        serve_until_stopped(
+            || {
+                accepts += 1;
+                outcomes.next().unwrap_or_else(|| {
+                    stop.store(true, Ordering::SeqCst);
+                    Ok(None)
+                })
+            },
+            &control,
+            &stop,
+        );
+        assert_eq!(accepts, 5);
+        let response: Value = serde_json::from_reader(client).unwrap();
+        assert_eq!(response["accepted"], true);
+        assert_eq!(response["result"]["state"], "running");
     }
 
     #[test]
