@@ -131,7 +131,6 @@ pub(crate) fn perform(
     input: PreparedInput,
     cancellation: &InputCancellation,
 ) -> Result<PerformFact, PerformError> {
-    client.set_action_sequence(input.action_sequence);
     let fence = client.cursor();
     let result = perform_input(client, &input, cancellation);
     complete_with_journal(client, fence, result)
@@ -293,12 +292,14 @@ fn navigation_key_fields(key: Key) -> KeyFields {
     }
 }
 
+/// A performed input is uncertain when the journal lost events from its own range,
+/// because the effects of the dispatch can no longer be read back.
 fn complete_with_journal(
     client: &CdpClient,
     fence: u64,
     result: Result<PerformFact, PerformError>,
 ) -> Result<PerformFact, PerformError> {
-    if result.is_ok() && client.snapshot_since(fence).overflowed {
+    if result.is_ok() && client.lost_events_since(fence) {
         return Err(PerformError::Uncertain("CDP journal overflowed".into()));
     }
     result
@@ -327,7 +328,7 @@ fn revalidate(
       if (hit!==element && !element.contains(hit)) return {{ok:false,reason:'covered'}};
       if ({} && (element.readOnly || element.getAttribute('aria-readonly')==='true' || !('value' in element || element.isContentEditable))) return {{ok:false,reason:'not_editable'}};
       let globalX=x, globalY=y, view=element.ownerDocument.defaultView;
-      while (view && view!==window) {{ const frame=view.frameElement; if (!frame) return {{ok:false,reason:'cross_origin_frame'}}; const frameRect=frame.getBoundingClientRect(); globalX+=frameRect.x; globalY+=frameRect.y; view=view.parent; }}
+      while (view && view!==window) {{ const frame=view.frameElement; if (!frame) return {{ok:false,reason:'cross_origin_frame'}}; const frameRect=frame.getBoundingClientRect(), frameStyle=frame.ownerDocument.defaultView.getComputedStyle(frame); globalX+=frameRect.x+frame.clientLeft+parseFloat(frameStyle.paddingLeft); globalY+=frameRect.y+frame.clientTop+parseFloat(frameStyle.paddingTop); view=view.parent; }}
       return {{ok:true,x:globalX,y:globalY}};
     }})()"#,
         input.node_id, document, editable
@@ -1074,32 +1075,69 @@ mod tests {
         assert_eq!(cancelled.received("Input.dispatchKeyEvent").len(), 1);
     }
 
+    fn flood() -> Vec<(&'static str, Value)> {
+        (0..10_100)
+            .map(|index| ("DOM.attributeModified", json!({"nodeId":index})))
+            .collect()
+    }
+
     #[test]
-    fn key_journal_overflow_is_uncertain_only_after_a_possible_dispatch() {
-        let overflowed = |chrome: &ScriptedChrome| {
-            for index in 0..10_100 {
-                chrome.push_event("DOM.attributeModified", json!({"nodeId":index}));
-            }
-        };
+    fn journal_loss_makes_only_a_performed_input_uncertain() {
         let (result, key_events) = press(Some(anchor()), |chrome| {
-            overflowed(chrome);
             reply_focus(chrome, None, "d");
+            chrome.emit_before_reply("Runtime.evaluate", 1, flood());
         });
         assert!(
             matches!(result, Err(PerformError::Rejected(ref reason)) if reason == "focus_changed"),
-            "{result:?}"
+            "a rejected input stays rejected: {result:?}"
         );
         assert_eq!(key_events, 0);
 
         let (result, key_events) = press(Some(anchor()), |chrome| {
-            overflowed(chrome);
             reply_focus(chrome, Some(anchor()), "d");
+            chrome.emit_before_reply("Input.dispatchKeyEvent", 2, flood());
         });
         assert!(
             matches!(result, Err(PerformError::Uncertain(ref reason)) if reason == "CDP journal overflowed"),
             "{result:?}"
         );
         assert_eq!(key_events, 2);
+
+        for (operation, dispatch) in [(PreparedOperation::Hover, 1), (PreparedOperation::Click, 2)]
+        {
+            let chrome = ScriptedChrome::start();
+            chrome.reply("Runtime.evaluate", revalidated());
+            chrome.emit_before_reply("Input.dispatchMouseEvent", dispatch, flood());
+            let result = perform(
+                &chrome.connect_raw(),
+                input(operation),
+                &InputCancellation::default(),
+            );
+            assert!(
+                matches!(result, Err(PerformError::Uncertain(ref reason)) if reason == "CDP journal overflowed"),
+                "{operation:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_event_stream_before_an_input_does_not_make_it_uncertain() {
+        let chrome = ScriptedChrome::start();
+        chrome.reply("Runtime.evaluate", revalidated());
+        let client = chrome.connect_raw();
+        for (method, params) in flood() {
+            chrome.push_event(method, params);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while client.cursor() < 10_100 {
+            assert!(Instant::now() < deadline, "flood was not recorded");
+            client.wait_for_journal_change(client.cursor(), Duration::from_millis(20));
+        }
+        assert!(client.lost_events_since(0));
+        for operation in [PreparedOperation::Click, PreparedOperation::Hover] {
+            let fact = perform(&client, input(operation), &InputCancellation::default());
+            assert!(fact.is_ok(), "{operation:?}: {fact:?}");
+        }
     }
 
     #[test]
@@ -1327,21 +1365,6 @@ mod tests {
     }
 
     #[test]
-    fn hover_during_journal_overflow_is_uncertain() {
-        let chrome = ScriptedChrome::start();
-        for index in 0..10_100 {
-            chrome.push_event("DOM.attributeModified", json!({"nodeId":index}));
-        }
-        chrome.reply("Runtime.evaluate", revalidated());
-
-        let result = hover_with(&chrome);
-        assert!(
-            matches!(result, Err(PerformError::Uncertain(ref reason)) if reason == "CDP journal overflowed"),
-            "{result:?}"
-        );
-    }
-
-    #[test]
     fn scrolling_skips_revalidation_and_scrolls_in_its_direction() {
         for (operation, step, suboperation) in [
             (PreparedOperation::ScrollUp, "scrollBy(0,-1 *", "scroll_up"),
@@ -1538,31 +1561,6 @@ mod tests {
             ),
             Err(PerformError::Uncertain(reason)) if reason == "readback value was unavailable"
         ));
-    }
-
-    #[test]
-    fn journal_overflow_makes_the_affected_action_uncertain() {
-        let chrome = ScriptedChrome::start();
-        for index in 0..10_100 {
-            chrome.push_event("DOM.attributeModified", json!({"nodeId":index}));
-        }
-        chrome.reply(
-            "Runtime.evaluate",
-            json!({"result":{"value":{"ok":true,"x":12.0,"y":20.0}}}),
-        );
-        let client = chrome.connect_raw();
-        let result = perform(
-            &client,
-            input(PreparedOperation::Click),
-            &InputCancellation::default(),
-        );
-        assert!(
-            matches!(
-                result,
-                Err(PerformError::Uncertain(ref reason)) if reason == "CDP journal overflowed"
-            ),
-            "{result:?}"
-        );
     }
 
     #[test]

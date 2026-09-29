@@ -23,7 +23,7 @@
   <label for="combo">Search choice</label>
   <input id="combo" role="combobox" aria-expanded="false">
   <button id="combo-option" role="option" hidden>Wanted option</button>
-  <output id="enter-count">0</output>
+  <output id="enter-count">Enter presses: 0</output>
 </section>
 <section>
   <label for="keyboard-only">Keyboard only</label>
@@ -37,7 +37,7 @@
 </section>
 <section id="shadow-host"></section>
 <section id="slot-host"><button slot="control" id="slotted">Slotted control</button></section>
-<iframe id="same-frame" title="Same-origin fixture" srcdoc="<button id='frame-button' onclick='parent.document.querySelector(&quot;#frame-result&quot;).textContent=&quot;clicked&quot;'>Frame control</button>"></iframe>
+<iframe id="same-frame" title="Same-origin fixture" srcdoc="<button id='frame-button' onclick='parent.document.querySelector(&quot;#frame-result&quot;).textContent=&quot;Frame clicked&quot;'>Frame control</button>"></iframe>
 <output id="frame-result"></output>
 <iframe title="Cross-origin fixture" src="http://127.0.0.1:9/"></iframe>
 <section id="closed-host"></section>
@@ -52,12 +52,13 @@
   select.addEventListener('change', () => document.querySelector('#select-events').textContent += 'change');
 
   const combo = document.querySelector('#combo');
+  let enterPresses = 0;
   combo.addEventListener('input', () => setTimeout(() => {
     combo.setAttribute('aria-expanded', 'true');
     document.querySelector('#combo-option').hidden = false;
   }, 220));
   combo.addEventListener('keydown', event => {
-    if (event.key === 'Enter') document.querySelector('#enter-count').textContent = String(Number(document.querySelector('#enter-count').textContent) + 1);
+    if (event.key === 'Enter') document.querySelector('#enter-count').textContent = `Enter presses: ${++enterPresses}`;
   });
   document.querySelector('#combo-option').addEventListener('click', event => event.currentTarget.textContent = 'Selected option');
 
@@ -88,7 +89,7 @@
 
   const shadow = document.querySelector('#shadow-host').attachShadow({mode: 'open'});
   shadow.innerHTML = '<button id="shadow-button">Shadow control</button><output id="shadow-result"></output>';
-  shadow.querySelector('button').addEventListener('click', () => shadow.querySelector('output').textContent = 'clicked');
+  shadow.querySelector('button').addEventListener('click', () => shadow.querySelector('output').textContent = 'Shadow clicked');
   const slots = document.querySelector('#slot-host').attachShadow({mode: 'open'});
   slots.innerHTML = '<slot name="control"></slot>';
   document.querySelector('#slotted').addEventListener('click', () => document.querySelector('#slotted').textContent = 'Slotted clicked');

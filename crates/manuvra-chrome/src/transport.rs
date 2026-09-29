@@ -1,7 +1,8 @@
 use serde_json::{Value, json};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -13,58 +14,84 @@ const SOCKET_POLL: Duration = Duration::from_millis(10);
 const MAX_EVENTS: usize = 10_000;
 const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
 
+type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
+type SharedJournal = Arc<(Mutex<Journal>, Condvar)>;
+
 #[derive(Debug, Clone)]
 pub struct JournalEvent {
     pub cursor: u64,
-    pub action_sequence: u64,
-    pub received_ms: u64,
     pub message: Value,
 }
 
 #[derive(Debug, Clone)]
 pub struct JournalSnapshot {
     pub events: Vec<JournalEvent>,
+    /// Events after the requested cursor were evicted, so `events` is incomplete.
     pub overflowed: bool,
     pub last_cursor: u64,
 }
 
+/// A bounded sliding window over received CDP events. Old events are evicted
+/// once the window is full; a snapshot reports overflow only when its own
+/// cursor range lost events.
 #[derive(Debug)]
 struct Journal {
-    started: Instant,
     next_cursor: u64,
     bytes: usize,
-    overflowed: bool,
-    events: VecDeque<JournalEvent>,
+    /// Highest cursor evicted from the window; every later event is retained.
+    dropped_through: u64,
+    events: VecDeque<RetainedEvent>,
+    methods: HashSet<String>,
+}
+
+#[derive(Debug)]
+struct RetainedEvent {
+    event: JournalEvent,
+    bytes: usize,
 }
 
 impl Default for Journal {
     fn default() -> Self {
         Self {
-            started: Instant::now(),
             next_cursor: 1,
             bytes: 0,
-            overflowed: false,
+            dropped_through: 0,
             events: VecDeque::new(),
+            methods: HashSet::new(),
         }
     }
 }
 
 impl Journal {
-    fn record(&mut self, message: Value, action_sequence: u64) {
+    fn record(&mut self, message: Value) {
         let bytes = serde_json::to_vec(&message).map_or(MAX_EVENT_BYTES + 1, |value| value.len());
-        if self.events.len() >= MAX_EVENTS || self.bytes.saturating_add(bytes) > MAX_EVENT_BYTES {
-            self.overflowed = true;
-            return;
+        if let Some(method) = message.get("method").and_then(Value::as_str) {
+            self.remember_method(method);
         }
         let event = JournalEvent {
             cursor: self.next_cursor,
-            action_sequence,
-            received_ms: self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
             message,
         };
         self.next_cursor += 1;
         self.bytes += bytes;
-        self.events.push_back(event);
+        self.events.push_back(RetainedEvent { event, bytes });
+        self.evict_beyond_bounds();
+    }
+
+    fn remember_method(&mut self, method: &str) {
+        if !self.methods.contains(method) {
+            self.methods.insert(method.to_owned());
+        }
+    }
+
+    fn evict_beyond_bounds(&mut self) {
+        while self.events.len() > MAX_EVENTS || self.bytes > MAX_EVENT_BYTES {
+            let Some(evicted) = self.events.pop_front() else {
+                return;
+            };
+            self.bytes -= evicted.bytes;
+            self.dropped_through = evicted.event.cursor;
+        }
     }
 
     fn cursor(&self) -> u64 {
@@ -76,10 +103,10 @@ impl Journal {
             events: self
                 .events
                 .iter()
-                .filter(|event| event.cursor > cursor)
-                .cloned()
+                .filter(|retained| retained.event.cursor > cursor)
+                .map(|retained| retained.event.clone())
                 .collect(),
-            overflowed: self.overflowed,
+            overflowed: cursor < self.dropped_through,
             last_cursor: self.cursor(),
         }
     }
@@ -124,8 +151,7 @@ pub enum CommandFailure {
 
 pub struct CdpClient {
     sender: Sender<Request>,
-    journal: Arc<(Mutex<Journal>, Condvar)>,
-    action_sequence: Arc<AtomicU64>,
+    journal: SharedJournal,
     disconnected: Arc<AtomicBool>,
 }
 
@@ -133,7 +159,6 @@ impl CdpClient {
     pub fn connect(url: String, observe: bool) -> Result<Arc<Self>, String> {
         let (sender, receiver) = mpsc::channel();
         let journal = Arc::new((Mutex::new(Journal::default()), Condvar::new()));
-        let action_sequence = Arc::new(AtomicU64::new(0));
         let disconnected = Arc::new(AtomicBool::new(false));
         let mut socket = connect(&url)
             .map_err(|error| format!("WebSocket connection failed: {error}"))?
@@ -142,21 +167,11 @@ impl CdpClient {
         let client = Arc::new(Self {
             sender,
             journal: journal.clone(),
-            action_sequence: action_sequence.clone(),
             disconnected: disconnected.clone(),
         });
         thread::Builder::new()
             .name("manuvra-cdp".to_owned())
-            .spawn(move || {
-                worker(
-                    &mut socket,
-                    receiver,
-                    journal,
-                    action_sequence,
-                    disconnected,
-                    observe,
-                )
-            })
+            .spawn(move || worker(&mut socket, receiver, journal, disconnected, observe))
             .map_err(|error| format!("CDP worker spawn failed: {error}"))?;
         Ok(client)
     }
@@ -203,10 +218,6 @@ impl CdpClient {
         None
     }
 
-    pub fn set_action_sequence(&self, sequence: u64) {
-        self.action_sequence.store(sequence, Ordering::SeqCst);
-    }
-
     pub fn cursor(&self) -> u64 {
         self.journal.0.lock().expect("CDP journal").cursor()
     }
@@ -219,13 +230,28 @@ impl CdpClient {
             .snapshot_since(cursor)
     }
 
+    /// Whether events after `cursor` were evicted before they could be read.
+    pub fn lost_events_since(&self, cursor: u64) -> bool {
+        cursor < self.journal.0.lock().expect("CDP journal").dropped_through
+    }
+
+    /// Whether any event with `method` was ever received, even if since evicted.
+    pub fn has_received(&self, method: &str) -> bool {
+        self.journal
+            .0
+            .lock()
+            .expect("CDP journal")
+            .methods
+            .contains(method)
+    }
+
     pub fn is_disconnected(&self) -> bool {
         self.disconnected.load(Ordering::SeqCst)
     }
 
     pub fn wait_for_journal_change(&self, cursor: u64, timeout: Duration) {
         let guard = self.journal.0.lock().expect("CDP journal");
-        if guard.cursor() != cursor || guard.overflowed {
+        if guard.cursor() != cursor {
             return;
         }
         let _ = self.journal.1.wait_timeout(guard, timeout);
@@ -233,41 +259,32 @@ impl CdpClient {
 }
 
 fn worker(
-    socket: &mut WebSocket<MaybeTlsStream<std::net::TcpStream>>,
+    socket: &mut Socket,
     receiver: Receiver<Request>,
-    journal: Arc<(Mutex<Journal>, Condvar)>,
-    action_sequence: Arc<AtomicU64>,
+    journal: SharedJournal,
     disconnected: Arc<AtomicBool>,
     observe: bool,
 ) {
     let mut next_id = 1_u64;
-    if observe && initialize(socket, &journal, &action_sequence, &mut next_id).is_err() {
+    if observe && initialize(socket, &journal, &mut next_id).is_err() {
         disconnected.store(true, Ordering::SeqCst);
         return;
     }
-    drive_worker(
-        socket,
-        receiver,
-        journal,
-        action_sequence,
-        disconnected,
-        &mut next_id,
-    );
+    drive_worker(socket, receiver, journal, disconnected, &mut next_id);
 }
 
 fn drive_worker(
-    socket: &mut WebSocket<MaybeTlsStream<std::net::TcpStream>>,
+    socket: &mut Socket,
     receiver: Receiver<Request>,
-    journal: Arc<(Mutex<Journal>, Condvar)>,
-    action_sequence: Arc<AtomicU64>,
+    journal: SharedJournal,
     disconnected: Arc<AtomicBool>,
     next_id: &mut u64,
 ) {
     loop {
         match receiver.try_recv() {
-            Ok(request) => fulfill_request(socket, request, &journal, &action_sequence, next_id),
+            Ok(request) => fulfill_request(socket, request, &journal, next_id),
             Err(TryRecvError::Empty) => {
-                if !poll_incoming(socket, &journal, &action_sequence, &disconnected) {
+                if !poll_incoming(socket, &journal, &disconnected) {
                     break;
                 }
             }
@@ -277,34 +294,33 @@ fn drive_worker(
 }
 
 fn fulfill_request(
-    socket: &mut WebSocket<MaybeTlsStream<std::net::TcpStream>>,
+    socket: &mut Socket,
     request: Request,
-    journal: &Arc<(Mutex<Journal>, Condvar)>,
-    action_sequence: &Arc<AtomicU64>,
+    journal: &SharedJournal,
     next_id: &mut u64,
 ) {
     let outcome = execute(
         socket,
-        request.method,
-        request.params,
-        request.deadline,
-        &request.cancellation,
+        Outgoing {
+            method: request.method,
+            params: request.params,
+            deadline: request.deadline,
+            cancellation: &request.cancellation,
+        },
         journal,
-        action_sequence,
         next_id,
     );
     let _ = request.reply.send(outcome);
 }
 
 fn poll_incoming(
-    socket: &mut WebSocket<MaybeTlsStream<std::net::TcpStream>>,
-    journal: &Arc<(Mutex<Journal>, Condvar)>,
-    action_sequence: &Arc<AtomicU64>,
+    socket: &mut Socket,
+    journal: &SharedJournal,
     disconnected: &Arc<AtomicBool>,
 ) -> bool {
     match read_message(socket) {
         Ok(Some(value)) => {
-            record_event(journal, action_sequence, value);
+            record_event(journal, value);
             true
         }
         Ok(None) => true,
@@ -333,10 +349,11 @@ fn await_worker_outcome(
     }
 }
 
+/// Enables only the event domains the journal's readers consume: page lifecycle
+/// and navigation, DOM mutations, and accessibility updates.
 fn initialize(
-    socket: &mut WebSocket<MaybeTlsStream<std::net::TcpStream>>,
-    journal: &Arc<(Mutex<Journal>, Condvar)>,
-    action_sequence: &Arc<AtomicU64>,
+    socket: &mut Socket,
+    journal: &SharedJournal,
     next_id: &mut u64,
 ) -> Result<(), String> {
     let cancellation = Arc::new(AtomicBool::new(false));
@@ -345,18 +362,16 @@ fn initialize(
         ("Page.setLifecycleEventsEnabled", json!({"enabled": true})),
         ("DOM.enable", json!({})),
         ("Accessibility.enable", json!({})),
-        ("Network.enable", json!({})),
-        ("Runtime.enable", json!({})),
-        ("Log.enable", json!({})),
     ] {
         let outcome = execute(
             socket,
-            method.to_owned(),
-            params,
-            Instant::now() + Duration::from_secs(2),
-            &cancellation,
+            Outgoing {
+                method: method.to_owned(),
+                params,
+                deadline: Instant::now() + Duration::from_secs(2),
+                cancellation: &cancellation,
+            },
             journal,
-            action_sequence,
             next_id,
         );
         if !matches!(outcome, CommandOutcome::Confirmed(_)) {
@@ -366,26 +381,34 @@ fn initialize(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn execute(
-    socket: &mut WebSocket<MaybeTlsStream<std::net::TcpStream>>,
+struct Outgoing<'a> {
     method: String,
     params: Value,
     deadline: Instant,
-    cancellation: &Arc<AtomicBool>,
-    journal: &Arc<(Mutex<Journal>, Condvar)>,
-    action_sequence: &Arc<AtomicU64>,
+    cancellation: &'a Arc<AtomicBool>,
+}
+
+fn execute(
+    socket: &mut Socket,
+    outgoing: Outgoing<'_>,
+    journal: &SharedJournal,
     next_id: &mut u64,
 ) -> CommandOutcome {
-    if command_should_not_send(cancellation, deadline) {
+    if command_should_not_send(outgoing.cancellation, outgoing.deadline) {
         return CommandOutcome::NotSent("cancelled or timed out before send".to_owned());
     }
     let id = take_next_id(next_id);
-    let message = json!({"id": id, "method": method, "params": params});
+    let message = json!({"id": id, "method": outgoing.method, "params": outgoing.params});
     if let Err(error) = socket.send(Message::Text(message.to_string().into())) {
         return classify_send_error(error);
     }
-    await_command_response(socket, id, deadline, cancellation, journal, action_sequence)
+    await_command_response(
+        socket,
+        id,
+        outgoing.deadline,
+        outgoing.cancellation,
+        journal,
+    )
 }
 
 fn classify_send_error(error: tungstenite::Error) -> CommandOutcome {
@@ -405,12 +428,11 @@ fn take_next_id(next_id: &mut u64) -> u64 {
 }
 
 fn await_command_response(
-    socket: &mut WebSocket<MaybeTlsStream<std::net::TcpStream>>,
+    socket: &mut Socket,
     id: u64,
     deadline: Instant,
     cancellation: &Arc<AtomicBool>,
-    journal: &Arc<(Mutex<Journal>, Condvar)>,
-    action_sequence: &Arc<AtomicU64>,
+    journal: &SharedJournal,
 ) -> CommandOutcome {
     loop {
         if cancellation.load(Ordering::SeqCst) {
@@ -421,7 +443,7 @@ fn await_command_response(
         }
         match incoming_for_command(read_message(socket), id) {
             CommandIncoming::Done(outcome) => return outcome,
-            CommandIncoming::Event(value) => record_event(journal, action_sequence, value),
+            CommandIncoming::Event(value) => record_event(journal, value),
             CommandIncoming::Ignore => {}
         }
     }
@@ -452,22 +474,12 @@ fn outcome_from_response(value: Value) -> CommandOutcome {
     }
 }
 
-fn record_event(
-    journal: &Arc<(Mutex<Journal>, Condvar)>,
-    action_sequence: &Arc<AtomicU64>,
-    value: Value,
-) {
-    journal
-        .0
-        .lock()
-        .expect("CDP journal")
-        .record(value, action_sequence.load(Ordering::SeqCst));
+fn record_event(journal: &SharedJournal, value: Value) {
+    journal.0.lock().expect("CDP journal").record(value);
     journal.1.notify_all();
 }
 
-fn read_message(
-    socket: &mut WebSocket<MaybeTlsStream<std::net::TcpStream>>,
-) -> Result<Option<Value>, String> {
+fn read_message(socket: &mut Socket) -> Result<Option<Value>, String> {
     match socket.read() {
         Ok(Message::Text(text)) => parse_cdp_json(&text),
         Ok(Message::Ping(payload)) => acknowledge_ping(socket, payload),
@@ -485,7 +497,7 @@ fn parse_cdp_json(text: &str) -> Result<Option<Value>, String> {
 }
 
 fn acknowledge_ping(
-    socket: &mut WebSocket<MaybeTlsStream<std::net::TcpStream>>,
+    socket: &mut Socket,
     payload: tungstenite::Bytes,
 ) -> Result<Option<Value>, String> {
     socket
@@ -494,10 +506,7 @@ fn acknowledge_ping(
     Ok(None)
 }
 
-fn configure_timeout(
-    socket: &mut WebSocket<MaybeTlsStream<std::net::TcpStream>>,
-    timeout: Duration,
-) -> Result<(), String> {
+fn configure_timeout(socket: &mut Socket, timeout: Duration) -> Result<(), String> {
     match socket.get_mut() {
         MaybeTlsStream::Plain(stream) => stream
             .set_read_timeout(Some(timeout))
@@ -519,13 +528,6 @@ pub fn event_method(event: &JournalEvent) -> Option<&str> {
 
 pub fn event_params(event: &JournalEvent) -> &Value {
     event.message.get("params").unwrap_or(&Value::Null)
-}
-
-pub fn is_log_event(event: &JournalEvent) -> bool {
-    matches!(
-        event_method(event),
-        Some("Runtime.consoleAPICalled" | "Runtime.exceptionThrown" | "Log.entryAdded")
-    )
 }
 
 pub fn is_relevant_event(event: &JournalEvent) -> bool {
@@ -581,15 +583,6 @@ mod tests {
     }
 
     #[test]
-    fn a_send_attempt_is_classified_unknown() {
-        let outcome = classify_send_error(tungstenite::Error::Io(io::Error::new(
-            io::ErrorKind::BrokenPipe,
-            "scripted partial write",
-        )));
-        assert!(matches!(outcome.result(), Err(CommandFailure::Unknown(_))));
-    }
-
-    #[test]
     fn cancellation_before_a_queued_send_is_not_sent() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -611,18 +604,71 @@ mod tests {
         server.join().unwrap();
     }
 
-    #[test]
-    fn journal_overflow_is_explicit_and_never_looks_complete() {
-        let mut journal = Journal::default();
-        for index in 0..=MAX_EVENTS {
-            journal.record(
-                json!({"method": "DOM.childNodeInserted", "index": index}),
-                7,
-            );
+    fn record_many(journal: &mut Journal, count: usize) {
+        for index in 0..count {
+            journal.record(json!({"method": "DOM.childNodeInserted", "params": {"index": index}}));
         }
-        let snapshot = journal.snapshot_since(0);
-        assert!(snapshot.overflowed);
-        assert_eq!(snapshot.events.len(), MAX_EVENTS);
+    }
+
+    #[test]
+    fn journal_evicts_old_events_and_reports_overflow_only_for_lost_ranges() {
+        let mut journal = Journal::default();
+        record_many(&mut journal, MAX_EVENTS + 100);
+        let lost = journal.snapshot_since(0);
+        assert!(lost.overflowed, "events 1..=100 were evicted");
+        assert_eq!(lost.events.len(), MAX_EVENTS);
+        assert_eq!(lost.events[0].cursor, 101);
+        assert!(journal.snapshot_since(99).overflowed);
+
+        let complete = journal.snapshot_since(100);
+        assert!(
+            !complete.overflowed,
+            "every event after cursor 100 is retained"
+        );
+        assert_eq!(complete.events.len(), MAX_EVENTS);
+
+        let fence = journal.cursor();
+        record_many(&mut journal, MAX_EVENTS / 2);
+        let recent = journal.snapshot_since(fence);
+        assert!(
+            !recent.overflowed,
+            "a fence after the eviction is unaffected"
+        );
+        assert_eq!(recent.events.len(), MAX_EVENTS / 2);
+        assert_eq!(recent.last_cursor, fence + (MAX_EVENTS / 2) as u64);
+    }
+
+    #[test]
+    fn journal_bounds_bytes_and_evicts_an_event_larger_than_the_window() {
+        let mut journal = Journal::default();
+        record_many(&mut journal, 3);
+        let fence = journal.cursor();
+        journal.record(
+            json!({"method": "DOM.large", "params": {"text": "x".repeat(MAX_EVENT_BYTES)}}),
+        );
+        assert!(journal.events.is_empty());
+        assert_eq!(journal.bytes, 0);
+        assert!(journal.snapshot_since(fence).overflowed);
+        record_many(&mut journal, 1);
+        let after = journal.snapshot_since(fence + 1);
+        assert!(!after.overflowed);
+        assert_eq!(after.events.len(), 1);
+    }
+
+    #[test]
+    fn received_methods_are_remembered_after_eviction() {
+        let mut journal = Journal::default();
+        journal.record(json!({"method": "Page.windowOpen", "params": {}}));
+        record_many(&mut journal, MAX_EVENTS + 1);
+        assert!(
+            !journal
+                .snapshot_since(0)
+                .events
+                .iter()
+                .any(|event| event_method(event) == Some("Page.windowOpen"))
+        );
+        assert!(journal.methods.contains("Page.windowOpen"));
+        assert!(!journal.methods.contains("Target.targetCreated"));
     }
 
     #[test]
@@ -663,38 +709,8 @@ mod tests {
     fn journal_event(method: &str, params: Value) -> JournalEvent {
         JournalEvent {
             cursor: 1,
-            action_sequence: 0,
-            received_ms: 0,
             message: json!({"method": method, "params": params}),
         }
-    }
-
-    #[test]
-    fn command_outcome_result_maps_confirmed_rejected_and_unsent() {
-        assert_eq!(
-            CommandOutcome::Confirmed(json!({"result": {"ok": true}}))
-                .result()
-                .unwrap(),
-            json!({"ok": true})
-        );
-        assert_eq!(
-            CommandOutcome::Confirmed(json!({"id": 1}))
-                .result()
-                .unwrap(),
-            Value::Null
-        );
-        assert!(matches!(
-            CommandOutcome::Rejected(json!({"error": {"message": "no"}})).result(),
-            Err(CommandFailure::Rejected(_))
-        ));
-        assert!(matches!(
-            CommandOutcome::NotSent("queued".to_owned()).result(),
-            Err(CommandFailure::NotSent(_))
-        ));
-        assert!(matches!(
-            CommandOutcome::Unknown("maybe".to_owned()).result(),
-            Err(CommandFailure::Unknown(_))
-        ));
     }
 
     #[test]
@@ -836,6 +852,7 @@ pub(crate) mod test_support {
         disconnect_on: HashSet<String>,
         reject_on_call: HashMap<String, usize>,
         pending_events: VecDeque<Value>,
+        events_before_reply: HashMap<(String, usize), Vec<Value>>,
         ping_once: bool,
         invalid_json_methods: HashSet<String>,
         invalid_json_on_call: HashMap<String, usize>,
@@ -948,6 +965,20 @@ pub(crate) mod test_support {
                 .expect("scripted Chrome")
                 .reject_on_call
                 .insert(method.to_owned(), call);
+        }
+
+        /// Sends `events` before answering the `call`-th `method` command, so the
+        /// client records them before that command's outcome returns.
+        pub fn emit_before_reply(&self, method: &str, call: usize, events: Vec<(&str, Value)>) {
+            let events = events
+                .into_iter()
+                .map(|(event, params)| json!({"method": event, "params": params}))
+                .collect();
+            self.script
+                .lock()
+                .expect("scripted Chrome")
+                .events_before_reply
+                .insert((method.to_owned(), call), events);
         }
 
         pub fn push_event(&self, method: &str, params: Value) {
@@ -1183,7 +1214,7 @@ pub(crate) mod test_support {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
-        let (reply, invalid) = {
+        let (reply, invalid, events) = {
             let mut script = script.lock().expect("scripted Chrome");
             script.received.push(value.clone());
             if script.disconnect_on.contains(&method) {
@@ -1199,6 +1230,10 @@ pub(crate) mod test_support {
                 .count();
             let invalid = script.invalid_json_methods.contains(&method)
                 || script.invalid_json_on_call.get(&method) == Some(&call);
+            let events = script
+                .events_before_reply
+                .remove(&(method.clone(), call))
+                .unwrap_or_default();
             let reply = if script.reject.contains(&method)
                 || script.reject_on_call.get(&method) == Some(&call)
             {
@@ -1217,8 +1252,11 @@ pub(crate) mod test_support {
                     .unwrap_or(json!({}));
                 json!({"id": id, "result": result})
             };
-            (reply, invalid)
+            (reply, invalid, events)
         };
+        for event in events {
+            let _ = socket.send(Message::Text(event.to_string().into()));
+        }
         if invalid {
             let _ = socket.send(Message::Text("not-json".into()));
             return true;

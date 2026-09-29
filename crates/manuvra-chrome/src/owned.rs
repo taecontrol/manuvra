@@ -45,6 +45,8 @@ mod platform {
 }
 
 const SNAPSHOT: &str = include_str!("snapshot.js");
+const MASKING: &str = include_str!("masking.js");
+const CAPTURE_ATTEMPTS: usize = 3;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const COVERAGE_PROBE: &str = r#"(() => {
   if (window.__manuvraCoverageProbeInstalled) return;
@@ -115,7 +117,7 @@ pub struct OwnedBrowser {
     client: Arc<CdpClient>,
     provenance: BrowserProvenance,
     ownership: platform::BrowserOwnership,
-    closed: bool,
+    lifecycle: Lifecycle,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -149,7 +151,8 @@ impl OwnedBrowser {
 
     pub fn navigate(&self, url: &str) -> Result<(), BrowserError> {
         let fence = self.client.cursor();
-        command(&self.client, "Page.navigate", json!({"url": url}))?;
+        let navigated = command(&self.client, "Page.navigate", json!({"url": url}))?;
+        require_committed_navigation(&navigated)?;
         wait_for_document(&self.client, fence)
     }
 
@@ -160,12 +163,9 @@ impl OwnedBrowser {
         crate::observation::mark_closed_shadow_focus(&mut observation, |method, params| {
             command(&self.client, method, params)
         })?;
-        if self.client.snapshot_since(0).events.iter().any(|event| {
-            matches!(
-                event.message.get("method").and_then(Value::as_str),
-                Some("Page.windowOpen" | "Target.targetCreated")
-            )
-        }) {
+        // A page session reports `window.open` as `Page.windowOpen`; the popup
+        // itself is another target Manuvra neither observes nor controls.
+        if self.client.has_received("Page.windowOpen") {
             observation.coverage.gaps.push("popup".into());
             observation.coverage.gaps.sort();
             observation.coverage.gaps.dedup();
@@ -187,31 +187,24 @@ impl OwnedBrowser {
     }
 
     pub fn capture(&self) -> Result<CapturedPage, BrowserError> {
-        for _ in 0..3 {
-            let fence = self.client.cursor();
-            let observation = self.observe()?;
-            let screenshot = page::capture_screenshot(
-                &self.client,
-                deadline(),
-                Arc::new(AtomicBool::new(false)),
-            )
-            .map_err(|error| BrowserError::Control(error.to_string()))?;
-            let changed = self
-                .client
-                .snapshot_since(fence)
-                .events
-                .iter()
-                .any(crate::transport::is_relevant_event);
-            if !changed {
-                return Ok(CapturedPage {
-                    observation,
-                    screenshot,
-                    redaction: RedactionProof {
-                        sensitive_values_checked: 0,
-                        matched_values: 0,
-                        mask_count: 0,
-                    },
-                });
+        self.capture_fenced(None)
+    }
+
+    pub fn capture_redacted(&self, sensitive: &[String]) -> Result<CapturedPage, BrowserError> {
+        if sensitive.is_empty() {
+            return self.capture();
+        }
+        self.capture_fenced(Some(Masking {
+            expression: masking_script(sensitive)?,
+            values: sensitive.len(),
+        }))
+    }
+
+    /// Retries until the observation and screenshot come from one unchanged page.
+    fn capture_fenced(&self, masking: Option<Masking>) -> Result<CapturedPage, BrowserError> {
+        for _ in 0..CAPTURE_ATTEMPTS {
+            if let Some(captured) = self.capture_once(masking.as_ref())? {
+                return Ok(captured);
             }
             thread::sleep(QUIET_WINDOW);
         }
@@ -220,45 +213,60 @@ impl OwnedBrowser {
         ))
     }
 
-    pub fn capture_redacted(&self, sensitive: &[String]) -> Result<CapturedPage, BrowserError> {
-        if sensitive.is_empty() {
-            return self.capture();
+    /// Masks are placed inside the fence on every attempt, so a secret that moves
+    /// before the screenshot invalidates the attempt instead of escaping its mask.
+    fn capture_once(
+        &self,
+        masking: Option<&Masking>,
+    ) -> Result<Option<CapturedPage>, BrowserError> {
+        let _mutations = DomMutationWatch::start(&self.client)?;
+        let fence = self.client.cursor();
+        let masks = install_masks(&self.client, masking)?;
+        let observation = self.observe()?;
+        let screenshot =
+            page::capture_screenshot(&self.client, deadline(), Arc::new(AtomicBool::new(false)))
+                .map_err(|error| BrowserError::Control(error.to_string()))?;
+        if page_changed_since(&self.client, fence) {
+            return Ok(None);
         }
-        self.capture_with_masks(sensitive)
+        Ok(Some(CapturedPage {
+            observation,
+            screenshot,
+            redaction: masks.proof.clone(),
+        }))
     }
 
-    fn capture_with_masks(&self, sensitive: &[String]) -> Result<CapturedPage, BrowserError> {
-        let expression = masking_script(sensitive)?;
-        let proof = match masking_proof(evaluate(&self.client, &expression)?, sensitive.len()) {
-            Ok(proof) => proof,
-            Err(_) => return self.unverifiable_mask(),
-        };
-        self.capture_then_unmask(proof)
-    }
-
-    fn unverifiable_mask(&self) -> Result<CapturedPage, BrowserError> {
-        let _ = evaluate(&self.client, "window.__manuvraRemoveMasks?.()");
-        Err(BrowserError::Control("redaction_unverifiable".into()))
-    }
-
-    fn capture_then_unmask(&self, proof: RedactionProof) -> Result<CapturedPage, BrowserError> {
-        let _masks = InstalledMasks {
-            client: &self.client,
-        };
-        let mut captured = self.capture()?;
-        captured.redaction = proof;
-        Ok(captured)
-    }
-
+    /// Terminates the browser at most once, then removes its profile. A failed
+    /// profile removal is retried without signalling the reaped process again.
     pub fn close(&mut self) -> Result<(), BrowserError> {
-        if self.closed {
-            return Ok(());
+        if self.lifecycle == Lifecycle::Running {
+            platform::terminate(&mut self.child, &mut self.ownership)
+                .map_err(BrowserError::Control)?;
+            self.lifecycle = Lifecycle::Terminated;
         }
-        platform::terminate(&mut self.child, &mut self.ownership).map_err(BrowserError::Control)?;
-        fs::remove_dir_all(&self.profile)
-            .map_err(|error| BrowserError::Control(safe_error(&error.to_string())))?;
-        self.closed = true;
+        if self.lifecycle == Lifecycle::Terminated {
+            fs::remove_dir_all(&self.profile)
+                .map_err(|error| BrowserError::Control(safe_error(&error.to_string())))?;
+            self.lifecycle = Lifecycle::Closed;
+        }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lifecycle {
+    Running,
+    Terminated,
+    Closed,
+}
+
+fn require_committed_navigation(navigated: &Value) -> Result<(), BrowserError> {
+    match navigated.get("errorText").and_then(Value::as_str) {
+        Some(error) if !error.is_empty() => Err(BrowserError::Control(format!(
+            "navigation failed: {}",
+            safe_error(error)
+        ))),
+        _ => Ok(()),
     }
 }
 
@@ -283,13 +291,85 @@ fn masking_proof(value: Value, expected_values: usize) -> Result<RedactionProof,
         .ok_or_else(|| BrowserError::Control("redaction_unverifiable".into()))
 }
 
-struct InstalledMasks<'a> {
-    client: &'a CdpClient,
+struct Masking {
+    expression: String,
+    values: usize,
 }
+
+/// Masks placed for one capture attempt; they are removed when dropped.
+struct InstalledMasks<'a> {
+    client: Option<&'a CdpClient>,
+    proof: RedactionProof,
+}
+
 impl Drop for InstalledMasks<'_> {
     fn drop(&mut self) {
-        let _ = evaluate(self.client, "window.__manuvraRemoveMasks?.(); true");
+        if let Some(client) = self.client {
+            let _ = evaluate(client, "window.__manuvraRemoveMasks?.(); true");
+        }
     }
+}
+
+fn install_masks<'a>(
+    client: &'a CdpClient,
+    masking: Option<&Masking>,
+) -> Result<InstalledMasks<'a>, BrowserError> {
+    let mut masks = InstalledMasks {
+        client: None,
+        proof: RedactionProof {
+            sensitive_values_checked: 0,
+            matched_values: 0,
+            mask_count: 0,
+        },
+    };
+    if let Some(masking) = masking {
+        masks.client = Some(client);
+        masks.proof = masking_proof(evaluate(client, &masking.expression)?, masking.values)?;
+    }
+    Ok(masks)
+}
+
+/// Chrome reports DOM mutations only for nodes the client has requested, so a
+/// capture requests the whole pierced document before its fence and releases
+/// those bindings afterwards to keep later waits insensitive to DOM churn.
+struct DomMutationWatch<'a> {
+    client: &'a CdpClient,
+}
+
+impl<'a> DomMutationWatch<'a> {
+    fn start(client: &'a CdpClient) -> Result<Self, BrowserError> {
+        let watch = Self { client };
+        command(
+            client,
+            "DOM.getDocument",
+            json!({"depth": -1, "pierce": true}),
+        )?;
+        Ok(watch)
+    }
+}
+
+impl Drop for DomMutationWatch<'_> {
+    fn drop(&mut self) {
+        let _ = command(self.client, "DOM.disable", json!({}));
+        let _ = command(self.client, "DOM.enable", json!({}));
+    }
+}
+
+fn page_changed_since(client: &CdpClient, fence: u64) -> bool {
+    let snapshot = client.snapshot_since(fence);
+    snapshot.overflowed
+        || snapshot
+            .events
+            .iter()
+            .any(|event| crate::transport::is_relevant_event(event) && !is_mask_insertion(event))
+}
+
+fn is_mask_insertion(event: &crate::JournalEvent) -> bool {
+    crate::transport::event_method(event) == Some("DOM.childNodeInserted")
+        && crate::transport::event_params(event)
+            .pointer("/node/attributes")
+            .and_then(Value::as_array)
+            .is_some_and(|attributes| attributes.iter().any(|name| name == "data-manuvra-mask"))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -384,7 +464,7 @@ impl StartingBrowser {
                 display_mode: display_mode(prepared.config.headless).into(),
             },
             ownership: take_ownership(&mut self.ownership),
-            closed: false,
+            lifecycle: Lifecycle::Running,
         })
     }
     fn prepared(&self) -> &PreparedBrowser {
@@ -786,26 +866,23 @@ fn deadline() -> Instant {
     Instant::now() + COMMAND_TIMEOUT
 }
 
+/// Applies `masking.js` to the sensitive values. They reach the page only as a
+/// JSON array argument, which is inert data and never executable source.
 fn masking_script(sensitive: &[String]) -> Result<String, BrowserError> {
     let values = serde_json::to_string(sensitive)
         .map_err(|error| BrowserError::Control(error.to_string()))?;
-    Ok(format!(
-        r#"(() => {{
-      window.__manuvraRemoveMasks?.(); const values={values}; const masks=[]; const matched=new Set(); let unverifiable=false;
-      const contexts=[],seen=new Set();const visit=(root,x,y)=>{{if(!root||seen.has(root))return;seen.add(root);contexts.push({{root,x,y}});if(root.defaultView?.__manuvraClosedShadowRoots>0)unverifiable=true;for(const e of root.querySelectorAll('*')){{if(e.shadowRoot)visit(e.shadowRoot,x,y);if(e.tagName==='IFRAME'||e.tagName==='FRAME'){{let child;try{{child=e.contentDocument;}}catch(_){{child=null;}}if(!child?.body){{unverifiable=true;continue;}}const r=e.getBoundingClientRect();visit(child,x+r.x,y+r.y);}}if(e.tagName==='CANVAS')unverifiable=true;}}}};visit(document,0,0);
-      const cover=(rect,x,y)=>{{if(!rect||!Number.isFinite(rect.x)||rect.width<=0||rect.height<=0){{unverifiable=true;return;}}const m=document.createElement('div');Object.assign(m.style,{{position:'fixed',left:`${{rect.x+x}}px`,top:`${{rect.y+y}}px`,width:`${{rect.width}}px`,height:`${{rect.height}}px`,background:'#000',zIndex:'2147483647',pointerEvents:'none'}});document.documentElement.appendChild(m);masks.push(m);}};
-      const matches=(text,coverMatch)=>{{values.forEach((value,index)=>{{if(!value)return;let start=0,found;while((found=String(text).indexOf(value,start))!==-1){{matched.add(index);coverMatch(found,found+value.length);start=found+Math.max(1,value.length);}}}});}};
-      for(const context of contexts){{for(const e of context.root.querySelectorAll('*')){{if(e.matches('input,textarea,[contenteditable="true"]'))matches(String(e.value??e.innerText),()=>cover(e.getBoundingClientRect(),context.x,context.y));const view=e.ownerDocument?.defaultView||window;for(const pseudo of ['::before','::after']){{const content=view.getComputedStyle(e,pseudo).content;matches(content||'',()=>cover(e.getBoundingClientRect(),context.x,context.y));}}}}const owner=context.root.ownerDocument||context.root,walker=owner.createTreeWalker(context.root,NodeFilter.SHOW_TEXT),nodes=[];let text='',n;while(n=walker.nextNode()){{const start=text.length;text+=n.textContent||'';nodes.push({{node:n,start,end:text.length}});}}matches(text,(start,end)=>{{const first=nodes.find(item=>item.start<=start&&start<item.end),last=nodes.find(item=>item.start<end&&end<=item.end);if(!first||!last){{unverifiable=true;return;}}const range=owner.createRange();range.setStart(first.node,start-first.start);range.setEnd(last.node,end-last.start);const rects=[...range.getClientRects()];if(!rects.length)unverifiable=true;else rects.forEach(rect=>cover(rect,context.x,context.y));}});}}
-      window.__manuvraRemoveMasks=()=>{{masks.forEach(m=>m.remove());delete window.__manuvraRemoveMasks;}}; return {{verified:!unverifiable,sensitive_values_checked:values.length,matched_values:matched.size,mask_count:masks.length}};
-    }})()"#
-    ))
+    Ok(format!("({})({values})", MASKING.trim_end()))
 }
 
 fn safe_error(message: &str) -> String {
-    message.replace(
-        env::var("TYPESAFE_API_KEY").as_deref().unwrap_or("\0"),
-        "<masked-key>",
-    )
+    mask_provider_key(message, env::var("TYPESAFE_API_KEY").ok().as_deref())
+}
+
+fn mask_provider_key(message: &str, key: Option<&str>) -> String {
+    match key {
+        Some(key) if !key.is_empty() => message.replace(key, "<masked-key>"),
+        _ => message.to_owned(),
+    }
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
@@ -1045,9 +1122,68 @@ mod tests {
 
     #[test]
     fn mask_script_does_not_embed_json_as_executable_source() {
-        let script = masking_script(&["x'; throw new Error('leak')//".into()]).unwrap();
-        assert!(script.contains("throw new Error"));
-        assert!(script.contains("const values=[\"x'; throw"));
+        let values = vec![
+            "x'; throw new Error('leak')//".to_owned(),
+            "\"]); alert(1); ([\"".to_owned(),
+        ];
+        let script = masking_script(&values).unwrap();
+        let argument = script
+            .strip_prefix(&format!("({})(", MASKING.trim_end()))
+            .and_then(|rest| rest.strip_suffix(')'))
+            .expect("masking.js applied to one argument");
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(argument).unwrap(),
+            values,
+            "the argument is a JSON array literal holding exactly the values"
+        );
+    }
+
+    #[test]
+    fn a_failed_profile_removal_is_retried_without_terminating_again() {
+        let chrome = ScriptedChrome::start();
+        let mut browser = browser_with_client(chrome.connect_raw());
+        let profile = browser.profile.clone();
+        fs::remove_dir_all(&profile).unwrap();
+        assert!(matches!(browser.close(), Err(BrowserError::Control(_))));
+        assert_eq!(browser.lifecycle, Lifecycle::Terminated);
+        assert!(browser.child.try_wait().unwrap().is_some());
+
+        fs::create_dir(&profile).unwrap();
+        browser.close().unwrap();
+        assert_eq!(browser.lifecycle, Lifecycle::Closed);
+        assert!(!profile.exists());
+        browser.close().unwrap();
+    }
+
+    #[test]
+    fn navigation_reported_failed_by_chrome_is_an_error() {
+        let chrome = ScriptedChrome::start();
+        chrome.reply(
+            "Page.navigate",
+            json!({"frameId":"main","errorText":"net::ERR_CONNECTION_REFUSED"}),
+        );
+        let browser = browser_with_client(chrome.connect_raw());
+        assert!(matches!(
+            browser.navigate("http://127.0.0.1:9/"),
+            Err(BrowserError::Control(message)) if message == "navigation failed: net::ERR_CONNECTION_REFUSED"
+        ));
+        assert!(
+            chrome.received("Runtime.evaluate").is_empty(),
+            "no wait for a document that never loaded"
+        );
+    }
+
+    #[test]
+    fn an_empty_or_absent_provider_key_leaves_messages_unchanged() {
+        assert_eq!(
+            mask_provider_key("launch failed", Some("")),
+            "launch failed"
+        );
+        assert_eq!(mask_provider_key("launch failed", None), "launch failed");
+        assert_eq!(
+            mask_provider_key("bad sk-123 key", Some("sk-123")),
+            "bad <masked-key> key"
+        );
     }
 
     #[test]
@@ -1375,7 +1511,7 @@ mod tests {
                 display_mode: "headless".into(),
             },
             ownership,
-            closed: false,
+            lifecycle: Lifecycle::Running,
         };
         browser.close().unwrap();
         assert!(!profile.exists());
@@ -1405,7 +1541,7 @@ mod tests {
                 display_mode: "headless".into(),
             },
             ownership,
-            closed: false,
+            lifecycle: Lifecycle::Running,
         };
         browser.close().unwrap();
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
@@ -1466,7 +1602,7 @@ mod tests {
                 display_mode: "headless".into(),
             },
             ownership,
-            closed: false,
+            lifecycle: Lifecycle::Running,
         };
         browser.close().unwrap();
         assert_eq!(
@@ -1502,7 +1638,7 @@ mod tests {
                 display_mode: "headless".into(),
             },
             ownership,
-            closed: false,
+            lifecycle: Lifecycle::Running,
         }
     }
 }

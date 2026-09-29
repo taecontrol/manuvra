@@ -8,6 +8,11 @@
   for (const [id, element] of cache.nodes) if (!element.isConnected) cache.nodes.delete(id);
 
   const gaps = [], contexts = [], seenRoots = new Set();
+  // A frame's document starts at its content box, inside the border and padding.
+  const frameOrigin = (frame) => {
+    const rect = frame.getBoundingClientRect(), style = frame.ownerDocument.defaultView.getComputedStyle(frame);
+    return {x: rect.x + frame.clientLeft + parseFloat(style.paddingLeft), y: rect.y + frame.clientTop + parseFloat(style.paddingTop)};
+  };
   const visit = (root, context, offsetX, offsetY) => {
     if (!root || seenRoots.has(root)) return;
     seenRoots.add(root); contexts.push({root, context, offsetX, offsetY});
@@ -18,8 +23,8 @@
       let child;
       try { child = element.contentDocument; } catch (_) { child = null; }
       if (!child?.body) { gaps.push('cross_origin_frame'); continue; }
-      const rect = element.getBoundingClientRect();
-      visit(child, `${context}/frame:${nodeId(element)}`, offsetX + rect.x, offsetY + rect.y);
+      const origin = frameOrigin(element);
+      visit(child, `${context}/frame:${nodeId(element)}`, offsetX + origin.x, offsetY + origin.y);
     }
   };
   visit(document, 'main', 0, 0);
@@ -166,7 +171,6 @@
       if (content && !['none', 'normal', '""', "''"].includes(content)) gaps.push('generated_content');
     }
   }
-  const uniqueGaps = [...new Set(gaps)];
   const dialogTexts = {};
   for (const record of dialogRecords) {
     const text = (record.dialog.innerText || '').replace(/\s+/g,' ').trim();

@@ -109,6 +109,14 @@ pub(super) fn terminate(child: &mut Child, ownership: &mut BrowserOwnership) -> 
 }
 
 fn terminate_process(child: &mut Child) -> Result<(), String> {
+    // Once reaped, the pid may belong to an unrelated process; until then it stays ours.
+    if child
+        .try_wait()
+        .map_err(|error| safe_error(&error.to_string()))?
+        .is_some()
+    {
+        return Ok(());
+    }
     signal_process(child_pid(child)?, libc::SIGTERM)?;
     if wait_for_process_exit(child, Duration::from_secs(2))? {
         return Ok(());
