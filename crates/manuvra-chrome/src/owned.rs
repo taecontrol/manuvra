@@ -460,7 +460,12 @@ fn browser_command(binary: &Path, profile: &Path, config: &BrowserConfig) -> Com
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     if config.headless {
-        command.arg("--headless=new").arg("--disable-gpu");
+        // Headless presents a desktop mouse so hover/pointer media queries match the input
+        // Manuvra dispatches, including controls revealed only under @media (hover: hover).
+        command
+            .arg("--headless=new")
+            .arg("--disable-gpu")
+            .arg("--blink-settings=primaryHoverType=2,availableHoverTypes=2,primaryPointerType=4,availablePointerTypes=4");
     }
     command.arg("about:blank");
     command
@@ -1004,21 +1009,38 @@ mod tests {
         };
         let command = browser_command(binary, temporary.path(), &config);
         assert_eq!(command.get_program(), binary);
-        assert!(
-            command
-                .get_args()
-                .any(|arg| arg == "--remote-debugging-address=127.0.0.1")
-        );
-        assert!(
-            command
-                .get_args()
-                .any(|arg| arg == "--remote-debugging-port=0")
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "--remote-debugging-address=127.0.0.1",
+                "--remote-debugging-port=0",
+                &format!("--user-data-dir={}", temporary.path().display()),
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-background-networking",
+                "--window-size=1120,780",
+                "about:blank",
+            ]
         );
         assert!(
             command
                 .get_envs()
                 .any(|(name, value)| { name == "TYPESAFE_API_KEY" && value.is_none() })
         );
+    }
+
+    #[test]
+    fn headless_browser_command_declares_a_desktop_mouse() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config = BrowserConfig {
+            explicit_binary: None,
+            headless: true,
+            width: 1120,
+            height: 780,
+            inherit_process_group: false,
+        };
+        let command = browser_command(Path::new("/browser"), temporary.path(), &config);
+        assert!(command.get_args().any(|arg| arg == "--blink-settings=primaryHoverType=2,availableHoverTypes=2,primaryPointerType=4,availablePointerTypes=4"));
     }
 
     #[test]

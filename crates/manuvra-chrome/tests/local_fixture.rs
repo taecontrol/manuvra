@@ -1455,3 +1455,107 @@ fn production_hover_reveals_only_its_region_controls_for_a_following_click() {
     #[cfg(target_os = "macos")]
     lifecycle.assert_cleaned();
 }
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn headless_owned_browser_presents_a_desktop_mouse() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(
+        r#"<!doctype html><body><script>
+        for (const feature of ['hover: hover', 'any-hover: hover', 'pointer: fine', 'any-pointer: fine']) {
+            const result = document.createElement('p');
+            result.textContent = feature + '=' + matchMedia('(' + feature + ')').matches;
+            document.body.appendChild(result);
+        }
+        </script></body>"#,
+    );
+    let mut browser = launch_headless();
+    #[cfg(target_os = "macos")]
+    let lifecycle = BrowserLifecycle::observe(&browser);
+    browser.navigate(&server.url()).unwrap();
+    let observed = browser.observe().unwrap();
+    for feature in [
+        "hover: hover",
+        "any-hover: hover",
+        "pointer: fine",
+        "any-pointer: fine",
+    ] {
+        assert!(
+            has_line(&observed, &format!("{feature}=true")),
+            "{}",
+            observed.visible_text
+        );
+    }
+    browser.close().unwrap();
+    #[cfg(target_os = "macos")]
+    lifecycle.assert_cleaned();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn headless_hover_reveals_media_gated_row_actions_for_a_following_click() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(HOVER_FIXTURE);
+    let mut browser = launch_headless();
+    #[cfg(target_os = "macos")]
+    let lifecycle = BrowserLifecycle::observe(&browser);
+    browser.navigate(&server.url()).unwrap();
+    let cancellation = InputCancellation::default();
+    let observed = browser.observe().unwrap();
+    assert_no_hidden_candidates(&observed);
+    let region = observed
+        .hover_regions
+        .iter()
+        .find(|region| region.name == "Rent")
+        .expect("Rent hover region");
+    browser
+        .perform(
+            PreparedInput {
+                document_id: observed.document_id.clone(),
+                node_id: region.node_id,
+                operation: PreparedOperation::Hover,
+                text: None,
+                previous_text: None,
+                option_node_id: None,
+                combobox: false,
+                action_sequence: 1,
+                focus_anchor: None,
+            },
+            &cancellation,
+        )
+        .unwrap();
+    let revealed = browser.observe().unwrap();
+    assert!(
+        candidate(&revealed, "Actions for Rent").is_some(),
+        "the media-gated control is a candidate after hover"
+    );
+    assert!(candidate(&revealed, "Actions for Groceries").is_none());
+    browser
+        .perform(
+            prepared(
+                &revealed,
+                "Actions for Rent",
+                PreparedOperation::Click,
+                None,
+                None,
+                2,
+            ),
+            &cancellation,
+        )
+        .unwrap();
+    let opened = browser.observe().unwrap();
+    assert_eq!(
+        candidate(&opened, "Actions for Rent").and_then(|element| element.expanded),
+        Some(true)
+    );
+    assert!(has_line(&opened, "Actions menu for Rent"));
+    assert!(
+        opened
+            .elements
+            .iter()
+            .any(|element| element.role == "menuitem" && element.name == "Delete category…")
+    );
+    browser.close().unwrap();
+    #[cfg(target_os = "macos")]
+    lifecycle.assert_cleaned();
+}
