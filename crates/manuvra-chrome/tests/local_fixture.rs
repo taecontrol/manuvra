@@ -14,8 +14,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::Duration;
 #[cfg(target_os = "macos")]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 const FIXTURE: &str = include_str!("../../../tests/fixtures/browser-adversarial.html");
 const INPUT_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-input-strategies.html");
@@ -24,6 +25,10 @@ const KEYBOARD_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-key
 const ACTIVATION_FIXTURE: &str =
     include_str!("../../../tests/fixtures/browser-keyboard-activation.html");
 const WIDGET_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-keyboard-widgets.html");
+const SUBMIT_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-keyboard-submit.html");
+const REVALIDATION_FIXTURE: &str =
+    include_str!("../../../tests/fixtures/browser-keyboard-revalidation.html");
+const EDITING_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-keyboard-editing.html");
 static REAL_BROWSER: Mutex<()> = Mutex::new(());
 
 #[cfg(target_os = "macos")]
@@ -119,12 +124,22 @@ struct FixtureServer {
     worker: Option<thread::JoinHandle<()>>,
 }
 
+type SlowPath = (&'static str, Duration);
+
 impl FixtureServer {
     fn start() -> Self {
         Self::with_body(FIXTURE)
     }
 
     fn with_body(body: &'static str) -> Self {
+        Self::serve(body, None)
+    }
+
+    fn with_slow_path(body: &'static str, path: &'static str, delay: Duration) -> Self {
+        Self::serve(body, Some((path, delay)))
+    }
+
+    fn serve(body: &'static str, slow: Option<SlowPath>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
@@ -133,9 +148,9 @@ impl FixtureServer {
         let worker = thread::spawn(move || {
             while !worker_stop.load(Ordering::Relaxed) {
                 match listener.accept() {
-                    Ok((mut stream, _)) => serve_fixture(&mut stream, body),
+                    Ok((mut stream, _)) => serve_fixture(&mut stream, body, slow),
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(std::time::Duration::from_millis(5));
+                        thread::sleep(Duration::from_millis(5));
                     }
                     Err(error) => panic!("fixture server failed: {error}"),
                 }
@@ -163,15 +178,70 @@ impl Drop for FixtureServer {
     }
 }
 
-fn serve_fixture(stream: &mut TcpStream, body: &str) {
-    let mut request = [0_u8; 2048];
-    let _ = stream.read(&mut request);
+fn serve_fixture(stream: &mut TcpStream, body: &str, slow: Option<SlowPath>) {
+    let request = read_request(stream);
+    let target = request.split_whitespace().nth(1).unwrap_or("/");
+    if let Some((path, delay)) = slow
+        && target.starts_with(path)
+    {
+        thread::sleep(delay);
+    }
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
     );
-    stream.write_all(response.as_bytes()).unwrap();
+    let _ = stream.write_all(response.as_bytes());
+}
+
+fn read_request(stream: &mut TcpStream) -> String {
+    stream.set_nonblocking(false).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut request = Vec::new();
+    let mut chunk = [0_u8; 2048];
+    while !request_complete(&request) {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => request.extend_from_slice(&chunk[..read]),
+        }
+    }
+    String::from_utf8_lossy(&request).into_owned()
+}
+
+fn request_complete(request: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(request);
+    let Some(end) = text.find("\r\n\r\n") else {
+        return false;
+    };
+    let length = text[..end]
+        .lines()
+        .find_map(|line| {
+            line.to_ascii_lowercase()
+                .strip_prefix("content-length:")
+                .and_then(|value| value.trim().parse::<usize>().ok())
+        })
+        .unwrap_or(0);
+    request.len() >= end + 4 + length
+}
+
+fn launch_headless() -> OwnedBrowser {
+    OwnedBrowser::launch(BrowserConfig {
+        explicit_binary: None,
+        headless: true,
+        width: 1120,
+        height: 780,
+        inherit_process_group: false,
+    })
+    .unwrap()
+}
+
+fn has_line(observation: &Observation, expected: &str) -> bool {
+    observation
+        .visible_text
+        .lines()
+        .any(|line| line == expected)
 }
 
 fn prepared(
@@ -322,6 +392,29 @@ fn arrow_home_end_and_enter_follow_composite_widget_state() {
     assert_eq!(descendant.id, "gamma");
     assert_eq!(descendant.name, "");
     assert_eq!(descendant.role, "");
+    assert_eq!(shadow_anchor.position, None);
+    for (sequence, (key, position)) in [
+        (Key::Tab, 1),
+        (Key::ArrowDown, 2),
+        (Key::ArrowDown, 3),
+        (Key::Tab, 7),
+        (Key::ArrowDown, 8),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        browser
+            .perform(
+                prepared_key(&observed, key, 7 + sequence as u64),
+                &InputCancellation::default(),
+            )
+            .unwrap();
+        observed = browser.observe().unwrap();
+        let anchor = observed.focus_anchor.as_ref().unwrap();
+        assert_eq!(anchor.role, "treeitem", "{key:?}");
+        assert_eq!(anchor.name, "", "{key:?}");
+        assert_eq!(anchor.position, Some(position), "{key:?}");
+    }
     browser.close().unwrap();
     #[cfg(target_os = "macos")]
     lifecycle.assert_cleaned();
@@ -362,7 +455,7 @@ fn enter_and_space_activate_a_focused_native_button_once_each() {
             .unwrap();
         let after = browser.observe().unwrap();
         assert!(
-            after.visible_text.contains("Activations: 1"),
+            has_line(&after, "Activations: 1"),
             "{key:?}: {}",
             after.visible_text
         );
@@ -520,20 +613,30 @@ fn production_snapshot_and_masking_cover_truncation_split_nodes_and_zero_masks()
 fn production_snapshot_observes_indexed_dialog_and_body_focus() {
     let _serial = REAL_BROWSER.lock().unwrap();
     let server = FixtureServer::with_body(FOCUS_FIXTURE);
-    let mut browser = OwnedBrowser::launch(BrowserConfig {
-        explicit_binary: None,
-        headless: true,
-        width: 1120,
-        height: 780,
-        inherit_process_group: false,
-    })
-    .unwrap();
-    for (query, focused, name, role, indexed) in [
-        ("button", true, "Save", "button", true),
-        ("dialog", true, "Breakdown", "interactive", false),
-        ("native-dialog", true, "Native breakdown", "dialog", false),
-        ("shadow", true, "Shadow details", "interactive", false),
-        ("body", false, "", "", false),
+    let mut browser = launch_headless();
+    #[cfg(target_os = "macos")]
+    let lifecycle = BrowserLifecycle::observe(&browser);
+    for (query, focused, name, role, indexed, dialog) in [
+        ("button", true, "Save", "button", true, None),
+        ("dialog", true, "", "interactive", false, Some("Breakdown")),
+        (
+            "labelled-dialog",
+            true,
+            "Breakdown",
+            "dialog",
+            false,
+            Some("Breakdown"),
+        ),
+        (
+            "native-dialog",
+            true,
+            "Native breakdown",
+            "dialog",
+            false,
+            Some("Native breakdown"),
+        ),
+        ("shadow", true, "Shadow details", "interactive", false, None),
+        ("body", false, "", "", false, None),
     ] {
         browser
             .navigate(&format!("{}?focus={query}", server.url()))
@@ -544,11 +647,15 @@ fn production_snapshot_observes_indexed_dialog_and_body_focus() {
         if let Some(anchor) = observed.focus_anchor {
             assert_eq!(anchor.name, name, "{query}");
             assert_eq!(anchor.role, role, "{query}");
+            assert_eq!(anchor.in_dialog.as_deref(), dialog, "{query}");
             assert!(anchor.covered, "{query}");
+            assert_eq!(anchor.surface, None, "{query}");
             assert!(!anchor.name.contains("Descendant text"));
         }
     }
     browser.close().unwrap();
+    #[cfg(target_os = "macos")]
+    lifecycle.assert_cleaned();
 }
 
 #[test]
@@ -556,14 +663,9 @@ fn production_snapshot_observes_indexed_dialog_and_body_focus() {
 fn production_snapshot_resolves_dialog_across_open_shadow_root() {
     let _serial = REAL_BROWSER.lock().unwrap();
     let server = FixtureServer::with_body(FOCUS_FIXTURE);
-    let mut browser = OwnedBrowser::launch(BrowserConfig {
-        explicit_binary: None,
-        headless: true,
-        width: 1120,
-        height: 780,
-        inherit_process_group: false,
-    })
-    .unwrap();
+    let mut browser = launch_headless();
+    #[cfg(target_os = "macos")]
+    let lifecycle = BrowserLifecycle::observe(&browser);
     browser
         .navigate(&format!("{}?focus=shadow-dialog", server.url()))
         .unwrap();
@@ -578,7 +680,16 @@ fn production_snapshot_resolves_dialog_across_open_shadow_root() {
         .unwrap();
     assert_eq!(button.in_dialog.as_deref(), Some("Checkout"));
     assert_eq!(observed.focused, Some(button.index));
+    let labelled = observed
+        .elements
+        .iter()
+        .find(|element| element.name == "Shadow labelled action")
+        .expect("aria-labelledby resolves inside the element's shadow root");
+    assert_eq!(labelled.role, "button");
+    assert_eq!(labelled.in_dialog, None);
     browser.close().unwrap();
+    #[cfg(target_os = "macos")]
+    lifecycle.assert_cleaned();
 }
 
 #[test]
@@ -586,14 +697,9 @@ fn production_snapshot_resolves_dialog_across_open_shadow_root() {
 fn production_snapshot_uses_aria_name_inside_shadow_dialog() {
     let _serial = REAL_BROWSER.lock().unwrap();
     let server = FixtureServer::with_body(FOCUS_FIXTURE);
-    let mut browser = OwnedBrowser::launch(BrowserConfig {
-        explicit_binary: None,
-        headless: true,
-        width: 1120,
-        height: 780,
-        inherit_process_group: false,
-    })
-    .unwrap();
+    let mut browser = launch_headless();
+    #[cfg(target_os = "macos")]
+    let lifecycle = BrowserLifecycle::observe(&browser);
     browser
         .navigate(&format!("{}?focus=shadow-dialog-pin", server.url()))
         .unwrap();
@@ -603,6 +709,222 @@ fn production_snapshot_uses_aria_name_inside_shadow_dialog() {
     assert_eq!(anchor.in_dialog.as_deref(), Some("Checkout"));
     assert_eq!(observed.focused, None);
     browser.close().unwrap();
+    #[cfg(target_os = "macos")]
+    lifecycle.assert_cleaned();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn production_snapshot_marks_focus_inside_uncovered_surfaces() {
+    use manuvra_chrome::FocusSurface;
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(FOCUS_FIXTURE);
+    let mut browser = launch_headless();
+    #[cfg(target_os = "macos")]
+    let lifecycle = BrowserLifecycle::observe(&browser);
+    for (query, covered, surface) in [
+        ("closed-shadow", false, Some(FocusSurface::ClosedShadowRoot)),
+        (
+            "declarative-shadow",
+            false,
+            Some(FocusSurface::ClosedShadowRoot),
+        ),
+        ("canvas", true, Some(FocusSurface::Canvas)),
+        ("frame", true, None),
+    ] {
+        browser
+            .navigate(&format!("{}?focus={query}", server.url()))
+            .unwrap();
+        let observed = browser.observe().unwrap();
+        let anchor = observed.focus_anchor.as_ref().expect(query);
+        assert_eq!(anchor.covered, covered, "{query}");
+        assert_eq!(anchor.surface, surface, "{query}");
+        assert!(!anchor.name.contains("inner"), "{query}");
+    }
+    let observed = browser.observe().unwrap();
+    let anchor = observed.focus_anchor.as_ref().unwrap();
+    assert!(anchor.context.starts_with("main/frame:"), "{anchor:?}");
+    assert_eq!(anchor.name, "Frame field");
+    assert_eq!(anchor.role, "textbox");
+    let field = observed
+        .elements
+        .iter()
+        .find(|element| element.name == "Frame field")
+        .unwrap();
+    assert_eq!(observed.focused, Some(field.index));
+    assert_eq!(anchor.context, field.context);
+    browser.close().unwrap();
+    #[cfg(target_os = "macos")]
+    lifecycle.assert_cleaned();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn production_snapshot_marks_focus_inside_a_cross_origin_frame() {
+    use manuvra_chrome::{FocusSurface, Key};
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(FOCUS_FIXTURE);
+    let other_origin = FixtureServer::with_body(FOCUS_FIXTURE);
+    let mut browser = launch_headless();
+    #[cfg(target_os = "macos")]
+    let lifecycle = BrowserLifecycle::observe(&browser);
+    browser
+        .navigate(&format!(
+            "{}?focus=cross-origin-frame&frame={}",
+            server.url(),
+            other_origin.url()
+        ))
+        .unwrap();
+    let observed = browser.observe().unwrap();
+    assert_eq!(observed.focus_anchor.as_ref().unwrap().name, "Before frame");
+    browser
+        .perform(
+            prepared_key(&observed, Key::Tab, 1),
+            &InputCancellation::default(),
+        )
+        .unwrap();
+    let observed = browser.observe().unwrap();
+    let anchor = observed.focus_anchor.as_ref().unwrap();
+    assert_eq!(anchor.role, "iframe");
+    assert!(!anchor.covered);
+    assert_eq!(anchor.surface, Some(FocusSurface::CrossOriginFrame));
+    browser.close().unwrap();
+    #[cfg(target_os = "macos")]
+    lifecycle.assert_cleaned();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn enter_on_a_submit_button_settles_slow_navigation_before_the_next_capture() {
+    use manuvra_chrome::Key;
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server =
+        FixtureServer::with_slow_path(SUBMIT_FIXTURE, "/submitted", Duration::from_millis(1500));
+    let mut browser = launch_headless();
+    #[cfg(target_os = "macos")]
+    let lifecycle = BrowserLifecycle::observe(&browser);
+    for (query, button) in [("", "Submit"), ("?focus=validated", "Validate and submit")] {
+        browser
+            .navigate(&format!("{}{query}", server.url()))
+            .unwrap();
+        let observed = browser.observe().unwrap();
+        assert_eq!(observed.focus_anchor.as_ref().unwrap().name, button);
+        browser
+            .perform(
+                prepared_key(&observed, Key::Enter, 1),
+                &InputCancellation::default(),
+            )
+            .unwrap();
+        let captured = browser.capture().unwrap().observation;
+        assert_eq!(captured.title, "Submitted", "{button}");
+        assert_eq!(captured.route, "/submitted", "{button}");
+        assert!(
+            has_line(&captured, "Submitted page"),
+            "{button}: {}",
+            captured.visible_text
+        );
+    }
+    browser.close().unwrap();
+    #[cfg(target_os = "macos")]
+    lifecycle.assert_cleaned();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn stale_focus_anchor_rejects_the_key_before_any_keydown_reaches_the_page() {
+    use manuvra_chrome::Key;
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(REVALIDATION_FIXTURE);
+    let mut browser = launch_headless();
+    #[cfg(target_os = "macos")]
+    let lifecycle = BrowserLifecycle::observe(&browser);
+    browser.navigate(&server.url()).unwrap();
+    let stale = browser.observe().unwrap();
+    assert_eq!(stale.focus_anchor.as_ref().unwrap().name, "First");
+    browser
+        .perform(
+            prepared(
+                &stale,
+                "Move focus",
+                PreparedOperation::Click,
+                None,
+                None,
+                1,
+            ),
+            &InputCancellation::default(),
+        )
+        .unwrap();
+    assert!(matches!(
+        browser.perform(
+            prepared_key(&stale, Key::Tab, 2),
+            &InputCancellation::default(),
+        ),
+        Err(PerformError::Rejected(reason)) if reason == "focus_changed"
+    ));
+    let current = browser.observe().unwrap();
+    assert!(
+        has_line(&current, "Keydowns: 0"),
+        "{}",
+        current.visible_text
+    );
+    assert_eq!(current.focus_anchor.as_ref().unwrap().name, "Field");
+    browser
+        .perform(
+            prepared_key(&current, Key::Tab, 3),
+            &InputCancellation::default(),
+        )
+        .unwrap();
+    let after = browser.observe().unwrap();
+    assert!(has_line(&after, "Keydowns: 1"), "{}", after.visible_text);
+    browser.close().unwrap();
+    #[cfg(target_os = "macos")]
+    lifecycle.assert_cleaned();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn arrow_keys_move_the_native_caret_in_text_fields() {
+    use manuvra_chrome::Key;
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(EDITING_FIXTURE);
+    let mut browser = launch_headless();
+    #[cfg(target_os = "macos")]
+    let lifecycle = BrowserLifecycle::observe(&browser);
+    for (query, field, steps) in [
+        (
+            "",
+            "Line",
+            [(Key::ArrowLeft, "Caret: 2"), (Key::ArrowRight, "Caret: 3")],
+        ),
+        (
+            "?field=lines",
+            "Lines",
+            [(Key::ArrowDown, "Caret: 3"), (Key::ArrowUp, "Caret: 0")],
+        ),
+    ] {
+        browser
+            .navigate(&format!("{}{query}", server.url()))
+            .unwrap();
+        let mut observed = browser.observe().unwrap();
+        assert_eq!(observed.focus_anchor.as_ref().unwrap().name, field);
+        for (sequence, (key, caret)) in steps.into_iter().enumerate() {
+            browser
+                .perform(
+                    prepared_key(&observed, key, sequence as u64 + 1),
+                    &InputCancellation::default(),
+                )
+                .unwrap();
+            observed = browser.observe().unwrap();
+            assert!(
+                has_line(&observed, caret),
+                "{key:?}: {}",
+                observed.visible_text
+            );
+        }
+    }
+    browser.close().unwrap();
+    #[cfg(target_os = "macos")]
+    lifecycle.assert_cleaned();
 }
 
 #[test]

@@ -836,6 +836,7 @@ pub(crate) mod test_support {
         pending_events: VecDeque<Value>,
         ping_once: bool,
         invalid_json_methods: HashSet<String>,
+        invalid_json_on_call: HashMap<String, usize>,
         binary_once: bool,
         http_status: Option<u16>,
         http_body: Option<Vec<u8>>,
@@ -933,6 +934,14 @@ pub(crate) mod test_support {
                 .expect("scripted Chrome")
                 .invalid_json_methods
                 .insert(method.to_owned());
+        }
+
+        pub fn reply_invalid_json_on_call(&self, method: &str, call: usize) {
+            self.script
+                .lock()
+                .expect("scripted Chrome")
+                .invalid_json_on_call
+                .insert(method.to_owned(), call);
         }
 
         pub fn send_binary_once(&self) {
@@ -1140,12 +1149,13 @@ pub(crate) mod test_support {
         let (reply, invalid) = {
             let mut script = script.lock().expect("scripted Chrome");
             script.received.push(value.clone());
-            let invalid = script.invalid_json_methods.contains(&method);
             let call = script
                 .received
                 .iter()
                 .filter(|item| item["method"] == method)
                 .count();
+            let invalid = script.invalid_json_methods.contains(&method)
+                || script.invalid_json_on_call.get(&method) == Some(&call);
             let reply = if script.reject.contains(&method)
                 || script.reject_on_call.get(&method) == Some(&call)
             {

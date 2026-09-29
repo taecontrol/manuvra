@@ -703,6 +703,7 @@ mod tests {
             expanded: None,
             selected: None,
             checked: None,
+            position: None,
         });
         assert_eq!(focus_matches(&observed, &wanted), DoneResult::Satisfied);
         observed.elements.push(Element {
@@ -711,12 +712,40 @@ mod tests {
             ..observed.elements[0].clone()
         });
         assert_eq!(focus_matches(&observed, &wanted), DoneResult::Unknown);
-        observed.focus_anchor.as_mut().unwrap().name = "Other".into();
+        observed.elements.truncate(1);
+        observed.focus_anchor.as_mut().unwrap().role = "combobox".into();
         assert_eq!(focus_matches(&observed, &wanted), DoneResult::NotSatisfied);
+        observed.focus_anchor.as_mut().unwrap().role = "textbox".into();
         observed.focus_anchor.as_mut().unwrap().covered = false;
         assert_eq!(focus_matches(&observed, &wanted), DoneResult::Unknown);
-        observed.focus_anchor = None;
+        observed.focus_anchor.as_mut().unwrap().name = "Other".into();
+        assert_eq!(focus_matches(&observed, &wanted), DoneResult::Unknown);
+        observed.focus_anchor.as_mut().unwrap().covered = true;
         assert_eq!(focus_matches(&observed, &wanted), DoneResult::NotSatisfied);
+        let mut dialog_anchor = observed.focus_anchor.take().unwrap();
+        assert_eq!(focus_matches(&observed, &wanted), DoneResult::NotSatisfied);
+
+        let dialog = manuvra_contract::Focused {
+            focused: "create account".into(),
+            role: None,
+            dialog: None,
+        };
+        dialog_anchor.node_id = 40;
+        dialog_anchor.role = "dialog".into();
+        dialog_anchor.name = "Create account".into();
+        observed.focus_anchor = Some(dialog_anchor);
+        assert_eq!(focus_matches(&observed, &dialog), DoneResult::Satisfied);
+        observed.elements[0].role = "button".into();
+        observed.elements[0].name = "Create account".into();
+        assert_eq!(focus_matches(&observed, &dialog), DoneResult::Unknown);
+        let dialog_role = manuvra_contract::Focused {
+            role: Some("dialog".into()),
+            ..dialog
+        };
+        assert_eq!(
+            focus_matches(&observed, &dialog_role),
+            DoneResult::Satisfied
+        );
     }
 
     fn values() -> BTreeMap<String, JobValue> {

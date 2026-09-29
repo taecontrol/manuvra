@@ -8,6 +8,21 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "macos")]
+#[path = "input/darwin.rs"]
+mod platform;
+#[cfg(target_os = "linux")]
+#[path = "input/linux.rs"]
+mod platform;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+mod platform {
+    use super::Key;
+    use serde_json::Value;
+
+    pub(super) fn add_editing_commands(_key: Key, _event: &mut Value) {}
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreparedOperation {
     Click,
@@ -116,11 +131,6 @@ pub(crate) fn perform(
     client.set_action_sequence(input.action_sequence);
     let fence = client.cursor();
     let result = perform_input(client, &input, cancellation);
-    if matches!(input.operation, PreparedOperation::PressKey(_))
-        && client.snapshot_since(fence).overflowed
-    {
-        return Err(PerformError::Uncertain("CDP journal overflowed".into()));
-    }
     complete_with_journal(client, fence, result)
 }
 
@@ -181,7 +191,7 @@ fn revalidate_focus(
         json!({"expression":include_str!("snapshot.js"),"returnByValue":true}),
         cancellation,
     )?;
-    let fresh: crate::Observation = serde_json::from_value(
+    let mut fresh: crate::Observation = serde_json::from_value(
         response
             .pointer("/result/value")
             .cloned()
@@ -191,6 +201,9 @@ fn revalidate_focus(
     if fresh.document_id != input.document_id {
         return Err(PerformError::Rejected("document_changed".into()));
     }
+    crate::observation::mark_closed_shadow_focus(&mut fresh, |method, params| {
+        command(client, method, params, cancellation)
+    })?;
     if !focus_identity_matches(&fresh.focus_anchor, &input.focus_anchor) {
         return Err(PerformError::Rejected("focus_changed".into()));
     }
@@ -210,45 +223,16 @@ fn press_key(
     key: Key,
     cancellation: &InputCancellation,
 ) -> Result<PerformFact, PerformError> {
-    const FIELDS: [(&str, &str, u32, u32); 11] = [
-        ("Escape", "Escape", 27, 0),
-        ("Tab", "Tab", 9, 0),
-        ("Tab", "Tab", 9, 8),
-        ("Enter", "Enter", 13, 0),
-        (" ", "Space", 32, 0),
-        ("ArrowUp", "ArrowUp", 38, 0),
-        ("ArrowDown", "ArrowDown", 40, 0),
-        ("ArrowLeft", "ArrowLeft", 37, 0),
-        ("ArrowRight", "ArrowRight", 39, 0),
-        ("Home", "Home", 36, 0),
-        ("End", "End", 35, 0),
-    ];
-    let (name, code, virtual_key, modifiers) = FIELDS[key as usize];
-    let params = |event_type| {
-        let mut event = json!({
-            "type":event_type,"key":name,"code":code,
-            "windowsVirtualKeyCode":virtual_key,"nativeVirtualKeyCode":virtual_key,
-            "modifiers":modifiers
-        });
-        if event_type == "keyDown" {
-            match key {
-                Key::Enter => event["text"] = json!("\r"),
-                Key::Space => event["text"] = json!(" "),
-                _ => {}
-            }
-        }
-        event
-    };
     command(
         client,
         "Input.dispatchKeyEvent",
-        params("keyDown"),
+        key_down(key),
         cancellation,
     )?;
     command_after_suboperation(
         client,
         "Input.dispatchKeyEvent",
-        params("keyUp"),
+        key_event("keyUp", key),
         cancellation,
     )?;
     Ok(PerformFact {
@@ -256,6 +240,61 @@ fn press_key(
         readback_matches: None,
         suboperations: vec!["key_down".into(), "key_up".into()],
     })
+}
+
+fn key_down(key: Key) -> Value {
+    let mut event = key_event("keyDown", key);
+    if let Some(text) = key_text(key) {
+        event["text"] = json!(text);
+    }
+    platform::add_editing_commands(key, &mut event);
+    event
+}
+
+fn key_text(key: Key) -> Option<&'static str> {
+    match key {
+        Key::Enter => Some("\r"),
+        Key::Space => Some(" "),
+        _ => None,
+    }
+}
+
+fn key_event(event_type: &str, key: Key) -> Value {
+    let (name, code, virtual_key, modifiers) = key_fields(key);
+    json!({
+        "type":event_type,"key":name,"code":code,
+        "windowsVirtualKeyCode":virtual_key,"nativeVirtualKeyCode":virtual_key,
+        "modifiers":modifiers
+    })
+}
+
+type KeyFields = (&'static str, &'static str, u32, u32);
+
+const SHIFT_MODIFIER: u32 = 8;
+
+fn key_fields(key: Key) -> KeyFields {
+    match key {
+        Key::Escape => ("Escape", "Escape", 27, 0),
+        Key::Tab => ("Tab", "Tab", 9, 0),
+        Key::ShiftTab => ("Tab", "Tab", 9, SHIFT_MODIFIER),
+        Key::Enter => ("Enter", "Enter", 13, 0),
+        Key::Space => (" ", "Space", 32, 0),
+        Key::ArrowUp | Key::ArrowDown | Key::ArrowLeft | Key::ArrowRight | Key::Home | Key::End => {
+            navigation_key_fields(key)
+        }
+    }
+}
+
+fn navigation_key_fields(key: Key) -> KeyFields {
+    match key {
+        Key::ArrowUp => ("ArrowUp", "ArrowUp", 38, 0),
+        Key::ArrowDown => ("ArrowDown", "ArrowDown", 40, 0),
+        Key::ArrowLeft => ("ArrowLeft", "ArrowLeft", 37, 0),
+        Key::ArrowRight => ("ArrowRight", "ArrowRight", 39, 0),
+        Key::Home => ("Home", "Home", 36, 0),
+        Key::End => ("End", "End", 35, 0),
+        Key::Escape | Key::Tab | Key::ShiftTab | Key::Enter | Key::Space => key_fields(key),
+    }
 }
 
 fn complete_with_journal(
@@ -721,6 +760,7 @@ mod tests {
                 expanded: None,
                 selected: None,
                 checked: None,
+                position: None,
             }),
         }
     }
@@ -736,38 +776,143 @@ mod tests {
         );
     }
 
-    #[test]
-    fn focus_revalidation_checks_identity_without_freezing_widget_state() {
+    fn press(
+        expected: Option<FocusAnchor>,
+        script: impl FnOnce(&ScriptedChrome),
+    ) -> (Result<PerformFact, PerformError>, usize) {
         let chrome = ScriptedChrome::start();
-        let input = focus_input(Key::ArrowDown);
-        let mut changed_state = input.focus_anchor.clone().unwrap();
-        changed_state.expanded = Some(true);
-        changed_state.active_descendant = Some(crate::ActiveDescendant {
-            id: "beta".into(),
+        script(&chrome);
+        let mut input = focus_input(Key::Tab);
+        input.focus_anchor = expected;
+        let result = perform(&chrome.connect_raw(), input, &InputCancellation::default());
+        (result, chrome.received("Input.dispatchKeyEvent").len())
+    }
+
+    fn anchor() -> FocusAnchor {
+        focus_input(Key::Tab).focus_anchor.unwrap()
+    }
+
+    fn descendant(id: &str, name: &str, selected: Option<bool>) -> crate::ActiveDescendant {
+        crate::ActiveDescendant {
+            id: id.into(),
             role: "option".into(),
-            name: "Beta".into(),
-            selected: Some(false),
+            name: name.into(),
+            selected,
             checked: None,
+        }
+    }
+
+    #[test]
+    fn stale_focus_or_document_rejects_without_key_dispatch() {
+        let mut widget = anchor();
+        widget.active_descendant = Some(descendant("alpha", "Alpha", None));
+        widget.position = Some(1);
+        let mut stale = vec![(Some(anchor()), None), (None, Some(anchor()))];
+        for change in [
+            (|anchor: &mut FocusAnchor| anchor.name = "Other".into()) as fn(&mut FocusAnchor),
+            |anchor| anchor.node_id = 8,
+            |anchor| anchor.expanded = Some(true),
+            |anchor| anchor.selected = Some(true),
+            |anchor| anchor.checked = Some(false),
+            |anchor| anchor.position = Some(2),
+            |anchor| anchor.active_descendant = None,
+            |anchor| anchor.active_descendant.as_mut().unwrap().id = "beta".into(),
+            |anchor| anchor.active_descendant.as_mut().unwrap().name = "Beta".into(),
+            |anchor| anchor.active_descendant.as_mut().unwrap().role = "treeitem".into(),
+        ] {
+            let mut fresh = widget.clone();
+            change(&mut fresh);
+            stale.push((Some(widget.clone()), Some(fresh)));
+        }
+        for (expected, fresh) in stale {
+            let (result, key_events) = press(expected, |chrome| reply_focus(chrome, fresh, "d"));
+            assert!(
+                matches!(result, Err(PerformError::Rejected(ref reason)) if reason == "focus_changed"),
+                "{result:?}"
+            );
+            assert_eq!(key_events, 0);
+        }
+
+        let (result, key_events) = press(Some(anchor()), |chrome| {
+            reply_focus(chrome, Some(anchor()), "changed")
         });
-        reply_focus(&chrome, Some(changed_state), "d");
-        assert!(perform(&chrome.connect_raw(), input, &InputCancellation::default()).is_ok());
-        assert_eq!(chrome.received("Input.dispatchKeyEvent").len(), 2);
+        assert!(
+            matches!(result, Err(PerformError::Rejected(ref reason)) if reason == "document_changed")
+        );
+        assert_eq!(key_events, 0);
+
+        for snapshot in [json!(null), json!({"document_id":"d"})] {
+            let (result, key_events) = press(Some(anchor()), |chrome| {
+                chrome.reply("Runtime.evaluate", json!({"result":{"value":snapshot}}))
+            });
+            assert!(
+                matches!(result, Err(PerformError::Rejected(ref reason)) if reason == "focus observation unavailable")
+            );
+            assert_eq!(key_events, 0);
+        }
+    }
+
+    #[test]
+    fn focus_revalidation_ignores_only_the_descendant_selection_state() {
+        let mut expected = anchor();
+        expected.active_descendant = Some(descendant("beta", "Beta", Some(false)));
+        let mut fresh = expected.clone();
+        fresh.active_descendant = Some(descendant("beta", "Beta", Some(true)));
+        let (result, key_events) = press(Some(expected), |chrome| {
+            reply_focus(chrome, Some(fresh), "d")
+        });
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(key_events, 2);
+    }
+
+    #[test]
+    fn focus_inside_a_closed_shadow_host_is_revalidated_through_cdp() {
+        let (result, key_events) = press(Some(anchor()), |chrome| {
+            reply_focus(chrome, Some(anchor()), "d");
+            chrome.reply(
+                "Runtime.evaluate",
+                json!({"result":{"type":"object","objectId":"focus-7"}}),
+            );
+            chrome.reply(
+                "DOM.describeNode",
+                json!({"node":{"shadowRoots":[{"shadowRootType":"closed"}]}}),
+            );
+        });
+        assert!(
+            matches!(result, Err(PerformError::Rejected(ref reason)) if reason == "focus_changed"),
+            "{result:?}"
+        );
+        assert_eq!(key_events, 0);
+
+        let (result, key_events) = press(Some(anchor()), |chrome| {
+            reply_focus(chrome, Some(anchor()), "d");
+            chrome.reply(
+                "Runtime.evaluate",
+                json!({"result":{"type":"object","objectId":"focus-7"}}),
+            );
+            chrome.reply(
+                "DOM.describeNode",
+                json!({"node":{"shadowRoots":[{"shadowRootType":"open"}]}}),
+            );
+        });
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(key_events, 2);
     }
 
     #[test]
     fn press_key_dispatches_exactly_two_events_with_native_key_parameters() {
-        for key in [
-            Key::Escape,
-            Key::Tab,
-            Key::ShiftTab,
-            Key::Enter,
-            Key::Space,
-            Key::ArrowUp,
-            Key::ArrowDown,
-            Key::ArrowLeft,
-            Key::ArrowRight,
-            Key::Home,
-            Key::End,
+        for (key, name, code, virtual_key) in [
+            (Key::Escape, "Escape", "Escape", 27),
+            (Key::Tab, "Tab", "Tab", 9),
+            (Key::ShiftTab, "Tab", "Tab", 9),
+            (Key::Enter, "Enter", "Enter", 13),
+            (Key::Space, " ", "Space", 32),
+            (Key::ArrowUp, "ArrowUp", "ArrowUp", 38),
+            (Key::ArrowDown, "ArrowDown", "ArrowDown", 40),
+            (Key::ArrowLeft, "ArrowLeft", "ArrowLeft", 37),
+            (Key::ArrowRight, "ArrowRight", "ArrowRight", 39),
+            (Key::Home, "Home", "Home", 36),
+            (Key::End, "End", "End", 35),
         ] {
             let chrome = ScriptedChrome::start();
             let input = focus_input(key);
@@ -777,84 +922,29 @@ mod tests {
             assert_eq!(fact.suboperations, ["key_down", "key_up"]);
             let events = chrome.received("Input.dispatchKeyEvent");
             assert_eq!(events.len(), 2, "{key:?}");
-            assert_eq!(events[0]["params"]["type"], "keyDown");
-            assert_eq!(events[1]["params"]["type"], "keyUp");
-            assert_eq!(
-                events[0]["params"]["key"],
-                match key {
-                    Key::Escape => "Escape",
-                    Key::Tab | Key::ShiftTab => "Tab",
-                    Key::Enter => "Enter",
-                    Key::Space => " ",
-                    Key::ArrowUp => "ArrowUp",
-                    Key::ArrowDown => "ArrowDown",
-                    Key::ArrowLeft => "ArrowLeft",
-                    Key::ArrowRight => "ArrowRight",
-                    Key::Home => "Home",
-                    Key::End => "End",
-                }
-            );
-            assert_eq!(
-                events[0]["params"]["modifiers"],
-                if key == Key::ShiftTab { 8 } else { 0 }
-            );
-            assert_eq!(
-                events[0]["params"]["code"],
-                match key {
-                    Key::Escape => "Escape",
-                    Key::Tab | Key::ShiftTab => "Tab",
-                    Key::Enter => "Enter",
-                    Key::Space => "Space",
-                    Key::ArrowUp => "ArrowUp",
-                    Key::ArrowDown => "ArrowDown",
-                    Key::ArrowLeft => "ArrowLeft",
-                    Key::ArrowRight => "ArrowRight",
-                    Key::Home => "Home",
-                    Key::End => "End",
-                }
-            );
-            assert_eq!(
-                events[0]["params"]["windowsVirtualKeyCode"],
-                match key {
-                    Key::Escape => 27,
-                    Key::Tab | Key::ShiftTab => 9,
-                    Key::Enter => 13,
-                    Key::Space => 32,
-                    Key::ArrowUp => 38,
-                    Key::ArrowDown => 40,
-                    Key::ArrowLeft => 37,
-                    Key::ArrowRight => 39,
-                    Key::Home => 36,
-                    Key::End => 35,
-                }
-            );
+            let modifiers = if key == Key::ShiftTab { 8 } else { 0 };
+            for (event, event_type) in events.iter().zip(["keyDown", "keyUp"]) {
+                let params = &event["params"];
+                assert_eq!(params["type"], event_type, "{key:?}");
+                assert_eq!(params["key"], name, "{key:?} {event_type}");
+                assert_eq!(params["code"], code, "{key:?} {event_type}");
+                assert_eq!(params["windowsVirtualKeyCode"], virtual_key, "{key:?}");
+                assert_eq!(params["modifiers"], modifiers, "{key:?} {event_type}");
+            }
             match key {
                 Key::Enter => assert_eq!(events[0]["params"]["text"], "\r"),
                 Key::Space => assert_eq!(events[0]["params"]["text"], " "),
                 _ => assert!(events[0]["params"].get("text").is_none()),
             }
             assert!(events[1]["params"].get("text").is_none());
+            assert!(events[1]["params"].get("commands").is_none());
         }
     }
 
     #[test]
-    fn stale_focus_or_document_rejects_without_key_dispatch() {
-        let mut renamed = focus_input(Key::Tab).focus_anchor;
-        renamed.as_mut().unwrap().name = "Other".into();
-        for (anchor, document) in [
-            (None, "d"),
-            (renamed, "d"),
-            (focus_input(Key::Tab).focus_anchor, "changed"),
-        ] {
-            let chrome = ScriptedChrome::start();
-            reply_focus(&chrome, anchor, document);
-            let result = perform(
-                &chrome.connect_raw(),
-                focus_input(Key::Tab),
-                &InputCancellation::default(),
-            );
-            assert!(matches!(result, Err(PerformError::Rejected(_))));
-            assert!(chrome.received("Input.dispatchKeyEvent").is_empty());
+    fn navigation_key_fields_answer_for_every_key() {
+        for key in [Key::Escape, Key::Tab, Key::ShiftTab, Key::Enter, Key::Space] {
+            assert_eq!(navigation_key_fields(key), key_fields(key));
         }
     }
 
@@ -869,46 +959,90 @@ mod tests {
         ));
         assert!(not_sent.received("Input.dispatchKeyEvent").is_empty());
 
-        let first = ScriptedChrome::start();
-        reply_focus(&first, focus_input(Key::Tab).focus_anchor, "d");
-        first.reject_on_call("Input.dispatchKeyEvent", 1);
+        let revalidation_not_sent = ScriptedChrome::start();
+        reply_focus(&revalidation_not_sent, Some(anchor()), "d");
+        let cancellation = InputCancellation::default();
+        cancellation.cancel();
         assert!(matches!(
             perform(
-                &first.connect_raw(),
+                &revalidation_not_sent.connect_raw(),
                 focus_input(Key::Tab),
-                &InputCancellation::default()
+                &cancellation
             ),
-            Err(PerformError::Rejected(_))
+            Err(PerformError::NotPerformed(_))
         ));
-        assert_eq!(first.received("Input.dispatchKeyEvent").len(), 1);
+        assert!(
+            revalidation_not_sent
+                .received("Input.dispatchKeyEvent")
+                .is_empty()
+        );
 
-        let unknown = ScriptedChrome::start();
-        unknown.reply_invalid_json("Input.dispatchKeyEvent");
-        assert!(matches!(
-            press_key(
-                &unknown.connect_raw(),
-                Key::Tab,
-                &InputCancellation::default()
+        for (script, expected_uncertain) in [
+            (
+                (|chrome: &ScriptedChrome| chrome.reply_invalid_json("Runtime.evaluate"))
+                    as fn(&ScriptedChrome),
+                true,
             ),
-            Err(PerformError::Uncertain(_))
-        ));
-        assert_eq!(unknown.received("Input.dispatchKeyEvent").len(), 1);
+            (|chrome| chrome.reject("Runtime.evaluate"), false),
+        ] {
+            let (result, key_events) = press(Some(anchor()), script);
+            if expected_uncertain {
+                assert!(
+                    matches!(result, Err(PerformError::Uncertain(_))),
+                    "{result:?}"
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(PerformError::Rejected(_))),
+                    "{result:?}"
+                );
+            }
+            assert_eq!(key_events, 0);
+        }
 
-        let second = ScriptedChrome::start();
-        reply_focus(&second, focus_input(Key::Tab).focus_anchor, "d");
-        second.reject_on_call("Input.dispatchKeyEvent", 2);
-        assert!(matches!(
-            perform(
-                &second.connect_raw(),
-                focus_input(Key::Tab),
-                &InputCancellation::default()
+        for (script, rejected, expected_events) in [
+            (
+                (|chrome: &ScriptedChrome| chrome.reject_on_call("Input.dispatchKeyEvent", 1))
+                    as fn(&ScriptedChrome),
+                true,
+                1,
             ),
-            Err(PerformError::Uncertain(_))
-        ));
-        assert_eq!(second.received("Input.dispatchKeyEvent").len(), 2);
+            (
+                |chrome| chrome.reply_invalid_json("Input.dispatchKeyEvent"),
+                false,
+                1,
+            ),
+            (
+                |chrome| chrome.reject_on_call("Input.dispatchKeyEvent", 2),
+                false,
+                2,
+            ),
+            (
+                |chrome| chrome.reply_invalid_json_on_call("Input.dispatchKeyEvent", 2),
+                false,
+                2,
+            ),
+        ] {
+            let (result, key_events) = press(Some(anchor()), |chrome| {
+                reply_focus(chrome, Some(anchor()), "d");
+                script(chrome);
+            });
+            if rejected {
+                assert!(
+                    matches!(result, Err(PerformError::Rejected(_))),
+                    "{result:?}"
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(PerformError::Uncertain(_))),
+                    "{result:?}"
+                );
+            }
+            assert_eq!(key_events, expected_events);
+        }
 
         let cancelled = ScriptedChrome::start();
-        reply_focus(&cancelled, focus_input(Key::Tab).focus_anchor, "d");
+        reply_focus(&cancelled, Some(anchor()), "d");
         let cancellation = InputCancellation::default();
         cancellation.cancel_before_boundary(1);
         assert!(matches!(
@@ -923,20 +1057,31 @@ mod tests {
     }
 
     #[test]
-    fn key_journal_overflow_is_uncertain() {
-        let chrome = ScriptedChrome::start();
-        for index in 0..10_100 {
-            chrome.push_event("DOM.attributeModified", json!({"nodeId":index}));
-        }
-        reply_focus(&chrome, focus_input(Key::Tab).focus_anchor, "d");
-        let result = perform(
-            &chrome.connect_raw(),
-            focus_input(Key::Tab),
-            &InputCancellation::default(),
-        );
+    fn key_journal_overflow_is_uncertain_only_after_a_possible_dispatch() {
+        let overflowed = |chrome: &ScriptedChrome| {
+            for index in 0..10_100 {
+                chrome.push_event("DOM.attributeModified", json!({"nodeId":index}));
+            }
+        };
+        let (result, key_events) = press(Some(anchor()), |chrome| {
+            overflowed(chrome);
+            reply_focus(chrome, None, "d");
+        });
         assert!(
-            matches!(result, Err(PerformError::Uncertain(reason)) if reason == "CDP journal overflowed")
+            matches!(result, Err(PerformError::Rejected(ref reason)) if reason == "focus_changed"),
+            "{result:?}"
         );
+        assert_eq!(key_events, 0);
+
+        let (result, key_events) = press(Some(anchor()), |chrome| {
+            overflowed(chrome);
+            reply_focus(chrome, Some(anchor()), "d");
+        });
+        assert!(
+            matches!(result, Err(PerformError::Uncertain(ref reason)) if reason == "CDP journal overflowed"),
+            "{result:?}"
+        );
+        assert_eq!(key_events, 2);
     }
 
     #[test]

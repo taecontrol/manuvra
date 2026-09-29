@@ -15,6 +15,15 @@
     <button id="second" role="menuitem" tabindex="-1">Second action</button>
   </div>
   <div id="shadow-host"></div>
+  <div role="tree" aria-label="Folders">
+    <div role="treeitem" tabindex="0">Documents</div>
+    <div role="treeitem" tabindex="-1">Music</div>
+    <div role="treeitem" tabindex="-1">Photos</div>
+  </div>
+  <div role="tree" aria-label="Recent">
+    <div role="treeitem" tabindex="0" aria-posinset="7" aria-setsize="20">Report</div>
+    <div role="treeitem" tabindex="-1" aria-posinset="8" aria-setsize="20">Budget</div>
+  </div>
   <script>
     document.getElementById('shadow-host').attachShadow({mode: 'open'}).innerHTML =
       '<input role="combobox" aria-label="Shadow choice" aria-activedescendant="gamma">';
@@ -33,8 +42,7 @@
         document.getElementById('selected').textContent = `Selected: ${options[active].textContent}`;
       }
     });
-    const items = [...document.querySelectorAll('[role="menuitem"]')];
-    items.forEach((item, index) => item.addEventListener('keydown', event => {
+    const roving = items => items.forEach((item, index) => item.addEventListener('keydown', event => {
       if (!['ArrowUp', 'ArrowDown'].includes(event.key)) return;
       event.preventDefault();
       item.tabIndex = -1;
@@ -42,6 +50,8 @@
       next.tabIndex = 0;
       next.focus();
     }));
+    roving([...document.querySelectorAll('[role="menuitem"]')]);
+    for (const tree of document.querySelectorAll('[role="tree"]')) roving([...tree.querySelectorAll('[role="treeitem"]')]);
   </script>
 </body>
 </html>

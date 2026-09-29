@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Keyboard revalidation fixture</title></head>
+<body>
+  <button id="first" type="button">First</button>
+  <button id="move" type="button">Move focus</button>
+  <input id="field" aria-label="Field">
+  <p id="log">Keydowns: 0</p>
+  <script>
+    let keydowns = 0;
+    document.addEventListener('keydown', () => {
+      document.getElementById('log').textContent = `Keydowns: ${++keydowns}`;
+    }, true);
+    document.getElementById('move').addEventListener('click', () => document.getElementById('field').focus());
+    document.getElementById('first').focus();
+  </script>
+</body>
+</html>

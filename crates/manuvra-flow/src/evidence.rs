@@ -316,6 +316,14 @@ fn is_protocol_collision(value: &str) -> bool {
         "Escape",
         "Tab",
         "Shift+Tab",
+        "Enter",
+        "Space",
+        "ArrowUp",
+        "ArrowDown",
+        "ArrowLeft",
+        "ArrowRight",
+        "Home",
+        "End",
         "missing_value",
         "unsupported_in_this_build",
         "unsupported_platform",
@@ -1228,6 +1236,26 @@ mod tests {
         assert!(!redactor.redact_export_text(key).contains(key));
         assert!(redactor.contains_sensitive(key));
         assert!(redactor.contains_export_leak(key.as_bytes()));
+    }
+
+    #[test]
+    fn every_key_in_the_roster_is_owned_protocol_vocabulary() {
+        for key in [
+            "Escape",
+            "Tab",
+            "Shift+Tab",
+            "Enter",
+            "Space",
+            "ArrowUp",
+            "ArrowDown",
+            "ArrowLeft",
+            "ArrowRight",
+            "Home",
+            "End",
+        ] {
+            assert!(manuvra_chrome::Key::from_choice(key).is_some(), "{key}");
+            assert!(is_protocol_collision(key), "{key}");
+        }
     }
 
     fn test_job(secret: bool) -> Job {

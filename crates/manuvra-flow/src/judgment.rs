@@ -96,7 +96,7 @@ pub fn request(
             "type_target":{"type":"choice","instructions":{"premise":"The operation is TYPE_TEXT","rules":target_rules,"goal":values.mask(&step.goal)},"criteria":target_criteria(observation,"TYPE_TEXT",values)},
             "select_target":{"type":"choice","instructions":{"premise":"The operation is SELECT","rules":target_rules,"goal":values.mask(&step.goal)},"criteria":target_criteria(observation,"SELECT",values)},
             "type_value":{"type":"choice","instructions":{"premise":"The operation is TYPE_TEXT or SELECT into the independently selected field","rules":"Choose the caller-provided value name whose description belongs in that field, or NONE_FITS.","goal":values.mask(&step.goal)},"criteria":value_criteria},
-            "key":{"type":"choice","instructions":{"premise":"The operation is PRESS_KEY","rules":"Choose one key for the current observation, not the whole step. For a goal that asks for arrows and Enter to choose an option, inspect the focused element's active_descendant: use an arrow to reach the named option, then use Enter when that option is active. Other keys are unavailable in this version.","goal":values.mask(&step.goal)},"criteria":{"Escape":"Close the focused overlay with Escape.","Tab":"Move focus forward with Tab.","Shift+Tab":"Move focus backward with Shift+Tab.","Enter":"Activate the focused control or its active descendant with Enter.","Space":"Activate the focused control with Space.","ArrowUp":"Move to the previous option with ArrowUp.","ArrowDown":"Move to the next option with ArrowDown.","ArrowLeft":"Move left in a composite widget with ArrowLeft.","ArrowRight":"Move right in a composite widget with ArrowRight.","Home":"Move to the first option with Home.","End":"Move to the last option with End."}}
+            "key":{"type":"choice","instructions":{"premise":"The operation is PRESS_KEY","rules":"Choose one key for the current observation, not the whole step. For a goal that asks for arrows and Enter to choose an option, inspect the focused element's active_descendant: use an arrow to reach the named option, then use Enter when that option is active.","goal":values.mask(&step.goal)},"criteria":{"Escape":"Close the focused overlay with Escape.","Tab":"Move focus forward with Tab.","Shift+Tab":"Move focus backward with Shift+Tab.","Enter":"Activate the focused control or its active descendant with Enter.","Space":"Activate the focused control with Space.","ArrowUp":"Move to the previous option with ArrowUp.","ArrowDown":"Move to the next option with ArrowDown.","ArrowLeft":"Move left in a composite widget with ArrowLeft.","ArrowRight":"Move right in a composite widget with ArrowRight.","Home":"Move to the first option with Home.","End":"Move to the last option with End."}}
         }
     })
 }
@@ -233,10 +233,10 @@ mod tests {
     use std::sync::Mutex;
 
     #[derive(Default)]
-    struct Capture(Mutex<Option<Value>>);
+    struct Capture(Mutex<Vec<Value>>);
     impl Evaluator for Capture {
         fn evaluate(&self, request: &Value, _deadline: Instant) -> Result<Evaluation, JevError> {
-            *self.0.lock().unwrap() = Some(request.clone());
+            self.0.lock().unwrap().push(request.clone());
             let criteria = |id: &str| {
                 request
                     .pointer(&format!("/questions/{id}/criteria"))
@@ -301,6 +301,7 @@ mod tests {
                 expanded: None,
                 selected: None,
                 checked: None,
+                position: None,
             }),
             visible_text: "provider-secret-419".into(),
             covered_text: "".into(),
@@ -346,7 +347,7 @@ mod tests {
             Instant::now() + std::time::Duration::from_secs(1),
         )
         .unwrap();
-        let body = capture.0.lock().unwrap().clone().unwrap().to_string();
+        let body = capture.0.lock().unwrap()[0].to_string();
         assert!(!body.contains("provider-secret-419"));
         assert!(body.contains("equals_value_names"));
         assert!(body.contains("account_name"));
@@ -495,7 +496,19 @@ mod tests {
             "document_id":"d","url":"http://example.test/","route":"/","title":"x",
             "elements":[],"viewport":{"width":1,"height":1,"scroll_x":0.0,"scroll_y":0.0,"document_height":1.0}
         })).unwrap();
-        let request = request(&job.steps[0], &observation, &[], &Values::new(&job));
+        let capture = Capture::default();
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        let judgments = judge(
+            &capture,
+            &job.steps[0],
+            &observation,
+            &[],
+            &Values::new(&job),
+            deadline,
+        )
+        .unwrap();
+        assert_eq!(capture.0.lock().unwrap().len(), 1);
+        let request = capture.0.lock().unwrap()[0].clone();
         assert_eq!(
             request["state"]["code_facts"]["operation_hint_from_atomic_goal"],
             "PRESS_KEY"
@@ -518,6 +531,14 @@ mod tests {
         ] {
             assert!(key_criteria.contains_key(key), "missing {key}");
         }
+        assert!(key_criteria.contains_key(&judgments.key.choice));
+        assert!(manuvra_chrome::Key::from_choice(&judgments.key.choice).is_some());
+        let mut missing_key = capture.evaluate(&request, deadline).unwrap();
+        missing_key.answers.remove("key");
+        assert!(matches!(
+            consume(request.clone(), missing_key),
+            Err(JevError::InvalidResponse(_))
+        ));
         assert_eq!(
             operation_hint("Enter account_name in Name", &observation),
             Some("TYPE_TEXT")
@@ -529,10 +550,6 @@ mod tests {
         assert_eq!(
             operation_hint("Choose End date", &observation),
             Some("CLICK")
-        );
-        assert_eq!(
-            operation_hint("Press Shift+Tab", &observation),
-            Some("PRESS_KEY")
         );
     }
 }

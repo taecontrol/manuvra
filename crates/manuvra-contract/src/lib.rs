@@ -714,37 +714,25 @@ impl DoneCondition {
 
 impl Assertion {
     fn validate(&self) -> Result<(), ValidationError> {
-        match self {
-            Self::FieldNonempty(value) => value.validate(),
-            Self::FieldEqualsValue(value) => value.validate(),
-            Self::Focused(value) => validate_nonempty("focused", &value.focused),
-            _ => self.validate_page_assertion(),
+        let (name, subject) = self.subject();
+        validate_nonempty(name, subject)?;
+        if let Self::FieldEqualsValue(value) = self {
+            validate_nonempty("equals_value", &value.equals_value)?;
         }
+        Ok(())
     }
 
-    fn validate_page_assertion(&self) -> Result<(), ValidationError> {
+    fn subject(&self) -> (&'static str, &str) {
         match self {
-            Self::TextVisible(value) => validate_nonempty("text_visible", &value.text_visible),
-            Self::TextAbsent(value) => validate_nonempty("text_absent", &value.text_absent),
-            Self::DialogOpen(value) => validate_nonempty("dialog_open", &value.dialog_open),
-            Self::DialogClosed(value) => validate_nonempty("dialog_closed", &value.dialog_closed),
-            Self::UrlContains(value) => validate_nonempty("url_contains", &value.url_contains),
-            // Only the non-field variants reach this private branch.
-            _ => unreachable!("field assertions are validated before page assertions"),
+            Self::TextVisible(value) => ("text_visible", &value.text_visible),
+            Self::TextAbsent(value) => ("text_absent", &value.text_absent),
+            Self::FieldNonempty(FieldNonempty { field, .. })
+            | Self::FieldEqualsValue(FieldEqualsValue { field, .. }) => ("field", field),
+            Self::Focused(value) => ("focused", &value.focused),
+            Self::DialogOpen(value) => ("dialog_open", &value.dialog_open),
+            Self::DialogClosed(value) => ("dialog_closed", &value.dialog_closed),
+            Self::UrlContains(value) => ("url_contains", &value.url_contains),
         }
-    }
-}
-
-impl FieldNonempty {
-    fn validate(&self) -> Result<(), ValidationError> {
-        validate_nonempty("field", &self.field)
-    }
-}
-
-impl FieldEqualsValue {
-    fn validate(&self) -> Result<(), ValidationError> {
-        validate_nonempty("field", &self.field)?;
-        validate_nonempty("equals_value", &self.equals_value)
     }
 }
 
@@ -1022,7 +1010,18 @@ mod tests {
         ]);
         let mut value = valid_job();
         value["steps"][0]["done_when"] = assertions;
-        assert!(parse(&value).is_ok());
+        let job = parse(&value).unwrap();
+        let DoneCondition::Structured(parsed) = &job.steps[0].done_when else {
+            panic!("structured done condition");
+        };
+        assert_eq!(
+            parsed[4],
+            Assertion::Focused(Focused {
+                focused: "Save".into(),
+                dialog: Some("Create".into()),
+                role: Some("button".into()),
+            })
+        );
     }
 
     #[test]

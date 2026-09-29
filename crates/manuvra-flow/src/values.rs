@@ -174,6 +174,7 @@ mod tests {
                 expanded: None,
                 selected: None,
                 checked: None,
+                position: None,
             }),
             visible_text: "raw-secret-742".into(),
             covered_text: "RAW SECRET".into(),
@@ -209,7 +210,9 @@ mod tests {
             },
             coverage: Coverage::default(),
         };
-        let serialized = Values::new(&job).model_view(&observation).to_string();
+        let view = Values::new(&job).model_view(&observation);
+        assert_eq!(view["focus_anchor"]["name"], "<value:secret_name>");
+        let serialized = view.to_string();
         assert!(!serialized.contains("raw-secret-742"));
         assert!(!serialized.contains("RAW SECRET"));
         assert!(!serialized.contains("internal-document-token"));

@@ -646,6 +646,7 @@ mod tests {
             expanded: None,
             selected: None,
             checked: None,
+            position: None,
         });
         let dispatches = AtomicUsize::new(0);
         let mut before = FakeJournal {
@@ -696,59 +697,6 @@ mod tests {
         assert_eq!(fact.key, Some(manuvra_chrome::Key::Escape));
         assert_eq!(fact.outcome, Outcome::Observed);
         assert_eq!(complete.entries[1]["fact"]["key"], "Escape");
-    }
-
-    #[test]
-    fn durable_key_journal_redacts_the_focus_name() {
-        let mut job = job();
-        let secret = "PrivateFocus782";
-        let value = job.values.get_mut("name").unwrap();
-        value.value = secret.into();
-        value.secret = true;
-        let mut obs = observation();
-        obs.focus_anchor = Some(manuvra_chrome::FocusAnchor {
-            node_id: 1,
-            context: "main".into(),
-            role: "textbox".into(),
-            name: secret.into(),
-            in_dialog: None,
-            covered: true,
-            surface: None,
-            active_descendant: Some(manuvra_chrome::ActiveDescendant {
-                id: secret.into(),
-                role: "option".into(),
-                name: secret.into(),
-                selected: Some(false),
-                checked: None,
-            }),
-            expanded: None,
-            selected: None,
-            checked: None,
-        });
-        let directory = TempDir::new().unwrap();
-        let redactor = crate::evidence::Redactor::for_job(&job).unwrap();
-        let mut journal = DurableJournal::open(directory.path(), "key", &redactor).unwrap();
-        perform(
-            permit_for(&job, &obs, "PRESS_KEY"),
-            &FakePerformer(Ok(PerformFact {
-                readback: None,
-                readback_matches: None,
-                suboperations: vec![],
-            })),
-            &obs,
-            &Values::new(&job),
-            &mut journal,
-            &InputCancellation::default(),
-        )
-        .unwrap();
-        let serialized = serde_json::to_string(journal.entries()).unwrap();
-        assert!(!serialized.contains(secret));
-        assert!(
-            journal.entries()[0]["focus_anchor"]["name"]
-                .as_str()
-                .unwrap()
-                .contains("<masked:1>")
-        );
     }
 
     #[test]

@@ -2,23 +2,42 @@
 <meta charset="utf-8">
 <title>Focus fixture</title>
 <button id="save">Save</button>
-<section role="dialog" aria-labelledby="dialog-title">
+<section id="labelled-dialog" role="dialog" aria-labelledby="dialog-title" tabindex="-1">
   <h2 id="dialog-title">Breakdown</h2>
   <div id="content" tabindex="-1">Descendant text must not name the focus</div>
 </section>
-<dialog id="native-dialog" open tabindex="-1" aria-label="Native breakdown"></dialog>
+<dialog id="native-dialog" open tabindex="-1"><h2>Native breakdown</h2></dialog>
 <section id="shadow-host"></section>
 <dialog open aria-label="Checkout"><div id="dialog-shadow-host"></div></dialog>
+<div id="closed-host"></div>
+<div id="declarative-host"><template shadowrootmode="closed" shadowrootdelegatesfocus><button>Declarative inner</button></template></div>
+<canvas id="canvas" tabindex="0" width="40" height="20"></canvas>
+<iframe id="same-frame" srcdoc="<label>Frame field <input id='field'></label>"></iframe>
 <script>
   const shadow = document.querySelector('#shadow-host').attachShadow({mode: 'open'});
-  shadow.innerHTML = '<span id="shadow-label">Shadow details</span><div id="shadow-content" tabindex="-1" aria-labelledby="shadow-label"></div>';
+  shadow.innerHTML = '<span id="shadow-label">Shadow details</span><div id="shadow-content" tabindex="-1" aria-labelledby="shadow-label"></div><span id="shadow-action-label">Shadow labelled action</span><button aria-labelledby="shadow-action-label">Unlabelled text</button>';
   const dialogShadow = document.querySelector('#dialog-shadow-host').attachShadow({mode: 'open'});
   dialogShadow.innerHTML = '<button>Confirm</button><div id="pin" tabindex="-1" aria-label="PIN">Descendant text must not name the focus</div>';
-  const target = new URL(location.href).searchParams.get('focus');
+  const closedRoot = document.querySelector('#closed-host').attachShadow({mode: 'closed'});
+  closedRoot.innerHTML = '<button>Closed inner</button>';
+  const sameFrame = document.querySelector('#same-frame');
+  const params = new URL(location.href).searchParams;
+  const target = params.get('focus');
   if (target === 'button') document.querySelector('#save').focus();
   if (target === 'dialog') document.querySelector('#content').focus();
+  if (target === 'labelled-dialog') document.querySelector('#labelled-dialog').focus();
   if (target === 'native-dialog') document.querySelector('#native-dialog').focus();
   if (target === 'shadow') shadow.querySelector('#shadow-content').focus();
   if (target === 'shadow-dialog') dialogShadow.querySelector('button').focus();
   if (target === 'shadow-dialog-pin') dialogShadow.querySelector('#pin').focus();
+  if (target === 'closed-shadow') closedRoot.querySelector('button').focus();
+  if (target === 'declarative-shadow') document.querySelector('#declarative-host').focus();
+  if (target === 'canvas') document.querySelector('#canvas').focus();
+  if (target === 'frame') sameFrame.addEventListener('load', () => sameFrame.contentDocument.querySelector('#field').focus());
+  if (target === 'cross-origin-frame') {
+    const before = Object.assign(document.createElement('button'), {textContent: 'Before frame'});
+    const frame = Object.assign(document.createElement('iframe'), {src: params.get('frame')});
+    document.body.append(before, frame);
+    before.focus();
+  }
 </script>

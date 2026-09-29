@@ -1024,10 +1024,7 @@ impl<'a> HostedMachine<'a> {
         {
             Ok(permit) => permit,
             Err(policy::PolicyStop::Uncertain(reason)) => {
-                let mut stale = pending;
-                stale.candidate = None;
-                stale.observation = captured.raw;
-                self.reissue(reason, Some(stale));
+                self.reissue_without_candidate(reason, pending, captured.raw);
                 return;
             }
             Err(stop) => {
@@ -1051,12 +1048,28 @@ impl<'a> HostedMachine<'a> {
         self.artifacts.caller_assisted = true;
         self.clear_pause();
         match performed {
+            Ok(fact) => self.policy.record_observed(&fact.replay_key),
             Err(actions::ActionStop::Reobserve(replay_key)) => {
                 self.policy.release_not_performed(&replay_key);
+                self.reissue_without_candidate(
+                    "candidate_revalidation_failed",
+                    pending,
+                    captured.raw,
+                );
             }
             Err(stop) => self.record_resumed_action_stop(stop, done, captured.raw),
-            Ok(_) => {}
         }
+    }
+
+    fn reissue_without_candidate(
+        &mut self,
+        reason: &'static str,
+        mut pending: PendingEscalation,
+        observation: Observation,
+    ) {
+        pending.candidate = None;
+        pending.observation = observation;
+        self.reissue(reason, Some(pending));
     }
 
     fn record_resumed_action_stop(
@@ -2279,6 +2292,7 @@ impl StepDriver<'_> {
             .extend(self.journal.entries()[journal_start..].iter().cloned());
         match result {
             Ok(fact) => {
+                self.policy.record_observed(&fact.replay_key);
                 if !matches!(
                     fact.operation,
                     judgment::Operation::ScrollUp | judgment::Operation::ScrollDown
@@ -3845,6 +3859,7 @@ mod tests {
             expanded: None,
             selected: None,
             checked: None,
+            position: None,
         });
         observation
     }
@@ -3994,11 +4009,66 @@ mod tests {
         assert!(journal.0.is_empty());
     }
 
-    #[test]
-    fn caller_execute_rejected_at_dispatch_reobserves_and_releases_replay() {
+    struct ClickSaveProvider(AtomicUsize);
+
+    impl manuvra_jev::Evaluator for ClickSaveProvider {
+        fn evaluate(
+            &self,
+            request: &Value,
+            deadline: Instant,
+        ) -> Result<manuvra_jev::Evaluation, manuvra_jev::JevError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let mut evaluation =
+                KeyProvider("Enter", 1.0, AtomicUsize::new(0)).evaluate(request, deadline)?;
+            for (question, selected) in [("operation", "CLICK"), ("click_target", "1")] {
+                evaluation.answers.insert(
+                    question.into(),
+                    manuvra_jev::Answer::Choice {
+                        choice: selected.into(),
+                        probabilities: BTreeMap::from([(selected.into(), 1.0)]),
+                        confidence: 1.0,
+                    },
+                );
+            }
+            Ok(evaluation)
+        }
+    }
+
+    fn save_button_focus() -> Observation {
+        let mut observation = key_observation("Save");
+        observation.elements.push(Element {
+            index: 1,
+            node_id: 3,
+            context: "main".into(),
+            role: "button".into(),
+            name: "Save".into(),
+            input_type: None,
+            value: String::new(),
+            checked: None,
+            selected: None,
+            expanded: None,
+            disabled: false,
+            in_dialog: None,
+            operations: vec!["CLICK".into()],
+            select_options: vec![],
+            rect: Rect {
+                x: 1.0,
+                y: 1.0,
+                width: 20.0,
+                height: 10.0,
+            },
+        });
+        observation
+    }
+
+    fn assert_rejected_execute_reissues_revalidation_failure(
+        operation: &str,
+        evaluator: &impl manuvra_jev::Evaluator,
+        evaluations: &AtomicUsize,
+    ) {
         let job = key_activation_job(true);
         let redactor = Redactor::for_job(&job).unwrap();
-        let focused = key_observation("Save");
+        let focused = save_button_focus();
         let browser = FakeBrowser {
             captures: Mutex::new(VecDeque::from([
                 observation_page(focused.clone()),
@@ -4009,84 +4079,50 @@ mod tests {
                 "focus_changed".into(),
             ))),
         };
-        let provider = KeyProvider("Enter", 1.0, AtomicUsize::new(0));
         let mut machine = HostedMachine::new(&job, &redactor);
         let mut journal = MemoryJournal::default();
         let cancellation = manuvra_chrome::InputCancellation::default();
-        let control = RecordingHostedControl::default();
         machine.drive(
             &browser,
-            &provider,
+            evaluator,
             &mut journal,
             &cancellation,
             None,
-            &control,
+            &RecordingHostedControl::default(),
         );
         let candidate = machine
             .artifacts
             .pending
             .as_ref()
-            .unwrap()
-            .candidate
-            .as_ref()
-            .unwrap()
-            .clone();
+            .and_then(|pending| pending.candidate.clone())
+            .unwrap();
+        assert_eq!(
+            machine.artifacts.escalations[0].1["offered_candidate"]["operation"],
+            operation
+        );
         machine.apply_execute(
             &candidate.id,
             &browser,
-            &provider,
+            evaluator,
             &mut journal,
             &cancellation,
         );
-        assert!(machine.artifacts.stop.is_none());
-        assert!(machine.artifacts.pending.is_none());
-        assert_eq!(
-            journal
-                .0
-                .iter()
-                .find(|event| event["event"] == "action_fact")
-                .unwrap()["fact"]["outcome"],
-            "not_performed"
-        );
-        assert_eq!(machine.policy.step_mutations(), 0);
-        let permit = machine
-            .policy
-            .authorize_caller(&job.steps[0], &focused, &candidate)
-            .unwrap();
-        machine.policy.release_unused(Box::new(permit));
-    }
 
-    #[test]
-    fn uncertain_enter_cannot_be_executed_or_replayed_after_retry_observation() {
-        let job = key_activation_job(false);
-        let redactor = Redactor::for_job(&job).unwrap();
-        let focused = key_observation("Save");
-        let browser = FakeBrowser {
-            captures: Mutex::new(VecDeque::from([
-                observation_page(focused.clone()),
-                observation_page(focused.clone()),
-            ])),
-            fallback: focused,
-            dispatch_result: Some(Err(manuvra_chrome::PerformError::Uncertain(
-                "lost key response".into(),
-            ))),
-        };
-        let provider = KeyProvider("Enter", 1.0, AtomicUsize::new(0));
-        let mut machine = HostedMachine::new(&job, &redactor);
-        let mut journal = MemoryJournal::default();
-        let cancellation = manuvra_chrome::InputCancellation::default();
-        let control = RecordingHostedControl::default();
-        machine.drive(
-            &browser,
-            &provider,
-            &mut journal,
-            &cancellation,
-            None,
-            &control,
-        );
-        assert_eq!(
-            machine.artifacts.stop.as_ref().unwrap().code,
-            "action_outcome_uncertain"
+        let stop = machine.artifacts.stop.as_ref().unwrap();
+        assert_eq!(stop.state, RunState::Uncertain, "{operation}");
+        assert_eq!(stop.code, "candidate_revalidation_failed", "{operation}");
+        assert_eq!(machine.artifacts.escalations.len(), 2);
+        let reissued = &machine.artifacts.escalations[1].1;
+        assert_eq!(reissued["gate_reason"], "candidate_revalidation_failed");
+        assert!(reissued["offered_candidate"].is_null());
+        assert!(
+            !machine
+                .artifacts
+                .escalation
+                .as_ref()
+                .unwrap()
+                .dispositions
+                .contains(&DispositionKind::Execute)
         );
         assert!(
             machine
@@ -4097,51 +4133,174 @@ mod tests {
                 .candidate
                 .is_none()
         );
-        assert!(
-            !machine
-                .artifacts
-                .escalation
-                .as_ref()
+        let prepared: Vec<_> = journal
+            .0
+            .iter()
+            .filter(|event| event["event"] == "action_prepared")
+            .collect();
+        assert_eq!(prepared.len(), 1, "{operation}");
+        assert_eq!(prepared[0]["operation"], operation);
+        assert_eq!(prepared[0]["basis"], "caller_authority");
+        let fact = journal
+            .0
+            .iter()
+            .find(|event| event["event"] == "action_fact")
+            .unwrap();
+        assert_eq!(fact["fact"]["outcome"], "not_performed");
+        assert_eq!(machine.index, 0);
+        assert_eq!(
+            machine.artifacts.verdicts[0].result,
+            VerdictResult::Unresolved
+        );
+        assert_eq!(evaluations.load(Ordering::SeqCst), 1, "{operation}");
+        assert_eq!(machine.policy.step_mutations(), 0);
+        let permit = machine
+            .policy
+            .authorize_caller(&job.steps[0], &focused, &candidate)
+            .expect("a rejected dispatch releases its replay entry");
+        machine.policy.release_unused(Box::new(permit));
+    }
+
+    #[test]
+    fn caller_execute_rejected_at_dispatch_releases_replay_and_reissues_revalidation_failure() {
+        let click = ClickSaveProvider(AtomicUsize::new(0));
+        assert_rejected_execute_reissues_revalidation_failure("CLICK", &click, &click.0);
+        let key = KeyProvider("Enter", 1.0, AtomicUsize::new(0));
+        assert_rejected_execute_reissues_revalidation_failure("PRESS_KEY", &key, &key.2);
+    }
+
+    fn anchor_state(role: &str, expanded: Option<bool>, checked: Option<bool>) -> Observation {
+        let mut observation = key_observation("Save");
+        let anchor = observation.focus_anchor.as_mut().unwrap();
+        anchor.role = role.into();
+        anchor.expanded = expanded;
+        anchor.checked = checked;
+        observation
+    }
+
+    #[test]
+    fn uncertain_key_press_cannot_be_executed_or_replayed_after_retry_observation() {
+        let lost_key_up = || manuvra_chrome::PerformError::Uncertain("lost key response".into());
+        let unsent_key_down =
+            || manuvra_chrome::PerformError::NotPerformed("key down not sent".into());
+        for (key, before, after, failure) in [
+            (
+                "Enter",
+                key_observation("Save"),
+                key_observation("Save"),
+                lost_key_up(),
+            ),
+            (
+                "Enter",
+                anchor_state("button", Some(false), None),
+                anchor_state("button", Some(true), None),
+                lost_key_up(),
+            ),
+            (
+                "Space",
+                anchor_state("checkbox", None, Some(false)),
+                anchor_state("checkbox", None, Some(true)),
+                unsent_key_down(),
+            ),
+        ] {
+            let job = key_activation_job(false);
+            let redactor = Redactor::for_job(&job).unwrap();
+            let browser = FakeBrowser {
+                captures: Mutex::new(VecDeque::from([
+                    observation_page(before),
+                    observation_page(after.clone()),
+                ])),
+                fallback: after,
+                dispatch_result: Some(Err(failure)),
+            };
+            let provider = KeyProvider(key, 1.0, AtomicUsize::new(0));
+            let mut machine = HostedMachine::new(&job, &redactor);
+            let mut journal = MemoryJournal::default();
+            let cancellation = manuvra_chrome::InputCancellation::default();
+            let control = RecordingHostedControl::default();
+            machine.drive(
+                &browser,
+                &provider,
+                &mut journal,
+                &cancellation,
+                None,
+                &control,
+            );
+            assert_eq!(
+                machine.artifacts.stop.as_ref().unwrap().code,
+                "action_outcome_uncertain"
+            );
+            assert!(
+                machine
+                    .artifacts
+                    .pending
+                    .as_ref()
+                    .unwrap()
+                    .candidate
+                    .is_none()
+            );
+            assert!(
+                !machine
+                    .artifacts
+                    .escalation
+                    .as_ref()
+                    .unwrap()
+                    .dispositions
+                    .contains(&DispositionKind::Execute)
+            );
+            let escalation_id = machine.artifacts.escalation.as_ref().unwrap().id.clone();
+            machine.apply(
+                DispositionRequest {
+                    schema_version: SchemaVersion,
+                    escalation_id,
+                    disposition: Disposition::RetryObservation(
+                        manuvra_contract::RetryObservationDisposition {
+                            kind: manuvra_contract::RetryObservationKind::RetryObservation,
+                        },
+                    ),
+                },
+                &browser,
+                &provider,
+                &mut journal,
+                &cancellation,
+            );
+            machine.drive(
+                &browser,
+                &provider,
+                &mut journal,
+                &cancellation,
+                None,
+                &control,
+            );
+            assert_eq!(
+                machine.artifacts.stop.as_ref().unwrap().code,
+                "replay_forbidden",
+                "{key}"
+            );
+            assert_eq!(provider.2.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                journal
+                    .0
+                    .iter()
+                    .filter(|event| event["event"] == "action_prepared")
+                    .count(),
+                1,
+                "{key}"
+            );
+            let refused = &machine.artifacts.escalations[1].1;
+            assert_eq!(refused["gate_reason"], "replay_forbidden");
+            assert_eq!(refused["candidates"]["operation"]["choice"], "PRESS_KEY");
+            assert_eq!(refused["candidates"]["key"]["choice"], key);
+            let prepared = refused["recent_actions"]
+                .as_array()
                 .unwrap()
-                .dispositions
-                .contains(&DispositionKind::Execute)
-        );
-        let escalation_id = machine.artifacts.escalation.as_ref().unwrap().id.clone();
-        machine.apply(
-            DispositionRequest {
-                schema_version: SchemaVersion,
-                escalation_id,
-                disposition: Disposition::RetryObservation(
-                    manuvra_contract::RetryObservationDisposition {
-                        kind: manuvra_contract::RetryObservationKind::RetryObservation,
-                    },
-                ),
-            },
-            &browser,
-            &provider,
-            &mut journal,
-            &cancellation,
-        );
-        machine.drive(
-            &browser,
-            &provider,
-            &mut journal,
-            &cancellation,
-            None,
-            &control,
-        );
-        assert_eq!(
-            machine.artifacts.stop.as_ref().unwrap().code,
-            "replay_forbidden"
-        );
-        assert_eq!(
-            journal
-                .0
                 .iter()
-                .filter(|event| event["event"] == "action_prepared")
-                .count(),
-            1
-        );
+                .find(|event| event["event"] == "action_prepared")
+                .unwrap();
+            assert_eq!(prepared["operation"], "PRESS_KEY");
+            assert_eq!(prepared["key"], key);
+            assert_eq!(prepared["focus_anchor"]["name"], "Save");
+        }
     }
 
     #[test]
@@ -4398,10 +4557,12 @@ mod tests {
             artifacts.escalations[0].1["offered_candidate"]["key"],
             "Tab"
         );
-        assert_eq!(
-            artifacts.escalations[0].1["offered_candidate"]["target_name"],
-            "First"
-        );
+        let offered = &artifacts.escalations[0].1["offered_candidate"];
+        assert_eq!(offered["focus_anchor"]["name"], "First");
+        assert_eq!(offered["focus_anchor"]["role"], "button");
+        let exported = offered.to_string();
+        assert!(!exported.contains("node_id"));
+        assert!(!exported.contains("context"));
     }
 
     fn job(wanted: &str) -> Job {
@@ -4980,6 +5141,7 @@ mod tests {
             expanded: None,
             selected: None,
             checked: None,
+            position: None,
         });
         let exported = redacted_observation(&observation, &redactor).unwrap();
         let text = exported.to_string();

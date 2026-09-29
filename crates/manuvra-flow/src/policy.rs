@@ -5,7 +5,7 @@ use manuvra_contract::{DoneCondition, JobOptions, Step};
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use url::Url;
 
@@ -115,7 +115,13 @@ pub struct Policy {
     model_calls: u16,
     step_mutations: u8,
     fallbacks: u8,
+    step: u32,
     replay: HashSet<String>,
+    /// Focus identity of each key press whose outcome is not yet known to be observed or not
+    /// performed, by replay key. An uncertain press may have changed the anchor's own state, so
+    /// while it stays here the same key on the same focus identity is refused whatever that
+    /// state now shows.
+    unsettled_keys: HashMap<String, String>,
     allowed_origins: Vec<String>,
     paused_at: Option<Instant>,
     paused_total: Duration,
@@ -141,7 +147,9 @@ impl Policy {
             model_calls: 0,
             step_mutations: 0,
             fallbacks: 0,
+            step: 0,
             replay: HashSet::new(),
+            unsettled_keys: HashMap::new(),
             allowed_origins,
             paused_at: None,
             paused_total: Duration::ZERO,
@@ -149,6 +157,7 @@ impl Policy {
     }
 
     pub fn begin_step(&mut self) {
+        self.step = self.step.wrapping_add(1);
         self.step_mutations = 0;
         self.fallbacks = 0;
     }
@@ -369,6 +378,7 @@ impl Policy {
         debug_assert_eq!(action_sequence, u64::from(self.actions));
         let removed = self.replay.remove(&replay_key);
         debug_assert!(removed);
+        self.unsettled_keys.remove(&replay_key);
         self.actions = self.actions.saturating_sub(1);
         self.step_mutations = self.step_mutations.saturating_sub(1);
         candidate
@@ -376,9 +386,15 @@ impl Policy {
 
     #[cfg(any(target_os = "linux", target_os = "macos", test))]
     pub(crate) fn release_not_performed(&mut self, replay_key: &str) {
+        self.unsettled_keys.remove(replay_key);
         if self.replay.remove(replay_key) {
             self.step_mutations = self.step_mutations.saturating_sub(1);
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", test))]
+    pub(crate) fn record_observed(&mut self, replay_key: &str) {
+        self.unsettled_keys.remove(replay_key);
     }
 
     fn authorize_context(&self, step: &Step, observation: &Observation) -> Result<(), PolicyStop> {
@@ -392,40 +408,74 @@ impl Policy {
     }
 
     fn mint(&mut self, observation: &Observation, candidate: Candidate) -> Next {
-        let replay_key = if let Some(target) = candidate
-            .target_index
-            .and_then(|index| observation.elements.iter().find(|item| item.index == index))
-        {
-            replay_key(observation, target, &candidate)
-        } else if candidate.operation == Operation::PressKey {
-            key_replay_key(observation, &candidate)
-        } else if matches!(
-            candidate.operation,
-            Operation::ScrollUp | Operation::ScrollDown
-        ) {
-            scroll_replay_key(observation, candidate.operation)
-        } else {
+        let Some(replay_key) = self.replay_key(observation, &candidate) else {
             return Next::Stop(PolicyStop::Uncertain("candidate_revalidation_failed"));
         };
-        if !self.replay.insert(replay_key.clone()) {
+        let identity_key = (candidate.operation == Operation::PressKey)
+            .then(|| self.key_digest(observation, &candidate, None));
+        let unsettled = identity_key.as_ref().is_some_and(|identity| {
+            self.unsettled_keys
+                .values()
+                .any(|pending| pending == identity)
+        });
+        if unsettled || !self.replay.insert(replay_key.clone()) {
             return Next::Stop(PolicyStop::Uncertain("replay_forbidden"));
         }
-        self.actions += 1;
-        if matches!(
-            candidate.operation,
-            Operation::ScrollUp | Operation::ScrollDown
-        ) {
-            self.fallbacks += 1;
-        } else {
-            self.step_mutations += 1;
-            self.fallbacks = 0;
+        if let Some(identity) = identity_key {
+            self.unsettled_keys.insert(replay_key.clone(), identity);
         }
+        self.count_action(candidate.operation);
         Next::Mutate(Box::new(Permit {
             candidate,
             document_id: observation.document_id.clone(),
             replay_key,
             action_sequence: u64::from(self.actions),
         }))
+    }
+
+    fn replay_key(&self, observation: &Observation, candidate: &Candidate) -> Option<String> {
+        if let Some(target) = candidate
+            .target_index
+            .and_then(|index| observation.elements.iter().find(|item| item.index == index))
+        {
+            return Some(replay_key(observation, target, candidate));
+        }
+        match candidate.operation {
+            Operation::PressKey => {
+                let state = candidate.focus_anchor.as_ref().map(focus_state);
+                Some(self.key_digest(observation, candidate, state))
+            }
+            Operation::ScrollUp | Operation::ScrollDown => {
+                Some(scroll_replay_key(observation, candidate.operation))
+            }
+            _ => None,
+        }
+    }
+
+    /// Key press replay keys carry the step ordinal, so the same key on the same focus is
+    /// refused only within one step.
+    fn key_digest(
+        &self,
+        observation: &Observation,
+        candidate: &Candidate,
+        state: Option<serde_json::Value>,
+    ) -> String {
+        let stable = serde_json::json!({
+            "operation":candidate.operation,"key":candidate.key,"route":observation.route,
+            "step":self.step,"focus":candidate.focus_anchor.as_ref().map(focus_identity),
+            "state":state,
+        });
+        hex::encode(Sha256::digest(stable.to_string().as_bytes()))
+    }
+
+    fn count_action(&mut self, operation: Operation) {
+        self.actions += 1;
+        if matches!(operation, Operation::ScrollUp | Operation::ScrollDown) {
+            self.fallbacks += 1;
+        } else {
+            self.step_mutations += 1;
+            self.fallbacks = 0;
+        }
     }
 
     pub fn active_ms(&self) -> u128 {
@@ -467,7 +517,7 @@ fn revalidate_caller_candidate(
         {
             return Err(PolicyStop::Uncertain("candidate_revalidation_failed"));
         }
-        if let Some(surface) = key_surface(observation) {
+        if let Some(surface) = key_surface(observation, candidate.key) {
             return Err(PolicyStop::UnsupportedSurface(surface));
         }
         return Ok(candidate.clone());
@@ -534,9 +584,7 @@ fn ready_operation(
     already_reobserved: bool,
 ) -> Result<Operation, Next> {
     let operation = selected_operation(judgments).ok();
-    if operation != Some(Operation::PressKey)
-        && let Some(surface) = unsupported_surface(observation, judgments)
-    {
+    if let Some(surface) = selected_surface(observation, judgments, operation) {
         return Err(Next::Stop(PolicyStop::UnsupportedSurface(surface)));
     }
     let operation =
@@ -545,25 +593,30 @@ fn ready_operation(
         return Err(next);
     }
     if operation == Operation::PressKey
-        && let Some(next) = key_preflight(observation, judgments, already_reobserved)
+        && let Some(next) = key_preflight(judgments, already_reobserved)
     {
         return Err(next);
     }
     Ok(operation)
 }
 
-fn key_preflight(
+fn selected_surface(
     observation: &Observation,
     judgments: &Judgments,
-    already_reobserved: bool,
-) -> Option<Next> {
+    operation: Option<Operation>,
+) -> Option<&'static str> {
+    if operation == Some(Operation::PressKey) {
+        key_surface(observation, Key::from_choice(&judgments.key.choice))
+    } else {
+        unsupported_surface(observation, judgments)
+    }
+}
+
+fn key_preflight(judgments: &Judgments, already_reobserved: bool) -> Option<Next> {
     if Key::from_choice(&judgments.key.choice).is_none() {
         return Some(Next::Stop(PolicyStop::Blocked("provider_invalid_response")));
     }
-    if let Some(next) = key_gate(judgments, already_reobserved) {
-        return Some(next);
-    }
-    key_surface(observation).map(|surface| Next::Stop(PolicyStop::UnsupportedSurface(surface)))
+    key_gate(judgments, already_reobserved)
 }
 
 fn key_gate(judgments: &Judgments, already_reobserved: bool) -> Option<Next> {
@@ -651,23 +704,25 @@ fn scroll_replay_key(observation: &Observation, operation: Operation) -> String 
     hex::encode(Sha256::digest(stable.to_string().as_bytes()))
 }
 
-fn key_replay_key(observation: &Observation, candidate: &Candidate) -> String {
-    let focus = candidate.focus_anchor.as_ref().map(|anchor| {
-        serde_json::json!({
-            "role":anchor.role,
-            "name":anchor.name.to_ascii_lowercase(),
-            "dialog":anchor.in_dialog,
-            "active_descendant":anchor.active_descendant,
-            "expanded":anchor.expanded,
-            "selected":anchor.selected,
-            "checked":anchor.checked,
-        })
-    });
-    let stable = serde_json::json!({
-        "operation":candidate.operation,"key":candidate.key,
-        "focus":focus,"route":observation.route,
-    });
-    hex::encode(Sha256::digest(stable.to_string().as_bytes()))
+fn focus_identity(anchor: &FocusAnchor) -> serde_json::Value {
+    serde_json::json!({
+        "role":anchor.role,
+        "name":anchor.name.to_ascii_lowercase(),
+        "dialog":anchor.in_dialog,
+        "position":anchor.position,
+    })
+}
+
+/// Anchor state a legitimate repeated key press changes, such as the active option of a
+/// listbox. It distinguishes repeated presses only while no earlier press on the same focus
+/// identity is unsettled.
+fn focus_state(anchor: &FocusAnchor) -> serde_json::Value {
+    serde_json::json!({
+        "active_descendant":anchor.active_descendant,
+        "expanded":anchor.expanded,
+        "selected":anchor.selected,
+        "checked":anchor.checked,
+    })
 }
 
 fn unsupported_surface(observation: &Observation, judgments: &Judgments) -> Option<&'static str> {
@@ -686,8 +741,23 @@ fn unsupported_surface(observation: &Observation, judgments: &Judgments) -> Opti
         .flatten()
 }
 
-fn key_surface(observation: &Observation) -> Option<&'static str> {
+fn key_surface(observation: &Observation, key: Option<Key>) -> Option<&'static str> {
     let anchor = observation.focus_anchor.as_ref()?;
+    anchor_surface(anchor).or_else(|| {
+        (matches!(key, Some(Key::Enter | Key::Space)) && focused_file_input(observation, anchor))
+            .then_some("file_input")
+    })
+}
+
+fn focused_file_input(observation: &Observation, anchor: &FocusAnchor) -> bool {
+    observation.elements.iter().any(|element| {
+        element.node_id == anchor.node_id
+            && element.context == anchor.context
+            && element.input_type.as_deref() == Some("file")
+    })
+}
+
+fn anchor_surface(anchor: &FocusAnchor) -> Option<&'static str> {
     match anchor.surface {
         Some(FocusSurface::Canvas) => Some("canvas_control"),
         Some(FocusSurface::CrossOriginFrame) => Some("cross_origin_frame"),
@@ -798,12 +868,34 @@ mod tests {
             expanded: None,
             selected: None,
             checked: None,
+            position: None,
         });
         observed
     }
 
+    fn observed_press(
+        policy: &mut Policy,
+        step: &Step,
+        observation: &Observation,
+        judgments: &Judgments,
+    ) -> Next {
+        let next = decide_not_done(policy, step, observation, judgments, false);
+        if let Next::Mutate(permit) = &next {
+            policy.record_observed(&permit.replay_key);
+        }
+        next
+    }
+
+    fn file_input_focus() -> Observation {
+        let mut observed = focused("Receipt");
+        observed.elements[0].name = "Receipt".into();
+        observed.elements[0].role = "button".into();
+        observed.elements[0].input_type = Some("file".into());
+        observed
+    }
+
     #[test]
-    fn key_gate_reobserves_once_and_does_not_gate_other_operations() {
+    fn key_gate_reobserves_once_then_stops_with_key_below_gate() {
         let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
         let mut key = judgments("PRESS_KEY");
         key.key.confidence = 0.69;
@@ -815,72 +907,142 @@ mod tests {
             decide_not_done(&mut policy, &step(), &focused("A"), &key, true),
             Next::Stop(PolicyStop::Uncertain("key_below_gate"))
         ));
-        let candidate = policy.caller_candidate(&focused("A"), &key).unwrap();
-        assert_eq!(candidate.key, Some(Key::Escape));
-        let mut changed_focus = focused("B");
-        assert!(matches!(
-            policy.authorize_caller(&step(), &changed_focus, &candidate),
-            Err(PolicyStop::Uncertain("candidate_revalidation_failed"))
-        ));
-        changed_focus.focus_anchor.as_mut().unwrap().surface = Some(FocusSurface::Canvas);
-        assert!(matches!(
-            policy.authorize_caller(&step(), &changed_focus, &candidate),
-            Err(PolicyStop::Uncertain("candidate_revalidation_failed"))
-        ));
-        changed_focus = focused("A");
-        let permit = policy
-            .authorize_caller(&step(), &changed_focus, &candidate)
-            .unwrap();
-        drop(permit);
-        assert!(matches!(
-            policy.authorize_caller(&step(), &changed_focus, &candidate),
-            Err(PolicyStop::Uncertain("replay_forbidden"))
-        ));
+        assert_eq!(policy.actions, 0);
+    }
+
+    #[test]
+    fn operation_gate_precedes_key_validity_and_key_validity_precedes_the_key_gate() {
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        let mut key = judgments("PRESS_KEY");
         key.operation.confidence = 0.69;
+        key.key.confidence = 0.69;
+        key.key.choice = "Control+W".into();
+        assert!(matches!(
+            decide_not_done(&mut policy, &step(), &focused("A"), &key, false),
+            Next::ReobserveOperation
+        ));
         assert!(matches!(
             decide_not_done(&mut policy, &step(), &focused("A"), &key, true),
             Next::Stop(PolicyStop::Uncertain("operation_below_gate"))
         ));
         key.operation.confidence = 1.0;
-        key.key.choice = "Control+W".into();
         assert!(matches!(
             decide_not_done(&mut policy, &step(), &focused("A"), &key, false),
             Next::Stop(PolicyStop::Blocked("provider_invalid_response"))
         ));
-        assert!(policy.caller_candidate(&focused("A"), &key).is_err());
-        for operation in ["CLICK", "TYPE_TEXT"] {
-            let mut other = judgments(operation);
-            other.key.confidence = 0.01;
-            other.key.choice = "Control+W".into();
-            let observed = observation(
-                operation,
-                if operation == "CLICK" {
-                    "button"
-                } else {
-                    "textbox"
-                },
-            );
+    }
+
+    #[test]
+    fn keys_outside_the_closed_roster_are_invalid_responses() {
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        let mut key = judgments("PRESS_KEY");
+        for choice in ["Control+W", "F5", "escape", ""] {
+            key.key.choice = choice.into();
             assert!(matches!(
-                decide_not_done(
-                    &mut Policy::new(&JobOptions::default(), "http://example.test/"),
-                    &step(),
-                    &observed,
-                    &other,
-                    false
-                ),
-                Next::Mutate(_)
+                decide_not_done(&mut policy, &step(), &focused("A"), &key, false),
+                Next::Stop(PolicyStop::Blocked("provider_invalid_response"))
             ));
+            assert_eq!(
+                policy.caller_candidate(&focused("A"), &key),
+                Err(PolicyStop::Blocked("provider_invalid_response"))
+            );
         }
+        assert_eq!(policy.actions, 0);
+    }
+
+    #[test]
+    fn caller_key_candidate_revalidates_document_and_focus_anchor() {
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        let candidate = policy
+            .caller_candidate(&focused("A"), &judgments("PRESS_KEY"))
+            .unwrap();
+        assert_eq!(candidate.key, Some(Key::Escape));
+        assert!(matches!(
+            policy.authorize_caller(&step(), &focused("B"), &candidate),
+            Err(PolicyStop::Uncertain("candidate_revalidation_failed"))
+        ));
+        let mut replaced = focused("A");
+        replaced.document_id = "replacement".into();
+        assert!(matches!(
+            policy.authorize_caller(&step(), &replaced, &candidate),
+            Err(PolicyStop::Uncertain("candidate_revalidation_failed"))
+        ));
+        let mut lost_focus = focused("A");
+        lost_focus.focus_anchor = None;
+        assert!(matches!(
+            policy.authorize_caller(&step(), &lost_focus, &candidate),
+            Err(PolicyStop::Uncertain("candidate_revalidation_failed"))
+        ));
+        assert_eq!(policy.actions, 0);
+        assert!(
+            policy
+                .authorize_caller(&step(), &focused("A"), &candidate)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn caller_key_candidate_on_an_unchanged_canvas_anchor_is_an_unsupported_surface() {
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        let mut canvas = focused("Drawing");
+        canvas.focus_anchor.as_mut().unwrap().surface = Some(FocusSurface::Canvas);
+        let candidate = policy
+            .caller_candidate(&canvas, &judgments("PRESS_KEY"))
+            .unwrap();
+        assert_eq!(
+            policy.authorize_caller(&step(), &canvas, &candidate).err(),
+            Some(PolicyStop::UnsupportedSurface("canvas_control"))
+        );
+        assert_eq!(policy.actions, 0);
+    }
+
+    #[test]
+    fn caller_key_candidate_already_in_the_replay_ledger_is_forbidden() {
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        let candidate = policy
+            .caller_candidate(&focused("A"), &judgments("PRESS_KEY"))
+            .unwrap();
+        let permit = policy
+            .authorize_caller(&step(), &focused("A"), &candidate)
+            .unwrap();
+        policy.record_observed(&permit.replay_key);
+        assert!(matches!(
+            policy.authorize_caller(&step(), &focused("A"), &candidate),
+            Err(PolicyStop::Uncertain("replay_forbidden"))
+        ));
+        assert!(matches!(
+            decide_not_done(
+                &mut policy,
+                &step(),
+                &focused("A"),
+                &judgments("PRESS_KEY"),
+                false
+            ),
+            Next::Stop(PolicyStop::Uncertain("replay_forbidden"))
+        ));
+        assert_eq!(policy.actions, 1);
     }
 
     #[test]
     fn key_permits_consume_budget_and_replay_tracks_focus_semantics() {
         let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
         let key = judgments("PRESS_KEY");
+        assert!(matches!(
+            decide_not_done(
+                &mut policy,
+                &step(),
+                &focused("A"),
+                &judgments("WAIT"),
+                false
+            ),
+            Next::Wait
+        ));
+        assert_eq!(policy.fallbacks, 1);
         let first = decide_not_done(&mut policy, &step(), &focused("A"), &key, false);
         let Next::Mutate(permit) = first else {
             panic!("first key permit")
         };
+        assert_eq!(policy.fallbacks, 0);
         let (_, _, replay_key, sequence) = permit.consume();
         assert_eq!(sequence, 1);
         assert_eq!(policy.step_mutations(), 1);
@@ -929,11 +1091,11 @@ mod tests {
         let mut arrow = judgments("PRESS_KEY");
         arrow.key = choice("ArrowDown");
         assert!(matches!(
-            decide_not_done(&mut policy, &step, &observed, &arrow, false),
+            observed_press(&mut policy, &step, &observed, &arrow),
             Next::Mutate(_)
         ));
         assert!(matches!(
-            decide_not_done(&mut policy, &step, &observed, &arrow, false),
+            observed_press(&mut policy, &step, &observed, &arrow),
             Next::Stop(PolicyStop::Uncertain("replay_forbidden"))
         ));
         let anchor = observed.focus_anchor.as_mut().unwrap();
@@ -945,31 +1107,24 @@ mod tests {
             checked: None,
         });
         assert!(matches!(
-            decide_not_done(&mut policy, &step, &observed, &arrow, false),
+            observed_press(&mut policy, &step, &observed, &arrow),
             Next::Mutate(_)
         ));
-        observed
+        let descendant = observed
             .focus_anchor
             .as_mut()
             .unwrap()
             .active_descendant
             .as_mut()
-            .unwrap()
-            .id = "beta".into();
-        observed
-            .focus_anchor
-            .as_mut()
-            .unwrap()
-            .active_descendant
-            .as_mut()
-            .unwrap()
-            .name = "Beta".into();
+            .unwrap();
+        descendant.id = "beta".into();
+        descendant.name = "Beta".into();
         assert!(matches!(
-            decide_not_done(&mut policy, &step, &observed, &arrow, false),
+            observed_press(&mut policy, &step, &observed, &arrow),
             Next::Mutate(_)
         ));
         assert!(matches!(
-            decide_not_done(&mut policy, &step, &observed, &arrow, false),
+            observed_press(&mut policy, &step, &observed, &arrow),
             Next::Stop(PolicyStop::Uncertain("replay_forbidden"))
         ));
         observed
@@ -981,17 +1136,17 @@ mod tests {
             .unwrap()
             .selected = Some(true);
         assert!(matches!(
-            decide_not_done(&mut policy, &step, &observed, &arrow, false),
+            observed_press(&mut policy, &step, &observed, &arrow),
             Next::Mutate(_)
         ));
         observed.focus_anchor.as_mut().unwrap().expanded = Some(false);
         assert!(matches!(
-            decide_not_done(&mut policy, &step, &observed, &arrow, false),
+            observed_press(&mut policy, &step, &observed, &arrow),
             Next::Mutate(_)
         ));
         observed.focus_anchor.as_mut().unwrap().checked = Some(true);
         assert!(matches!(
-            decide_not_done(&mut policy, &step, &observed, &arrow, false),
+            observed_press(&mut policy, &step, &observed, &arrow),
             Next::Mutate(_)
         ));
 
@@ -1011,20 +1166,257 @@ mod tests {
     }
 
     #[test]
-    fn key_surface_checks_only_the_focus_anchor() {
+    fn key_replay_distinguishes_unnamed_roving_items_by_position() {
         let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
-        let mut observed = focused("A");
-        observed.coverage.gaps.push("canvas".into());
+        let mut step = step();
+        step.mutation_limit = 8;
+        let mut first = focused("");
+        let anchor = first.focus_anchor.as_mut().unwrap();
+        anchor.role = "treeitem".into();
+        anchor.position = Some(1);
+        let mut arrow = judgments("PRESS_KEY");
+        arrow.key = choice("ArrowDown");
+        assert!(matches!(
+            observed_press(&mut policy, &step, &first, &arrow),
+            Next::Mutate(_)
+        ));
+        let mut second = first.clone();
+        second.focus_anchor.as_mut().unwrap().position = Some(2);
+        assert!(matches!(
+            observed_press(&mut policy, &step, &second, &arrow),
+            Next::Mutate(_)
+        ));
+        assert!(matches!(
+            observed_press(&mut policy, &step, &second, &arrow),
+            Next::Stop(PolicyStop::Uncertain("replay_forbidden"))
+        ));
+    }
+
+    #[test]
+    fn unsettled_key_press_forbids_the_same_key_on_the_same_focus_whatever_its_state() {
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        let mut step = step();
+        step.mutation_limit = 8;
+        let mut unchecked = focused("Accept terms");
+        let anchor = unchecked.focus_anchor.as_mut().unwrap();
+        anchor.role = "checkbox".into();
+        anchor.checked = Some(false);
+        let mut space = judgments("PRESS_KEY");
+        space.key = choice("Space");
+        assert!(matches!(
+            decide_not_done(&mut policy, &step, &unchecked, &space, false),
+            Next::Mutate(_)
+        ));
+        let mut checked = unchecked.clone();
+        let anchor = checked.focus_anchor.as_mut().unwrap();
+        anchor.checked = Some(true);
+        anchor.expanded = Some(true);
+        assert!(matches!(
+            decide_not_done(&mut policy, &step, &checked, &space, false),
+            Next::Stop(PolicyStop::Uncertain("replay_forbidden"))
+        ));
+        let candidate = policy.caller_candidate(&checked, &space).unwrap();
+        assert!(matches!(
+            policy.authorize_caller(&step, &checked, &candidate),
+            Err(PolicyStop::Uncertain("replay_forbidden"))
+        ));
+        let mut other_key = space.clone();
+        other_key.key = choice("Tab");
+        assert!(matches!(
+            observed_press(&mut policy, &step, &checked, &other_key),
+            Next::Mutate(_)
+        ));
+        let mut other_focus = checked.clone();
+        other_focus.focus_anchor.as_mut().unwrap().name = "Subscribe".into();
+        assert!(matches!(
+            observed_press(&mut policy, &step, &other_focus, &space),
+            Next::Mutate(_)
+        ));
+        assert_eq!(policy.actions, 3);
+    }
+
+    #[test]
+    fn not_performed_key_press_releases_its_unsettled_focus_identity() {
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        let mut enter = judgments("PRESS_KEY");
+        enter.key = choice("Enter");
+        let mut collapsed = focused("Menu");
+        collapsed.focus_anchor.as_mut().unwrap().expanded = Some(false);
+        let Next::Mutate(permit) = decide_not_done(&mut policy, &step(), &collapsed, &enter, false)
+        else {
+            panic!("first key permit")
+        };
+        policy.release_not_performed(&permit.replay_key);
+        let mut expanded = collapsed.clone();
+        expanded.focus_anchor.as_mut().unwrap().expanded = Some(true);
+        let Next::Mutate(permit) = decide_not_done(&mut policy, &step(), &expanded, &enter, false)
+        else {
+            panic!("released key permit")
+        };
+        policy.release_unused(permit);
+        assert!(matches!(
+            decide_not_done(&mut policy, &step(), &collapsed, &enter, false),
+            Next::Mutate(_)
+        ));
+    }
+
+    #[test]
+    fn key_replay_is_scoped_to_the_step() {
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        let mut step = step();
+        step.mutation_limit = 8;
+        policy.begin_step();
+        let escape = judgments("PRESS_KEY");
+        let popover = focused("Breakdown");
+        assert!(matches!(
+            observed_press(&mut policy, &step, &popover, &escape),
+            Next::Mutate(_)
+        ));
+        assert!(matches!(
+            observed_press(&mut policy, &step, &popover, &escape),
+            Next::Stop(PolicyStop::Uncertain("replay_forbidden"))
+        ));
+        let mut space = judgments("PRESS_KEY");
+        space.key = choice("Space");
+        assert!(matches!(
+            decide_not_done(&mut policy, &step, &popover, &space, false),
+            Next::Mutate(_)
+        ));
+        let mut changed = popover.clone();
+        changed.focus_anchor.as_mut().unwrap().expanded = Some(true);
+        assert!(matches!(
+            decide_not_done(&mut policy, &step, &changed, &space, false),
+            Next::Stop(PolicyStop::Uncertain("replay_forbidden"))
+        ));
+
+        policy.begin_step();
+        assert!(matches!(
+            observed_press(&mut policy, &step, &popover, &escape),
+            Next::Mutate(_)
+        ));
+        assert!(matches!(
+            observed_press(&mut policy, &step, &changed, &space),
+            Next::Mutate(_)
+        ));
+        assert!(matches!(
+            observed_press(&mut policy, &step, &popover, &escape),
+            Next::Stop(PolicyStop::Uncertain("replay_forbidden"))
+        ));
+    }
+
+    #[test]
+    fn activation_keys_on_a_focused_file_input_are_an_unsupported_surface() {
+        let file = file_input_focus();
+        for activation in ["Enter", "Space"] {
+            let mut key = judgments("PRESS_KEY");
+            key.key = choice(activation);
+            let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+            assert!(matches!(
+                decide_not_done(&mut policy, &step(), &file, &key, false),
+                Next::Stop(PolicyStop::UnsupportedSurface("file_input"))
+            ));
+            let candidate = policy.caller_candidate(&file, &key).unwrap();
+            assert_eq!(
+                policy.authorize_caller(&step(), &file, &candidate).err(),
+                Some(PolicyStop::UnsupportedSurface("file_input"))
+            );
+            assert_eq!(policy.actions, 0);
+        }
+        for other in [
+            "Escape",
+            "Tab",
+            "Shift+Tab",
+            "ArrowUp",
+            "ArrowDown",
+            "ArrowLeft",
+            "ArrowRight",
+            "Home",
+            "End",
+        ] {
+            let mut key = judgments("PRESS_KEY");
+            key.key = choice(other);
+            assert!(matches!(
+                decide_not_done(
+                    &mut Policy::new(&JobOptions::default(), "http://example.test/"),
+                    &step(),
+                    &file,
+                    &key,
+                    false
+                ),
+                Next::Mutate(_)
+            ));
+        }
+        let mut other_context = file_input_focus();
+        other_context.focus_anchor.as_mut().unwrap().context = "main/frame:2".into();
+        let mut enter = judgments("PRESS_KEY");
+        enter.key = choice("Enter");
         assert!(matches!(
             decide_not_done(
-                &mut policy,
+                &mut Policy::new(&JobOptions::default(), "http://example.test/"),
                 &step(),
-                &observed,
-                &judgments("PRESS_KEY"),
+                &other_context,
+                &enter,
                 false
             ),
             Next::Mutate(_)
         ));
+    }
+
+    #[test]
+    fn unsupported_key_focus_stops_before_the_confidence_gates() {
+        let mut canvas = focused("Drawing");
+        canvas.focus_anchor.as_mut().unwrap().surface = Some(FocusSurface::Canvas);
+        let mut low_operation = judgments("PRESS_KEY");
+        low_operation.operation.confidence = 0.69;
+        let mut low_key = judgments("PRESS_KEY");
+        low_key.key.confidence = 0.69;
+        let mut enter = low_key.clone();
+        enter.key.choice = "Enter".into();
+        for (observed, key) in [
+            (&canvas, &low_operation),
+            (&canvas, &low_key),
+            (&file_input_focus(), &enter),
+        ] {
+            let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+            assert!(matches!(
+                decide_not_done(&mut policy, &step(), observed, key, false),
+                Next::Stop(PolicyStop::UnsupportedSurface(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn key_surface_checks_only_the_focus_anchor() {
+        for gap in ["canvas", "cross_origin_frame", "closed_shadow_root"] {
+            let mut observed = focused("A");
+            observed.coverage.gaps.push(gap.into());
+            assert!(
+                matches!(
+                    decide_not_done(
+                        &mut Policy::new(&JobOptions::default(), "http://example.test/"),
+                        &step(),
+                        &observed,
+                        &judgments("PRESS_KEY"),
+                        false
+                    ),
+                    Next::Mutate(_)
+                ),
+                "{gap}"
+            );
+        }
+        let mut popup = focused("A");
+        popup.coverage.gaps.push("popup".into());
+        assert!(matches!(
+            decide_not_done(
+                &mut Policy::new(&JobOptions::default(), "http://example.test/"),
+                &step(),
+                &popup,
+                &judgments("PRESS_KEY"),
+                false
+            ),
+            Next::Stop(PolicyStop::UnsupportedSurface("popup_or_new_tab"))
+        ));
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
         let mut unsafe_focus = focused("frame");
         unsafe_focus.focus_anchor.as_mut().unwrap().role = "iframe".into();
         unsafe_focus.focus_anchor.as_mut().unwrap().covered = false;
@@ -1051,6 +1443,18 @@ mod tests {
                 Next::Stop(PolicyStop::UnsupportedSurface(actual)) if actual == reason
             ));
         }
+        let mut uncovered = focused("A");
+        uncovered.focus_anchor.as_mut().unwrap().covered = false;
+        assert!(matches!(
+            decide_not_done(
+                &mut policy,
+                &step(),
+                &uncovered,
+                &judgments("PRESS_KEY"),
+                false
+            ),
+            Next::Stop(PolicyStop::UnsupportedSurface("closed_shadow_root"))
+        ));
         let mut no_focus = focused("A");
         no_focus.focus_anchor = None;
         assert!(matches!(
@@ -1064,6 +1468,7 @@ mod tests {
             Next::Mutate(_)
         ));
     }
+
     fn step() -> Step {
         Step {
             id: "submit".into(),
@@ -1253,6 +1658,34 @@ mod tests {
             ),
             Next::Mutate(_)
         ));
+
+        let mut key = judgments("PRESS_KEY");
+        key.key.confidence = 0.69;
+        assert!(matches!(
+            decide_not_done(
+                &mut Policy::new(&JobOptions::default(), "http://example.test/"),
+                &step(),
+                &focused("A"),
+                &key,
+                false
+            ),
+            Next::ReobserveOperation
+        ));
+        for (operation, role) in [("CLICK", "button"), ("TYPE_TEXT", "textbox")] {
+            let mut other = judgments(operation);
+            other.key.confidence = 0.01;
+            other.key.choice = "Control+W".into();
+            assert!(matches!(
+                decide_not_done(
+                    &mut Policy::new(&JobOptions::default(), "http://example.test/"),
+                    &step(),
+                    &observation(operation, role),
+                    &other,
+                    false
+                ),
+                Next::Mutate(_)
+            ));
+        }
     }
 
     #[test]
