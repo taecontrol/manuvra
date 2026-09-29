@@ -15,7 +15,9 @@ mod platform;
 
 #[cfg(all(test, target_os = "linux"))]
 use platform::process_is_same;
-pub use platform::{child_exited_without_reaping, process_identity, signal_process_group};
+pub use platform::{
+    child_exited_without_reaping, process_identity, process_is_live, signal_process_group,
+};
 
 pub const IPC_VERSION: u16 = 1;
 

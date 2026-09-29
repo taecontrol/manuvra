@@ -17,6 +17,13 @@ pub fn process_is_same(identity: &ProcessIdentity) -> bool {
     stable_identity_fields(identity.pid).is_ok_and(|fields| fields.matches(identity))
 }
 
+/// The recorded process still runs: it has its recorded identity and has not exited into a
+/// zombie awaiting its parent.
+pub fn process_is_live(identity: &ProcessIdentity) -> bool {
+    stable_identity_fields(identity.pid)
+        .is_ok_and(|fields| fields.matches(identity) && !fields.exited)
+}
+
 pub fn signal_process_group(identity: &ProcessIdentity, signal: i32) -> Result<bool, String> {
     if identity.process_group != identity.pid {
         return Ok(false);
@@ -163,7 +170,11 @@ struct IdentityFields {
     process_group: u32,
     session_id: u32,
     start_time: u64,
+    exited: bool,
 }
+
+/// `SZOMB` from `<sys/proc.h>`: the process exited and awaits its parent.
+const ZOMBIE_STATUS: u32 = 5;
 
 impl IdentityFields {
     fn matches(self, identity: &ProcessIdentity) -> bool {
@@ -182,6 +193,7 @@ fn stable_identity_fields(pid: u32) -> Result<IdentityFields, String> {
         process_group: first.pbi_pgid,
         session_id,
         start_time,
+        exited: second.pbi_status == ZOMBIE_STATUS,
     })
 }
 
@@ -349,6 +361,22 @@ mod tests {
         assert!(child.try_wait().unwrap().is_none());
         assert!(signal_process_group(&current, libc::SIGKILL).unwrap());
         child.wait().unwrap();
+    }
+
+    #[test]
+    fn an_unreaped_zombie_is_not_live() {
+        let mut child = isolated_group_child();
+        let identity = process_identity(child.id()).unwrap();
+        assert!(process_is_live(&identity));
+        child.kill().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !child_exited_without_reaping(child.id()).unwrap() {
+            assert!(Instant::now() < deadline, "child did not exit");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!process_is_live(&identity));
+        child.wait().unwrap();
+        assert!(!process_is_live(&identity));
     }
 
     #[test]

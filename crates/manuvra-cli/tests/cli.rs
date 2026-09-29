@@ -2780,6 +2780,38 @@ fn paused_abort_is_deduplicated_and_conflicting_control_request_is_rejected() {
     assert_eq!(one_object(&conflict)["error"]["code"], "request_conflict");
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn status_publishes_host_loss_when_host_and_watchdog_die_leaving_their_socket() {
+    let temp = hosted_temp();
+    let (initial, control_path, runtime_run) = start_fault_window(&temp, "pause_abort");
+    let run_id = initial["run_id"].as_str().unwrap();
+    let browser_child_pid = wait_for_pid_file(&runtime_run.join("fake-browser-child.pid"));
+    let paused = wait_for_control_value(&control_path, |value| {
+        value["result"]["state"] == "uncertain" && value["watchdog"]["pid"].is_u64()
+    });
+    let watchdog_pid = paused["watchdog"]["pid"].as_u64().unwrap() as u32;
+    let host_pid = paused["host"]["pid"].as_u64().unwrap() as u32;
+    assert_eq!(unsafe { libc::kill(watchdog_pid as i32, libc::SIGKILL) }, 0);
+    assert_process_gone(watchdog_pid);
+    assert_eq!(unsafe { libc::kill(host_pid as i32, libc::SIGKILL) }, 0);
+    assert_process_gone(host_pid);
+    assert!(runtime_run.join("control.sock").exists());
+
+    let status = hosted_invoke(&temp, &["status", run_id, "--wait-ms", "5000"]);
+    assert_eq!(status.status.code(), Some(3));
+    let result = one_object(&status);
+    assert_eq!(result["state"], "blocked");
+    assert_eq!(result["terminal"], true);
+    assert_eq!(result["reason"]["code"], "host_lost");
+    assert!(!runtime_run.join("control.sock").exists());
+    assert_process_gone(browser_child_pid);
+
+    let repeated = hosted_invoke(&temp, &["status", run_id]);
+    assert_eq!(repeated.status.code(), Some(3));
+    assert_eq!(repeated.stdout, status.stdout);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn watchdog_lifetime_state_excludes_provider_key_embedded_in_caller_text() {

@@ -31,6 +31,20 @@ pub fn validate_socket_path(path: &Path) -> Result<(), String> {
     platform::validate_socket_path(path)
 }
 
+/// Removes the control socket of a host whose death the run lock has confirmed. Only a socket is
+/// removed; any other entry at the recorded path is reported and left in place.
+pub fn remove_dead_socket(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::FileTypeExt;
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() => std::fs::remove_file(path)
+            .map_err(|error| format!("cannot remove dead host socket: {error}")),
+        Ok(_) => Err("dead host socket path is not an owned socket".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("cannot inspect dead host socket: {error}")),
+    }
+}
+
 fn validate_run_id(run_id: &str) -> Result<(), String> {
     let valid = run_id.len() == 18
         && run_id.starts_with("r_")
@@ -79,6 +93,27 @@ mod tests {
             run_dir_under(temporary.path(), "r_1234567890abcdef").unwrap(),
             directory
         );
+    }
+
+    #[test]
+    fn dead_socket_removal_is_bounded_to_sockets() {
+        let temporary = tempfile::Builder::new()
+            .prefix("mds")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let absent = temporary.path().join("absent.sock");
+        assert!(remove_dead_socket(&absent).is_ok());
+
+        let socket = temporary.path().join("owned.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        assert!(remove_dead_socket(&socket).is_ok());
+        assert!(!socket.exists());
+        drop(listener);
+
+        let ordinary = temporary.path().join("ordinary");
+        std::fs::write(&ordinary, b"not a socket").unwrap();
+        assert!(remove_dead_socket(&ordinary).is_err());
+        assert_eq!(std::fs::read(&ordinary).unwrap(), b"not a socket");
     }
 
     #[cfg(target_os = "macos")]

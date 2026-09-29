@@ -752,7 +752,7 @@ fn remove_dead_host_socket(
     control: &store::RunControl,
     lock: store::RunLock,
 ) -> Result<(), Invocation> {
-    remove_confirmed_dead_socket(&control.socket)
+    runtime::remove_dead_socket(&control.socket)
         .map_err(|error| internal_error(prepared.redactor.redact_text(&error)))?;
     drop(lock);
     Ok(())
@@ -771,21 +771,6 @@ fn unreachable_host_message(lock_present: bool) -> String {
         "existing run host holds its lock but failed the live IPC identity check".into()
     } else {
         "existing browser run has no death-detection lock; it will not be restarted".into()
-    }
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn remove_confirmed_dead_socket(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::FileTypeExt;
-
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_socket() => fs::remove_file(path)
-            .map_err(|error| format!("cannot remove confirmed dead host socket: {error}")),
-        Ok(_) => Err("confirmed dead host socket path is not an owned socket".into()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!(
-            "cannot inspect confirmed dead host socket: {error}"
-        )),
     }
 }
 
@@ -1611,34 +1596,9 @@ pub(crate) fn internal_error(message: String) -> Invocation {
 
 #[cfg(test)]
 mod boundary_tests {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    use super::remove_confirmed_dead_socket;
     use super::{role_matches_path, validate_evidence_shape};
     use manuvra_contract::{Artifact, Manifest, SchemaVersion};
     use serde_json::json;
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    use std::os::unix::net::UnixListener;
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    use tempfile::TempDir;
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn confirmed_dead_socket_removal_is_bounded_to_sockets() {
-        let temporary = TempDir::new().unwrap();
-        let absent = temporary.path().join("absent.sock");
-        assert!(remove_confirmed_dead_socket(&absent).is_ok());
-
-        let socket = temporary.path().join("owned.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        assert!(remove_confirmed_dead_socket(&socket).is_ok());
-        assert!(!socket.exists());
-        drop(listener);
-
-        let ordinary = temporary.path().join("ordinary");
-        std::fs::write(&ordinary, b"not a socket").unwrap();
-        assert!(remove_confirmed_dead_socket(&ordinary).is_err());
-        assert_eq!(std::fs::read(&ordinary).unwrap(), b"not a socket");
-    }
 
     #[test]
     fn completed_resume_checkpoint_may_be_nonterminal_but_product_may_not() {
