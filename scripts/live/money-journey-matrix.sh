@@ -510,7 +510,10 @@ run_case() {
   elif [[ -z "$failure" ]]; then
     failure="fixture cleanup was not confirmed"
   fi
-  [[ -z "$run_id" ]] || rmdir "$runtime_root/manuvra/runs/$run_id" 2>/dev/null || true
+  if [[ -n "$run_id" ]] && ! runtime_dir_removed "$runtime_root/manuvra/runs/$run_id" &&
+    [[ -z "$failure" ]]; then
+    failure="runtime directory was not removed"
+  fi
 
   if ! provider_key_present "$case_root" >/dev/null &&
     ! rg -a -l '"(document_id|node_id|target_node_id)"' "$case_root" >/dev/null &&

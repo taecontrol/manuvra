@@ -11,7 +11,8 @@ require_command cargo
 require_command rg
 require_provider_key
 stamp=$(date +%Y%m%d-%H%M%S)-$$
-evidence_root="$repo_root/.work/live/browser-observation/$stamp"
+# The secret job classifies protocol words such as "browser", so evidence paths must avoid them.
+evidence_root="$repo_root/.work/live/observation/$stamp"
 state_root="$evidence_root/state"
 mkdir -p "$evidence_root" "$state_root"
 trap cleanup_active_fixture EXIT
@@ -41,6 +42,8 @@ run_case() {
   fi
   status=$?
   set -e
+  [[ $status -eq 0 || $status -eq 2 || $status -eq 3 || $status -eq 4 || $status -eq 6 ]]
+  status=$(settle_run "$state_root/$label" "$evidence_root/$label-stdout.json")
   [[ $status -eq $expected_exit ]]
   [[ "$(jq -r '.state' "$evidence_root/$label-stdout.json")" == "$expected_state" ]]
   observe_fixture accounts.empty >"$evidence_root/$label-observe.json"
@@ -48,7 +51,7 @@ run_case() {
 }
 
 run_case observe observe.json 0 passed
-run_case dialog dialog-closed.json 4 failed
+run_case dialog unmet-done-condition.json 4 failed
 run_case secret secret-redaction.json 0 passed
 run_case provider provider-redaction.json 0 passed live-provider-export-marker
 

@@ -2,14 +2,14 @@
   "schema_version": 1,
   "target": {"kind": "browser", "url": "http://127.0.0.1:4351/"},
   "context": {
-    "journey": "Confirm a closed dialog is not open",
+    "journey": "A done condition the page never satisfies fails the step",
     "revision": "verified-by-money-doctor",
     "environment": "fresh local money fixture",
     "actor": "synthetic owner",
-    "authority": "observe only"
+    "authority": "open the Create account dialog only"
   },
   "steps": [
-    {"id": "dialog-open", "goal": "Observe the Create account dialog.", "done_when": [{"dialog_open": "Create account"}]}
+    {"id": "dialog-open", "goal": "Open the Create account dialog.", "done_when": [{"dialog_open": "Delete account"}]}
   ],
   "options": {"allowed_origins": ["http://127.0.0.1:4351"]}
 }

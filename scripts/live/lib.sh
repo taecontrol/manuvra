@@ -100,6 +100,15 @@ stop_fixture() {
   jq -e '.status == "completed" and .result.cleanup == "cleaned"' "$output" >/dev/null || return 1
   active_fixture=
   active_fixture_state=
+  port_released
+}
+
+# Waits for the fixture runtime to release port 4351; cleanup can report before its last worker exits.
+port_released() {
+  local deadline
+  deadline=$(( $(date +%s) + 10 ))
+  while port_is_open && [[ $(date +%s) -lt $deadline ]]; do sleep 0.1; done
+  ! port_is_open
 }
 
 # Follows a running Run with `status` until it reaches a checkpoint. Uses the caller's `$manuvra`.
@@ -122,6 +131,40 @@ wait_checkpoint() {
     state=$(jq -r '.state' "$current")
   done
   [[ "$state" != running ]]
+}
+
+# Follows a Run from its first result to the next non-running checkpoint, rewrites `current`
+# with that checkpoint, and prints the exit code `status` reports for it.
+settle_run() {
+  local state_root=$1 current=$2 run_id code
+  run_id=$(jq -r '.run_id' "$current")
+  wait_checkpoint "$state_root" "$run_id" "$current" || return 1
+  set +e
+  XDG_STATE_HOME="$state_root" "${manuvra:?settle_run needs the manuvra binary path}" \
+    status "$run_id" >"$current.settled" 2>"$current.settled.stderr"
+  code=$?
+  set -e
+  mv "$current.settled" "$current"
+  echo "$code"
+}
+
+# Aborts a Run paused for a disposition so it releases its browser, and confirms the abort.
+abort_paused_run() {
+  local state_root=$1 run_id=$2 output=$3 code
+  set +e
+  XDG_STATE_HOME="$state_root" "${manuvra:?abort_paused_run needs the manuvra binary path}" \
+    abort "$run_id" --request-id "abort-$run_id" >"$output" 2>"${output%.json}.stderr"
+  code=$?
+  set -e
+  [[ $code -eq 5 ]] && jq -e '.state == "aborted" and .terminal == true' "$output" >/dev/null
+}
+
+# Waits for Manuvra to remove a finished Run's private runtime directory.
+runtime_dir_removed() {
+  local dir=$1 deadline
+  deadline=$(( $(date +%s) + 5 ))
+  while [[ -e "$dir" && $(date +%s) -lt $deadline ]]; do sleep 0.05; done
+  [[ ! -e "$dir" ]]
 }
 
 # Succeeds when an escalation payload offers the one operation each Money job step intends.

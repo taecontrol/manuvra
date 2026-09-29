@@ -51,6 +51,8 @@ assert_correct_stop() {
   local output=$1 payload run_dir step operation target_choice snapshot target_name expected
   payload=$(jq -r '.escalation.payload' "$output")
   [[ -f "$payload" ]]
+  # A final-verification stop has no step candidate to check.
+  if jq -e '.phase == "verification"' "$payload" >/dev/null; then return 0; fi
   jq -e '.phase == "step"' "$payload" >/dev/null
   if jq -e '.offered_candidate != null' "$payload" >/dev/null; then
     candidate_is_expected "$payload"
@@ -110,15 +112,19 @@ run_case() {
     >"$evidence_root/$label-stdout.json" 2>"$evidence_root/$label-stderr.txt"
   status=$?
   set -e
+  [[ $status -eq 0 || $status -eq 2 || $status -eq 6 ]]
+  output="$evidence_root/$label-stdout.json"
+  status=$(settle_run "$state_root/$label" "$output")
   finished=$(date +%s%3N)
   [[ $status -eq 0 || $status -eq 2 ]]
-  output="$evidence_root/$label-stdout.json"
   state=$(jq -r '.state' "$output")
   [[ "$state" == passed || "$state" == uncertain ]]
   classification=autonomous
   if [[ "$state" == uncertain ]]; then
     assert_correct_stop "$output"
     classification=stopped
+    abort_paused_run "$state_root/$label" "$(jq -r '.run_id' "$output")" \
+      "$evidence_root/$label-abort.json"
   fi
   assert_actions_correct "$output"
   verify_manifest "$output"

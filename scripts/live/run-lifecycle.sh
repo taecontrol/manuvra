@@ -141,7 +141,7 @@ done <"$evidence_root/lifecycle-pids.txt"
 observe_fixture accounts.create >"$evidence_root/observe.json"
 jq -e '.result.accounts | length == 0' "$evidence_root/observe.json" >/dev/null
 stop_fixture "$evidence_root/cleanup.json" "$evidence_root/cleanup.stderr"
-rmdir "$runtime_root/manuvra/runs/$run_id"
+runtime_dir_removed "$runtime_root/manuvra/runs/$run_id"
 
 if provider_key_present "$evidence_root"; then
   echo "provider key leaked into live evidence" >&2

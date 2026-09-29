@@ -174,7 +174,7 @@ jq -e '.error.code == "request_conflict"' "$case_root/resume-stale-conflict.json
 
 printf '%s\t%s\t%s\t%s\n' "$label" "$run_id" "$assists" "$(jq -r '.state' "$result")" >>"$live_root/matrix.tsv"
 stop_fixture "$case_root/cleanup.json" "$case_root/cleanup.stderr"
-rmdir "$runtime_root/manuvra/runs/$run_id"
+runtime_dir_removed "$runtime_root/manuvra/runs/$run_id"
 
 if provider_key_present "$live_root"; then
   echo "provider key leaked into live evidence" >&2
