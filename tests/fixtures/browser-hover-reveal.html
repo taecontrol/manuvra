@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Plan · September</title>
+<style>
+  body { font: 14px system-ui, sans-serif; margin: 24px; }
+  main { width: 720px; }
+  ul { list-style: none; padding: 0; margin: 0 0 16px; }
+  .row { display: grid; grid-template-columns: 2rem 1fr 8rem 8rem 2.5rem; align-items: center; min-height: 36px; border-top: 1px solid #ddd; padding: 0 8px; cursor: grab; }
+  .group-row { background: #f2f2f2; font-weight: 600; }
+  .reveal { opacity: 0; transition: opacity 150ms; }
+  .row:hover .reveal, .row:focus-within .reveal { opacity: 1; }
+  button { font: inherit; background: none; border: 0; padding: 4px 6px; cursor: pointer; }
+  .cell { display: flex; width: 40px; height: 36px; align-items: center; justify-content: center; }
+  [role="menu"] { position: fixed; background: #fff; border: 1px solid #999; padding: 4px; display: flex; flex-direction: column; min-width: 180px; }
+  [role="menuitem"] { padding: 4px 8px; cursor: default; }
+  .menu-label { padding: 4px 8px; font-weight: 600; color: #555; }
+  [role="alertdialog"] { position: fixed; top: 120px; left: 200px; width: 360px; background: #fff; border: 1px solid #333; padding: 16px; }
+</style>
+</head>
+<body>
+<header><h1>Plan</h1><button type="button">Previous month</button> September 2026 <button type="button">Next month</button> <button type="button">+ Add group</button></header>
+<main id="catalog"></main>
+<script>
+  // Reproduces a budget plan whose row actions are revealed only by :hover or :focus-within.
+  // ?many=1 adds enough revealing rows to exceed the snapshot's hover region cap.
+  const groups = [
+    ['Essentials', [['Groceries', '$400.00', '$312.50'], ['Rent', '$1,500.00', '$1,500.00'], ['Utilities', '$180.00', '$96.20']]],
+    ['Lifestyle', [['Dining out', '$150.00', '$88.00'], ['Streaming', '$25.00', '$25.00'], ['Gym', '$40.00', '$40.00', 'aria-hidden'], ['Travel', '$90.00', '$0.00', 'inert']]],
+  ];
+  if (new URLSearchParams(location.search).has('many')) {
+    groups.push(['Subscriptions', Array.from({length: 16}, (_, i) => [`Subscription ${i + 1}`, '$9.00', '$9.00'])]);
+  }
+  const main = document.getElementById('catalog');
+
+  const closeMenus = () => {
+    document.querySelectorAll('[role="menu"]').forEach(menu => menu.remove());
+    document.querySelectorAll('[aria-haspopup="menu"]').forEach(trigger => trigger.setAttribute('aria-expanded', 'false'));
+  };
+  document.addEventListener('pointerdown', event => {
+    if (!event.target.closest('[role="menu"],[aria-haspopup="menu"]')) closeMenus();
+  });
+
+  const confirmDelete = (row, label) => {
+    main.setAttribute('aria-hidden', 'true');
+    const dialog = document.createElement('div');
+    dialog.setAttribute('role', 'alertdialog');
+    dialog.setAttribute('aria-modal', 'true');
+    dialog.setAttribute('aria-labelledby', 'confirm-title');
+    dialog.innerHTML = `<h2 id="confirm-title">Delete category?</h2><p>${label} and its history will be removed.</p>`;
+    const finish = remove => () => {
+      if (remove) row.remove();
+      dialog.remove();
+      main.removeAttribute('aria-hidden');
+    };
+    for (const [text, remove] of [['Cancel', false], ['Delete', true]]) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = text;
+      button.onclick = finish(remove);
+      dialog.appendChild(button);
+    }
+    document.body.appendChild(dialog);
+  };
+
+  const openMenu = (trigger, row, label, items) => {
+    const wasOpen = trigger.getAttribute('aria-expanded') === 'true';
+    closeMenus();
+    if (wasOpen) return;
+    trigger.setAttribute('aria-expanded', 'true');
+    const menu = document.createElement('div');
+    menu.setAttribute('role', 'menu');
+    menu.setAttribute('aria-label', `Actions for ${label}`);
+    // Non-modal and portalled beside the list, so it never covers another row's controls.
+    menu.style.left = `${main.getBoundingClientRect().right + 24}px`;
+    menu.style.top = `${row.getBoundingClientRect().top}px`;
+    // A visible, non-interactive label names the row, so a structured done condition can tell
+    // one row's open menu from another's.
+    const heading = document.createElement('div');
+    heading.className = 'menu-label';
+    heading.textContent = `Actions menu for ${label}`;
+    menu.appendChild(heading);
+    for (const item of items) {
+      const entry = document.createElement('div');
+      entry.setAttribute('role', 'menuitem');
+      entry.tabIndex = -1;
+      entry.textContent = item;
+      entry.onclick = () => {
+        closeMenus();
+        if (item === 'Delete category…') confirmDelete(row, label);
+      };
+      menu.appendChild(entry);
+    }
+    document.body.appendChild(menu);
+  };
+
+  const actions = (row, label, items, concealment) => {
+    const cell = document.createElement('div');
+    cell.className = 'cell';
+    const wrapper = document.createElement('div');
+    wrapper.className = 'reveal';
+    if (concealment === 'aria-hidden') wrapper.setAttribute('aria-hidden', 'true');
+    if (concealment === 'inert') wrapper.inert = true;
+    const trigger = document.createElement('button');
+    trigger.type = 'button';
+    trigger.setAttribute('aria-label', `Actions for ${label}`);
+    trigger.setAttribute('aria-haspopup', 'menu');
+    trigger.setAttribute('aria-expanded', 'false');
+    trigger.innerHTML = '<span aria-hidden="true">⋯</span>';
+    trigger.onclick = () => openMenu(trigger, row, label, items);
+    wrapper.appendChild(trigger);
+    cell.appendChild(wrapper);
+    return cell;
+  };
+
+  for (const [group, categories] of groups) {
+    const list = document.createElement('ul');
+    list.setAttribute('aria-label', group);
+    const head = document.createElement('li');
+    head.className = 'row group-row';
+    head.setAttribute('aria-label', group);
+    head.innerHTML = `<span></span><span>${group}</span><span>Assigned</span><span>Activity</span>`;
+    head.appendChild(actions(head, group, ['Rename group', 'Add category', 'Delete group…']));
+    list.appendChild(head);
+    for (const [name, assigned, activity, concealment] of categories) {
+      const row = document.createElement('li');
+      row.className = 'row';
+      row.setAttribute('aria-label', name);
+      row.draggable = true;
+      row.innerHTML = `<span></span><span>${name}</span>` +
+        `<button type="button" aria-label="Edit assigned amount for ${name}, ${assigned}">${assigned}</button>` +
+        `<button type="button" aria-label="View activity for ${name}, ${activity}">${activity}</button>`;
+      row.appendChild(actions(row, name, ['Rename', 'Move up', 'Move down', 'Move to group…', 'Delete category…'], concealment));
+      list.appendChild(row);
+    }
+    main.appendChild(list);
+  }
+</script>
+</body>
+</html>

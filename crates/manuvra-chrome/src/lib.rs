@@ -12,7 +12,7 @@ pub use input::{
     InputCancellation, Key, PerformError, PerformFact, PreparedInput, PreparedOperation,
 };
 pub use observation::{
-    ActiveDescendant, Coverage, Element, FocusAnchor, FocusSurface, Observation, Rect,
+    ActiveDescendant, Coverage, Element, FocusAnchor, FocusSurface, HoverRegion, Observation, Rect,
     SelectOption, ViewportState,
 };
 pub use owned::{

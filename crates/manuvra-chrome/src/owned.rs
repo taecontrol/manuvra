@@ -178,16 +178,11 @@ impl OwnedBrowser {
         input: PreparedInput,
         cancellation: &InputCancellation,
     ) -> Result<PerformFact, PerformError> {
-        let settle_navigation = matches!(
-            input.operation,
-            PreparedOperation::Click | PreparedOperation::PressKey(_)
-        );
+        let operation = input.operation;
         let fence = self.client.cursor();
         let fact = crate::input::perform(&self.client, input, cancellation)?;
-        if settle_navigation {
-            settle_input_navigation(&self.client, fence)
-                .map_err(|error| PerformError::Uncertain(error.to_string()))?;
-        }
+        settle_after_input(&self.client, operation, fence)
+            .map_err(|error| PerformError::Uncertain(error.to_string()))?;
         Ok(fact)
     }
 
@@ -629,6 +624,32 @@ fn wait_for_document(client: &CdpClient, mut cursor: u64) -> Result<(), BrowserE
             return Err(BrowserError::Control("page did not become quiet".into()));
         }
         client.wait_for_journal_change(cursor, Duration::from_millis(25));
+    }
+}
+
+/// Lets the page react to performed input before the next observation.
+fn settle_after_input(
+    client: &CdpClient,
+    operation: PreparedOperation,
+    fence: u64,
+) -> Result<(), BrowserError> {
+    match operation {
+        PreparedOperation::Click | PreparedOperation::PressKey(_) => {
+            settle_input_navigation(client, fence)
+        }
+        // Hover styles apply on a later rendering frame, and an opacity transition that reveals
+        // controls starts from zero, so an immediate observation still finds them hidden. A fixed
+        // window, unlike a quiet-journal wait, cannot turn a performed hover into an error on a
+        // page that never stops changing.
+        PreparedOperation::Hover => {
+            thread::sleep(QUIET_WINDOW);
+            Ok(())
+        }
+        PreparedOperation::TypeText
+        | PreparedOperation::Select
+        | PreparedOperation::SetValue
+        | PreparedOperation::ScrollUp
+        | PreparedOperation::ScrollDown => Ok(()),
     }
 }
 
@@ -1181,6 +1202,43 @@ mod tests {
             )
             .unwrap();
         assert_eq!(fact.suboperations, ["mouse_press", "mouse_release"]);
+        browser.close().unwrap();
+    }
+
+    #[test]
+    fn owned_perform_lets_a_hover_settle_before_the_next_observation() {
+        let chrome = ScriptedChrome::start();
+        chrome.reply(
+            "Runtime.evaluate",
+            json!({"result":{"value":{"ok":true,"x":12.0,"y":20.0}}}),
+        );
+        let mut browser = browser_with_client(chrome.connect_raw());
+        let perform = |operation| {
+            let started = Instant::now();
+            let fact = browser
+                .perform(
+                    PreparedInput {
+                        document_id: "d".into(),
+                        node_id: 7,
+                        operation,
+                        text: None,
+                        previous_text: None,
+                        option_node_id: None,
+                        combobox: false,
+                        action_sequence: 1,
+                        focus_anchor: None,
+                    },
+                    &InputCancellation::default(),
+                )
+                .unwrap();
+            (fact.suboperations, started.elapsed())
+        };
+
+        let (hover, hover_duration) = perform(PreparedOperation::Hover);
+        assert_eq!(hover, ["mouse_move"]);
+        assert!(hover_duration >= QUIET_WINDOW, "{hover_duration:?}");
+        let (scroll, _) = perform(PreparedOperation::ScrollDown);
+        assert_eq!(scroll, ["scroll_down"]);
         browser.close().unwrap();
     }
 

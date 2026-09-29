@@ -1,8 +1,9 @@
 use crate::judgment::Operation;
-use crate::policy::Permit;
+use crate::policy::{HoverTarget, Permit};
 use crate::values::Values;
 use manuvra_chrome::{
-    InputCancellation, Observation, PerformError, PerformFact, PreparedInput, PreparedOperation,
+    Element, HoverRegion, InputCancellation, Observation, PerformError, PerformFact, PreparedInput,
+    PreparedOperation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -23,6 +24,9 @@ pub struct ActionFact {
     pub candidate_id: String,
     pub operation: Operation,
     pub target_name: Option<String>,
+    /// The hover region a `HOVER` targeted, naming the controls it reveals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hover_target: Option<HoverTarget>,
     pub value_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key: Option<manuvra_chrome::Key>,
@@ -214,22 +218,15 @@ fn prepare(
 ) -> Result<PreparedAction, ActionStop> {
     let (candidate, document_id, replay_key, action_sequence) = permit.consume();
     let target = prepared_target(&candidate, observation)?;
+    let region = prepared_hover_region(&candidate, observation)?;
     let text = resolved_text(&candidate, values)?;
     let option_node_id = selected_option_identity(&candidate, target, text)?;
     let focus_anchor = candidate.focus_anchor.clone();
-    let mut evidence = json!({"event":"action_prepared","action_sequence":action_sequence,"candidate_id":candidate.id,"operation":candidate.operation,"target":target.map(|target|json!({"role":target.role,"name":target.name,"dialog":target.in_dialog})),"value_name":candidate.value_name,"replay_key":replay_key,"outcome":"not_performed","basis":basis});
-    if candidate.operation == Operation::PressKey {
-        evidence["focus_anchor"] = json!(focus_anchor.as_ref().map(|anchor| json!({
-            "role":anchor.role,"name":anchor.name,"dialog":anchor.in_dialog,
-            "active_descendant":anchor.active_descendant,
-            "expanded":anchor.expanded,"selected":anchor.selected,"checked":anchor.checked,
-        })));
-        evidence["key"] = json!(candidate.key);
-    }
+    let evidence = prepared_evidence(&candidate, target, action_sequence, &replay_key, basis);
     let operation = prepared_operation(candidate.operation, candidate.key, target)?;
     let input = PreparedInput {
         document_id,
-        node_id: target.map_or(0, |target| target.node_id),
+        node_id: input_node_id(target, region),
         operation,
         text: text.map(str::to_owned),
         previous_text: target.map(|target| target.value.clone()),
@@ -250,6 +247,33 @@ fn prepare(
     })
 }
 
+/// The `action_prepared` journal entry: what is about to be dispatched, without dispatch identity.
+fn prepared_evidence(
+    candidate: &crate::policy::Candidate,
+    target: Option<&Element>,
+    action_sequence: u64,
+    replay_key: &str,
+    basis: &str,
+) -> Value {
+    let mut evidence = json!({"event":"action_prepared","action_sequence":action_sequence,"candidate_id":candidate.id,"operation":candidate.operation,"target":target.map(|target|json!({"role":target.role,"name":target.name,"dialog":target.in_dialog})),"value_name":candidate.value_name,"replay_key":replay_key,"outcome":"not_performed","basis":basis});
+    if let Some(hover_target) = &candidate.hover_target {
+        evidence["hover_target"] = json!(hover_target);
+    }
+    if candidate.operation == Operation::PressKey {
+        add_key_evidence(&mut evidence, candidate);
+    }
+    evidence
+}
+
+fn add_key_evidence(evidence: &mut Value, candidate: &crate::policy::Candidate) {
+    evidence["focus_anchor"] = json!(candidate.focus_anchor.as_ref().map(|anchor| json!({
+        "role":anchor.role,"name":anchor.name,"dialog":anchor.in_dialog,
+        "active_descendant":anchor.active_descendant,
+        "expanded":anchor.expanded,"selected":anchor.selected,"checked":anchor.checked,
+    })));
+    evidence["key"] = json!(candidate.key);
+}
+
 fn prepared_target<'a>(
     candidate: &crate::policy::Candidate,
     observation: &'a Observation,
@@ -262,11 +286,33 @@ fn prepared_target<'a>(
     });
     let target_optional = matches!(
         candidate.operation,
-        Operation::ScrollUp | Operation::ScrollDown | Operation::PressKey
+        Operation::ScrollUp | Operation::ScrollDown | Operation::Hover | Operation::PressKey
     );
     (target.is_some() || target_optional)
         .then_some(target)
         .ok_or(ActionStop::InvalidPermit)
+}
+
+/// A `HOVER` dispatches to its region's first hidden control, which must still be the observed
+/// region the permit named.
+fn prepared_hover_region<'a>(
+    candidate: &crate::policy::Candidate,
+    observation: &'a Observation,
+) -> Result<Option<&'a HoverRegion>, ActionStop> {
+    if candidate.operation != Operation::Hover {
+        return Ok(None);
+    }
+    candidate
+        .hover_region(observation)
+        .map(Some)
+        .ok_or(ActionStop::InvalidPermit)
+}
+
+fn input_node_id(target: Option<&Element>, region: Option<&HoverRegion>) -> u64 {
+    target
+        .map(|target| target.node_id)
+        .or_else(|| region.map(|region| region.node_id))
+        .unwrap_or(0)
 }
 
 fn resolved_text<'a>(
@@ -319,6 +365,7 @@ fn prepared_fallback(operation: Operation) -> Result<PreparedOperation, ActionSt
     match operation {
         Operation::ScrollUp => Ok(PreparedOperation::ScrollUp),
         Operation::ScrollDown => Ok(PreparedOperation::ScrollDown),
+        Operation::Hover => Ok(PreparedOperation::Hover),
         Operation::Wait | Operation::Blocked => Err(ActionStop::InvalidPermit),
         Operation::Click | Operation::TypeText | Operation::Select | Operation::PressKey => {
             unreachable!("input operation")
@@ -376,6 +423,7 @@ fn action_fact(
         candidate_id: prepared.candidate.id,
         operation: prepared.candidate.operation,
         target_name: prepared.candidate.target_name,
+        hover_target: prepared.candidate.hover_target,
         value_name: prepared.candidate.value_name,
         key: prepared.candidate.key,
         outcome,
@@ -523,6 +571,8 @@ mod tests {
                 document_height: 10.,
             },
             coverage: Coverage::default(),
+            hover_regions: Vec::new(),
+            hover_regions_truncated: false,
         }
     }
     fn permit(job: &Job, obs: &Observation) -> Permit {
@@ -541,6 +591,7 @@ mod tests {
             select_target: c("1"),
             type_value: c("name"),
             key: c("Escape"),
+            hover_target: None,
             step_done: 0.,
             usage: BTreeMap::new(),
             request_id: None,
@@ -853,5 +904,213 @@ mod tests {
         journal.append(&json!({"event":"clear_test"})).unwrap();
         journal.clear().unwrap();
         assert!(!clear_path.exists());
+    }
+
+    fn hover_page() -> Observation {
+        let mut page = observation();
+        page.hover_regions = vec![HoverRegion {
+            index: 1,
+            name: "Groceries".into(),
+            reveals_on_hover: vec!["Actions for Groceries".into()],
+            node_id: 41,
+        }];
+        page
+    }
+
+    fn hover_permit(page: &Observation) -> Permit {
+        let c = |s: &str| ChoiceJudgment {
+            choice: s.into(),
+            probabilities: BTreeMap::from([(s.into(), 1.)]),
+            confidence: 1.,
+        };
+        let j = Judgments {
+            operation: c("HOVER"),
+            click_target: c("NO_CLICK_TARGET"),
+            type_target: c("NO_TYPE_TEXT_TARGET"),
+            select_target: c("NO_SELECT_TARGET"),
+            type_value: c("NONE_FITS"),
+            key: c("Escape"),
+            hover_target: Some(c("R1")),
+            step_done: 0.,
+            usage: BTreeMap::new(),
+            request_id: None,
+            model: "jev".into(),
+            request: Value::Null,
+        };
+        let job = job();
+        match Policy::new(&job.options, "http://example.test").decide(
+            &job.steps[0],
+            page,
+            &j,
+            crate::verification::DoneResult::NotSatisfied,
+            false,
+            false,
+        ) {
+            Next::Mutate(permit) => *permit,
+            _ => panic!("hover permit"),
+        }
+    }
+
+    fn hover_with(
+        performer: &(impl Performer + ?Sized),
+        page: &Observation,
+        journal: &mut FakeJournal,
+    ) -> Result<ActionFact, ActionStop> {
+        let job = job();
+        perform(
+            hover_permit(&hover_page()),
+            performer,
+            page,
+            &Values::new(&job),
+            journal,
+            &InputCancellation::default(),
+        )
+    }
+
+    #[test]
+    fn hover_dispatches_to_the_region_hidden_control_and_records_the_region() {
+        let capture = CapturingPerformer(Mutex::new(None));
+        let mut journal = FakeJournal::default();
+        let fact = hover_with(&capture, &hover_page(), &mut journal).unwrap();
+
+        let input = capture.0.lock().unwrap().clone().unwrap();
+        assert_eq!(input.operation, PreparedOperation::Hover);
+        assert_eq!(input.node_id, 41);
+        assert_eq!(input.document_id, "d");
+        assert_eq!(input.text, None);
+        assert_eq!(input.previous_text, None);
+        let named =
+            json!({"index":1,"name":"Groceries","reveals_on_hover":["Actions for Groceries"]});
+        assert_eq!(journal.entries[0]["event"], "action_prepared");
+        assert_eq!(journal.entries[0]["operation"], "HOVER");
+        assert_eq!(journal.entries[0]["target"], Value::Null);
+        assert_eq!(journal.entries[0]["hover_target"], named);
+        assert_eq!(journal.entries[1]["fact"]["hover_target"], named);
+        assert_eq!(fact.outcome, Outcome::Observed);
+        assert_eq!(fact.operation, Operation::Hover);
+        assert_eq!(fact.readback_matches, None);
+    }
+
+    #[test]
+    fn non_hover_evidence_carries_no_hover_target() {
+        let job = job();
+        let obs = observation();
+        let mut journal = FakeJournal::default();
+        perform(
+            permit(&job, &obs),
+            &CountingPerformer(&AtomicUsize::new(0)),
+            &obs,
+            &Values::new(&job),
+            &mut journal,
+            &InputCancellation::default(),
+        )
+        .unwrap();
+        assert!(journal.entries[0].get("hover_target").is_none());
+        assert!(journal.entries[1]["fact"].get("hover_target").is_none());
+    }
+
+    #[test]
+    fn hover_action_outcomes_preserve_truth() {
+        let dispatches = AtomicUsize::new(0);
+        let mut missing_region = hover_page();
+        missing_region.hover_regions.clear();
+        let mut journal = FakeJournal::default();
+        assert_eq!(
+            hover_with(
+                &CountingPerformer(&dispatches),
+                &missing_region,
+                &mut journal
+            ),
+            Err(ActionStop::InvalidPermit)
+        );
+        assert!(journal.entries.is_empty());
+
+        let mut unavailable = FakeJournal {
+            entries: vec![],
+            fail_at: Some(0),
+        };
+        assert_eq!(
+            hover_with(
+                &CountingPerformer(&dispatches),
+                &hover_page(),
+                &mut unavailable
+            ),
+            Err(ActionStop::EvidenceUnavailable)
+        );
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+
+        let mut rejected = FakeJournal::default();
+        assert!(matches!(
+            hover_with(
+                &FakePerformer(Err(PerformError::Rejected("covered".into()))),
+                &hover_page(),
+                &mut rejected
+            ),
+            Err(ActionStop::Reobserve(_))
+        ));
+        assert_eq!(rejected.entries[1]["fact"]["outcome"], "not_performed");
+
+        for failure in [
+            PerformError::NotPerformed("not queued".into()),
+            PerformError::Uncertain("sent without answer".into()),
+        ] {
+            let mut journal = FakeJournal::default();
+            assert_eq!(
+                hover_with(&FakePerformer(Err(failure)), &hover_page(), &mut journal),
+                Err(ActionStop::Uncertain)
+            );
+            assert_eq!(journal.entries[1]["fact"]["outcome"], "uncertain");
+        }
+
+        let mut incomplete = FakeJournal {
+            entries: vec![],
+            fail_at: Some(1),
+        };
+        assert_eq!(
+            hover_with(
+                &CountingPerformer(&dispatches),
+                &hover_page(),
+                &mut incomplete
+            ),
+            Err(ActionStop::IncompleteEvidence)
+        );
+        assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn persisted_hover_evidence_redacts_region_text_and_omits_the_dispatch_node() {
+        let mut job = job();
+        job.values.get_mut("name").unwrap().secret = true;
+        let mut page = hover_page();
+        page.hover_regions[0].name = "Wanted".into();
+        page.hover_regions[0].reveals_on_hover = vec!["Actions for Wanted".into()];
+        let root = TempDir::new().unwrap();
+        let redactor = crate::evidence::Redactor::for_job(&job).unwrap();
+        let mut journal = DurableJournal::open(root.path(), "hover-test", &redactor).unwrap();
+
+        perform(
+            hover_permit(&page),
+            &CountingPerformer(&AtomicUsize::new(0)),
+            &page,
+            &Values::new(&job),
+            &mut journal,
+            &InputCancellation::default(),
+        )
+        .unwrap();
+
+        let persisted =
+            std::fs::read_to_string(root.path().join(".hover-test.action-journal.jsonl")).unwrap();
+        assert_eq!(persisted.matches("\"hover_target\"").count(), 2);
+        assert!(!persisted.contains("Wanted"), "{persisted}");
+        assert!(!persisted.contains("node_id") && !persisted.contains(":41"));
+        journal.remove().unwrap();
+    }
+
+    #[test]
+    fn hover_maps_to_the_prepared_hover_input() {
+        assert_eq!(
+            prepared_fallback(Operation::Hover),
+            Ok(PreparedOperation::Hover)
+        );
     }
 }

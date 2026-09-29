@@ -147,6 +147,8 @@ For an uncertain run, create a disposition matching `manuvra schema disposition`
 - `retry_observation`: use when fresher browser evidence can resolve the uncertainty.
 - `abort`: use when authority, intent, or safe continuation is absent.
 
+An offered `HOVER` candidate names a hover region in `hover_target.name` and the controls it reveals in `hover_target.reveals_on_hover`. Execute it when a revealed control is the one the step needs. The hover only reveals those controls; Manuvra then continues the step on its own.
+
 Example `execute` disposition:
 
 ```json

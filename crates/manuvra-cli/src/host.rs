@@ -732,6 +732,8 @@ fn fault_observation() -> manuvra_flow::Observation {
             document_height: 100.0,
         },
         coverage: manuvra_flow::Coverage::default(),
+        hover_regions: Vec::new(),
+        hover_regions_truncated: false,
     }
 }
 
@@ -749,6 +751,7 @@ fn fault_judgments() -> manuvra_flow::judgment::Judgments {
         select_target: choice("NO_SELECT_TARGET"),
         type_value: choice("NONE_FITS"),
         key: choice("Escape"),
+        hover_target: None,
         step_done: 0.0,
         usage: BTreeMap::new(),
         request_id: None,
@@ -1246,6 +1249,7 @@ fn monitor_watchdog(fd: Option<i32>, control: Arc<Control>) {
 mod tests {
     use super::*;
     use crate::process::IPC_VERSION;
+    use std::os::fd::IntoRawFd;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use tempfile::TempDir;
 
@@ -1746,8 +1750,7 @@ mod tests {
                 .unwrap()
                 .contains("dispatch click submit")
         );
-        browser.kill().unwrap();
-        browser.wait().unwrap();
+        close_fake_browser(&mut browser);
     }
 
     #[cfg(debug_assertions)]
@@ -1843,8 +1846,9 @@ mod tests {
     #[test]
     fn watchdog_pipe_loss_cancels_input_and_marks_the_host() {
         let temporary = TempDir::new().unwrap();
-        let mut descriptors = [-1_i32; 2];
-        assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+        // A close-on-exec pipe keeps children spawned by concurrent tests from
+        // inheriting the write end and withholding end-of-file.
+        let (reader, writer) = std::io::pipe().unwrap();
         let cancellation = InputCancellation::default();
         let control = Arc::new(Control {
             state_root: temporary.path().join("state"),
@@ -1871,10 +1875,8 @@ mod tests {
             resume: Mutex::new(ResumeAdmission::default()),
             pause_timeout_ms: 1_000,
         });
-        monitor_watchdog(Some(descriptors[0]), control.clone());
-        unsafe {
-            libc::close(descriptors[1]);
-        }
+        monitor_watchdog(Some(reader.into_raw_fd()), control.clone());
+        drop(writer);
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         while !control.watchdog_lost.load(Ordering::SeqCst) {
             assert!(std::time::Instant::now() < deadline);

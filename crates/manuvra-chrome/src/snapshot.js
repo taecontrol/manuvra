@@ -87,6 +87,20 @@
     elements.push({index:current,node_id:nodeId(element),context:context.context,role:elementRole,name:name(element)||elementRole,input_type:element.tagName==='INPUT'?element.type:null,value:'value' in element?String(element.value):(element.isContentEditable?element.innerText.trim():''),checked:'checked' in element?Boolean(element.checked):boolAttr('aria-checked'),selected:'selected' in element?Boolean(element.selected):boolAttr('aria-selected'),expanded:boolAttr('aria-expanded'),disabled:Boolean(element.disabled)||element.getAttribute('aria-disabled')==='true',in_dialog:containingDialog?dialogTitle(containingDialog):null,operations,select_options:selectOptions,rect:{x:rect.x+context.offsetX,y:rect.y+context.offsetY,width:rect.width,height:rect.height}});
   }
 
+  const REGION_LIMIT = 20, REGION_NAME_LIMIT = 120;
+  const hiddenByOpacity = (element, context) => inViewport(element, context) && element.checkVisibility({checkVisibilityCSS:true}) &&
+    !element.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}) && !ancestors(element).some(node => node.matches?.('[aria-hidden="true"],[inert]'));
+  const revealingRegion = (element) => ancestors(element).slice(1).find(node => node.checkVisibility({checkOpacity:true}) &&
+    (node.matches('li,tr,[role=row],[role=listitem]') || node.hasAttribute('aria-label')));
+  const regionRecords = new Map(), seenHidden = new Set();
+  for (const context of contexts) for (const element of context.root.querySelectorAll(selector)) {
+    if (seenHidden.has(element) || !hiddenByOpacity(element, context)) continue; seenHidden.add(element);
+    const region = revealingRegion(element); if (!region) continue;
+    if (!regionRecords.has(region)) regionRecords.set(region, {name:(region.getAttribute('aria-label') || region.innerText.replace(/\s+/g,' ').trim()).slice(0,REGION_NAME_LIMIT),reveals_on_hover:[],node_id:nodeId(element)});
+    regionRecords.get(region).reveals_on_hover.push(name(element) || role(element));
+  }
+  const hoverRegions = [...regionRecords.values()].slice(0, REGION_LIMIT).map((record, offset) => ({index:offset + 1, ...record}));
+
   const TEXT_LIMIT = 8000;
   const visibleText = [], coveredText = []; let visibleLength = 0, coveredLength = 0;
   const appendText = (parts, value, kind, length) => {
@@ -160,5 +174,5 @@
     dialogTexts[record.title] = text.slice(0,TEXT_LIMIT);
   }
   const finalGaps = [...new Set(gaps)], truncated = finalGaps.some(gap => gap.endsWith('_truncated'));
-  return {document_id:String(performance.timeOrigin),url:location.href,route:location.pathname+location.search,title:document.title,dialogs,focused,focus_anchor:focusAnchor,visible_text:visibleText.join('\n'),covered_text:coveredText.join('\n'),dialog_texts:dialogTexts,elements,viewport:{width:innerWidth,height:innerHeight,scroll_x:scrollX,scroll_y:scrollY,document_height:document.documentElement.scrollHeight},coverage:{viewport_complete:!truncated,open_shadow_roots:true,slots:true,same_origin_frames:!finalGaps.includes('cross_origin_frame'),gaps:finalGaps}};
+  return {document_id:String(performance.timeOrigin),url:location.href,route:location.pathname+location.search,title:document.title,dialogs,focused,focus_anchor:focusAnchor,visible_text:visibleText.join('\n'),covered_text:coveredText.join('\n'),dialog_texts:dialogTexts,elements,viewport:{width:innerWidth,height:innerHeight,scroll_x:scrollX,scroll_y:scrollY,document_height:document.documentElement.scrollHeight},coverage:{viewport_complete:!truncated,open_shadow_roots:true,slots:true,same_origin_frames:!finalGaps.includes('cross_origin_frame'),gaps:finalGaps},hover_regions:hoverRegions,hover_regions_truncated:regionRecords.size > REGION_LIMIT};
 })()
