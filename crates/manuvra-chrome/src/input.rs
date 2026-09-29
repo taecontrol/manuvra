@@ -1298,8 +1298,15 @@ mod tests {
             )
         });
 
+        // The caller and the connection worker both observe the cancellation once the
+        // move is sent; whichever notices first names the reason.
         assert!(
-            matches!(result, Err(PerformError::Uncertain(ref reason)) if reason.contains("awaiting CDP reply")),
+            matches!(
+                result,
+                Err(PerformError::Uncertain(ref reason))
+                    if ["cancelled while awaiting CDP reply", "cancelled after send"]
+                        .contains(&reason.as_str())
+            ),
             "{result:?}"
         );
         assert_eq!(mouse_moves(&chrome).len(), 1);
