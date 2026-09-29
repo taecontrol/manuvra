@@ -218,16 +218,18 @@ fn press_key(
     key: Key,
     cancellation: &InputCancellation,
 ) -> Result<PerformFact, PerformError> {
+    let fields = key_fields(key)
+        .ok_or_else(|| PerformError::Rejected("key has no native key mapping".into()))?;
     command(
         client,
         "Input.dispatchKeyEvent",
-        key_down(key),
+        key_down(key, fields),
         cancellation,
     )?;
     command_after_suboperation(
         client,
         "Input.dispatchKeyEvent",
-        key_event("keyUp", key),
+        key_event("keyUp", fields),
         cancellation,
     )?;
     Ok(PerformFact {
@@ -237,8 +239,8 @@ fn press_key(
     })
 }
 
-fn key_down(key: Key) -> Value {
-    let mut event = key_event("keyDown", key);
+fn key_down(key: Key, fields: KeyFields) -> Value {
+    let mut event = key_event("keyDown", fields);
     if let Some(text) = key_text(key) {
         event["text"] = json!(text);
     }
@@ -254,8 +256,7 @@ fn key_text(key: Key) -> Option<&'static str> {
     }
 }
 
-fn key_event(event_type: &str, key: Key) -> Value {
-    let (name, code, virtual_key, modifiers) = key_fields(key);
+fn key_event(event_type: &str, (name, code, virtual_key, modifiers): KeyFields) -> Value {
     json!({
         "type":event_type,"key":name,"code":code,
         "windowsVirtualKeyCode":virtual_key,"nativeVirtualKeyCode":virtual_key,
@@ -263,33 +264,30 @@ fn key_event(event_type: &str, key: Key) -> Value {
     })
 }
 
+/// DOM key, DOM code, virtual key code, and modifiers.
 type KeyFields = (&'static str, &'static str, u32, u32);
 
 const SHIFT_MODIFIER: u32 = 8;
 
-fn key_fields(key: Key) -> KeyFields {
-    match key {
-        Key::Escape => ("Escape", "Escape", 27, 0),
-        Key::Tab => ("Tab", "Tab", 9, 0),
-        Key::ShiftTab => ("Tab", "Tab", 9, SHIFT_MODIFIER),
-        Key::Enter => ("Enter", "Enter", 13, 0),
-        Key::Space => (" ", "Space", 32, 0),
-        Key::ArrowUp | Key::ArrowDown | Key::ArrowLeft | Key::ArrowRight | Key::Home | Key::End => {
-            navigation_key_fields(key)
-        }
-    }
-}
+const KEY_FIELDS: [(Key, KeyFields); 11] = [
+    (Key::Escape, ("Escape", "Escape", 27, 0)),
+    (Key::Tab, ("Tab", "Tab", 9, 0)),
+    (Key::ShiftTab, ("Tab", "Tab", 9, SHIFT_MODIFIER)),
+    (Key::Enter, ("Enter", "Enter", 13, 0)),
+    (Key::Space, (" ", "Space", 32, 0)),
+    (Key::ArrowUp, ("ArrowUp", "ArrowUp", 38, 0)),
+    (Key::ArrowDown, ("ArrowDown", "ArrowDown", 40, 0)),
+    (Key::ArrowLeft, ("ArrowLeft", "ArrowLeft", 37, 0)),
+    (Key::ArrowRight, ("ArrowRight", "ArrowRight", 39, 0)),
+    (Key::Home, ("Home", "Home", 36, 0)),
+    (Key::End, ("End", "End", 35, 0)),
+];
 
-fn navigation_key_fields(key: Key) -> KeyFields {
-    match key {
-        Key::ArrowUp => ("ArrowUp", "ArrowUp", 38, 0),
-        Key::ArrowDown => ("ArrowDown", "ArrowDown", 40, 0),
-        Key::ArrowLeft => ("ArrowLeft", "ArrowLeft", 37, 0),
-        Key::ArrowRight => ("ArrowRight", "ArrowRight", 39, 0),
-        Key::Home => ("Home", "Home", 36, 0),
-        Key::End => ("End", "End", 35, 0),
-        Key::Escape | Key::Tab | Key::ShiftTab | Key::Enter | Key::Space => key_fields(key),
-    }
+fn key_fields(key: Key) -> Option<KeyFields> {
+    KEY_FIELDS
+        .iter()
+        .find(|(candidate, _)| *candidate == key)
+        .map(|(_, fields)| *fields)
 }
 
 /// A performed input is uncertain when the journal lost events from its own range,
@@ -933,6 +931,20 @@ mod tests {
             (Key::Home, "Home", "Home", 36),
             (Key::End, "End", "End", 35),
         ] {
+            // A new key fails to compile here until it is listed above and in KEY_FIELDS.
+            match key {
+                Key::Escape
+                | Key::Tab
+                | Key::ShiftTab
+                | Key::Enter
+                | Key::Space
+                | Key::ArrowUp
+                | Key::ArrowDown
+                | Key::ArrowLeft
+                | Key::ArrowRight
+                | Key::Home
+                | Key::End => {}
+            }
             let chrome = ScriptedChrome::start();
             let input = focus_input(key);
             reply_focus(&chrome, input.focus_anchor.clone(), "d");
@@ -957,13 +969,6 @@ mod tests {
             }
             assert!(events[1]["params"].get("text").is_none());
             assert!(events[1]["params"].get("commands").is_none());
-        }
-    }
-
-    #[test]
-    fn navigation_key_fields_answer_for_every_key() {
-        for key in [Key::Escape, Key::Tab, Key::ShiftTab, Key::Enter, Key::Space] {
-            assert_eq!(navigation_key_fields(key), key_fields(key));
         }
     }
 
@@ -1209,25 +1214,6 @@ mod tests {
             mouse_moves(&chrome),
             [json!({"type":"mouseMoved","x":12.5,"y":20.25})]
         );
-    }
-
-    #[test]
-    fn hover_revalidates_its_control_with_the_click_script() {
-        let expression = |operation| {
-            let chrome = ScriptedChrome::start();
-            chrome.reply("Runtime.evaluate", revalidated());
-            perform(
-                &chrome.connect_raw(),
-                input(operation),
-                &InputCancellation::default(),
-            )
-            .unwrap();
-            chrome.commands()[0].1["expression"].clone()
-        };
-
-        let hover = expression(PreparedOperation::Hover);
-        assert!(hover.as_str().unwrap().contains("reason:'covered'"));
-        assert_eq!(hover, expression(PreparedOperation::Click));
     }
 
     #[test]

@@ -1082,7 +1082,37 @@ mod tests {
             ownership: Some(ownership),
         };
         let mut browser = starting.finish(client, "Chromium Test".into()).unwrap();
+        assert_eq!(
+            chrome
+                .commands()
+                .into_iter()
+                .map(|(method, _)| method)
+                .collect::<Vec<_>>(),
+            [
+                "Page.addScriptToEvaluateOnNewDocument",
+                "Runtime.evaluate",
+                "Emulation.setDeviceMetricsOverride",
+                "Emulation.setFocusEmulationEnabled",
+            ]
+        );
+        assert_eq!(
+            chrome.received("Page.addScriptToEvaluateOnNewDocument")[0]["params"]["source"],
+            COVERAGE_PROBE
+        );
+        assert_eq!(
+            chrome.received("Runtime.evaluate")[0]["params"]["expression"],
+            COVERAGE_PROBE
+        );
+        assert_eq!(
+            chrome.received("Emulation.setDeviceMetricsOverride")[0]["params"],
+            json!({"width":800,"height":600,"deviceScaleFactor":1,"mobile":false})
+        );
+        assert_eq!(
+            chrome.received("Emulation.setFocusEmulationEnabled")[0]["params"],
+            json!({"enabled":true})
+        );
         assert_eq!(browser.provenance().viewport.width, 800);
+        assert_eq!(browser.provenance().browser_version, "Chromium Test");
         browser.close().unwrap();
         assert!(!profile.exists());
     }
@@ -1270,18 +1300,6 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_click_navigation_settles_before_the_next_observation() {
-        let chrome = ScriptedChrome::start();
-        chrome.reply("Runtime.evaluate", json!({"result":{"value":"complete"}}));
-        let client = chrome.connect_raw();
-        let fence = client.cursor();
-        chrome.push_event("Page.frameNavigated", json!({"frame":{"id":"main"}}));
-        command(&client, "Page.enable", json!({})).unwrap();
-
-        settle_input_navigation(&client, fence).unwrap();
-    }
-
-    #[test]
     fn input_navigation_waits_until_every_started_frame_stops_loading() {
         let chrome = Arc::new(ScriptedChrome::start());
         chrome.reply("Runtime.evaluate", json!({"result":{"value":"complete"}}));
@@ -1315,24 +1333,73 @@ mod tests {
     }
 
     #[test]
-    fn owned_perform_settles_navigation_after_a_key_press() {
+    fn input_settling_waits_for_the_document_only_after_a_navigation_signal() {
         let chrome = ScriptedChrome::start();
-        chrome.reply(
-            "Runtime.evaluate",
-            json!({"result":{"value":{
-                "document_id":"d","url":"http://example.test/","route":"/","title":"x",
-                "focused":null,"focus_anchor":null,"elements":[],
-                "viewport":{"width":10,"height":10,"scroll_x":0,"scroll_y":0,"document_height":10}
-            }}}),
+        chrome.reply("Runtime.evaluate", json!({"result":{"value":"complete"}}));
+        let client = chrome.connect_raw();
+        settle_input_navigation(&client, client.cursor()).unwrap();
+        assert!(
+            chrome.received("Runtime.evaluate").is_empty(),
+            "without a navigation signal no document wait is needed"
+        );
+
+        let fence = client.cursor();
+        chrome.emit_before_reply(
+            "Page.enable",
+            1,
+            vec![("Page.frameNavigated", json!({"frame":{"id":"main"}}))],
+        );
+        command(&client, "Page.enable", json!({})).unwrap();
+        let started = Instant::now();
+        settle_input_navigation(&client, fence).unwrap();
+        assert!(started.elapsed() >= QUIET_WINDOW);
+        let checks = chrome.received("Runtime.evaluate");
+        assert!(!checks.is_empty(), "a navigation holds for the document");
+        assert!(
+            checks
+                .iter()
+                .all(|check| check["params"]["expression"] == "document.readyState")
+        );
+    }
+
+    /// Performs `operation` against a page whose final dispatch starts a
+    /// navigation that stops loading only after `delay`.
+    fn perform_starting_navigation(
+        operation: PreparedOperation,
+        revalidation: Value,
+        final_dispatch: &str,
+        delay: Duration,
+    ) -> (PerformFact, Duration, Vec<String>) {
+        let chrome = Arc::new(ScriptedChrome::start());
+        chrome.reply("Runtime.evaluate", revalidation);
+        chrome.reply("Runtime.evaluate", json!({"result":{"value":"complete"}}));
+        chrome.emit_before_reply(
+            final_dispatch,
+            2,
+            vec![
+                ("Page.frameRequestedNavigation", json!({"frameId":"main"})),
+                ("Page.frameStartedLoading", json!({"frameId":"main"})),
+            ],
         );
         let mut browser = browser_with_client(chrome.connect_raw());
+        let stopper = {
+            let chrome = Arc::clone(&chrome);
+            let final_dispatch = final_dispatch.to_owned();
+            thread::spawn(move || {
+                while chrome.received(&final_dispatch).len() < 2 {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                thread::sleep(delay);
+                chrome.push_event("Page.frameStoppedLoading", json!({"frameId":"main"}));
+            })
+        };
         let started = Instant::now();
         let fact = browser
             .perform(
                 PreparedInput {
                     document_id: "d".into(),
-                    node_id: 0,
-                    operation: PreparedOperation::PressKey(crate::Key::Enter),
+                    node_id: 7,
+                    operation,
                     text: None,
                     previous_text: None,
                     option_node_id: None,
@@ -1343,38 +1410,66 @@ mod tests {
                 &InputCancellation::default(),
             )
             .unwrap();
-        assert_eq!(fact.suboperations, ["key_down", "key_up"]);
-        assert!(started.elapsed() >= QUIET_WINDOW);
+        let elapsed = started.elapsed();
+        stopper.join().unwrap();
         browser.close().unwrap();
+        let methods = chrome
+            .commands()
+            .into_iter()
+            .map(|(method, params)| match params["expression"].as_str() {
+                Some("document.readyState") => "readyState".to_owned(),
+                _ => method,
+            })
+            .collect();
+        (fact, elapsed, methods)
     }
 
     #[test]
-    fn owned_perform_routes_confirmed_click_through_navigation_settling() {
-        let chrome = ScriptedChrome::start();
-        chrome.reply(
-            "Runtime.evaluate",
+    fn a_confirmed_click_waits_for_the_navigation_it_started_to_settle() {
+        let delay = Duration::from_millis(300);
+        let (fact, elapsed, methods) = perform_starting_navigation(
+            PreparedOperation::Click,
             json!({"result":{"value":{"ok":true,"x":12.0,"y":20.0}}}),
+            "Input.dispatchMouseEvent",
+            delay,
         );
-        let client = chrome.connect_raw();
-        let mut browser = browser_with_client(client);
-        let fact = browser
-            .perform(
-                PreparedInput {
-                    document_id: "d".into(),
-                    node_id: 7,
-                    operation: PreparedOperation::Click,
-                    text: None,
-                    previous_text: None,
-                    option_node_id: None,
-                    combobox: false,
-                    action_sequence: 1,
-                    focus_anchor: None,
-                },
-                &InputCancellation::default(),
-            )
-            .unwrap();
         assert_eq!(fact.suboperations, ["mouse_press", "mouse_release"]);
-        browser.close().unwrap();
+        assert!(elapsed >= delay + QUIET_WINDOW, "{elapsed:?}");
+        assert_eq!(
+            methods[..4],
+            [
+                "Runtime.evaluate",
+                "Input.dispatchMouseEvent",
+                "Input.dispatchMouseEvent",
+                "readyState",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_key_press_waits_for_the_navigation_it_started_to_settle() {
+        let delay = Duration::from_millis(300);
+        let (fact, elapsed, methods) = perform_starting_navigation(
+            PreparedOperation::PressKey(crate::Key::Enter),
+            json!({"result":{"value":{
+                "document_id":"d","url":"http://example.test/","route":"/","title":"x",
+                "focused":null,"focus_anchor":null,"elements":[],
+                "viewport":{"width":10,"height":10,"scroll_x":0,"scroll_y":0,"document_height":10}
+            }}}),
+            "Input.dispatchKeyEvent",
+            delay,
+        );
+        assert_eq!(fact.suboperations, ["key_down", "key_up"]);
+        assert!(elapsed >= delay + QUIET_WINDOW, "{elapsed:?}");
+        assert_eq!(
+            methods[..4],
+            [
+                "Runtime.evaluate",
+                "Input.dispatchKeyEvent",
+                "Input.dispatchKeyEvent",
+                "readyState",
+            ]
+        );
     }
 
     #[test]
