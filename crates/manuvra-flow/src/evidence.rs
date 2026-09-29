@@ -130,6 +130,30 @@ impl Redactor {
         self.redact_export_text(text)
     }
 
+    /// Redacts every string and object key of a JSON value in place. Redacting the decoded strings
+    /// rather than serialized JSON text also masks values that serialization escapes, such as a
+    /// secret containing a quote or a backslash.
+    pub fn redact_export_value(&self, value: &mut Value) {
+        match value {
+            Value::String(text) => *text = self.redact_export_text(text),
+            Value::Array(items) => items
+                .iter_mut()
+                .for_each(|item| self.redact_export_value(item)),
+            Value::Object(fields) => self.redact_export_fields(fields),
+            _ => {}
+        }
+    }
+
+    fn redact_export_fields(&self, fields: &mut Map<String, Value>) {
+        *fields = std::mem::take(fields)
+            .into_iter()
+            .map(|(key, mut item)| {
+                self.redact_export_value(&mut item);
+                (self.redact_export_text(&key), item)
+            })
+            .collect();
+    }
+
     pub fn contains_sensitive(&self, text: &str) -> bool {
         self.replacements
             .iter()
@@ -158,14 +182,24 @@ impl Redactor {
             .filter(|value| !is_protocol_collision(value))
     }
 
+    /// Whether exported bytes contain a classified value, either raw or in the escaped form JSON
+    /// serialization gives a value containing quotes, backslashes, or control characters.
     pub fn contains_export_leak(&self, bytes: &[u8]) -> bool {
-        self.leak_scan_values().any(|secret| {
-            !secret.is_empty()
-                && bytes
-                    .windows(secret.len())
-                    .any(|window| window == secret.as_bytes())
-        })
+        self.leak_scan_values()
+            .flat_map(|secret| [secret.to_owned(), json_escaped(secret)])
+            .any(|secret| {
+                !secret.is_empty()
+                    && bytes
+                        .windows(secret.len())
+                        .any(|window| window == secret.as_bytes())
+            })
     }
+}
+
+/// A value as it appears inside a serialized JSON string, without the surrounding quotes.
+fn json_escaped(value: &str) -> String {
+    let quoted = Value::String(value.to_owned()).to_string();
+    quoted[1..quoted.len() - 1].to_owned()
 }
 
 fn is_protocol_collision(value: &str) -> bool {
@@ -330,7 +364,6 @@ fn is_protocol_collision(value: &str) -> bool {
         "Home",
         "End",
         "missing_value",
-        "unsupported_in_this_build",
         "unsupported_platform",
         "browser_unavailable",
         "browser_launch_failed",
@@ -1241,6 +1274,29 @@ mod tests {
         assert!(!redactor.redact_export_text(key).contains(key));
         assert!(redactor.contains_sensitive(key));
         assert!(redactor.contains_export_leak(key.as_bytes()));
+    }
+
+    #[test]
+    fn values_with_json_escapes_are_redacted_by_value_and_caught_by_the_leak_scan() {
+        let job: Job = serde_json::from_value(json!({"schema_version":1,"target":{"kind":"browser","url":"http://127.0.0.1/"},"context":{"journey":"j","revision":"r","environment":"e","actor":"a","authority":"a"},"values":{"escaped":{"value":"Se\"cr\\et","description":"escaped","secret":true}},"steps":[{"id":"s","goal":"g","done_when":[{"url_contains":"/"}]}]})).unwrap();
+        let secret = "Se\"cr\\et";
+        assert_eq!(job.values["escaped"].value, secret);
+        let redactor = Redactor::for_job(&job).unwrap();
+        let mut value =
+            json!({"text":format!("typed {secret}"),"list":[secret],secret:{"nested":secret}});
+        let serialized = value.to_string();
+        assert!(!serialized.contains(secret));
+        assert!(redactor.contains_export_leak(serialized.as_bytes()));
+
+        redactor.redact_export_value(&mut value);
+
+        let redacted = value.to_string();
+        assert!(
+            !redactor.contains_export_leak(redacted.as_bytes()),
+            "{redacted}"
+        );
+        assert!(value["text"].as_str().unwrap().starts_with("typed "));
+        assert_eq!(value.as_object().unwrap().len(), 3);
     }
 
     #[test]

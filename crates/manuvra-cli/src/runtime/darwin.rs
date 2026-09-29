@@ -13,7 +13,7 @@ pub fn runtime_root() -> Result<PathBuf, String> {
 fn runtime_root_from(xdg: Option<PathBuf>, temporary: Option<PathBuf>) -> Result<PathBuf, String> {
     xdg.filter(|path| !path.as_os_str().is_empty())
         .or_else(|| temporary.filter(|path| !path.as_os_str().is_empty()))
-        .ok_or_else(|| "runtime_directory_unavailable".into())
+        .ok_or_else(|| "neither XDG_RUNTIME_DIR nor TMPDIR is set".into())
 }
 
 pub fn validate_socket_path(path: &Path) -> Result<(), String> {
@@ -62,7 +62,7 @@ mod tests {
         );
         assert_eq!(
             runtime_root_from(None, None).unwrap_err(),
-            "runtime_directory_unavailable"
+            "neither XDG_RUNTIME_DIR nor TMPDIR is set"
         );
     }
 }

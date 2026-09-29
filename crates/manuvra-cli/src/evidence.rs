@@ -17,7 +17,6 @@ use crate::store;
 
 pub enum BlockedStop {
     MissingValue { value_name: String, step_id: String },
-    Unsupported { feature: &'static str },
 }
 
 impl BlockedStop {
@@ -26,10 +25,6 @@ impl BlockedStop {
             value_name,
             step_id,
         }
-    }
-
-    pub fn unsupported(feature: &'static str) -> Self {
-        Self::Unsupported { feature }
     }
 
     fn into_reason(self, redactor: &Redactor) -> Reason {
@@ -49,10 +44,6 @@ impl BlockedStop {
                         json!(redactor.redact_export_text(&value_name)),
                     ),
                 ]),
-            },
-            Self::Unsupported { feature } => Reason {
-                code: "unsupported_in_this_build".into(),
-                details: BTreeMap::from([("feature".into(), json!(feature))]),
             },
         }
     }

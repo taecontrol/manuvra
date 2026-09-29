@@ -46,7 +46,7 @@ Homebrew builds Manuvra from source and does not use a bottle. That installation
 
 At runtime, Manuvra looks for the browser specified by `--browser`, then `MANUVRA_BROWSER`, then known Chromium and Chrome locations. On macOS it checks the directly executable Google Chrome and Chromium binaries inside `/Applications` and `~/Applications` app bundles before searching `PATH`; an explicit path must name the inner executable, such as `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`. It uses the current macOS desktop, Wayland, or X11 display unless you pass `--headless`. Headless mode presents a desktop mouse, including hover support and a fine pointer.
 
-Manuvra stores durable run records under `XDG_STATE_HOME`, or the user's standard XDG state directory when that variable is unset. It uses `XDG_RUNTIME_DIR` for private control sockets and other short-lived state. On macOS, if `XDG_RUNTIME_DIR` is unset, it creates a private mode-`0700` runtime directory beneath the explicit `TMPDIR`; if both are unavailable, `run` stops with `runtime_directory_unavailable` before creating state or children. The caller chooses a separate evidence root for each `run` command.
+Manuvra stores durable run records under `XDG_STATE_HOME`, or the user's standard XDG state directory when that variable is unset. It uses `XDG_RUNTIME_DIR` for private control sockets and other short-lived state. On macOS, if `XDG_RUNTIME_DIR` is unset, it creates a private mode-`0700` runtime directory beneath the explicit `TMPDIR`. When no runtime directory is available (`XDG_RUNTIME_DIR` on Linux, or both variables on macOS), `run` exits with status 3 and `runtime_directory_unavailable` before creating state or children, so the same request id can be retried once the variable is set. The caller chooses a separate evidence root for each `run` command.
 
 Install the [Manuvra skill](skills/manuvra/SKILL.md) for your coding agents with the [skills](https://skills.sh/) CLI:
 
@@ -210,25 +210,46 @@ make test
 make crap
 ```
 
-`make live` uses `/bin/bash`, builds a release binary, and runs the Money journey matrix against fresh fixtures. Set `MONEY_DIR` explicitly to a disposable Money checkout and provide `TYPESAFE_API_KEY` in the environment. The checkout must have its documented Node and pnpm application-driver dependencies ready. The command also requires `jq`, `grep`, `rg`, native `date`, `shasum`, and `nc`, Rust build tools, Google Chrome, and a headed desktop. On Linux the matrix requires `XDG_RUNTIME_DIR` and passes it to Manuvra. On macOS it requires `TMPDIR` and leaves `XDG_RUNTIME_DIR` unset so Manuvra exercises its private `TMPDIR` runtime fallback. It runs the create-unit, create-account, and record-transaction journeys three times each, followed by one forced escalation round trip. It retains timestamped, redacted Evidence and a `report.json` under `.work/live/money-journey/`; the report records the source revision, release-binary digest, Bash version, Run classifications, application persistence checks, and cleanup results.
-
-The Linux keyboard matrix uses real Jev and Chromium with four synthetic journeys, five fresh Runs each: `escape-popover` closes a popover with Escape, `tab-enter-save` tabs to Save and activates it with Enter, `caller-execute-enter` does the same with a forced stop before Enter and one `execute` disposition, and `listbox-choice` chooses Beta in a combobox with arrow, Home, or End keys followed by Enter. Their jobs are `tests/live/keyboard-<journey>.json`. Run the matrix in an interactive Bash shell that loads `TYPESAFE_API_KEY`:
+`fmt`, `lint`, and `test` also check the CRAP gate tool in `tools/crap-gate`, which is outside the workspace. `make crap` needs the Rust `llvm-tools-preview` component, `cargo-crap` 0.4.3, and `cargo-llvm-cov` 0.9.0, the versions CI installs:
 
 ```bash
-bash -ic 'python3 scripts/live-keyboard-matrix.py'
+rustup component add llvm-tools-preview
+cargo install cargo-crap --version 0.4.3 --locked
+cargo install cargo-llvm-cov --version 0.9.0 --locked
 ```
 
-Every invocation first runs the detector self-test, which classifies synthetic Evidence and browser facts without a browser or provider. Run only the self-test with `python3 scripts/live-keyboard-matrix.py --self-test-detectors`.
+`make live-self-test` checks the live-suite harnesses against synthetic input without a provider key, browser, or Money checkout. CI runs it on Linux and macOS.
+
+The live suites use real Jev judgments and a real browser against synthetic fixtures. Each needs `TYPESAFE_API_KEY` exported in the environment and retains timestamped, redacted Evidence under `.work/live/`. `make live-all` runs every suite below in sequence.
+
+`make live` uses `/bin/bash`, builds a release binary, and runs the Money journey matrix against fresh fixtures. Set `MONEY_DIR` explicitly to a disposable Money checkout and provide `TYPESAFE_API_KEY` in the environment. The checkout must have its documented Node and pnpm application-driver dependencies ready. The command also requires `jq`, `grep`, `rg`, native `date`, `shasum`, and `nc`, Rust build tools, Google Chrome, and a headed desktop. On Linux the matrix requires `XDG_RUNTIME_DIR` and passes it to Manuvra. On macOS it requires `TMPDIR` and leaves `XDG_RUNTIME_DIR` unset so Manuvra exercises its private `TMPDIR` runtime fallback. It runs the create-unit, create-account, and record-transaction journeys three times each, one create-account journey whose account name is classified, and one forced escalation round trip. The classified Run must keep the name out of its results, state, and Evidence. It retains timestamped, redacted Evidence and a `report.json` under `.work/live/money-journey/`; the report records the source revision, release-binary digest, Bash version, Run classifications, application persistence checks, and cleanup results.
+
+The remaining Money suites run on Linux with the same `MONEY_DIR`, `TYPESAFE_API_KEY`, and headed desktop:
+
+- `make live-observation` runs read-only observation jobs, including classified rendered text and a provider key stand-in that must never be exported.
+- `make live-natural-done` runs the create-account journey three times with natural-language done conditions. A Run passes, or stops without preparing an action the job does not intend.
+- `make live-resume-dispositions` needs `XDG_RUNTIME_DIR`. It races two resumes for one escalation, then checks request replay, stale escalations, and request conflicts.
+- `make live-run-lifecycle` needs `XDG_RUNTIME_DIR`. It follows one forced-pause Run through attach, expiry, retry, and process exit.
+
+`make live-hover` runs the hover-reveal journey three times on Linux in headless Chromium against `tests/browser/hover-reveal.html` and needs no Money checkout. Every Run must pass.
+
+The Linux keyboard matrix uses real Jev and Chromium with four synthetic journeys, five fresh Runs each: `escape-popover` closes a popover with Escape, `tab-enter-save` tabs to Save and activates it with Enter, `caller-execute-enter` does the same with a forced stop before Enter and one `execute` disposition, and `listbox-choice` chooses Beta in a combobox with arrow, Home, or End keys followed by Enter. Their jobs are `tests/live/keyboard/<journey>.json`. Run it with `make live-keyboard`, for example from an interactive Bash shell that loads `TYPESAFE_API_KEY`:
+
+```bash
+bash -ic 'make live-keyboard'
+```
+
+Every invocation first runs the detector self-test, which classifies synthetic Evidence and browser facts without a browser or provider. Run only the self-test with `python3 scripts/live/keyboard-matrix.py --self-test-detectors`.
 
 The matrix writes each Run's result, Evidence, browser event facts, and a `report.json` with `"mode": "matrix"` under `.work/live/keyboard/`. The report retains the first Run that was not autonomous, or not assisted for `caller-execute-enter`. Each Run is classified `autonomous`, `assisted`, `stopped`, `failed`, or `prohibited`. The three autonomous journeys require at least 13 of 15 autonomous Runs and at least four per journey; `caller-execute-enter` requires at least four of five assisted Runs with one `execute` disposition. A Run is `prohibited` when it shows a forbidden result: a duplicate effect (a second Enter or Escape, or an activation count above one), a key received while the page's focus or event target differed from the action's focus anchor, a click other than the fixture's setup click or a native Enter- or Space-generated click on Save, or caller assistance in an autonomous journey. Any prohibited Run fails the matrix. Other mismatches, such as an extra key or a wrong final state, make the Run `failed`. The command exits with status 0 only when the threshold is met and the provider key is absent from every retained file.
 
-To check the duplicate-effect detector, run `bash -ic 'python3 scripts/live-keyboard-matrix.py --double-activation-check'`. It runs `tab-enter-save` once against a fixture that counts each activation twice and writes a report with `"mode": "double_activation_check"`. The command exits with status 0 only when the `activation_count_not_one` detector fires and the provider key is absent from the retained files.
+To check the duplicate-effect detector, run `bash -ic 'python3 scripts/live/keyboard-matrix.py --double-activation-check'`. It runs `tab-enter-save` once against a fixture that counts each activation twice and writes a report with `"mode": "double_activation_check"`. The command exits with status 0 only when the `activation_count_not_one` detector fires and the provider key is absent from the retained files.
 
 Contributors and coding agents should follow [docs/CODING_STANDARDS.md](docs/CODING_STANDARDS.md). The [architecture decision records](docs/adrs/) explain the project's design choices.
 
 ## Release
 
-Releases start from the `release` workflow on `main`. Enter the workspace version from `Cargo.toml` without the leading `v`. The workflow requires a successful CI run for that exact commit, then:
+Releases start from the `release` workflow on `main`; a dispatch from any other ref fails before building anything. Enter the workspace version from `Cargo.toml` without the leading `v`. The workflow requires a successful CI run for that exact commit, then:
 
 1. Builds deterministic Linux and macOS x64 and ARM64 archives and publishes their SHA-256 checksums.
 2. Creates GitHub build-provenance attestations for all four native binary archives.
@@ -236,7 +257,7 @@ Releases start from the `release` workflow on `main`. Enter the workspace versio
 4. Verifies each published archive and attestation, then installs it through `mise` on the matching native Linux or macOS runner and checks `version` and `schema job`.
 5. Builds the rendered Homebrew formula from the source archive on macOS and opens an auto-merge pull request in [`taecontrol/homebrew-tap`](https://github.com/taecontrol/homebrew-tap). The formula remains source-only and does not use bottles.
 
-Repository secret `HOMEBREW_TAP_TOKEN` provides write access to the tap. The release workflow does not modify Omarchy; Omarchy consumes the ordinary GitHub release through `mise`.
+The workflow needs two repository secrets. `RELEASE_TAG_DEPLOY_KEY` is the private SSH key of a deploy key with write access to this repository; the workflow pushes the release tag with it. `HOMEBREW_TAP_TOKEN` provides write access to the tap. The release workflow does not modify Omarchy; Omarchy consumes the ordinary GitHub release through `mise`.
 
 ## License
 

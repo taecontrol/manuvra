@@ -12,11 +12,14 @@ pub fn process_identity(pid: u32) -> Result<ProcessIdentity, String> {
 }
 
 pub fn process_is_same(identity: &ProcessIdentity) -> bool {
-    proc_identity_fields(identity.pid).is_ok_and(|fields| {
-        fields.process_group == identity.process_group
-            && fields.start_ticks == identity.start_marker
-            && fields.session_id == identity.session_id
-    })
+    proc_identity_fields(identity.pid).is_ok_and(|fields| fields.matches(identity))
+}
+
+/// The recorded process still runs: it has its recorded identity and has not exited into a
+/// zombie awaiting its parent.
+pub fn process_is_live(identity: &ProcessIdentity) -> bool {
+    proc_identity_fields(identity.pid)
+        .is_ok_and(|fields| fields.matches(identity) && !fields.exited)
 }
 
 pub fn signal_process_group(identity: &ProcessIdentity, signal: i32) -> Result<bool, String> {
@@ -105,6 +108,15 @@ struct ProcIdentityFields {
     process_group: u32,
     session_id: u32,
     start_ticks: u64,
+    exited: bool,
+}
+
+impl ProcIdentityFields {
+    fn matches(self, identity: &ProcessIdentity) -> bool {
+        self.process_group == identity.process_group
+            && self.start_ticks == identity.start_marker
+            && self.session_id == identity.session_id
+    }
 }
 
 fn proc_identity_fields(pid: u32) -> Result<ProcIdentityFields, String> {
@@ -130,6 +142,9 @@ fn proc_identity_fields(pid: u32) -> Result<ProcIdentityFields, String> {
             .try_into()
             .map_err(|_| format!("process {pid} session id does not fit u32"))?,
         start_ticks: parse(19, "start identity")?,
+        exited: fields
+            .first()
+            .is_some_and(|state| matches!(*state, "Z" | "X" | "x")),
     })
 }
 
@@ -168,5 +183,27 @@ mod tests {
         assert!(!process_is_same(&identity));
         assert!(!owned_group_has_member(&identity).unwrap());
         assert!(!signal_process_group(&identity, libc::SIGKILL).unwrap());
+    }
+
+    #[test]
+    fn an_unreaped_zombie_keeps_its_identity_but_is_not_live() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let identity = process_identity(child.id()).unwrap();
+        assert!(process_is_live(&identity));
+        child.kill().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !child_exited_without_reaping(child.id()).unwrap() {
+            assert!(std::time::Instant::now() < deadline, "child did not exit");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(process_is_same(&identity));
+        assert!(!process_is_live(&identity));
+        child.wait().unwrap();
+        assert!(!process_is_live(&identity));
     }
 }

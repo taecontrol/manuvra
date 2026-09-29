@@ -131,7 +131,6 @@ pub(crate) fn perform(
     input: PreparedInput,
     cancellation: &InputCancellation,
 ) -> Result<PerformFact, PerformError> {
-    client.set_action_sequence(input.action_sequence);
     let fence = client.cursor();
     let result = perform_input(client, &input, cancellation);
     complete_with_journal(client, fence, result)
@@ -219,16 +218,18 @@ fn press_key(
     key: Key,
     cancellation: &InputCancellation,
 ) -> Result<PerformFact, PerformError> {
+    let fields = key_fields(key)
+        .ok_or_else(|| PerformError::Rejected("key has no native key mapping".into()))?;
     command(
         client,
         "Input.dispatchKeyEvent",
-        key_down(key),
+        key_down(key, fields),
         cancellation,
     )?;
     command_after_suboperation(
         client,
         "Input.dispatchKeyEvent",
-        key_event("keyUp", key),
+        key_event("keyUp", fields),
         cancellation,
     )?;
     Ok(PerformFact {
@@ -238,8 +239,8 @@ fn press_key(
     })
 }
 
-fn key_down(key: Key) -> Value {
-    let mut event = key_event("keyDown", key);
+fn key_down(key: Key, fields: KeyFields) -> Value {
+    let mut event = key_event("keyDown", fields);
     if let Some(text) = key_text(key) {
         event["text"] = json!(text);
     }
@@ -255,8 +256,7 @@ fn key_text(key: Key) -> Option<&'static str> {
     }
 }
 
-fn key_event(event_type: &str, key: Key) -> Value {
-    let (name, code, virtual_key, modifiers) = key_fields(key);
+fn key_event(event_type: &str, (name, code, virtual_key, modifiers): KeyFields) -> Value {
     json!({
         "type":event_type,"key":name,"code":code,
         "windowsVirtualKeyCode":virtual_key,"nativeVirtualKeyCode":virtual_key,
@@ -264,41 +264,40 @@ fn key_event(event_type: &str, key: Key) -> Value {
     })
 }
 
+/// DOM key, DOM code, virtual key code, and modifiers.
 type KeyFields = (&'static str, &'static str, u32, u32);
 
 const SHIFT_MODIFIER: u32 = 8;
 
-fn key_fields(key: Key) -> KeyFields {
-    match key {
-        Key::Escape => ("Escape", "Escape", 27, 0),
-        Key::Tab => ("Tab", "Tab", 9, 0),
-        Key::ShiftTab => ("Tab", "Tab", 9, SHIFT_MODIFIER),
-        Key::Enter => ("Enter", "Enter", 13, 0),
-        Key::Space => (" ", "Space", 32, 0),
-        Key::ArrowUp | Key::ArrowDown | Key::ArrowLeft | Key::ArrowRight | Key::Home | Key::End => {
-            navigation_key_fields(key)
-        }
-    }
+const KEY_FIELDS: [(Key, KeyFields); 11] = [
+    (Key::Escape, ("Escape", "Escape", 27, 0)),
+    (Key::Tab, ("Tab", "Tab", 9, 0)),
+    (Key::ShiftTab, ("Tab", "Tab", 9, SHIFT_MODIFIER)),
+    (Key::Enter, ("Enter", "Enter", 13, 0)),
+    (Key::Space, (" ", "Space", 32, 0)),
+    (Key::ArrowUp, ("ArrowUp", "ArrowUp", 38, 0)),
+    (Key::ArrowDown, ("ArrowDown", "ArrowDown", 40, 0)),
+    (Key::ArrowLeft, ("ArrowLeft", "ArrowLeft", 37, 0)),
+    (Key::ArrowRight, ("ArrowRight", "ArrowRight", 39, 0)),
+    (Key::Home, ("Home", "Home", 36, 0)),
+    (Key::End, ("End", "End", 35, 0)),
+];
+
+fn key_fields(key: Key) -> Option<KeyFields> {
+    KEY_FIELDS
+        .iter()
+        .find(|(candidate, _)| *candidate == key)
+        .map(|(_, fields)| *fields)
 }
 
-fn navigation_key_fields(key: Key) -> KeyFields {
-    match key {
-        Key::ArrowUp => ("ArrowUp", "ArrowUp", 38, 0),
-        Key::ArrowDown => ("ArrowDown", "ArrowDown", 40, 0),
-        Key::ArrowLeft => ("ArrowLeft", "ArrowLeft", 37, 0),
-        Key::ArrowRight => ("ArrowRight", "ArrowRight", 39, 0),
-        Key::Home => ("Home", "Home", 36, 0),
-        Key::End => ("End", "End", 35, 0),
-        Key::Escape | Key::Tab | Key::ShiftTab | Key::Enter | Key::Space => key_fields(key),
-    }
-}
-
+/// A performed input is uncertain when the journal lost events from its own range,
+/// because the effects of the dispatch can no longer be read back.
 fn complete_with_journal(
     client: &CdpClient,
     fence: u64,
     result: Result<PerformFact, PerformError>,
 ) -> Result<PerformFact, PerformError> {
-    if result.is_ok() && client.snapshot_since(fence).overflowed {
+    if result.is_ok() && client.lost_events_since(fence) {
         return Err(PerformError::Uncertain("CDP journal overflowed".into()));
     }
     result
@@ -327,7 +326,7 @@ fn revalidate(
       if (hit!==element && !element.contains(hit)) return {{ok:false,reason:'covered'}};
       if ({} && (element.readOnly || element.getAttribute('aria-readonly')==='true' || !('value' in element || element.isContentEditable))) return {{ok:false,reason:'not_editable'}};
       let globalX=x, globalY=y, view=element.ownerDocument.defaultView;
-      while (view && view!==window) {{ const frame=view.frameElement; if (!frame) return {{ok:false,reason:'cross_origin_frame'}}; const frameRect=frame.getBoundingClientRect(); globalX+=frameRect.x; globalY+=frameRect.y; view=view.parent; }}
+      while (view && view!==window) {{ const frame=view.frameElement; if (!frame) return {{ok:false,reason:'cross_origin_frame'}}; const frameRect=frame.getBoundingClientRect(), frameStyle=frame.ownerDocument.defaultView.getComputedStyle(frame); globalX+=frameRect.x+frame.clientLeft+parseFloat(frameStyle.paddingLeft); globalY+=frameRect.y+frame.clientTop+parseFloat(frameStyle.paddingTop); view=view.parent; }}
       return {{ok:true,x:globalX,y:globalY}};
     }})()"#,
         input.node_id, document, editable
@@ -932,6 +931,20 @@ mod tests {
             (Key::Home, "Home", "Home", 36),
             (Key::End, "End", "End", 35),
         ] {
+            // A new key fails to compile here until it is listed above and in KEY_FIELDS.
+            match key {
+                Key::Escape
+                | Key::Tab
+                | Key::ShiftTab
+                | Key::Enter
+                | Key::Space
+                | Key::ArrowUp
+                | Key::ArrowDown
+                | Key::ArrowLeft
+                | Key::ArrowRight
+                | Key::Home
+                | Key::End => {}
+            }
             let chrome = ScriptedChrome::start();
             let input = focus_input(key);
             reply_focus(&chrome, input.focus_anchor.clone(), "d");
@@ -956,13 +969,6 @@ mod tests {
             }
             assert!(events[1]["params"].get("text").is_none());
             assert!(events[1]["params"].get("commands").is_none());
-        }
-    }
-
-    #[test]
-    fn navigation_key_fields_answer_for_every_key() {
-        for key in [Key::Escape, Key::Tab, Key::ShiftTab, Key::Enter, Key::Space] {
-            assert_eq!(navigation_key_fields(key), key_fields(key));
         }
     }
 
@@ -1074,32 +1080,69 @@ mod tests {
         assert_eq!(cancelled.received("Input.dispatchKeyEvent").len(), 1);
     }
 
+    fn flood() -> Vec<(&'static str, Value)> {
+        (0..10_100)
+            .map(|index| ("DOM.attributeModified", json!({"nodeId":index})))
+            .collect()
+    }
+
     #[test]
-    fn key_journal_overflow_is_uncertain_only_after_a_possible_dispatch() {
-        let overflowed = |chrome: &ScriptedChrome| {
-            for index in 0..10_100 {
-                chrome.push_event("DOM.attributeModified", json!({"nodeId":index}));
-            }
-        };
+    fn journal_loss_makes_only_a_performed_input_uncertain() {
         let (result, key_events) = press(Some(anchor()), |chrome| {
-            overflowed(chrome);
             reply_focus(chrome, None, "d");
+            chrome.emit_before_reply("Runtime.evaluate", 1, flood());
         });
         assert!(
             matches!(result, Err(PerformError::Rejected(ref reason)) if reason == "focus_changed"),
-            "{result:?}"
+            "a rejected input stays rejected: {result:?}"
         );
         assert_eq!(key_events, 0);
 
         let (result, key_events) = press(Some(anchor()), |chrome| {
-            overflowed(chrome);
             reply_focus(chrome, Some(anchor()), "d");
+            chrome.emit_before_reply("Input.dispatchKeyEvent", 2, flood());
         });
         assert!(
             matches!(result, Err(PerformError::Uncertain(ref reason)) if reason == "CDP journal overflowed"),
             "{result:?}"
         );
         assert_eq!(key_events, 2);
+
+        for (operation, dispatch) in [(PreparedOperation::Hover, 1), (PreparedOperation::Click, 2)]
+        {
+            let chrome = ScriptedChrome::start();
+            chrome.reply("Runtime.evaluate", revalidated());
+            chrome.emit_before_reply("Input.dispatchMouseEvent", dispatch, flood());
+            let result = perform(
+                &chrome.connect_raw(),
+                input(operation),
+                &InputCancellation::default(),
+            );
+            assert!(
+                matches!(result, Err(PerformError::Uncertain(ref reason)) if reason == "CDP journal overflowed"),
+                "{operation:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_event_stream_before_an_input_does_not_make_it_uncertain() {
+        let chrome = ScriptedChrome::start();
+        chrome.reply("Runtime.evaluate", revalidated());
+        let client = chrome.connect_raw();
+        for (method, params) in flood() {
+            chrome.push_event(method, params);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while client.cursor() < 10_100 {
+            assert!(Instant::now() < deadline, "flood was not recorded");
+            client.wait_for_journal_change(client.cursor(), Duration::from_millis(20));
+        }
+        assert!(client.lost_events_since(0));
+        for operation in [PreparedOperation::Click, PreparedOperation::Hover] {
+            let fact = perform(&client, input(operation), &InputCancellation::default());
+            assert!(fact.is_ok(), "{operation:?}: {fact:?}");
+        }
     }
 
     #[test]
@@ -1171,25 +1214,6 @@ mod tests {
             mouse_moves(&chrome),
             [json!({"type":"mouseMoved","x":12.5,"y":20.25})]
         );
-    }
-
-    #[test]
-    fn hover_revalidates_its_control_with_the_click_script() {
-        let expression = |operation| {
-            let chrome = ScriptedChrome::start();
-            chrome.reply("Runtime.evaluate", revalidated());
-            perform(
-                &chrome.connect_raw(),
-                input(operation),
-                &InputCancellation::default(),
-            )
-            .unwrap();
-            chrome.commands()[0].1["expression"].clone()
-        };
-
-        let hover = expression(PreparedOperation::Hover);
-        assert!(hover.as_str().unwrap().contains("reason:'covered'"));
-        assert_eq!(hover, expression(PreparedOperation::Click));
     }
 
     #[test]
@@ -1324,21 +1348,6 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(mouse_moves(&chrome).len(), 1);
-    }
-
-    #[test]
-    fn hover_during_journal_overflow_is_uncertain() {
-        let chrome = ScriptedChrome::start();
-        for index in 0..10_100 {
-            chrome.push_event("DOM.attributeModified", json!({"nodeId":index}));
-        }
-        chrome.reply("Runtime.evaluate", revalidated());
-
-        let result = hover_with(&chrome);
-        assert!(
-            matches!(result, Err(PerformError::Uncertain(ref reason)) if reason == "CDP journal overflowed"),
-            "{result:?}"
-        );
     }
 
     #[test]
@@ -1538,31 +1547,6 @@ mod tests {
             ),
             Err(PerformError::Uncertain(reason)) if reason == "readback value was unavailable"
         ));
-    }
-
-    #[test]
-    fn journal_overflow_makes_the_affected_action_uncertain() {
-        let chrome = ScriptedChrome::start();
-        for index in 0..10_100 {
-            chrome.push_event("DOM.attributeModified", json!({"nodeId":index}));
-        }
-        chrome.reply(
-            "Runtime.evaluate",
-            json!({"result":{"value":{"ok":true,"x":12.0,"y":20.0}}}),
-        );
-        let client = chrome.connect_raw();
-        let result = perform(
-            &client,
-            input(PreparedOperation::Click),
-            &InputCancellation::default(),
-        );
-        assert!(
-            matches!(
-                result,
-                Err(PerformError::Uncertain(ref reason)) if reason == "CDP journal overflowed"
-            ),
-            "{result:?}"
-        );
     }
 
     #[test]

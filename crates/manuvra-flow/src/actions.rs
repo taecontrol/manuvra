@@ -1,5 +1,5 @@
 use crate::judgment::Operation;
-use crate::policy::{HoverTarget, Permit};
+use crate::policy::{HoverTarget, Permit, offered_select_option};
 use crate::values::Values;
 use manuvra_chrome::{
     Element, HoverRegion, InputCancellation, Observation, PerformError, PerformFact, PreparedInput,
@@ -98,13 +98,6 @@ impl DurableJournal {
         &self.entries
     }
 
-    pub fn remove(self) -> Result<(), String> {
-        let parent = self.path.parent().map(Path::to_path_buf);
-        drop(self.file);
-        fs::remove_file(self.path).map_err(|error| error.to_string())?;
-        sync_parent(parent.as_deref())
-    }
-
     pub fn clear(&mut self) -> Result<(), String> {
         self.file.sync_all().map_err(|error| error.to_string())?;
         fs::remove_file(&self.path).map_err(|error| error.to_string())?;
@@ -122,10 +115,8 @@ fn sync_parent(parent: Option<&Path>) -> Result<(), String> {
 
 impl ActionJournal for DurableJournal {
     fn append(&mut self, value: &Value) -> Result<(), String> {
-        let serialized = serde_json::to_string(value).map_err(|error| error.to_string())?;
-        let redacted = self.redactor.redact_export_text(&serialized);
-        let persisted: Value =
-            serde_json::from_str(&redacted).map_err(|error| error.to_string())?;
+        let mut persisted = value.clone();
+        self.redactor.redact_export_value(&mut persisted);
         let mut bytes = serde_json::to_vec(&persisted).map_err(|error| error.to_string())?;
         bytes.push(b'\n');
         self.file
@@ -336,11 +327,7 @@ fn selected_option_identity(
     }
     let expected = text.ok_or(ActionStop::InvalidPermit)?;
     target
-        .and_then(|target| {
-            target.select_options.iter().find(|option| {
-                !option.disabled && (option.value == expected || option.label == expected)
-            })
-        })
+        .and_then(|target| offered_select_option(target, expected))
         .map(|option| Some(option.node_id))
         .ok_or(ActionStop::InvalidPermit)
 }
@@ -384,6 +371,10 @@ fn text_operation(target: Option<&manuvra_chrome::Element>) -> PreparedOperation
     }
 }
 
+/// The browser boundary reports `NotPerformed` only when no input command left the transport and
+/// `Rejected` only when revalidation or CDP refused the first input command, so both are proven
+/// non-effects that release their replay key and reobserve. Every other failure after dispatch may
+/// have had an effect and stays uncertain.
 fn action_fact(
     prepared: PreparedAction,
     dispatched: Result<PerformFact, PerformError>,
@@ -406,13 +397,13 @@ fn action_fact(
             )
         }
         Ok(fact) => (Outcome::Observed, None, None, fact.suboperations),
-        Err(PerformError::Rejected(_)) => (
+        Err(PerformError::Rejected(_) | PerformError::NotPerformed(_)) => (
             Outcome::NotPerformed,
             None,
             Some(ActionStop::Reobserve(prepared.replay_key.clone())),
             Vec::new(),
         ),
-        Err(PerformError::NotPerformed(_) | PerformError::Uncertain(_)) => (
+        Err(PerformError::Uncertain(_)) => (
             Outcome::Uncertain,
             None,
             Some(ActionStop::Uncertain),
@@ -441,7 +432,7 @@ mod tests {
     use crate::judgment::{ChoiceJudgment, Judgments};
     use crate::policy::{Next, Policy};
     use manuvra_chrome::{Coverage, Element, Rect, SelectOption, ViewportState};
-    use manuvra_contract::{DoneCondition, Job, Step};
+    use manuvra_contract::Job;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -598,7 +589,8 @@ mod tests {
             model: "jev".into(),
             request: Value::Null,
         };
-        let mut p = Policy::new(&job.options, "http://example.test");
+        let mut p =
+            Policy::new(&job.options, "http://example.test").with_provided_values(&job.values);
         match p.decide(
             &job.steps[0],
             obs,
@@ -802,7 +794,7 @@ mod tests {
         let cancellation = InputCancellation::default();
         cancellation.cancel();
         let mut after_flush_before_send = FakeJournal::default();
-        assert_eq!(
+        assert!(matches!(
             perform(
                 permit(&job, &obs),
                 &CancellationBoundaryPerformer(&dispatches),
@@ -811,15 +803,18 @@ mod tests {
                 &mut after_flush_before_send,
                 &cancellation,
             ),
-            Err(ActionStop::Uncertain)
-        );
+            Err(ActionStop::Reobserve(_))
+        ));
         assert_eq!(dispatches.load(Ordering::SeqCst), 0);
         assert_eq!(
             after_flush_before_send.entries[0]["event"],
             "action_prepared"
         );
+        assert_eq!(
+            after_flush_before_send.entries[1]["fact"]["outcome"],
+            "not_performed"
+        );
         for failure in [
-            PerformError::NotPerformed("before send".into()),
             PerformError::Uncertain("after send".into()),
             PerformError::Uncertain("cancelled between suboperations".into()),
             PerformError::Uncertain("readback unavailable".into()),
@@ -837,18 +832,24 @@ mod tests {
                 Err(ActionStop::Uncertain)
             );
             assert_eq!(journal.entries[0]["event"], "action_prepared");
+            assert_eq!(journal.entries[1]["fact"]["outcome"], "uncertain");
         }
-        let mut remounted = FakeJournal::default();
-        let result = perform(
-            permit(&job, &obs),
-            &FakePerformer(Err(PerformError::Rejected("target_missing".into()))),
-            &obs,
-            &Values::new(&job),
-            &mut remounted,
-            &InputCancellation::default(),
-        );
-        assert!(matches!(result, Err(ActionStop::Reobserve(_))));
-        assert_eq!(remounted.entries[1]["fact"]["outcome"], "not_performed");
+        for failure in [
+            PerformError::Rejected("target_missing".into()),
+            PerformError::NotPerformed("before send".into()),
+        ] {
+            let mut journal = FakeJournal::default();
+            let result = perform(
+                permit(&job, &obs),
+                &FakePerformer(Err(failure)),
+                &obs,
+                &Values::new(&job),
+                &mut journal,
+                &InputCancellation::default(),
+            );
+            assert!(matches!(result, Err(ActionStop::Reobserve(_))));
+            assert_eq!(journal.entries[1]["fact"]["outcome"], "not_performed");
+        }
         let mut after = FakeJournal {
             entries: vec![],
             fail_at: Some(1),
@@ -871,49 +872,30 @@ mod tests {
     }
 
     #[test]
-    fn permit_type_is_not_constructible_outside_policy_module() {
-        let _ = Step {
-            id: "x".into(),
-            goal: "x".into(),
-            done_when: DoneCondition::Structured(vec![]),
-            requires_values: vec![],
-            mutation_limit: 1,
-        };
-    }
-
-    #[test]
-    fn durable_journal_flushes_redacted_json_and_removes_itself() {
+    fn durable_journal_flushes_redacted_json_and_clears_itself() {
         let mut job = job();
         job.values.get_mut("name").unwrap().secret = true;
+        job.values.get_mut("name").unwrap().value = r#"Se"cr\et"#.into();
         let root = TempDir::new().unwrap();
         let path = root.path().join(".journal-test.action-journal.jsonl");
         let redactor = crate::evidence::Redactor::for_job(&job).unwrap();
         let mut journal = DurableJournal::open(root.path(), "journal-test", &redactor).unwrap();
         journal
-            .append(&json!({"event":"action_prepared","value":"Wanted"}))
+            .append(&json!({"event":"action_prepared","value":r#"typed Se"cr\et"#}))
             .unwrap();
         let persisted = std::fs::read_to_string(&path).unwrap();
         assert!(persisted.contains("action_prepared"));
-        assert!(!persisted.contains("Wanted"));
+        assert!(!persisted.contains("Se"), "{persisted}");
+        assert!(!redactor.contains_export_leak(persisted.as_bytes()));
+        assert!(!journal.entries()[0].to_string().contains("Se"));
         assert_eq!(journal.entries().len(), 1);
-        journal.remove().unwrap();
-        assert!(!path.exists());
-
-        let clear_path = root.path().join(".clear-test.action-journal.jsonl");
-        let mut journal = DurableJournal::open(root.path(), "clear-test", &redactor).unwrap();
-        journal.append(&json!({"event":"clear_test"})).unwrap();
         journal.clear().unwrap();
-        assert!(!clear_path.exists());
+        assert!(!path.exists());
     }
 
     fn hover_page() -> Observation {
         let mut page = observation();
-        page.hover_regions = vec![HoverRegion {
-            index: 1,
-            name: "Groceries".into(),
-            reveals_on_hover: vec!["Actions for Groceries".into()],
-            node_id: 41,
-        }];
+        page.hover_regions = vec![crate::test_support::hover_region(1, "Groceries", 41)];
         page
     }
 
@@ -1050,17 +1032,27 @@ mod tests {
         ));
         assert_eq!(rejected.entries[1]["fact"]["outcome"], "not_performed");
 
-        for failure in [
-            PerformError::NotPerformed("not queued".into()),
-            PerformError::Uncertain("sent without answer".into()),
-        ] {
-            let mut journal = FakeJournal::default();
-            assert_eq!(
-                hover_with(&FakePerformer(Err(failure)), &hover_page(), &mut journal),
-                Err(ActionStop::Uncertain)
-            );
-            assert_eq!(journal.entries[1]["fact"]["outcome"], "uncertain");
-        }
+        let mut not_queued = FakeJournal::default();
+        assert!(matches!(
+            hover_with(
+                &FakePerformer(Err(PerformError::NotPerformed("not queued".into()))),
+                &hover_page(),
+                &mut not_queued
+            ),
+            Err(ActionStop::Reobserve(_))
+        ));
+        assert_eq!(not_queued.entries[1]["fact"]["outcome"], "not_performed");
+
+        let mut unanswered = FakeJournal::default();
+        assert_eq!(
+            hover_with(
+                &FakePerformer(Err(PerformError::Uncertain("sent without answer".into()))),
+                &hover_page(),
+                &mut unanswered
+            ),
+            Err(ActionStop::Uncertain)
+        );
+        assert_eq!(unanswered.entries[1]["fact"]["outcome"], "uncertain");
 
         let mut incomplete = FakeJournal {
             entries: vec![],
@@ -1103,7 +1095,7 @@ mod tests {
         assert_eq!(persisted.matches("\"hover_target\"").count(), 2);
         assert!(!persisted.contains("Wanted"), "{persisted}");
         assert!(!persisted.contains("node_id") && !persisted.contains(":41"));
-        journal.remove().unwrap();
+        journal.clear().unwrap();
     }
 
     #[test]

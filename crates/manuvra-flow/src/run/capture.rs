@@ -1,0 +1,368 @@
+//! Capturing the target for a step: a verifiably redacted observation and screenshot, or a
+//! withheld screenshot when masking cannot be verified, and the redacted export of each.
+
+use super::artifacts::RunArtifacts;
+use crate::actions;
+use crate::evidence::Redactor;
+use crate::verification::DoneResult;
+use manuvra_chrome::{BrowserError, CapturedPage, Observation};
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
+
+pub(super) trait BrowserPage {
+    fn capture_redacted_page(&self, sensitive: &[String]) -> Result<CapturedPage, BrowserError>;
+    fn observe_page(&self) -> Result<Observation, BrowserError>;
+}
+
+pub(super) trait DriveBrowser: BrowserPage + actions::Performer {}
+impl<T: BrowserPage + actions::Performer> DriveBrowser for T {}
+
+pub(super) struct Captured {
+    pub(super) raw: Observation,
+    pub(super) artifact: (String, Value, Option<Vec<u8>>),
+    pub(super) redaction_verified: bool,
+}
+
+pub(super) fn capture_step(
+    browser: &(impl BrowserPage + ?Sized),
+    redactor: &Redactor,
+    step: usize,
+    attempt: usize,
+) -> Result<Captured, String> {
+    let name = format!("o_{step:04}_{attempt}");
+    let sensitive = redactor.sensitive_values();
+    match browser.capture_redacted_page(&sensitive) {
+        Ok(captured) if captured.redaction.verifies(sensitive.len()) => {
+            let observation = redacted_observation(&captured.observation, redactor)?;
+            Ok(Captured {
+                raw: captured.observation,
+                artifact: (name, observation, Some(captured.screenshot.bytes)),
+                redaction_verified: true,
+            })
+        }
+        Ok(_) => withheld_capture(browser, redactor, name),
+        Err(BrowserError::Control(message)) if message == "redaction_unverifiable" => {
+            withheld_capture(browser, redactor, name)
+        }
+        Err(error) => Err(redactor.redact_external_text(&error.to_string())),
+    }
+}
+
+fn withheld_capture(
+    browser: &(impl BrowserPage + ?Sized),
+    redactor: &Redactor,
+    name: String,
+) -> Result<Captured, String> {
+    let raw = browser
+        .observe_page()
+        .map_err(|error| redactor.redact_external_text(&error.to_string()))?;
+    let mut observation = redacted_observation(&raw, redactor)?;
+    if let Value::Object(fields) = &mut observation {
+        fields.insert(
+            "screenshot".into(),
+            json!({"withheld":"redaction_unverifiable"}),
+        );
+    }
+    Ok(Captured {
+        raw,
+        artifact: (name, observation, None),
+        redaction_verified: false,
+    })
+}
+
+fn redacted_observation(raw: &Observation, redactor: &Redactor) -> Result<Value, String> {
+    let redact = |text: &str| redactor.redact_external_text(text);
+    let elements = raw
+        .elements
+        .iter()
+        .map(|element| {
+            json!({
+                "index":element.index,
+                "role":element.role,
+                "name":redact(&element.name),
+                "input_type":element.input_type,
+                "value":redact(&element.value),
+                "checked":element.checked,
+                "selected":element.selected,
+                "expanded":element.expanded,
+                "disabled":element.disabled,
+                "in_dialog":element.in_dialog.as_ref().map(|dialog|redact(dialog)),
+                "operations":element.operations,
+                "select_options":element.select_options.iter().map(|option|json!({
+                    "label":redact(&option.label),
+                    "value":redact(&option.value),
+                    "disabled":option.disabled,
+                    "selected":option.selected,
+                })).collect::<Vec<_>>(),
+                "rect":element.rect,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut exported = json!({
+        "url":redact(&raw.url),
+        "route":redact(&raw.route),
+        "title":redact(&raw.title),
+        "dialogs":raw.dialogs.iter().map(|dialog|redact(dialog)).collect::<Vec<_>>(),
+        "focused":raw.focused,
+        "focus_anchor":raw.focus_anchor.as_ref().map(|anchor|json!({
+            "role":redact(&anchor.role),
+            "name":redact(&anchor.name),
+            "in_dialog":anchor.in_dialog.as_ref().map(|dialog|redact(dialog)),
+            "covered":anchor.covered,
+            "active_descendant":anchor.active_descendant.as_ref().map(|item|json!({
+                "id":redact(&item.id),"role":redact(&item.role),"name":redact(&item.name),
+                "selected":item.selected,"checked":item.checked,
+            })),
+            "expanded":anchor.expanded,"selected":anchor.selected,"checked":anchor.checked,
+        })),
+        "visible_text":redact(&raw.visible_text),
+        "covered_text":redact(&raw.covered_text),
+        "dialog_texts":raw.dialog_texts.iter().map(|(name,text)|(redact(name),redact(text))).collect::<BTreeMap<_,_>>(),
+        "elements":elements,
+        "viewport":raw.viewport,
+        "coverage":raw.coverage,
+    });
+    if let Value::Object(fields) = &mut exported {
+        fields.extend(exported_hover_regions(raw, redactor));
+    }
+    Ok(exported)
+}
+
+/// Hover regions appear in evidence only when present, with page text redacted and without the
+/// internal dispatch identity.
+fn exported_hover_regions(raw: &Observation, redactor: &Redactor) -> Vec<(String, Value)> {
+    let redact = |text: &str| redactor.redact_external_text(text);
+    let regions = raw
+        .hover_regions
+        .iter()
+        .map(|region| {
+            json!({
+                "index":region.index,
+                "name":redact(&region.name),
+                "reveals_on_hover":region.reveals_on_hover.iter().map(|name|redact(name)).collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut fields = Vec::new();
+    if !regions.is_empty() {
+        fields.push(("hover_regions".to_owned(), Value::Array(regions)));
+    }
+    if raw.hover_regions_truncated {
+        fields.push(("hover_regions_truncated".to_owned(), Value::Bool(true)));
+    }
+    fields
+}
+
+pub(super) fn redacted_value(value: &impl serde::Serialize, redactor: &Redactor) -> Value {
+    let mut value = serde_json::to_value(value).unwrap_or(Value::Null);
+    redactor.redact_export_value(&mut value);
+    value
+}
+
+pub(super) fn record_capture(
+    artifacts: &mut RunArtifacts,
+    redactor: &Redactor,
+    step: &manuvra_contract::Step,
+    captured: &Captured,
+    event: &str,
+    done: DoneResult,
+) {
+    artifacts.observations.push(captured.artifact.clone());
+    artifacts
+        .trace
+        .push(json!({"event":event,"step_id":redactor.redact_export_text(&step.id),"done":done}));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::run::tests::support::*;
+    use manuvra_chrome::{Element, FocusAnchor, Rect};
+
+    #[test]
+    fn exported_observation_keeps_public_indices_but_omits_browser_identity() {
+        let mut job = mutation_job();
+        job.values.get_mut("name").unwrap().secret = true;
+        let redactor = Redactor::for_job(&job).unwrap();
+        let mut observation = text_field("");
+        observation.document_id = "internal-document-token".into();
+        observation.elements[0].node_id = 981_723;
+        observation.elements[0].context = "main/shadow:981723".into();
+        observation.focus_anchor = Some(FocusAnchor {
+            node_id: 981_723,
+            context: "main/shadow:981723".into(),
+            role: "textbox".into(),
+            name: "Wanted".into(),
+            in_dialog: None,
+            covered: true,
+            surface: None,
+            active_descendant: None,
+            expanded: None,
+            selected: None,
+            checked: None,
+            position: None,
+        });
+        let exported = redacted_observation(&observation, &redactor).unwrap();
+        let text = exported.to_string();
+
+        assert_eq!(exported["elements"][0]["index"], 1);
+        assert_eq!(exported["elements"][0]["name"], "Name");
+        assert!(!text.contains("internal-document-token"));
+        assert!(!text.contains("981723"));
+        assert!(!text.contains("document_id"));
+        assert!(!text.contains("node_id"));
+        assert!(!text.contains("main/shadow"));
+        assert!(!text.contains("Wanted"));
+        assert!(
+            exported["focus_anchor"]["name"]
+                .as_str()
+                .unwrap()
+                .contains("<masked:")
+        );
+        assert!(exported["elements"][0].get("context").is_none());
+    }
+
+    fn richly_observed() -> Observation {
+        let mut observation = text_field("Wanted");
+        observation.visible_text = "Ready Wanted".into();
+        observation.covered_text = "Behind Wanted".into();
+        observation.dialogs = vec!["Confirm Wanted".into()];
+        observation.dialog_texts =
+            BTreeMap::from([("Confirm Wanted".into(), "Keep Wanted?".into())]);
+        observation.focused = Some(1);
+        observation.elements.push(Element {
+            index: 2,
+            node_id: 8,
+            context: "main/frame:3".into(),
+            role: "combobox".into(),
+            name: "Account".into(),
+            input_type: None,
+            value: "wanted-id".into(),
+            checked: Some(false),
+            selected: None,
+            expanded: Some(true),
+            disabled: false,
+            in_dialog: Some("Confirm Wanted".into()),
+            operations: vec!["SELECT".into()],
+            select_options: vec![manuvra_chrome::SelectOption {
+                node_id: 9,
+                label: "Wanted".into(),
+                value: "wanted-id".into(),
+                disabled: false,
+                selected: true,
+            }],
+            rect: Rect {
+                x: 2.5,
+                y: 30.0,
+                width: 120.0,
+                height: 24.0,
+            },
+        });
+        observation.coverage.viewport_complete = false;
+        observation.coverage.gaps = vec!["canvas".into(), "visible_text_truncated".into()];
+        observation
+    }
+
+    #[test]
+    fn exported_observation_without_hover_regions_is_unchanged() {
+        let mut job = mutation_job();
+        job.values.get_mut("name").unwrap().secret = true;
+        let redactor = Redactor::for_job(&job).unwrap();
+
+        let exported = redacted_observation(&richly_observed(), &redactor)
+            .unwrap()
+            .to_string();
+
+        let golden = r#"{"coverage":{"gaps":["canvas","visible_text_truncated"],"open_shadow_roots":true,"same_origin_frames":true,"slots":true,"viewport_complete":false},"covered_text":"Behind {m}","dialog_texts":{"Confirm {m}":"Keep {m}?"},"dialogs":["Confirm {m}"],"elements":[{"checked":null,"disabled":false,"expanded":null,"in_dialog":null,"index":1,"input_type":"text","name":"Name","operations":["TYPE_TEXT"],"rect":{"height":10.0,"width":20.0,"x":1.0,"y":1.0},"role":"textbox","select_options":[],"selected":null,"value":"{m}"},{"checked":false,"disabled":false,"expanded":true,"in_dialog":"Confirm {m}","index":2,"input_type":null,"name":"Account","operations":["SELECT"],"rect":{"height":24.0,"width":120.0,"x":2.5,"y":30.0},"role":"combobox","select_options":[{"disabled":false,"label":"{m}","selected":true,"value":"wanted-id"}],"selected":null,"value":"wanted-id"}],"focus_anchor":null,"focused":1,"route":"/","title":"Money · Accounts","url":"http://127.0.0.1:4351/","viewport":{"document_height":780.0,"height":780,"scroll_x":0.0,"scroll_y":0.0,"width":1120},"visible_text":"Ready {m}"}"#;
+        assert_eq!(
+            exported,
+            golden.replace("{m}", "\u{e000}<masked:1>\u{e000}")
+        );
+    }
+
+    #[test]
+    fn persisted_observation_lists_redacted_hover_regions_without_browser_identity() {
+        let mut job = job("Ready");
+        job.values.insert(
+            "category".into(),
+            manuvra_contract::JobValue {
+                value: "Groceries".into(),
+                description: "classified category".into(),
+                formats: None,
+                secret: true,
+            },
+        );
+        let redactor = Redactor::for_job(&job).unwrap();
+        let mut observation = observed("Ready");
+        observation.hover_regions = vec![
+            manuvra_chrome::HoverRegion {
+                index: 1,
+                name: "Groceries".into(),
+                reveals_on_hover: vec!["Actions for Groceries".into()],
+                node_id: 981_723,
+            },
+            manuvra_chrome::HoverRegion {
+                index: 2,
+                name: "Rent".into(),
+                reveals_on_hover: vec!["Actions for Rent".into(), "Pin Rent".into()],
+                node_id: 981_724,
+            },
+        ];
+        observation.hover_regions_truncated = true;
+
+        let artifacts = driven(
+            &job,
+            &FakeBrowser::new([observation]),
+            &NoProvider,
+            &mut MemoryJournal::default(),
+        );
+
+        assert!(artifacts.stop.is_none());
+        let persisted = &artifacts.observations[0].1;
+        let masked = "\u{e000}<masked:1>\u{e000}";
+        assert_eq!(
+            persisted["hover_regions"],
+            json!([
+                {"index":1,"name":masked,"reveals_on_hover":[format!("Actions for {masked}")]},
+                {"index":2,"name":"Rent","reveals_on_hover":["Actions for Rent","Pin Rent"]}
+            ])
+        );
+        assert_eq!(persisted["hover_regions_truncated"], true);
+        assert!(
+            persisted["coverage"]["viewport_complete"]
+                .as_bool()
+                .unwrap()
+        );
+        let text = persisted.to_string();
+        assert!(!text.contains("Groceries"));
+        assert!(!text.contains("node_id"));
+        assert!(!text.contains("98172"));
+        assert!(!redactor.contains_export_leak(text.as_bytes()));
+    }
+
+    #[test]
+    fn classified_values_with_json_escapes_are_redacted_before_persistence() {
+        let mut job = mutation_job();
+        job.values.insert(
+            "escaped".into(),
+            manuvra_contract::JobValue {
+                value: r#"Se"cr\et"#.into(),
+                description: "classified value with JSON escapes".into(),
+                formats: None,
+                secret: true,
+            },
+        );
+        let redactor = Redactor::for_job(&job).unwrap();
+        let value = redacted_value(
+            &json!({"rationale":r#"typed Se"cr\et"#,"nested":[{r#"Se"cr\et"#:true}]}),
+            &redactor,
+        );
+        let exported = value.to_string();
+        assert!(!exported.contains(r#"Se\"cr\\et"#), "{exported}");
+        assert!(!redactor.contains_export_leak(exported.as_bytes()));
+        assert!(value["rationale"].as_str().unwrap().starts_with("typed "));
+        assert!(
+            redactor.contains_export_leak(json!({"leaked":r#"Se"cr\et"#}).to_string().as_bytes())
+        );
+    }
+}

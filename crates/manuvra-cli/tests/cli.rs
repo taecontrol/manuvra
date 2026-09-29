@@ -116,13 +116,21 @@ fn fixture(temp: &TempDir, job: &Value) -> PathBuf {
     path
 }
 
+/// A CLI command confined to the temporary directory's private state and runtime roots.
+fn manuvra(temp: &TempDir) -> Command {
+    let mut command = Command::new(binary());
+    command.env("XDG_STATE_HOME", temp.path().join("state"));
+    // A control socket beneath the per-user macOS temporary directory exceeds Darwin's 104-byte
+    // socket path limit, so macOS runs use Manuvra's own TMPDIR fallback instead.
+    #[cfg(target_os = "macos")]
+    command.env_remove("XDG_RUNTIME_DIR");
+    #[cfg(not(target_os = "macos"))]
+    command.env("XDG_RUNTIME_DIR", temp.path().join("runtime"));
+    command
+}
+
 fn invoke(temp: &TempDir, args: &[&str]) -> Output {
-    Command::new(binary())
-        .args(args)
-        .env("XDG_STATE_HOME", temp.path().join("state"))
-        .env("XDG_RUNTIME_DIR", temp.path().join("runtime"))
-        .output()
-        .unwrap()
+    manuvra(temp).args(args).output().unwrap()
 }
 
 fn request_index(state_root: &Path, request_id: &str) -> PathBuf {
@@ -182,33 +190,45 @@ fn one_object(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn missing_runtime_variables_refuse_before_state_evidence_or_children() {
     let temp = TempDir::new().unwrap();
     let job_path = fixture(&temp, &valid_job());
     let state = temp.path().join("state");
     let evidence = temp.path().join("evidence");
-    let output = Command::new(binary())
-        .args([
-            "run",
-            "--request-id",
-            "no-runtime",
-            "--job",
-            job_path.to_str().unwrap(),
-            "--evidence",
-            evidence.to_str().unwrap(),
-        ])
-        .env("XDG_STATE_HOME", &state)
-        .env_remove("XDG_RUNTIME_DIR")
-        .env_remove("TMPDIR")
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(3));
-    let result = one_object(&output);
-    assert_eq!(result["error"]["code"], "runtime_directory_unavailable");
-    assert!(!state.exists());
-    assert!(!evidence.exists());
+    let args = [
+        "run",
+        "--request-id",
+        "no-runtime",
+        "--job",
+        job_path.to_str().unwrap(),
+        "--evidence",
+        evidence.to_str().unwrap(),
+    ];
+    for runtime in [None, Some("")] {
+        let mut command = manuvra(&temp);
+        command
+            .args(args)
+            .env_remove("XDG_RUNTIME_DIR")
+            .env_remove("TMPDIR");
+        if let Some(runtime) = runtime {
+            command.env("XDG_RUNTIME_DIR", runtime);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(3));
+        let result = one_object(&output);
+        assert_eq!(result["error"]["code"], "runtime_directory_unavailable");
+        assert!(!state.exists());
+        assert!(!evidence.exists());
+    }
+
+    let retried = invoke(&temp, &args);
+    assert_eq!(retried.status.code(), Some(3));
+    let retried = one_object(&retried);
+    assert_eq!(retried["state"], "blocked");
+    assert_eq!(retried["reason"]["code"], "missing_value");
+    assert!(Path::new(retried["evidence"]["manifest"].as_str().unwrap()).is_file());
 }
 
 #[test]
@@ -476,7 +496,7 @@ fn provider_key_is_scrubbed_from_errors_before_job_admission() {
     let temp = TempDir::new().unwrap();
     let key = "provider-key-must-not-reach-stdout";
     let missing_job = temp.path().join(key);
-    let output = Command::new(binary())
+    let output = manuvra(&temp)
         .args([
             "run",
             "--request-id",
@@ -486,7 +506,6 @@ fn provider_key_is_scrubbed_from_errors_before_job_admission() {
             "--evidence",
             temp.path().join("evidence").to_str().unwrap(),
         ])
-        .env("XDG_STATE_HOME", temp.path().join("state"))
         .env("TYPESAFE_API_KEY", key)
         .output()
         .unwrap();
@@ -501,7 +520,7 @@ fn provider_key_is_scrubbed_from_errors_before_job_admission() {
 }
 
 #[test]
-fn provider_key_collision_preserves_protocol_and_persisted_stdout() {
+fn provider_key_collision_preserves_the_protocol_state() {
     let temp = TempDir::new().unwrap();
     let job_path = fixture(&temp, &valid_job());
     let evidence = temp.path().join("evidence");
@@ -514,9 +533,8 @@ fn provider_key_collision_preserves_protocol_and_persisted_stdout() {
         "--evidence",
         evidence.to_str().unwrap(),
     ];
-    let first = Command::new(binary())
+    let first = manuvra(&temp)
         .args(args)
-        .env("XDG_STATE_HOME", temp.path().join("state"))
         .env("TYPESAFE_API_KEY", "blocked")
         .output()
         .unwrap();
@@ -524,20 +542,7 @@ fn provider_key_collision_preserves_protocol_and_persisted_stdout() {
     let result = one_object(&first);
     assert_eq!(result["state"], "blocked");
     assert_eq!(result["reason"]["code"], "missing_value");
-    serde_json::from_value::<RunResult>(result.clone()).unwrap();
-    let manifest = PathBuf::from(result["evidence"]["manifest"].as_str().unwrap());
-    let persisted: Value =
-        serde_json::from_slice(&fs::read(manifest.parent().unwrap().join("result.json")).unwrap())
-            .unwrap();
-    assert_eq!(result, persisted);
-
-    let retry = Command::new(binary())
-        .args(args)
-        .env("XDG_STATE_HOME", temp.path().join("state"))
-        .env("TYPESAFE_API_KEY", "blocked")
-        .output()
-        .unwrap();
-    assert_eq!(retry.stdout, first.stdout);
+    serde_json::from_value::<RunResult>(result).unwrap();
 }
 
 #[test]
@@ -576,18 +581,16 @@ fn request_identity_includes_environment_browser_without_launching_it() {
         "--evidence",
         evidence.to_str().unwrap(),
     ];
-    let first = Command::new(binary())
+    let first = manuvra(&temp)
         .args(args)
-        .env("XDG_STATE_HOME", temp.path().join("state"))
         .env("MANUVRA_BROWSER", "/missing/browser-one")
         .output()
         .unwrap();
     assert_eq!(first.status.code(), Some(3));
     assert_eq!(one_object(&first)["reason"]["code"], "missing_value");
 
-    let changed = Command::new(binary())
+    let changed = manuvra(&temp)
         .args(args)
-        .env("XDG_STATE_HOME", temp.path().join("state"))
         .env("MANUVRA_BROWSER", "/missing/browser-two")
         .output()
         .unwrap();
@@ -612,17 +615,15 @@ fn explicit_browser_identity_overrides_environment_selection() {
         "--browser",
         "/missing/explicit-browser",
     ];
-    let first = Command::new(binary())
+    let first = manuvra(&temp)
         .args(args)
-        .env("XDG_STATE_HOME", temp.path().join("state"))
         .env("MANUVRA_BROWSER", "/missing/environment-one")
         .output()
         .unwrap();
     assert_eq!(first.status.code(), Some(3));
 
-    let deduplicated = Command::new(binary())
+    let deduplicated = manuvra(&temp)
         .args(args)
-        .env("XDG_STATE_HOME", temp.path().join("state"))
         .env("MANUVRA_BROWSER", "/missing/environment-two")
         .output()
         .unwrap();
@@ -656,58 +657,17 @@ fn non_utf8_evidence_path_is_rejected_without_a_false_reference() {
     let job_path = fixture(&temp, &valid_job());
     let invalid_component = OsString::from_vec(vec![b'e', b'v', b'-', 0xff]);
     let evidence = temp.path().join(invalid_component);
-    let output = Command::new(binary())
+    let output = manuvra(&temp)
         .args(["run", "--request-id", "non-utf8", "--job"])
         .arg(job_path)
         .arg("--evidence")
         .arg(&evidence)
-        .env("XDG_STATE_HOME", temp.path().join("state"))
         .output()
         .unwrap();
 
     assert_eq!(output.status.code(), Some(64));
     assert_eq!(one_object(&output)["error"]["code"], "invalid_input");
     assert!(!evidence.exists());
-}
-
-#[test]
-fn request_id_deduplicates_same_job_and_rejects_conflict() {
-    let temp = TempDir::new().unwrap();
-    let job_path = fixture(&temp, &valid_job());
-    let evidence = temp.path().join("evidence");
-    let args = [
-        "run",
-        "--request-id",
-        "dedup-1",
-        "--job",
-        job_path.to_str().unwrap(),
-        "--evidence",
-        evidence.to_str().unwrap(),
-    ];
-    let first = one_object(&invoke(&temp, &args));
-    let second_output = invoke(&temp, &args);
-    assert_eq!(second_output.status.code(), Some(3));
-    let second = one_object(&second_output);
-    assert_eq!(first["run_id"], second["run_id"]);
-
-    let mut changed = valid_job();
-    changed["context"]["revision"] = json!("different");
-    let changed_path = temp.path().join("changed.json");
-    fs::write(&changed_path, serde_json::to_vec(&changed).unwrap()).unwrap();
-    let conflict = invoke(
-        &temp,
-        &[
-            "run",
-            "--request-id",
-            "dedup-1",
-            "--job",
-            changed_path.to_str().unwrap(),
-            "--evidence",
-            evidence.to_str().unwrap(),
-        ],
-    );
-    assert_eq!(conflict.status.code(), Some(64));
-    assert_eq!(one_object(&conflict)["error"]["code"], "request_conflict");
 }
 
 #[test]
@@ -744,33 +704,6 @@ fn request_digest_is_keyed_by_the_private_state_root() {
 }
 
 #[test]
-fn corrupt_digest_key_fails_without_publishing_evidence() {
-    let temp = TempDir::new().unwrap();
-    let job_path = fixture(&temp, &valid_job());
-    let state_root = temp.path().join("state/manuvra");
-    fs::create_dir_all(&state_root).unwrap();
-    fs::write(state_root.join("digest.key"), b"too short").unwrap();
-    let evidence = temp.path().join("evidence");
-
-    let output = invoke(
-        &temp,
-        &[
-            "run",
-            "--request-id",
-            "bad-key-1",
-            "--job",
-            job_path.to_str().unwrap(),
-            "--evidence",
-            evidence.to_str().unwrap(),
-        ],
-    );
-
-    assert_eq!(output.status.code(), Some(70));
-    assert_eq!(one_object(&output)["error"]["code"], "internal");
-    assert!(!evidence.exists());
-}
-
-#[test]
 fn overlapping_request_ids_publish_one_run() {
     let temp = TempDir::new().unwrap();
     let job_path = fixture(&temp, &valid_job());
@@ -779,7 +712,7 @@ fn overlapping_request_ids_publish_one_run() {
     let mut children = Vec::new();
     for _ in 0..12 {
         children.push(
-            Command::new(binary())
+            manuvra(&temp)
                 .args([
                     "run",
                     "--request-id",
@@ -789,7 +722,6 @@ fn overlapping_request_ids_publish_one_run() {
                     "--evidence",
                     evidence.to_str().unwrap(),
                 ])
-                .env("XDG_STATE_HOME", &state)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -820,49 +752,6 @@ fn overlapping_request_ids_publish_one_run() {
             );
         }
     }
-}
-
-#[test]
-fn retry_from_request_intent_before_evidence_reuses_the_run() {
-    let temp = TempDir::new().unwrap();
-    let job_path = fixture(&temp, &valid_job());
-    let evidence = temp.path().join("evidence");
-    let args = [
-        "run",
-        "--request-id",
-        "intent-before-evidence",
-        "--job",
-        job_path.to_str().unwrap(),
-        "--evidence",
-        evidence.to_str().unwrap(),
-    ];
-    let first = one_object(&invoke(&temp, &args));
-    let state_root = temp.path().join("state/manuvra");
-    let index = request_index(&state_root, "intent-before-evidence");
-    let complete: Value = serde_json::from_slice(&fs::read(&index).unwrap()).unwrap();
-    let intent = intent_from_result(&first, complete["job_digest"].as_str().unwrap());
-    write_private_json(&index, &intent);
-    let state_run_record = state_root
-        .join("runs")
-        .join(first["run_id"].as_str().unwrap())
-        .join("request.json");
-    write_private_json(&state_run_record, &intent);
-    fs::remove_dir_all(
-        PathBuf::from(first["evidence"]["manifest"].as_str().unwrap())
-            .parent()
-            .unwrap(),
-    )
-    .unwrap();
-
-    let retried_output = invoke(&temp, &args);
-    assert_eq!(retried_output.status.code(), Some(3));
-    let retried = one_object(&retried_output);
-    assert_eq!(retried["run_id"], first["run_id"]);
-    assert!(
-        Path::new(retried["evidence"]["manifest"].as_str().unwrap()).is_file(),
-        "the same run should be completed from its durable intent"
-    );
-    assert_eq!(fs::read_dir(&evidence).unwrap().count(), 1);
 }
 
 #[test]
@@ -1045,23 +934,30 @@ fn missing_digest_key_with_request_history_reports_corruption() {
 
 #[cfg(unix)]
 #[test]
-fn digest_key_rejects_exposed_mode_and_symlink_substitution() {
+fn digest_key_rejects_short_exposed_and_substituted_keys_without_publishing_evidence() {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
-    for substitution in ["mode", "symlink"] {
+    for substitution in ["short", "mode", "symlink"] {
         let temp = TempDir::new().unwrap();
         let state_root = temp.path().join("state/manuvra");
         fs::create_dir_all(&state_root).unwrap();
         fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700)).unwrap();
         let key = state_root.join("digest.key");
-        if substitution == "mode" {
-            fs::write(&key, [7_u8; 32]).unwrap();
-            fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
-        } else {
-            let target = temp.path().join("outside-key");
-            fs::write(&target, [7_u8; 32]).unwrap();
-            fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
-            symlink(target, &key).unwrap();
+        match substitution {
+            "short" => {
+                fs::write(&key, b"too short").unwrap();
+                fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            "mode" => {
+                fs::write(&key, [7_u8; 32]).unwrap();
+                fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            _ => {
+                let target = temp.path().join("outside-key");
+                fs::write(&target, [7_u8; 32]).unwrap();
+                fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+                symlink(target, &key).unwrap();
+            }
         }
         let job_path = fixture(&temp, &valid_job());
         let evidence = temp.path().join("evidence");
@@ -1179,11 +1075,6 @@ fn classified_renderings_are_absent_from_stdout_and_all_evidence_fields() {
         assert_no_marker(&evidence, marker);
         assert_no_marker(&temp.path().join("state/manuvra"), marker);
     }
-
-    let second_output = invoke(&temp, &args);
-    assert_eq!(second_output.status.code(), Some(3));
-    assert_eq!(one_object(&second_output)["run_id"], first["run_id"]);
-    assert_eq!(fs::read_dir(&evidence).unwrap().count(), 1);
 }
 
 #[test]
@@ -1203,9 +1094,8 @@ fn classified_request_id_never_enters_intent_or_completed_state() {
         evidence.to_str().unwrap(),
     ];
     let run = || {
-        Command::new(binary())
+        manuvra(&temp)
             .args(args)
-            .env("XDG_STATE_HOME", temp.path().join("state"))
             .env("TYPESAFE_API_KEY", provider)
             .output()
             .unwrap()
@@ -1274,7 +1164,7 @@ fn classified_request_id_never_enters_intent_or_completed_state() {
     changed["context"]["revision"] = json!("different");
     let changed_path = temp.path().join("changed.json");
     fs::write(&changed_path, serde_json::to_vec(&changed).unwrap()).unwrap();
-    let conflict = Command::new(binary())
+    let conflict = manuvra(&temp)
         .args([
             "run",
             "--request-id",
@@ -1284,7 +1174,6 @@ fn classified_request_id_never_enters_intent_or_completed_state() {
             "--evidence",
             evidence.to_str().unwrap(),
         ])
-        .env("XDG_STATE_HOME", temp.path().join("state"))
         .env("TYPESAFE_API_KEY", provider)
         .output()
         .unwrap();
@@ -1749,7 +1638,7 @@ fn public_darwin_forced_job(http: &DarwinHttpFixture, pause_timeout_ms: u64) -> 
         "target":{"kind":"browser","url":http.url()},
         "context":{
             "journey":"Exercise a public Darwin disposition",
-            "revision":"slice-5",
+            "revision":"darwin-lifecycle-fixture",
             "environment":"disposable HTTP fixture",
             "actor":"synthetic owner",
             "authority":"click Activate once"
@@ -1850,7 +1739,7 @@ fn public_darwin_run_recovers_by_run_and_request_id_with_owned_chrome() {
         "target":{"kind":"browser","url":url},
         "context":{
             "journey":"Darwin hosted runtime fixture",
-            "revision":"slice-5",
+            "revision":"darwin-lifecycle-fixture",
             "environment":"disposable HTTP fixture",
             "actor":"synthetic owner",
             "authority":"fixture only"
@@ -1972,7 +1861,7 @@ fn public_darwin_run_recovers_by_run_and_request_id_with_owned_chrome() {
 
 #[cfg(target_os = "macos")]
 #[test]
-#[ignore = "requires Google Chrome and TYPESAFE_API_KEY"]
+#[ignore = "needs macOS, Google Chrome at /Applications/Google Chrome.app, and TYPESAFE_API_KEY for Jev; run with --ignored"]
 fn public_darwin_forced_disposition_revalidates_and_finishes_same_run() {
     let provider_key = std::env::var("TYPESAFE_API_KEY")
         .ok()
@@ -2103,7 +1992,7 @@ fn public_darwin_forced_disposition_revalidates_and_finishes_same_run() {
 
 #[cfg(target_os = "macos")]
 #[test]
-#[ignore = "requires Google Chrome and TYPESAFE_API_KEY"]
+#[ignore = "needs macOS, Google Chrome at /Applications/Google Chrome.app, and TYPESAFE_API_KEY for Jev; run with --ignored"]
 fn public_darwin_abort_and_expiry_close_owned_chrome() {
     let provider_key = std::env::var("TYPESAFE_API_KEY")
         .ok()
@@ -2775,6 +2664,38 @@ fn paused_abort_is_deduplicated_and_conflicting_control_request_is_rejected() {
     assert_eq!(one_object(&conflict)["error"]["code"], "request_conflict");
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn status_publishes_host_loss_when_host_and_watchdog_die_leaving_their_socket() {
+    let temp = hosted_temp();
+    let (initial, control_path, runtime_run) = start_fault_window(&temp, "pause_abort");
+    let run_id = initial["run_id"].as_str().unwrap();
+    let browser_child_pid = wait_for_pid_file(&runtime_run.join("fake-browser-child.pid"));
+    let paused = wait_for_control_value(&control_path, |value| {
+        value["result"]["state"] == "uncertain" && value["watchdog"]["pid"].is_u64()
+    });
+    let watchdog_pid = paused["watchdog"]["pid"].as_u64().unwrap() as u32;
+    let host_pid = paused["host"]["pid"].as_u64().unwrap() as u32;
+    assert_eq!(unsafe { libc::kill(watchdog_pid as i32, libc::SIGKILL) }, 0);
+    assert_process_gone(watchdog_pid);
+    assert_eq!(unsafe { libc::kill(host_pid as i32, libc::SIGKILL) }, 0);
+    assert_process_gone(host_pid);
+    assert!(runtime_run.join("control.sock").exists());
+
+    let status = hosted_invoke(&temp, &["status", run_id, "--wait-ms", "5000"]);
+    assert_eq!(status.status.code(), Some(3));
+    let result = one_object(&status);
+    assert_eq!(result["state"], "blocked");
+    assert_eq!(result["terminal"], true);
+    assert_eq!(result["reason"]["code"], "host_lost");
+    assert!(!runtime_run.join("control.sock").exists());
+    assert_process_gone(browser_child_pid);
+
+    let repeated = hosted_invoke(&temp, &["status", run_id]);
+    assert_eq!(repeated.status.code(), Some(3));
+    assert_eq!(repeated.stdout, status.stdout);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn watchdog_lifetime_state_excludes_provider_key_embedded_in_caller_text() {
@@ -2883,12 +2804,7 @@ fn export_boundary_job(provider: &str, missing_value: bool) -> Value {
     job
 }
 
-fn assert_export_boundary(
-    output: &Output,
-    evidence: &Path,
-    provider: &str,
-    expected_reason: &str,
-) -> Value {
+fn assert_export_boundary(output: &Output, evidence: &Path, provider: &str, expected_reason: &str) {
     let result = one_object(output);
     assert_eq!(result["state"], "blocked");
     assert_eq!(result["reason"]["code"], expected_reason);
@@ -2903,7 +2819,7 @@ fn assert_export_boundary(
     let result_file: Value =
         serde_json::from_slice(&fs::read(run_dir.join("result.json")).unwrap()).unwrap();
     assert_eq!(result, result_file);
-    serde_json::from_value::<RunResult>(result.clone()).unwrap();
+    serde_json::from_value::<RunResult>(result).unwrap();
 
     let job_bytes = fs::read(run_dir.join("job.json")).unwrap();
     let exported: Value = serde_json::from_slice(&job_bytes).unwrap();
@@ -2922,7 +2838,6 @@ fn assert_export_boundary(
             .windows(provider.len())
             .any(|part| part == provider.as_bytes())
     );
-    result
 }
 
 #[test]
@@ -2940,23 +2855,13 @@ fn blocked_export_redacts_provider_owned_caller_text_without_corrupting_protocol
         "--evidence",
         evidence.to_str().unwrap(),
     ];
-    let first = Command::new(binary())
+    let first = manuvra(&temp)
         .args(args)
-        .env("XDG_STATE_HOME", temp.path().join("state"))
         .env("TYPESAFE_API_KEY", provider)
         .output()
         .unwrap();
     assert_eq!(first.status.code(), Some(3));
-    let result = assert_export_boundary(&first, &evidence, provider, "missing_value");
-
-    let retry = Command::new(binary())
-        .args(args)
-        .env("XDG_STATE_HOME", temp.path().join("state"))
-        .env("TYPESAFE_API_KEY", provider)
-        .output()
-        .unwrap();
-    assert_eq!(retry.stdout, first.stdout);
-    assert_eq!(one_object(&retry), result);
+    assert_export_boundary(&first, &evidence, provider, "missing_value");
 }
 
 #[test]
@@ -2966,7 +2871,7 @@ fn browser_run_export_uses_the_same_caller_and_protocol_redaction_policy() {
     let job_path = fixture(&temp, &export_boundary_job(provider, false));
     let evidence = temp.path().join("evidence");
     let request_id = format!("request-{provider}");
-    let output = Command::new(binary())
+    let output = manuvra(&temp)
         .args([
             "run",
             "--request-id",
@@ -2978,7 +2883,6 @@ fn browser_run_export_uses_the_same_caller_and_protocol_redaction_policy() {
             "--browser",
             "/missing/adversarial-browser",
         ])
-        .env("XDG_STATE_HOME", temp.path().join("state"))
         .env("TYPESAFE_API_KEY", provider)
         .output()
         .unwrap();

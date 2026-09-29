@@ -1155,14 +1155,12 @@ mod tests {
 
     #[test]
     fn recorded_money_snapshots_cover_structured_resolution() {
-        let dialog: Observation = serde_json::from_str(include_str!(
-            "../../../tests/fixtures/recorded-money-dialog.json"
-        ))
-        .unwrap();
-        let final_page: Observation = serde_json::from_str(include_str!(
-            "../../../tests/fixtures/recorded-money-final.json"
-        ))
-        .unwrap();
+        let dialog: Observation =
+            serde_json::from_str(include_str!("../tests/fixtures/recorded-money-dialog.json"))
+                .unwrap();
+        let final_page: Observation =
+            serde_json::from_str(include_str!("../tests/fixtures/recorded-money-final.json"))
+                .unwrap();
         let recorded_values = BTreeMap::from([(
             "account_name".into(),
             JobValue {

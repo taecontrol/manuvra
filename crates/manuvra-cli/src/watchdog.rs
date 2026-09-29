@@ -6,7 +6,6 @@ use serde_json::{Value, json};
 use std::fs;
 use std::io::Write;
 use std::os::fd::{FromRawFd, RawFd};
-use std::os::unix::fs::FileTypeExt;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -240,7 +239,7 @@ fn finish_terminal_host(
     bootstrap: &WatchdogBootstrap,
 ) -> Result<(), String> {
     terminate_owned_group(child, host, shutdown_grace())?;
-    remove_dead_socket(&bootstrap.runtime_dir.join("control.sock"))
+    crate::runtime::sweep_dead_run(&bootstrap.runtime_dir)
 }
 
 fn terminate_owned_group(
@@ -303,12 +302,11 @@ fn reconcile_dead_host(
     state: Option<&'static str>,
     host: Option<&store::ProcessIdentity>,
 ) -> Result<(), String> {
-    let socket = bootstrap.runtime_dir.join("control.sock");
     let _publication_lock = wait_for_publication_lock(bootstrap)?;
     if let Some(host) = host {
         let _ = process::signal_process_group(host, libc::SIGKILL)?;
     }
-    remove_dead_socket(&socket)?;
+    crate::runtime::sweep_dead_run(&bootstrap.runtime_dir)?;
     let mut control = store::read_run_control(&bootstrap.state_root, &bootstrap.intent.run_id)?
         .unwrap_or_else(|| lost_control(bootstrap));
     if control.result.get("terminal").and_then(Value::as_bool) == Some(true) {
@@ -382,19 +380,6 @@ fn crash_reason(bootstrap: &WatchdogBootstrap, code: &str) -> Value {
         store::unresolved_action(&bootstrap.intent.evidence_root, &bootstrap.intent.run_id)
             .unwrap_or(true);
     json!({"code":code,"current_action":if prepared { "uncertain" } else { "none" }})
-}
-
-fn remove_dead_socket(path: &std::path::Path) -> Result<(), String> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_socket() => remove_socket(path),
-        Ok(_) => Err("dead host socket path is not an owned socket".into()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.to_string()),
-    }
-}
-
-fn remove_socket(path: &std::path::Path) -> Result<(), String> {
-    fs::remove_file(path).map_err(|error| error.to_string())
 }
 
 fn liveness_pipe() -> Result<(RawFd, RawFd), String> {
@@ -625,6 +610,10 @@ mod tests {
         run_watchdog_with_spawn(&bootstrap, &mut bootstrap_bytes, lock, spawn_synthetic_host)
             .unwrap();
         assert!(bootstrap_bytes.iter().all(|byte| *byte == 0));
+        assert!(
+            !bootstrap.runtime_dir.exists(),
+            "the dead run directory is swept"
+        );
         let first = store::read_run_control(&bootstrap.state_root, &bootstrap.intent.run_id)
             .unwrap()
             .unwrap();
@@ -658,6 +647,10 @@ mod tests {
             .unwrap();
         assert_eq!(preserved.sequence, control.sequence);
         assert_eq!(preserved.result["state"], "blocked");
+        assert!(
+            !bootstrap.runtime_dir.exists(),
+            "the dead run directory is swept"
+        );
     }
 
     #[test]

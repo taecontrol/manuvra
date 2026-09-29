@@ -31,6 +31,83 @@ mod platform;
 #[path = "owned/linux.rs"]
 mod platform;
 
+/// Executable and signal mechanics that are identical on every supported
+/// platform. Process identity and group ownership stay in the siblings.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod process {
+    use super::safe_error;
+    use std::env;
+    use std::ffi::OsStr;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::process::Child;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    pub(super) const GRACEFUL_TIMEOUT: Duration = Duration::from_secs(2);
+    pub(super) const FORCED_TIMEOUT: Duration = Duration::from_secs(1);
+
+    pub(super) fn find_on_path(name: &str, search_path: Option<&OsStr>) -> Option<PathBuf> {
+        env::split_paths(search_path?).find_map(|directory| usable_binary(&directory.join(name)))
+    }
+
+    pub(super) fn usable_binary(path: &Path) -> Option<PathBuf> {
+        let metadata = path.metadata().ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        (metadata.permissions().mode() & 0o111 != 0)
+            .then(|| fs::canonicalize(path).ok())
+            .flatten()
+    }
+
+    pub(super) fn wait_for_process_exit(
+        child: &mut Child,
+        timeout: Duration,
+    ) -> Result<bool, String> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if child
+                .try_wait()
+                .map_err(|error| safe_error(&error.to_string()))?
+                .is_some()
+            {
+                return Ok(true);
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        Ok(false)
+    }
+
+    pub(super) fn pid_t(id: u32) -> Result<i32, String> {
+        id.try_into()
+            .map_err(|_| "process id does not fit pid_t".to_owned())
+    }
+
+    /// Signals one process; a process that no longer exists is not an error.
+    pub(super) fn signal_pid(pid: u32, signal: i32) -> Result<(), String> {
+        send_signal(pid_t(pid)?, signal)
+    }
+
+    /// Signals every member of a process group; an empty group is not an error.
+    pub(super) fn signal_group(process_group: u32, signal: i32) -> Result<(), String> {
+        send_signal(-pid_t(process_group)?, signal)
+    }
+
+    fn send_signal(target: i32, signal: i32) -> Result<(), String> {
+        if unsafe { libc::kill(target, signal) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(safe_error(&error.to_string()))
+        }
+    }
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod platform {
     use std::process::Child;
@@ -45,6 +122,8 @@ mod platform {
 }
 
 const SNAPSHOT: &str = include_str!("snapshot.js");
+const MASKING: &str = include_str!("masking.js");
+const CAPTURE_ATTEMPTS: usize = 3;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const COVERAGE_PROBE: &str = r#"(() => {
   if (window.__manuvraCoverageProbeInstalled) return;
@@ -115,7 +194,7 @@ pub struct OwnedBrowser {
     client: Arc<CdpClient>,
     provenance: BrowserProvenance,
     ownership: platform::BrowserOwnership,
-    closed: bool,
+    lifecycle: Lifecycle,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -149,7 +228,8 @@ impl OwnedBrowser {
 
     pub fn navigate(&self, url: &str) -> Result<(), BrowserError> {
         let fence = self.client.cursor();
-        command(&self.client, "Page.navigate", json!({"url": url}))?;
+        let navigated = command(&self.client, "Page.navigate", json!({"url": url}))?;
+        require_committed_navigation(&navigated)?;
         wait_for_document(&self.client, fence)
     }
 
@@ -160,12 +240,9 @@ impl OwnedBrowser {
         crate::observation::mark_closed_shadow_focus(&mut observation, |method, params| {
             command(&self.client, method, params)
         })?;
-        if self.client.snapshot_since(0).events.iter().any(|event| {
-            matches!(
-                event.message.get("method").and_then(Value::as_str),
-                Some("Page.windowOpen" | "Target.targetCreated")
-            )
-        }) {
+        // A page session reports `window.open` as `Page.windowOpen`; the popup
+        // itself is another target Manuvra neither observes nor controls.
+        if self.client.has_received("Page.windowOpen") {
             observation.coverage.gaps.push("popup".into());
             observation.coverage.gaps.sort();
             observation.coverage.gaps.dedup();
@@ -187,31 +264,24 @@ impl OwnedBrowser {
     }
 
     pub fn capture(&self) -> Result<CapturedPage, BrowserError> {
-        for _ in 0..3 {
-            let fence = self.client.cursor();
-            let observation = self.observe()?;
-            let screenshot = page::capture_screenshot(
-                &self.client,
-                deadline(),
-                Arc::new(AtomicBool::new(false)),
-            )
-            .map_err(|error| BrowserError::Control(error.to_string()))?;
-            let changed = self
-                .client
-                .snapshot_since(fence)
-                .events
-                .iter()
-                .any(crate::transport::is_relevant_event);
-            if !changed {
-                return Ok(CapturedPage {
-                    observation,
-                    screenshot,
-                    redaction: RedactionProof {
-                        sensitive_values_checked: 0,
-                        matched_values: 0,
-                        mask_count: 0,
-                    },
-                });
+        self.capture_fenced(None)
+    }
+
+    pub fn capture_redacted(&self, sensitive: &[String]) -> Result<CapturedPage, BrowserError> {
+        if sensitive.is_empty() {
+            return self.capture();
+        }
+        self.capture_fenced(Some(Masking {
+            expression: masking_script(sensitive)?,
+            values: sensitive.len(),
+        }))
+    }
+
+    /// Retries until the observation and screenshot come from one unchanged page.
+    fn capture_fenced(&self, masking: Option<Masking>) -> Result<CapturedPage, BrowserError> {
+        for _ in 0..CAPTURE_ATTEMPTS {
+            if let Some(captured) = self.capture_once(masking.as_ref())? {
+                return Ok(captured);
             }
             thread::sleep(QUIET_WINDOW);
         }
@@ -220,45 +290,60 @@ impl OwnedBrowser {
         ))
     }
 
-    pub fn capture_redacted(&self, sensitive: &[String]) -> Result<CapturedPage, BrowserError> {
-        if sensitive.is_empty() {
-            return self.capture();
+    /// Masks are placed inside the fence on every attempt, so a secret that moves
+    /// before the screenshot invalidates the attempt instead of escaping its mask.
+    fn capture_once(
+        &self,
+        masking: Option<&Masking>,
+    ) -> Result<Option<CapturedPage>, BrowserError> {
+        let _mutations = DomMutationWatch::start(&self.client)?;
+        let fence = self.client.cursor();
+        let masks = install_masks(&self.client, masking)?;
+        let observation = self.observe()?;
+        let screenshot =
+            page::capture_screenshot(&self.client, deadline(), Arc::new(AtomicBool::new(false)))
+                .map_err(|error| BrowserError::Control(error.to_string()))?;
+        if page_changed_since(&self.client, fence) {
+            return Ok(None);
         }
-        self.capture_with_masks(sensitive)
+        Ok(Some(CapturedPage {
+            observation,
+            screenshot,
+            redaction: masks.proof.clone(),
+        }))
     }
 
-    fn capture_with_masks(&self, sensitive: &[String]) -> Result<CapturedPage, BrowserError> {
-        let expression = masking_script(sensitive)?;
-        let proof = match masking_proof(evaluate(&self.client, &expression)?, sensitive.len()) {
-            Ok(proof) => proof,
-            Err(_) => return self.unverifiable_mask(),
-        };
-        self.capture_then_unmask(proof)
-    }
-
-    fn unverifiable_mask(&self) -> Result<CapturedPage, BrowserError> {
-        let _ = evaluate(&self.client, "window.__manuvraRemoveMasks?.()");
-        Err(BrowserError::Control("redaction_unverifiable".into()))
-    }
-
-    fn capture_then_unmask(&self, proof: RedactionProof) -> Result<CapturedPage, BrowserError> {
-        let _masks = InstalledMasks {
-            client: &self.client,
-        };
-        let mut captured = self.capture()?;
-        captured.redaction = proof;
-        Ok(captured)
-    }
-
+    /// Terminates the browser at most once, then removes its profile. A failed
+    /// profile removal is retried without signalling the reaped process again.
     pub fn close(&mut self) -> Result<(), BrowserError> {
-        if self.closed {
-            return Ok(());
+        if self.lifecycle == Lifecycle::Running {
+            platform::terminate(&mut self.child, &mut self.ownership)
+                .map_err(BrowserError::Control)?;
+            self.lifecycle = Lifecycle::Terminated;
         }
-        platform::terminate(&mut self.child, &mut self.ownership).map_err(BrowserError::Control)?;
-        fs::remove_dir_all(&self.profile)
-            .map_err(|error| BrowserError::Control(safe_error(&error.to_string())))?;
-        self.closed = true;
+        if self.lifecycle == Lifecycle::Terminated {
+            fs::remove_dir_all(&self.profile)
+                .map_err(|error| BrowserError::Control(safe_error(&error.to_string())))?;
+            self.lifecycle = Lifecycle::Closed;
+        }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lifecycle {
+    Running,
+    Terminated,
+    Closed,
+}
+
+fn require_committed_navigation(navigated: &Value) -> Result<(), BrowserError> {
+    match navigated.get("errorText").and_then(Value::as_str) {
+        Some(error) if !error.is_empty() => Err(BrowserError::Control(format!(
+            "navigation failed: {}",
+            safe_error(error)
+        ))),
+        _ => Ok(()),
     }
 }
 
@@ -283,13 +368,85 @@ fn masking_proof(value: Value, expected_values: usize) -> Result<RedactionProof,
         .ok_or_else(|| BrowserError::Control("redaction_unverifiable".into()))
 }
 
-struct InstalledMasks<'a> {
-    client: &'a CdpClient,
+struct Masking {
+    expression: String,
+    values: usize,
 }
+
+/// Masks placed for one capture attempt; they are removed when dropped.
+struct InstalledMasks<'a> {
+    client: Option<&'a CdpClient>,
+    proof: RedactionProof,
+}
+
 impl Drop for InstalledMasks<'_> {
     fn drop(&mut self) {
-        let _ = evaluate(self.client, "window.__manuvraRemoveMasks?.(); true");
+        if let Some(client) = self.client {
+            let _ = evaluate(client, "window.__manuvraRemoveMasks?.(); true");
+        }
     }
+}
+
+fn install_masks<'a>(
+    client: &'a CdpClient,
+    masking: Option<&Masking>,
+) -> Result<InstalledMasks<'a>, BrowserError> {
+    let mut masks = InstalledMasks {
+        client: None,
+        proof: RedactionProof {
+            sensitive_values_checked: 0,
+            matched_values: 0,
+            mask_count: 0,
+        },
+    };
+    if let Some(masking) = masking {
+        masks.client = Some(client);
+        masks.proof = masking_proof(evaluate(client, &masking.expression)?, masking.values)?;
+    }
+    Ok(masks)
+}
+
+/// Chrome reports DOM mutations only for nodes the client has requested, so a
+/// capture requests the whole pierced document before its fence and releases
+/// those bindings afterwards to keep later waits insensitive to DOM churn.
+struct DomMutationWatch<'a> {
+    client: &'a CdpClient,
+}
+
+impl<'a> DomMutationWatch<'a> {
+    fn start(client: &'a CdpClient) -> Result<Self, BrowserError> {
+        let watch = Self { client };
+        command(
+            client,
+            "DOM.getDocument",
+            json!({"depth": -1, "pierce": true}),
+        )?;
+        Ok(watch)
+    }
+}
+
+impl Drop for DomMutationWatch<'_> {
+    fn drop(&mut self) {
+        let _ = command(self.client, "DOM.disable", json!({}));
+        let _ = command(self.client, "DOM.enable", json!({}));
+    }
+}
+
+fn page_changed_since(client: &CdpClient, fence: u64) -> bool {
+    let snapshot = client.snapshot_since(fence);
+    snapshot.overflowed
+        || snapshot
+            .events
+            .iter()
+            .any(|event| crate::transport::is_relevant_event(event) && !is_mask_insertion(event))
+}
+
+fn is_mask_insertion(event: &crate::transport::JournalEvent) -> bool {
+    crate::transport::event_method(event) == Some("DOM.childNodeInserted")
+        && crate::transport::event_params(event)
+            .pointer("/node/attributes")
+            .and_then(Value::as_array)
+            .is_some_and(|attributes| attributes.iter().any(|name| name == "data-manuvra-mask"))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -384,7 +541,7 @@ impl StartingBrowser {
                 display_mode: display_mode(prepared.config.headless).into(),
             },
             ownership: take_ownership(&mut self.ownership),
-            closed: false,
+            lifecycle: Lifecycle::Running,
         })
     }
     fn prepared(&self) -> &PreparedBrowser {
@@ -676,7 +833,7 @@ fn settle_input_navigation(client: &CdpClient, fence: u64) -> Result<(), Browser
     }
 }
 
-fn starts_navigation(event: &crate::JournalEvent) -> bool {
+fn starts_navigation(event: &crate::transport::JournalEvent) -> bool {
     matches!(
         crate::transport::event_method(event),
         Some(
@@ -711,7 +868,7 @@ fn wait_for_loading(client: &CdpClient, fence: u64) -> Result<(), BrowserError> 
     }
 }
 
-fn loading_frames(events: &[crate::JournalEvent]) -> HashSet<&str> {
+fn loading_frames(events: &[crate::transport::JournalEvent]) -> HashSet<&str> {
     let mut loading = HashSet::new();
     for event in events {
         let frame = crate::transport::event_params(event)
@@ -733,7 +890,7 @@ fn loading_frames(events: &[crate::JournalEvent]) -> HashSet<&str> {
 fn update_quiet_since(
     quiet_since: &mut Option<Instant>,
     ready: bool,
-    events: &[crate::JournalEvent],
+    events: &[crate::transport::JournalEvent],
 ) {
     if events.iter().any(crate::transport::is_relevant_event) {
         *quiet_since = None
@@ -742,7 +899,9 @@ fn update_quiet_since(
     }
 }
 
-fn require_navigation_journal(snapshot: &crate::JournalSnapshot) -> Result<(), BrowserError> {
+fn require_navigation_journal(
+    snapshot: &crate::transport::JournalSnapshot,
+) -> Result<(), BrowserError> {
     if snapshot.overflowed {
         Err(BrowserError::Control(
             "CDP journal overflowed during navigation".into(),
@@ -786,101 +945,33 @@ fn deadline() -> Instant {
     Instant::now() + COMMAND_TIMEOUT
 }
 
+/// Applies `masking.js` to the sensitive values. They reach the page only as a
+/// JSON array argument, which is inert data and never executable source.
 fn masking_script(sensitive: &[String]) -> Result<String, BrowserError> {
     let values = serde_json::to_string(sensitive)
         .map_err(|error| BrowserError::Control(error.to_string()))?;
-    Ok(format!(
-        r#"(() => {{
-      window.__manuvraRemoveMasks?.(); const values={values}; const masks=[]; const matched=new Set(); let unverifiable=false;
-      const contexts=[],seen=new Set();const visit=(root,x,y)=>{{if(!root||seen.has(root))return;seen.add(root);contexts.push({{root,x,y}});if(root.defaultView?.__manuvraClosedShadowRoots>0)unverifiable=true;for(const e of root.querySelectorAll('*')){{if(e.shadowRoot)visit(e.shadowRoot,x,y);if(e.tagName==='IFRAME'||e.tagName==='FRAME'){{let child;try{{child=e.contentDocument;}}catch(_){{child=null;}}if(!child?.body){{unverifiable=true;continue;}}const r=e.getBoundingClientRect();visit(child,x+r.x,y+r.y);}}if(e.tagName==='CANVAS')unverifiable=true;}}}};visit(document,0,0);
-      const cover=(rect,x,y)=>{{if(!rect||!Number.isFinite(rect.x)||rect.width<=0||rect.height<=0){{unverifiable=true;return;}}const m=document.createElement('div');Object.assign(m.style,{{position:'fixed',left:`${{rect.x+x}}px`,top:`${{rect.y+y}}px`,width:`${{rect.width}}px`,height:`${{rect.height}}px`,background:'#000',zIndex:'2147483647',pointerEvents:'none'}});document.documentElement.appendChild(m);masks.push(m);}};
-      const matches=(text,coverMatch)=>{{values.forEach((value,index)=>{{if(!value)return;let start=0,found;while((found=String(text).indexOf(value,start))!==-1){{matched.add(index);coverMatch(found,found+value.length);start=found+Math.max(1,value.length);}}}});}};
-      for(const context of contexts){{for(const e of context.root.querySelectorAll('*')){{if(e.matches('input,textarea,[contenteditable="true"]'))matches(String(e.value??e.innerText),()=>cover(e.getBoundingClientRect(),context.x,context.y));const view=e.ownerDocument?.defaultView||window;for(const pseudo of ['::before','::after']){{const content=view.getComputedStyle(e,pseudo).content;matches(content||'',()=>cover(e.getBoundingClientRect(),context.x,context.y));}}}}const owner=context.root.ownerDocument||context.root,walker=owner.createTreeWalker(context.root,NodeFilter.SHOW_TEXT),nodes=[];let text='',n;while(n=walker.nextNode()){{const start=text.length;text+=n.textContent||'';nodes.push({{node:n,start,end:text.length}});}}matches(text,(start,end)=>{{const first=nodes.find(item=>item.start<=start&&start<item.end),last=nodes.find(item=>item.start<end&&end<=item.end);if(!first||!last){{unverifiable=true;return;}}const range=owner.createRange();range.setStart(first.node,start-first.start);range.setEnd(last.node,end-last.start);const rects=[...range.getClientRects()];if(!rects.length)unverifiable=true;else rects.forEach(rect=>cover(rect,context.x,context.y));}});}}
-      window.__manuvraRemoveMasks=()=>{{masks.forEach(m=>m.remove());delete window.__manuvraRemoveMasks;}}; return {{verified:!unverifiable,sensitive_values_checked:values.length,matched_values:matched.size,mask_count:masks.length}};
-    }})()"#
-    ))
+    Ok(format!("({})({values})", MASKING.trim_end()))
 }
 
 fn safe_error(message: &str) -> String {
-    message.replace(
-        env::var("TYPESAFE_API_KEY").as_deref().unwrap_or("\0"),
-        "<masked-key>",
-    )
+    mask_provider_key(message, env::var("TYPESAFE_API_KEY").ok().as_deref())
+}
+
+fn mask_provider_key(message: &str, key: Option<&str>) -> String {
+    match key {
+        Some(key) if !key.is_empty() => message.replace(key, "<masked-key>"),
+        _ => message.to_owned(),
+    }
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
     use crate::transport::test_support::ScriptedChrome;
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::io::{BufRead, BufReader, Write};
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::net::TcpListener;
-    #[cfg(target_os = "linux")]
-    use std::os::unix::process::CommandExt;
     use std::process::Command;
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn discovery_prefers_explicit_then_environment_then_path() {
-        let temporary = tempfile::tempdir().unwrap();
-        let explicit = temporary.path().join("explicit");
-        let environment = temporary.path().join("environment");
-        let path_dir = temporary.path().join("bin");
-        fs::create_dir(&path_dir).unwrap();
-        let path_binary = path_dir.join("chromium");
-        use std::os::unix::fs::PermissionsExt;
-        for binary in [&explicit, &environment, &path_binary] {
-            fs::write(binary, b"").unwrap();
-            fs::set_permissions(binary, fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        assert_eq!(
-            platform::discover_binary_from(
-                Some(&explicit),
-                Some(environment.clone()),
-                Some(path_dir.clone().into_os_string())
-            )
-            .unwrap(),
-            fs::canonicalize(&explicit).unwrap()
-        );
-        assert_eq!(
-            platform::discover_binary_from(
-                None,
-                Some(environment.clone()),
-                Some(path_dir.clone().into_os_string())
-            )
-            .unwrap(),
-            fs::canonicalize(&environment).unwrap()
-        );
-        assert_eq!(
-            platform::discover_binary_from(None, None, Some(path_dir.into_os_string())).unwrap(),
-            fs::canonicalize(&path_binary).unwrap()
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn discovery_rejects_a_non_executable_file() {
-        let temporary = tempfile::tempdir().unwrap();
-        let binary = temporary.path().join("chromium");
-        let path_dir = temporary.path().join("bin");
-        fs::create_dir(&path_dir).unwrap();
-        let fallback = path_dir.join("chromium");
-        fs::write(&binary, b"").unwrap();
-        fs::write(&fallback, b"").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&fallback, fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(matches!(
-            platform::discover_binary(Some(&binary), None, None),
-            Err(BrowserError::Unavailable)
-        ));
-        assert!(matches!(
-            platform::discover_binary_from(None, Some(binary), Some(path_dir.into_os_string())),
-            Err(BrowserError::Unavailable)
-        ));
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn prepared_spawn_cleans_its_profile_on_success_and_failure() {
         let config = BrowserConfig {
@@ -991,7 +1082,37 @@ mod tests {
             ownership: Some(ownership),
         };
         let mut browser = starting.finish(client, "Chromium Test".into()).unwrap();
+        assert_eq!(
+            chrome
+                .commands()
+                .into_iter()
+                .map(|(method, _)| method)
+                .collect::<Vec<_>>(),
+            [
+                "Page.addScriptToEvaluateOnNewDocument",
+                "Runtime.evaluate",
+                "Emulation.setDeviceMetricsOverride",
+                "Emulation.setFocusEmulationEnabled",
+            ]
+        );
+        assert_eq!(
+            chrome.received("Page.addScriptToEvaluateOnNewDocument")[0]["params"]["source"],
+            COVERAGE_PROBE
+        );
+        assert_eq!(
+            chrome.received("Runtime.evaluate")[0]["params"]["expression"],
+            COVERAGE_PROBE
+        );
+        assert_eq!(
+            chrome.received("Emulation.setDeviceMetricsOverride")[0]["params"],
+            json!({"width":800,"height":600,"deviceScaleFactor":1,"mobile":false})
+        );
+        assert_eq!(
+            chrome.received("Emulation.setFocusEmulationEnabled")[0]["params"],
+            json!({"enabled":true})
+        );
         assert_eq!(browser.provenance().viewport.width, 800);
+        assert_eq!(browser.provenance().browser_version, "Chromium Test");
         browser.close().unwrap();
         assert!(!profile.exists());
     }
@@ -1045,9 +1166,68 @@ mod tests {
 
     #[test]
     fn mask_script_does_not_embed_json_as_executable_source() {
-        let script = masking_script(&["x'; throw new Error('leak')//".into()]).unwrap();
-        assert!(script.contains("throw new Error"));
-        assert!(script.contains("const values=[\"x'; throw"));
+        let values = vec![
+            "x'; throw new Error('leak')//".to_owned(),
+            "\"]); alert(1); ([\"".to_owned(),
+        ];
+        let script = masking_script(&values).unwrap();
+        let argument = script
+            .strip_prefix(&format!("({})(", MASKING.trim_end()))
+            .and_then(|rest| rest.strip_suffix(')'))
+            .expect("masking.js applied to one argument");
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(argument).unwrap(),
+            values,
+            "the argument is a JSON array literal holding exactly the values"
+        );
+    }
+
+    #[test]
+    fn a_failed_profile_removal_is_retried_without_terminating_again() {
+        let chrome = ScriptedChrome::start();
+        let mut browser = browser_with_client(chrome.connect_raw());
+        let profile = browser.profile.clone();
+        fs::remove_dir_all(&profile).unwrap();
+        assert!(matches!(browser.close(), Err(BrowserError::Control(_))));
+        assert_eq!(browser.lifecycle, Lifecycle::Terminated);
+        assert!(browser.child.try_wait().unwrap().is_some());
+
+        fs::create_dir(&profile).unwrap();
+        browser.close().unwrap();
+        assert_eq!(browser.lifecycle, Lifecycle::Closed);
+        assert!(!profile.exists());
+        browser.close().unwrap();
+    }
+
+    #[test]
+    fn navigation_reported_failed_by_chrome_is_an_error() {
+        let chrome = ScriptedChrome::start();
+        chrome.reply(
+            "Page.navigate",
+            json!({"frameId":"main","errorText":"net::ERR_CONNECTION_REFUSED"}),
+        );
+        let browser = browser_with_client(chrome.connect_raw());
+        assert!(matches!(
+            browser.navigate("http://127.0.0.1:9/"),
+            Err(BrowserError::Control(message)) if message == "navigation failed: net::ERR_CONNECTION_REFUSED"
+        ));
+        assert!(
+            chrome.received("Runtime.evaluate").is_empty(),
+            "no wait for a document that never loaded"
+        );
+    }
+
+    #[test]
+    fn an_empty_or_absent_provider_key_leaves_messages_unchanged() {
+        assert_eq!(
+            mask_provider_key("launch failed", Some("")),
+            "launch failed"
+        );
+        assert_eq!(mask_provider_key("launch failed", None), "launch failed");
+        assert_eq!(
+            mask_provider_key("bad sk-123 key", Some("sk-123")),
+            "bad <masked-key> key"
+        );
     }
 
     #[test]
@@ -1120,18 +1300,6 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_click_navigation_settles_before_the_next_observation() {
-        let chrome = ScriptedChrome::start();
-        chrome.reply("Runtime.evaluate", json!({"result":{"value":"complete"}}));
-        let client = chrome.connect_raw();
-        let fence = client.cursor();
-        chrome.push_event("Page.frameNavigated", json!({"frame":{"id":"main"}}));
-        command(&client, "Page.enable", json!({})).unwrap();
-
-        settle_input_navigation(&client, fence).unwrap();
-    }
-
-    #[test]
     fn input_navigation_waits_until_every_started_frame_stops_loading() {
         let chrome = Arc::new(ScriptedChrome::start());
         chrome.reply("Runtime.evaluate", json!({"result":{"value":"complete"}}));
@@ -1165,24 +1333,73 @@ mod tests {
     }
 
     #[test]
-    fn owned_perform_settles_navigation_after_a_key_press() {
+    fn input_settling_waits_for_the_document_only_after_a_navigation_signal() {
         let chrome = ScriptedChrome::start();
-        chrome.reply(
-            "Runtime.evaluate",
-            json!({"result":{"value":{
-                "document_id":"d","url":"http://example.test/","route":"/","title":"x",
-                "focused":null,"focus_anchor":null,"elements":[],
-                "viewport":{"width":10,"height":10,"scroll_x":0,"scroll_y":0,"document_height":10}
-            }}}),
+        chrome.reply("Runtime.evaluate", json!({"result":{"value":"complete"}}));
+        let client = chrome.connect_raw();
+        settle_input_navigation(&client, client.cursor()).unwrap();
+        assert!(
+            chrome.received("Runtime.evaluate").is_empty(),
+            "without a navigation signal no document wait is needed"
+        );
+
+        let fence = client.cursor();
+        chrome.emit_before_reply(
+            "Page.enable",
+            1,
+            vec![("Page.frameNavigated", json!({"frame":{"id":"main"}}))],
+        );
+        command(&client, "Page.enable", json!({})).unwrap();
+        let started = Instant::now();
+        settle_input_navigation(&client, fence).unwrap();
+        assert!(started.elapsed() >= QUIET_WINDOW);
+        let checks = chrome.received("Runtime.evaluate");
+        assert!(!checks.is_empty(), "a navigation holds for the document");
+        assert!(
+            checks
+                .iter()
+                .all(|check| check["params"]["expression"] == "document.readyState")
+        );
+    }
+
+    /// Performs `operation` against a page whose final dispatch starts a
+    /// navigation that stops loading only after `delay`.
+    fn perform_starting_navigation(
+        operation: PreparedOperation,
+        revalidation: Value,
+        final_dispatch: &str,
+        delay: Duration,
+    ) -> (PerformFact, Duration, Vec<String>) {
+        let chrome = Arc::new(ScriptedChrome::start());
+        chrome.reply("Runtime.evaluate", revalidation);
+        chrome.reply("Runtime.evaluate", json!({"result":{"value":"complete"}}));
+        chrome.emit_before_reply(
+            final_dispatch,
+            2,
+            vec![
+                ("Page.frameRequestedNavigation", json!({"frameId":"main"})),
+                ("Page.frameStartedLoading", json!({"frameId":"main"})),
+            ],
         );
         let mut browser = browser_with_client(chrome.connect_raw());
+        let stopper = {
+            let chrome = Arc::clone(&chrome);
+            let final_dispatch = final_dispatch.to_owned();
+            thread::spawn(move || {
+                while chrome.received(&final_dispatch).len() < 2 {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                thread::sleep(delay);
+                chrome.push_event("Page.frameStoppedLoading", json!({"frameId":"main"}));
+            })
+        };
         let started = Instant::now();
         let fact = browser
             .perform(
                 PreparedInput {
                     document_id: "d".into(),
-                    node_id: 0,
-                    operation: PreparedOperation::PressKey(crate::Key::Enter),
+                    node_id: 7,
+                    operation,
                     text: None,
                     previous_text: None,
                     option_node_id: None,
@@ -1193,38 +1410,66 @@ mod tests {
                 &InputCancellation::default(),
             )
             .unwrap();
-        assert_eq!(fact.suboperations, ["key_down", "key_up"]);
-        assert!(started.elapsed() >= QUIET_WINDOW);
+        let elapsed = started.elapsed();
+        stopper.join().unwrap();
         browser.close().unwrap();
+        let methods = chrome
+            .commands()
+            .into_iter()
+            .map(|(method, params)| match params["expression"].as_str() {
+                Some("document.readyState") => "readyState".to_owned(),
+                _ => method,
+            })
+            .collect();
+        (fact, elapsed, methods)
     }
 
     #[test]
-    fn owned_perform_routes_confirmed_click_through_navigation_settling() {
-        let chrome = ScriptedChrome::start();
-        chrome.reply(
-            "Runtime.evaluate",
+    fn a_confirmed_click_waits_for_the_navigation_it_started_to_settle() {
+        let delay = Duration::from_millis(300);
+        let (fact, elapsed, methods) = perform_starting_navigation(
+            PreparedOperation::Click,
             json!({"result":{"value":{"ok":true,"x":12.0,"y":20.0}}}),
+            "Input.dispatchMouseEvent",
+            delay,
         );
-        let client = chrome.connect_raw();
-        let mut browser = browser_with_client(client);
-        let fact = browser
-            .perform(
-                PreparedInput {
-                    document_id: "d".into(),
-                    node_id: 7,
-                    operation: PreparedOperation::Click,
-                    text: None,
-                    previous_text: None,
-                    option_node_id: None,
-                    combobox: false,
-                    action_sequence: 1,
-                    focus_anchor: None,
-                },
-                &InputCancellation::default(),
-            )
-            .unwrap();
         assert_eq!(fact.suboperations, ["mouse_press", "mouse_release"]);
-        browser.close().unwrap();
+        assert!(elapsed >= delay + QUIET_WINDOW, "{elapsed:?}");
+        assert_eq!(
+            methods[..4],
+            [
+                "Runtime.evaluate",
+                "Input.dispatchMouseEvent",
+                "Input.dispatchMouseEvent",
+                "readyState",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_key_press_waits_for_the_navigation_it_started_to_settle() {
+        let delay = Duration::from_millis(300);
+        let (fact, elapsed, methods) = perform_starting_navigation(
+            PreparedOperation::PressKey(crate::Key::Enter),
+            json!({"result":{"value":{
+                "document_id":"d","url":"http://example.test/","route":"/","title":"x",
+                "focused":null,"focus_anchor":null,"elements":[],
+                "viewport":{"width":10,"height":10,"scroll_x":0,"scroll_y":0,"document_height":10}
+            }}}),
+            "Input.dispatchKeyEvent",
+            delay,
+        );
+        assert_eq!(fact.suboperations, ["key_down", "key_up"]);
+        assert!(elapsed >= delay + QUIET_WINDOW, "{elapsed:?}");
+        assert_eq!(
+            methods[..4],
+            [
+                "Runtime.evaluate",
+                "Input.dispatchKeyEvent",
+                "Input.dispatchKeyEvent",
+                "readyState",
+            ]
+        );
     }
 
     #[test]
@@ -1311,8 +1556,8 @@ mod tests {
         assert_eq!(
             wait_for_endpoint(&mut child, temporary.path(), Duration::from_millis(50))
                 .unwrap()
-                .port(),
-            45678
+                .label(),
+            "127.0.0.1:45678"
         );
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -1350,134 +1595,44 @@ mod tests {
         assert_eq!(page.0, "ws://127.0.0.1/devtools/page/1");
     }
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn private_profile_and_close_remove_only_owned_process_and_directory() {
-        let profile = private_profile().unwrap();
-        assert!(profile.is_dir());
-        let chrome = ScriptedChrome::start();
-        let client = chrome.connect_raw();
-        let mut command = Command::new("sleep");
-        command.arg("30").process_group(0);
-        let child = command.spawn().unwrap();
-        let ownership = platform::ownership_for_test(&child, true);
-        let mut browser = OwnedBrowser {
-            child,
-            profile: profile.clone(),
-            client,
-            provenance: BrowserProvenance {
-                browser_path: "fake".into(),
-                browser_version: "fake".into(),
-                viewport: ProvenanceViewport {
-                    width: 1,
-                    height: 1,
-                },
-                display_mode: "headless".into(),
-            },
-            ownership,
-            closed: false,
-        };
-        browser.close().unwrap();
-        assert!(!profile.exists());
-        browser.close().unwrap();
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn close_terminates_only_the_browser_when_it_inherits_the_host_group() {
-        let profile = private_profile().unwrap();
-        let chrome = ScriptedChrome::start();
-        let client = chrome.connect_raw();
-        let child = Command::new("sleep").arg("30").spawn().unwrap();
-        let pid = child.id();
-        let ownership = platform::ownership_for_test(&child, false);
-        let mut browser = OwnedBrowser {
-            child,
-            profile,
-            client,
-            provenance: BrowserProvenance {
-                browser_path: "fake".into(),
-                browser_version: "fake".into(),
-                viewport: ProvenanceViewport {
-                    width: 1,
-                    height: 1,
-                },
-                display_mode: "headless".into(),
-            },
-            ownership,
-            closed: false,
-        };
-        browser.close().unwrap();
-        assert!(!Path::new(&format!("/proc/{pid}")).exists());
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn inherited_browser_ignoring_term_is_killed_without_signalling_host_group() {
-        let mut child = Command::new("sh")
-            .args(["-c", "trap '' TERM; printf 'ready\\n'; exec sleep 30"])
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut ready = String::new();
-        BufReader::new(child.stdout.take().unwrap())
-            .read_line(&mut ready)
-            .unwrap();
-        assert_eq!(ready, "ready\n");
-        let pid = child.id();
-        let mut ownership = platform::ownership_for_test(&child, false);
-        platform::terminate(&mut child, &mut ownership).unwrap();
-        assert!(child.try_wait().unwrap().is_some());
-        assert!(!Path::new(&format!("/proc/{pid}")).exists());
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn close_terminates_the_entire_owned_process_group() {
-        let profile = private_profile().unwrap();
-        let chrome = ScriptedChrome::start();
-        let client = chrome.connect_raw();
-        let mut command = Command::new("sh");
-        command
-            .args([
-                "-c",
-                "sh -c 'trap \"\" TERM; echo $$; exec sleep 30' & wait",
-            ])
-            .process_group(0)
-            .stdout(Stdio::piped());
-        let mut child = command.spawn().unwrap();
-        let mut descendant = String::new();
-        BufReader::new(child.stdout.take().unwrap())
-            .read_line(&mut descendant)
-            .unwrap();
-        let descendant: i32 = descendant.trim().parse().unwrap();
-        let ownership = platform::ownership_for_test(&child, true);
-        let mut browser = OwnedBrowser {
-            child,
-            profile,
-            client,
-            provenance: BrowserProvenance {
-                browser_path: "fake".into(),
-                browser_version: "fake".into(),
-                viewport: ProvenanceViewport {
-                    width: 1,
-                    height: 1,
-                },
-                display_mode: "headless".into(),
-            },
-            ownership,
-            closed: false,
-        };
-        browser.close().unwrap();
-        assert_eq!(
-            unsafe { libc::kill(descendant, 0) },
-            -1,
-            "signal-ignoring descendant survived owned cleanup"
-        );
+    fn assert_exits(pid: u32) {
+        let pid = process::pid_t(pid).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(Instant::now() < deadline, "process {pid} survived close");
+            thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ESRCH)
         );
+    }
+
+    #[test]
+    fn close_ends_the_owned_process_group_and_removes_only_its_profile() {
+        let profile = private_profile().unwrap();
+        let unrelated = private_profile().unwrap();
+        let chrome = ScriptedChrome::start();
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 30 & echo $!; wait"])
+            .stdout(Stdio::piped());
+        let (mut child, ownership) = platform::spawn(command, false).unwrap();
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let descendant: u32 = line.trim().parse().unwrap();
+        let leader = child.id();
+        let mut browser = owned_browser(child, ownership, profile.clone(), chrome.connect_raw());
+
+        browser.close().unwrap();
+        assert_exits(leader);
+        assert_exits(descendant);
+        assert!(!profile.exists());
+        assert!(unrelated.is_dir(), "another profile is never removed");
+        browser.close().unwrap();
+        fs::remove_dir(unrelated).unwrap();
     }
 
     fn snapshot_value() -> Value {
@@ -1488,6 +1643,15 @@ mod tests {
         let profile = tempfile::tempdir().unwrap().keep();
         let child = Command::new("sleep").arg("30").spawn().unwrap();
         let ownership = platform::ownership_for_test(&child, false);
+        owned_browser(child, ownership, profile, client)
+    }
+
+    fn owned_browser(
+        child: Child,
+        ownership: platform::BrowserOwnership,
+        profile: PathBuf,
+        client: Arc<CdpClient>,
+    ) -> OwnedBrowser {
         OwnedBrowser {
             child,
             profile,
@@ -1502,7 +1666,7 @@ mod tests {
                 display_mode: "headless".into(),
             },
             ownership,
-            closed: false,
+            lifecycle: Lifecycle::Running,
         }
     }
 }

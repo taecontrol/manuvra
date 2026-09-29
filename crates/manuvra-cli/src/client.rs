@@ -1,13 +1,12 @@
 use crate::Invocation;
-#[cfg(target_os = "macos")]
-#[path = "client/darwin.rs"]
-mod platform;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::process::{IPC_VERSION, now_unix_ms};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::recovery::result_exit_code;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::store::{self, RunControl};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use crate::{EXIT_INTERNAL, internal_error, result_exit_code};
+use crate::{EXIT_INTERNAL, internal_error};
 use crate::{validate_request_id, validate_run_id};
 use manuvra_contract::DispositionRequest;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -577,7 +576,7 @@ fn validate_terminal_resume_evidence(
         .get("request_id")
         .and_then(Value::as_str)
         .ok_or_else(|| internal_error("completed resume result has no request id".into()))?;
-    crate::validate_published_result(
+    crate::recovery::validate_published_result(
         Path::new(manifest),
         &record.run_id,
         result_request_id,
@@ -807,15 +806,14 @@ fn read_control(root: &Path, run_id: &str) -> Result<Option<RunControl>, Invocat
         .unwrap_or(Ok(None))
 }
 
+/// Publishes host loss when the run lock proves the host is dead and no live watchdog remains to
+/// reconcile it. A stale socket left by a killed host does not keep the run open.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn reconcile_confirmed_host_loss(
     root: &Path,
-    mut control: RunControl,
+    control: RunControl,
 ) -> Result<RunControl, Invocation> {
-    if is_terminal(&control)
-        || control.host.is_none()
-        || !socket_is_absent(&control.socket).map_err(internal_error)?
-    {
+    if !awaits_host_loss_reconciliation(&control) {
         return Ok(control);
     }
     let Some(_publication_lock) =
@@ -823,6 +821,33 @@ fn reconcile_confirmed_host_loss(
     else {
         return Ok(control);
     };
+    let locked = store::read_run_control(root, &control.run_id)
+        .map_err(internal_error)?
+        .unwrap_or(control);
+    match locked.host.clone() {
+        Some(host) if !is_terminal(&locked) => publish_host_loss(root, locked, &host),
+        _ => Ok(locked),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn awaits_host_loss_reconciliation(control: &RunControl) -> bool {
+    !is_terminal(control)
+        && control.host.is_some()
+        && !control
+            .watchdog
+            .as_ref()
+            .is_some_and(crate::process::process_is_live)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn publish_host_loss(
+    root: &Path,
+    mut control: RunControl,
+    host: &store::ProcessIdentity,
+) -> Result<RunControl, Invocation> {
+    crate::process::signal_process_group(host, libc::SIGKILL).map_err(internal_error)?;
+    crate::runtime::sweep_recorded_run(&control.socket, &control.run_id).map_err(internal_error)?;
     let current_action = current_action(root, &control);
     control.sequence = control.sequence.saturating_add(1);
     control.pause_deadline_unix_ms = None;
@@ -837,15 +862,6 @@ fn reconcile_confirmed_host_loss(
     });
     store::write_run_control(root, &control).map_err(internal_error)?;
     Ok(control)
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn socket_is_absent(path: &Path) -> Result<bool, String> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => Ok(false),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
-        Err(error) => Err(format!("cannot inspect run host socket: {error}")),
-    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -897,6 +913,14 @@ fn run_invocation(control: RunControl) -> Invocation {
     }
 }
 
+/// Bounds one control exchange. The host answers from memory, but admitting a resume first
+/// persists the paused control state and may queue behind one checkpoint publication; both wait
+/// on fsync, which takes seconds under I/O contention. Treating an accepted request as failed
+/// would report exit 70 for a resume or abort the host already applied. The bound stays below
+/// the watchdog's shutdown grace, which follows its deadline request.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn request(socket: &Path, kind: &str) -> Result<Value, String> {
     request_value(socket, &json!({"kind":kind,"ipc_version":IPC_VERSION}))
@@ -907,15 +931,11 @@ fn request_value(socket: &Path, payload: &Value) -> Result<Value, String> {
     use std::net::Shutdown;
     use std::os::unix::net::UnixStream;
 
-    #[cfg(test)]
-    let io_timeout = Duration::from_secs(5);
-    #[cfg(not(test))]
-    let io_timeout = Duration::from_millis(250);
     validate_socket(socket)?;
     let mut stream = UnixStream::connect(socket).map_err(|error| error.to_string())?;
     stream
-        .set_read_timeout(Some(io_timeout))
-        .and_then(|()| stream.set_write_timeout(Some(io_timeout)))
+        .set_read_timeout(Some(CONTROL_REPLY_TIMEOUT))
+        .and_then(|()| stream.set_write_timeout(Some(CONTROL_REPLY_TIMEOUT)))
         .map_err(|error| error.to_string())?;
     crate::control_socket::write_frame(&mut stream, payload)?;
     stream
@@ -929,14 +949,9 @@ fn request_value(socket: &Path, payload: &Value) -> Result<Value, String> {
     validate_response(response)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn request_host_deadline(control: &RunControl) -> Result<(), String> {
     request_effect_for_control(control, "deadline").map(|_| ())
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn request_host_deadline(control: &crate::store::RunControl) -> Result<(), String> {
-    platform::request_deadline(control, crate::process::IPC_VERSION)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -984,6 +999,7 @@ fn response_identity_matches(response: &Value, run_id: &str, job_digest: &str) -
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn validate_socket(socket: &Path) -> Result<(), String> {
     use std::os::unix::fs::FileTypeExt;
+    crate::runtime::validate_socket_path(socket)?;
     let metadata = std::fs::symlink_metadata(socket)
         .map_err(|error| format!("run host socket is unavailable: {error}"))?;
     (!metadata.file_type().is_symlink() && metadata.file_type().is_socket())
@@ -1549,42 +1565,144 @@ mod tests {
         assert_eq!(corrupt.output["error"]["code"], "internal");
     }
 
+    /// Starts a process-group leader that leaves one member running, then reaps the leader, as a
+    /// killed host leaves its browser behind.
+    fn dead_host_with_surviving_member() -> (store::ProcessIdentity, i32) {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        // The leader waits for its input to close, so its identity is read while it runs.
+        let mut leader = Command::new("sh")
+            .args(["-c", "sleep 30 </dev/null & echo $!; read _; exit 0"])
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(leader.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let identity = crate::process::process_identity(leader.id()).unwrap();
+        drop(leader.stdin.take());
+        leader.wait().unwrap();
+        (identity, line.trim().parse().unwrap())
+    }
+
+    fn assert_process_exits(pid: i32) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(Instant::now() < deadline, "host group member survived");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn absent_socket_plus_obtainable_lock_publishes_host_loss_once() {
-        let temporary = TempDir::new().unwrap();
+    fn dead_host_with_a_stale_socket_publishes_host_loss_once() {
+        use std::os::unix::net::UnixListener;
+
+        let temporary = tempfile::Builder::new()
+            .prefix("mhl")
+            .tempdir_in("/tmp")
+            .unwrap();
         let root = temporary.path().join("state");
         let mut control = test_control(&root, false);
-        control.host = Some(store::ProcessIdentity {
-            pid: u32::MAX,
-            process_group: u32::MAX,
-            start_marker: 1,
-            session_id: 1,
-        });
+        control.socket = temporary.path().join("control.sock");
+        drop(UnixListener::bind(&control.socket).unwrap());
+        let (host, member) = dead_host_with_surviving_member();
+        control.host = Some(host);
         let lock = store::lock_run(&root, &control.run_id).unwrap();
         store::write_run_control(&root, &control).unwrap();
+
+        let held = read_control(&root, &control.run_id).unwrap().unwrap();
+        assert_eq!(
+            held.result["state"], "running",
+            "a held run lock means a live host"
+        );
+        assert!(control.socket.exists());
+
+        control.watchdog = Some(crate::process::process_identity(std::process::id()).unwrap());
+        store::write_run_control(&root, &control).unwrap();
         drop(lock);
-        assert!(!control.socket.exists());
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deferred = read_control(&root, &control.run_id).unwrap().unwrap();
+        assert_eq!(
+            deferred.result["state"], "running",
+            "a live watchdog owns host-loss reconciliation"
+        );
+
+        control.watchdog = None;
+        store::write_run_control(&root, &control).unwrap();
+        // A child forked by a concurrent test briefly shares the dropped lock until it execs.
+        let deadline = Instant::now() + Duration::from_secs(5);
         let recovered = loop {
-            match read_control(&root, &control.run_id) {
-                Ok(Some(control)) if control.result["state"] == "blocked" => break control,
-                Ok(Some(_)) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                _ => panic!("host loss should become recoverable"),
+            let current = read_control(&root, &control.run_id).unwrap().unwrap();
+            if current.result["state"] != "running" || Instant::now() >= deadline {
+                break current;
             }
+            std::thread::sleep(Duration::from_millis(5));
         };
         assert_eq!(recovered.result["state"], "blocked");
         assert_eq!(recovered.result["reason"]["code"], "host_lost");
         assert_eq!(recovered.result["reason"]["current_action"], "none");
         assert_eq!(recovered.result["evidence"]["complete"], false);
+        assert!(!control.socket.exists(), "the stale socket is swept");
+        assert_process_exits(member);
+        assert_eq!(run_invocation(recovered.clone()).exit_code, 3);
 
-        let repeated = match read_control(&root, &control.run_id) {
-            Ok(Some(control)) => control,
-            _ => panic!("terminal host loss should remain readable"),
-        };
+        let repeated = read_control(&root, &control.run_id).unwrap().unwrap();
         assert_eq!(repeated.sequence, recovered.sequence);
+    }
+
+    #[test]
+    fn socket_validation_rejects_regular_file_and_symlink_substitution() {
+        let temporary = TempDir::new().unwrap();
+        let regular = temporary.path().join("regular");
+        std::fs::write(&regular, b"unchanged").unwrap();
+        assert!(validate_socket(&regular).is_err());
+        let link = temporary.path().join("link");
+        std::os::unix::fs::symlink(&regular, &link).unwrap();
+        assert!(validate_socket(&link).is_err());
+        assert_eq!(std::fs::read(regular).unwrap(), b"unchanged");
+    }
+
+    #[test]
+    fn deadline_request_requires_an_accepted_matching_identity() {
+        use std::os::unix::net::UnixListener;
+
+        for (version, run_id, accepted, delivered) in [
+            (IPC_VERSION, "r_abort", true, true),
+            (IPC_VERSION, "r_abort", false, false),
+            (IPC_VERSION, "r_other", true, false),
+            (IPC_VERSION + 1, "r_abort", true, false),
+        ] {
+            let temporary = tempfile::Builder::new()
+                .prefix("mcd")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let mut control = test_control(temporary.path(), false);
+            control.socket = temporary.path().join("control.sock");
+            let listener = UnixListener::bind(&control.socket).unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request: Value = crate::control_socket::read_frame(&mut stream).unwrap();
+                assert_eq!(request["kind"], "deadline");
+                assert_eq!(request["run_id"], "r_abort");
+                serde_json::to_writer(
+                    &mut stream,
+                    &json!({
+                        "ipc_version":version,
+                        "run_id":run_id,
+                        "job_digest":"job",
+                        "accepted":accepted
+                    }),
+                )
+                .unwrap();
+            });
+            assert_eq!(request_host_deadline(&control).is_ok(), delivered);
+            server.join().unwrap();
+        }
     }
 
     #[test]

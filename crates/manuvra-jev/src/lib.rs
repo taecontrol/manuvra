@@ -722,15 +722,76 @@ mod tests {
     }
 
     #[test]
-    fn connect_failures_retry_only_within_the_attempt_budget() {
+    fn retryable_statuses_retry_only_within_the_attempt_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        // Counts evaluation attempts until the test's own empty connection ends the count.
+        let server = thread::spawn(move || {
+            let mut attempts = 0;
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                if !read_complete_request(&mut stream) {
+                    break;
+                }
+                attempts += 1;
+                write!(
+                    stream,
+                    "HTTP/1.1 503 Service Unavailable\r\nretry-after-ms: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+            }
+            attempts
+        });
+        let client = Client::new("transport-test-key".into(), format!("http://{address}")).unwrap();
+        assert_eq!(
+            client.evaluate(&request(), Instant::now() + Duration::from_secs(10)),
+            Err(JevError::Unavailable)
+        );
+        drop(TcpStream::connect(address).unwrap());
+        assert_eq!(server.join().unwrap(), 3, "one attempt plus two retries");
+    }
+
+    #[test]
+    fn connect_failures_are_retried_with_backoff_before_failing() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
         let client = Client::new("transport-test-key".into(), endpoint).unwrap();
+        let started = Instant::now();
         assert_eq!(
-            client.evaluate(&request(), Instant::now() + Duration::from_secs(4)),
+            client.evaluate(&request(), Instant::now() + Duration::from_secs(10)),
             Err(JevError::Unavailable)
         );
+        // Two retries wait at least 75% of the 500 ms and 1 s backoff steps.
+        assert!(started.elapsed() >= Duration::from_millis(1_125));
+    }
+
+    /// Reads one whole HTTP request so the reply never races unread request bytes. Returns
+    /// false for a connection closed without a request.
+    fn read_complete_request(stream: &mut TcpStream) -> bool {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 8_192];
+        let header_end = loop {
+            if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                break end + 4;
+            }
+            let read = stream.read(&mut buffer).unwrap();
+            if read == 0 {
+                return false;
+            }
+            request.extend_from_slice(&buffer[..read]);
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+        let body_length: usize = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .map_or(0, |value| value.trim().parse().unwrap());
+        while request.len() < header_end + body_length {
+            let read = stream.read(&mut buffer).unwrap();
+            assert_ne!(read, 0, "request body ended early");
+            request.extend_from_slice(&buffer[..read]);
+        }
+        true
     }
 
     fn read_request(stream: &mut TcpStream) {

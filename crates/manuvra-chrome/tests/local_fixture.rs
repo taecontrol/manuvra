@@ -1,81 +1,74 @@
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use manuvra_chrome::{
-    BrowserConfig, Element, InputCancellation, Observation, OwnedBrowser, PerformError,
-    PreparedInput, PreparedOperation,
+    BrowserConfig, BrowserError, Element, InputCancellation, Observation, OwnedBrowser,
+    PerformError, PreparedInput, PreparedOperation,
 };
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-#[cfg(target_os = "macos")]
-use std::path::PathBuf;
-#[cfg(target_os = "macos")]
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
-#[cfg(target_os = "macos")]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-const FIXTURE: &str = include_str!("../../../tests/fixtures/browser-adversarial.html");
-const INPUT_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-input-strategies.html");
-const HOVER_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-hover-reveal.html");
-const FOCUS_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-focus.html");
-const KEYBOARD_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-keyboard-focus.html");
-const ACTIVATION_FIXTURE: &str =
-    include_str!("../../../tests/fixtures/browser-keyboard-activation.html");
-const WIDGET_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-keyboard-widgets.html");
-const SUBMIT_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-keyboard-submit.html");
+const FIXTURE: &str = include_str!("../../../tests/browser/adversarial.html");
+const INPUT_FIXTURE: &str = include_str!("../../../tests/browser/input-strategies.html");
+const HOVER_FIXTURE: &str = include_str!("../../../tests/browser/hover-reveal.html");
+const FOCUS_FIXTURE: &str = include_str!("../../../tests/browser/focus.html");
+const KEYBOARD_FIXTURE: &str = include_str!("../../../tests/browser/keyboard-focus.html");
+const ACTIVATION_FIXTURE: &str = include_str!("../../../tests/browser/keyboard-activation.html");
+const WIDGET_FIXTURE: &str = include_str!("../../../tests/browser/keyboard-widgets.html");
+const SUBMIT_FIXTURE: &str = include_str!("../../../tests/browser/keyboard-submit.html");
 const REVALIDATION_FIXTURE: &str =
-    include_str!("../../../tests/fixtures/browser-keyboard-revalidation.html");
-const EDITING_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-keyboard-editing.html");
+    include_str!("../../../tests/browser/keyboard-revalidation.html");
+const EDITING_FIXTURE: &str = include_str!("../../../tests/browser/keyboard-editing.html");
 static REAL_BROWSER: Mutex<()> = Mutex::new(());
 
-#[cfg(target_os = "macos")]
+/// The owned browser's process group and profile, observed from outside the crate.
 struct BrowserLifecycle {
     process_group: i32,
     profile: PathBuf,
 }
 
-#[cfg(target_os = "macos")]
 impl BrowserLifecycle {
-    fn observe(browser: &OwnedBrowser) -> Self {
-        let path = &browser.provenance().browser_path;
+    /// Finds this test process's owned browser by its private profile, whose name
+    /// embeds the test process id, so other Chromium instances are never mistaken for it.
+    fn observe() -> Self {
+        let owned_prefix = format!("manuvra-chromium-{}-", std::process::id());
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            let rows = process_rows();
-            if let Some((pid, process_group, command)) = rows.iter().find(|(_, _, command)| {
-                command.contains(path) && command.contains("--remote-debugging-port=0")
-            }) {
-                let profile = command
-                    .split_whitespace()
-                    .find_map(|argument| argument.strip_prefix("--user-data-dir="))
-                    .map(PathBuf::from)
-                    .expect("owned Chrome command has an isolated profile");
-                assert_eq!(pid, process_group, "standalone Chrome must lead its group");
+            let rows: Vec<_> = process_rows()
+                .into_iter()
+                .filter_map(|(pid, group, command)| {
+                    owned_profile(&command, &owned_prefix).map(|profile| (pid, group, profile))
+                })
+                .collect();
+            let leader = rows.iter().find(|(pid, group, _)| pid == group);
+            if let Some((_, process_group, profile)) = leader
+                && rows.len() > 1
+            {
+                assert!(
+                    rows.iter()
+                        .all(|(_, group, member)| group == process_group && member == profile),
+                    "owned Chrome helpers left the owned group: {rows:?}"
+                );
                 assert!(profile.is_dir());
-                let owned = format!("--user-data-dir={}", profile.display());
-                let observed: Vec<_> = rows
-                    .iter()
-                    .filter(|(_, _, command)| command.contains(&owned))
-                    .collect();
-                if observed.len() > 1 {
-                    assert!(observed.iter().all(|(_, group, _)| group == process_group));
-                    eprintln!(
-                        "owned Chrome group observed: pgid={process_group} members={} profile={}",
-                        observed.len(),
-                        profile.display()
-                    );
-                    return Self {
-                        process_group: *process_group,
-                        profile,
-                    };
-                }
+                eprintln!(
+                    "owned Chrome group observed: pgid={process_group} members={} profile={}",
+                    rows.len(),
+                    profile.display()
+                );
+                return Self {
+                    process_group: *process_group,
+                    profile: profile.clone(),
+                };
             }
             assert!(
                 Instant::now() < deadline,
-                "Chrome helper group was not observable"
+                "owned Chrome group leader and helpers were not observable: {rows:?}"
             );
             thread::sleep(Duration::from_millis(20));
         }
@@ -100,7 +93,18 @@ impl BrowserLifecycle {
     }
 }
 
-#[cfg(target_os = "macos")]
+fn owned_profile(command: &str, owned_prefix: &str) -> Option<PathBuf> {
+    command
+        .split_whitespace()
+        .find_map(|argument| argument.strip_prefix("--user-data-dir="))
+        .filter(|path| {
+            Path::new(path)
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(owned_prefix))
+        })
+        .map(PathBuf::from)
+}
+
 fn process_rows() -> Vec<(i32, i32, String)> {
     let output = Command::new("ps")
         .args(["-axo", "pid=,pgid=,command="])
@@ -303,8 +307,7 @@ fn arrow_home_end_and_enter_follow_composite_widget_state() {
         inherit_process_group: false,
     })
     .unwrap();
-    #[cfg(target_os = "macos")]
-    let lifecycle = BrowserLifecycle::observe(&browser);
+    let lifecycle = BrowserLifecycle::observe();
     browser.navigate(&server.url()).unwrap();
     let mut observed = browser.observe().unwrap();
     for (key, active_id) in [
@@ -417,7 +420,6 @@ fn arrow_home_end_and_enter_follow_composite_widget_state() {
         assert_eq!(anchor.position, Some(position), "{key:?}");
     }
     browser.close().unwrap();
-    #[cfg(target_os = "macos")]
     lifecycle.assert_cleaned();
 }
 
@@ -435,8 +437,7 @@ fn enter_and_space_activate_a_focused_native_button_once_each() {
         inherit_process_group: false,
     })
     .unwrap();
-    #[cfg(target_os = "macos")]
-    let lifecycle = BrowserLifecycle::observe(&browser);
+    let lifecycle = BrowserLifecycle::observe();
     for key in [Key::Enter, Key::Space] {
         browser.navigate(&server.url()).unwrap();
         let observed = browser.observe().unwrap();
@@ -463,7 +464,6 @@ fn enter_and_space_activate_a_focused_native_button_once_each() {
         assert_eq!(after.focus_anchor.as_ref().unwrap().name, "Save");
     }
     browser.close().unwrap();
-    #[cfg(target_os = "macos")]
     lifecycle.assert_cleaned();
 }
 
@@ -481,8 +481,7 @@ fn keyboard_popover_traps_tab_and_escape_restores_trigger_focus() {
         inherit_process_group: false,
     })
     .unwrap();
-    #[cfg(target_os = "macos")]
-    let lifecycle = BrowserLifecycle::observe(&browser);
+    let lifecycle = BrowserLifecycle::observe();
     browser.navigate(&server.url()).unwrap();
     let mut observed = browser.observe().unwrap();
     assert!(observed.focus_anchor.is_none());
@@ -555,7 +554,6 @@ fn keyboard_popover_traps_tab_and_escape_restores_trigger_focus() {
         "Open breakdown"
     );
     browser.close().unwrap();
-    #[cfg(target_os = "macos")]
     lifecycle.assert_cleaned();
 }
 
@@ -573,8 +571,7 @@ fn production_snapshot_and_masking_cover_truncation_split_nodes_and_zero_masks()
     })
     .unwrap();
     assert_ne!(browser.provenance().browser_version, "unknown");
-    #[cfg(target_os = "macos")]
-    let lifecycle = BrowserLifecycle::observe(&browser);
+    let lifecycle = BrowserLifecycle::observe();
     browser.navigate(&server.url()).unwrap();
 
     let observed = browser.observe().unwrap();
@@ -607,7 +604,6 @@ fn production_snapshot_and_masking_cover_truncation_split_nodes_and_zero_masks()
     assert_eq!(absent.redaction.mask_count, 0);
     eprintln!("real Chrome CDP snapshot, screenshot, and masking fixture completed");
     browser.close().unwrap();
-    #[cfg(target_os = "macos")]
     lifecycle.assert_cleaned();
 }
 
@@ -617,8 +613,7 @@ fn production_snapshot_observes_indexed_dialog_and_body_focus() {
     let _serial = REAL_BROWSER.lock().unwrap();
     let server = FixtureServer::with_body(FOCUS_FIXTURE);
     let mut browser = launch_headless();
-    #[cfg(target_os = "macos")]
-    let lifecycle = BrowserLifecycle::observe(&browser);
+    let lifecycle = BrowserLifecycle::observe();
     for (query, focused, name, role, indexed, dialog) in [
         ("button", true, "Save", "button", true, None),
         ("dialog", true, "", "interactive", false, Some("Breakdown")),
@@ -657,7 +652,6 @@ fn production_snapshot_observes_indexed_dialog_and_body_focus() {
         }
     }
     browser.close().unwrap();
-    #[cfg(target_os = "macos")]
     lifecycle.assert_cleaned();
 }
 
@@ -667,8 +661,7 @@ fn production_snapshot_resolves_dialog_across_open_shadow_root() {
     let _serial = REAL_BROWSER.lock().unwrap();
     let server = FixtureServer::with_body(FOCUS_FIXTURE);
     let mut browser = launch_headless();
-    #[cfg(target_os = "macos")]
-    let lifecycle = BrowserLifecycle::observe(&browser);
+    let lifecycle = BrowserLifecycle::observe();
     browser
         .navigate(&format!("{}?focus=shadow-dialog", server.url()))
         .unwrap();
@@ -691,7 +684,6 @@ fn production_snapshot_resolves_dialog_across_open_shadow_root() {
     assert_eq!(labelled.role, "button");
     assert_eq!(labelled.in_dialog, None);
     browser.close().unwrap();
-    #[cfg(target_os = "macos")]
     lifecycle.assert_cleaned();
 }
 
@@ -701,8 +693,7 @@ fn production_snapshot_uses_aria_name_inside_shadow_dialog() {
     let _serial = REAL_BROWSER.lock().unwrap();
     let server = FixtureServer::with_body(FOCUS_FIXTURE);
     let mut browser = launch_headless();
-    #[cfg(target_os = "macos")]
-    let lifecycle = BrowserLifecycle::observe(&browser);
+    let lifecycle = BrowserLifecycle::observe();
     browser
         .navigate(&format!("{}?focus=shadow-dialog-pin", server.url()))
         .unwrap();
@@ -712,7 +703,6 @@ fn production_snapshot_uses_aria_name_inside_shadow_dialog() {
     assert_eq!(anchor.in_dialog.as_deref(), Some("Checkout"));
     assert_eq!(observed.focused, None);
     browser.close().unwrap();
-    #[cfg(target_os = "macos")]
     lifecycle.assert_cleaned();
 }
 
@@ -723,8 +713,7 @@ fn production_snapshot_marks_focus_inside_uncovered_surfaces() {
     let _serial = REAL_BROWSER.lock().unwrap();
     let server = FixtureServer::with_body(FOCUS_FIXTURE);
     let mut browser = launch_headless();
-    #[cfg(target_os = "macos")]
-    let lifecycle = BrowserLifecycle::observe(&browser);
+    let lifecycle = BrowserLifecycle::observe();
     for (query, covered, surface) in [
         ("closed-shadow", false, Some(FocusSurface::ClosedShadowRoot)),
         (
@@ -757,7 +746,6 @@ fn production_snapshot_marks_focus_inside_uncovered_surfaces() {
     assert_eq!(observed.focused, Some(field.index));
     assert_eq!(anchor.context, field.context);
     browser.close().unwrap();
-    #[cfg(target_os = "macos")]
     lifecycle.assert_cleaned();
 }
 
@@ -769,8 +757,7 @@ fn production_snapshot_marks_focus_inside_a_cross_origin_frame() {
     let server = FixtureServer::with_body(FOCUS_FIXTURE);
     let other_origin = FixtureServer::with_body(FOCUS_FIXTURE);
     let mut browser = launch_headless();
-    #[cfg(target_os = "macos")]
-    let lifecycle = BrowserLifecycle::observe(&browser);
+    let lifecycle = BrowserLifecycle::observe();
     browser
         .navigate(&format!(
             "{}?focus=cross-origin-frame&frame={}",
@@ -792,7 +779,6 @@ fn production_snapshot_marks_focus_inside_a_cross_origin_frame() {
     assert!(!anchor.covered);
     assert_eq!(anchor.surface, Some(FocusSurface::CrossOriginFrame));
     browser.close().unwrap();
-    #[cfg(target_os = "macos")]
     lifecycle.assert_cleaned();
 }
 
@@ -804,8 +790,7 @@ fn enter_on_a_submit_button_settles_slow_navigation_before_the_next_capture() {
     let server =
         FixtureServer::with_slow_path(SUBMIT_FIXTURE, "/submitted", Duration::from_millis(1500));
     let mut browser = launch_headless();
-    #[cfg(target_os = "macos")]
-    let lifecycle = BrowserLifecycle::observe(&browser);
+    let lifecycle = BrowserLifecycle::observe();
     for (query, button) in [("", "Submit"), ("?focus=validated", "Validate and submit")] {
         browser
             .navigate(&format!("{}{query}", server.url()))
@@ -828,7 +813,6 @@ fn enter_on_a_submit_button_settles_slow_navigation_before_the_next_capture() {
         );
     }
     browser.close().unwrap();
-    #[cfg(target_os = "macos")]
     lifecycle.assert_cleaned();
 }
 
@@ -839,8 +823,7 @@ fn stale_focus_anchor_rejects_the_key_before_any_keydown_reaches_the_page() {
     let _serial = REAL_BROWSER.lock().unwrap();
     let server = FixtureServer::with_body(REVALIDATION_FIXTURE);
     let mut browser = launch_headless();
-    #[cfg(target_os = "macos")]
-    let lifecycle = BrowserLifecycle::observe(&browser);
+    let lifecycle = BrowserLifecycle::observe();
     browser.navigate(&server.url()).unwrap();
     let stale = browser.observe().unwrap();
     assert_eq!(stale.focus_anchor.as_ref().unwrap().name, "First");
@@ -880,7 +863,6 @@ fn stale_focus_anchor_rejects_the_key_before_any_keydown_reaches_the_page() {
     let after = browser.observe().unwrap();
     assert!(has_line(&after, "Keydowns: 1"), "{}", after.visible_text);
     browser.close().unwrap();
-    #[cfg(target_os = "macos")]
     lifecycle.assert_cleaned();
 }
 
@@ -891,8 +873,7 @@ fn arrow_keys_move_the_native_caret_in_text_fields() {
     let _serial = REAL_BROWSER.lock().unwrap();
     let server = FixtureServer::with_body(EDITING_FIXTURE);
     let mut browser = launch_headless();
-    #[cfg(target_os = "macos")]
-    let lifecycle = BrowserLifecycle::observe(&browser);
+    let lifecycle = BrowserLifecycle::observe();
     for (query, field, steps) in [
         (
             "",
@@ -926,7 +907,6 @@ fn arrow_keys_move_the_native_caret_in_text_fields() {
         }
     }
     browser.close().unwrap();
-    #[cfg(target_os = "macos")]
     lifecycle.assert_cleaned();
 }
 
@@ -944,8 +924,7 @@ fn production_input_strategies_cover_native_and_bounded_fallback_paths() {
     })
     .unwrap();
     assert_ne!(browser.provenance().browser_version, "unknown");
-    #[cfg(target_os = "macos")]
-    let lifecycle = BrowserLifecycle::observe(&browser);
+    let lifecycle = BrowserLifecycle::observe();
     browser.navigate(&server.url()).unwrap();
     let cancellation = InputCancellation::default();
     let mut sequence = 1;
@@ -1051,8 +1030,16 @@ fn production_input_strategies_cover_native_and_bounded_fallback_paths() {
         .unwrap();
     sequence += 1;
     let observed = browser.observe().unwrap();
-    assert!(observed.visible_text.contains("Selected option"));
-    assert!(observed.visible_text.contains("0"));
+    assert!(
+        has_line(&observed, "Selected option"),
+        "{}",
+        observed.visible_text
+    );
+    assert!(
+        has_line(&observed, "Enter presses: 0"),
+        "typing and choosing an option never presses Enter: {}",
+        observed.visible_text
+    );
 
     let fact = browser
         .perform(
@@ -1139,8 +1126,13 @@ fn production_input_strategies_cover_native_and_bounded_fallback_paths() {
         sequence += 1;
     }
     let observed = browser.observe().unwrap();
-    assert!(observed.visible_text.contains("clicked"));
-    assert!(observed.visible_text.contains("Slotted clicked"));
+    for clicked in ["Shadow clicked", "Slotted clicked", "Frame clicked"] {
+        assert!(
+            has_line(&observed, clicked),
+            "{clicked}: {}",
+            observed.visible_text
+        );
+    }
     for gap in ["cross_origin_frame", "closed_shadow_root", "canvas"] {
         assert!(observed.coverage.gaps.iter().any(|actual| actual == gap));
     }
@@ -1220,7 +1212,6 @@ fn production_input_strategies_cover_native_and_bounded_fallback_paths() {
     ));
     eprintln!("real Chrome CDP input and readback fixture completed");
     browser.close().unwrap();
-    #[cfg(target_os = "macos")]
     lifecycle.assert_cleaned();
 }
 
@@ -1264,8 +1255,7 @@ fn production_snapshot_lists_hover_regions_and_keeps_their_controls_out_of_candi
         inherit_process_group: false,
     })
     .unwrap();
-    #[cfg(target_os = "macos")]
-    let lifecycle = BrowserLifecycle::observe(&browser);
+    let lifecycle = BrowserLifecycle::observe();
     browser.navigate(&server.url()).unwrap();
 
     let observed = browser.observe().unwrap();
@@ -1354,7 +1344,6 @@ fn production_snapshot_lists_hover_regions_and_keeps_their_controls_out_of_candi
     assert_no_hidden_candidates(&capped);
     eprintln!("real Chrome hover region fixture completed");
     browser.close().unwrap();
-    #[cfg(target_os = "macos")]
     lifecycle.assert_cleaned();
 }
 
@@ -1378,8 +1367,7 @@ fn production_hover_reveals_only_its_region_controls_for_a_following_click() {
         inherit_process_group: false,
     })
     .unwrap();
-    #[cfg(target_os = "macos")]
-    let lifecycle = BrowserLifecycle::observe(&browser);
+    let lifecycle = BrowserLifecycle::observe();
     browser.navigate(&server.url()).unwrap();
     let cancellation = InputCancellation::default();
 
@@ -1452,7 +1440,6 @@ fn production_hover_reveals_only_its_region_controls_for_a_following_click() {
     assert!(regions.contains(&"Rent"), "{regions:?}");
     eprintln!("real Chrome hover reveal fixture completed");
     browser.close().unwrap();
-    #[cfg(target_os = "macos")]
     lifecycle.assert_cleaned();
 }
 
@@ -1470,8 +1457,7 @@ fn headless_owned_browser_presents_a_desktop_mouse() {
         </script></body>"#,
     );
     let mut browser = launch_headless();
-    #[cfg(target_os = "macos")]
-    let lifecycle = BrowserLifecycle::observe(&browser);
+    let lifecycle = BrowserLifecycle::observe();
     browser.navigate(&server.url()).unwrap();
     let observed = browser.observe().unwrap();
     for feature in [
@@ -1487,7 +1473,6 @@ fn headless_owned_browser_presents_a_desktop_mouse() {
         );
     }
     browser.close().unwrap();
-    #[cfg(target_os = "macos")]
     lifecycle.assert_cleaned();
 }
 
@@ -1497,8 +1482,7 @@ fn headless_hover_reveals_media_gated_row_actions_for_a_following_click() {
     let _serial = REAL_BROWSER.lock().unwrap();
     let server = FixtureServer::with_body(HOVER_FIXTURE);
     let mut browser = launch_headless();
-    #[cfg(target_os = "macos")]
-    let lifecycle = BrowserLifecycle::observe(&browser);
+    let lifecycle = BrowserLifecycle::observe();
     browser.navigate(&server.url()).unwrap();
     let cancellation = InputCancellation::default();
     let observed = browser.observe().unwrap();
@@ -1556,6 +1540,303 @@ fn headless_hover_reveals_media_gated_row_actions_for_a_following_click() {
             .any(|element| element.role == "menuitem" && element.name == "Delete category…")
     );
     browser.close().unwrap();
-    #[cfg(target_os = "macos")]
+    lifecycle.assert_cleaned();
+}
+
+const TICKING_PAGE: &str = r#"<!doctype html><title>Ticking</title><body><p>Static</p><script>
+const where = new URLSearchParams(location.search).get('tick');
+const tick = (node) => { let count = 0; setInterval(() => { node.textContent = `Tick ${++count}`; }, 5); };
+if (where === 'main') tick(document.body.appendChild(document.createElement('p')));
+for (const mode of ['open', 'closed']) if (where === `${mode}-shadow`) {
+  const root = document.body.appendChild(document.createElement('div')).attachShadow({mode});
+  tick(root.appendChild(document.createElement('p')));
+}
+if (where === 'frame') {
+  const frame = document.createElement('iframe');
+  frame.srcdoc = '<p>Frame</p><script>let count = 0; setInterval(() => { document.querySelector("p").textContent = `Tick ${++count}`; }, 5);<\/script>';
+  document.body.append(frame);
+}
+</script></body>"#;
+
+const FENCING_FAILED: &str = "page changed throughout screenshot fencing";
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn capture_is_refused_while_the_dom_keeps_changing_anywhere_on_the_page() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(TICKING_PAGE);
+    let mut browser = launch_headless();
+    let lifecycle = BrowserLifecycle::observe();
+    browser.navigate(&server.url()).unwrap();
+    let still = browser.capture().unwrap();
+    assert!(has_line(&still.observation, "Static"));
+    for (tick, redacted_failure) in [
+        ("main", FENCING_FAILED),
+        ("open-shadow", FENCING_FAILED),
+        // Masking cannot see inside a closed shadow root, so redaction fails first.
+        ("closed-shadow", "redaction_unverifiable"),
+        ("frame", FENCING_FAILED),
+    ] {
+        browser
+            .navigate(&format!("{}?tick={tick}", server.url()))
+            .unwrap();
+        assert!(
+            matches!(browser.capture(), Err(BrowserError::Control(message)) if message == FENCING_FAILED),
+            "{tick}"
+        );
+        assert!(
+            matches!(
+                browser.capture_redacted(&["Static".into()]),
+                Err(BrowserError::Control(message)) if message == redacted_failure
+            ),
+            "{tick}"
+        );
+    }
+    browser.close().unwrap();
+    lifecycle.assert_cleaned();
+}
+
+const MOVING_SECRET_PAGE: &str = r#"<!doctype html><title>Moving secret</title>
+<style>body { margin: 0; font: 20px monospace; } #secret { position: absolute; left: 10px; top: 20px; margin: 0; } #result { position: absolute; left: 10px; top: 400px; margin: 0; }</style>
+<p id="secret">moving-secret</p><p id="result">Mask pending</p>
+<script>
+  const secret = document.querySelector('#secret'), masks = new Map(); let moved = false;
+  new MutationObserver(records => {
+    for (const record of records) {
+      for (const node of record.addedNodes) if (node.hasAttribute?.('data-manuvra-mask')) {
+        masks.set(node, node.getBoundingClientRect());
+        // The first mask ever placed makes the secret move away from it once.
+        if (!moved) { moved = true; secret.style.top = '200px'; }
+      }
+      for (const node of record.removedNodes) if (masks.has(node)) {
+        const mask = masks.get(node); masks.delete(node);
+        const range = document.createRange(); range.selectNodeContents(secret);
+        const text = range.getBoundingClientRect();
+        const covered = mask.left <= text.left && mask.top <= text.top && mask.right >= text.right && mask.bottom >= text.bottom;
+        document.querySelector('#result').textContent = `Mask covered secret: ${covered}`;
+      }
+    }
+  }).observe(document.documentElement, {childList: true});
+</script>"#;
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn a_secret_that_moves_after_masking_is_masked_again_before_the_screenshot() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(MOVING_SECRET_PAGE);
+    let mut browser = launch_headless();
+    let lifecycle = BrowserLifecycle::observe();
+    browser.navigate(&server.url()).unwrap();
+    let captured = browser.capture_redacted(&["moving-secret".into()]).unwrap();
+    assert!(captured.redaction.verifies(1));
+    assert_eq!(captured.redaction.matched_values, 1);
+    let after = browser.observe().unwrap();
+    assert!(
+        has_line(&after, "Mask covered secret: true"),
+        "the screenshot's masks must cover the secret where it was captured: {}",
+        after.visible_text
+    );
+    browser.close().unwrap();
+    lifecycle.assert_cleaned();
+}
+
+const UNPAINTED_SECRET_PAGE: &str = r#"<!doctype html><title>hidden-secret</title>
+<style>/* hidden-secret */</style>
+<script>const note = 'hidden-secret';</script>
+<noscript>hidden-secret</noscript>
+<template><p>hidden-secret</p></template>
+<div style="display: none">hidden-secret</div>
+<div hidden><p>hidden-secret</p></div>
+<input type="hidden" value="hidden-secret">
+<input aria-label="Collapsed" value="hidden-secret" style="width: 0; height: 0; border: 0; padding: 0">
+<textarea hidden>hidden-secret</textarea>
+<iframe hidden srcdoc="<p>hidden-secret</p>"></iframe>
+<canvas hidden></canvas>
+<p>Shown: <span style="display: contents">shown-secret</span></p>"#;
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn text_that_is_never_painted_neither_matches_nor_blocks_redaction() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(UNPAINTED_SECRET_PAGE);
+    let mut browser = launch_headless();
+    let lifecycle = BrowserLifecycle::observe();
+    browser.navigate(&server.url()).unwrap();
+    let captured = browser
+        .capture_redacted(&["hidden-secret".into(), "shown-secret".into()])
+        .unwrap();
+    assert!(captured.redaction.verifies(2), "{:?}", captured.redaction);
+    assert_eq!(
+        captured.redaction.matched_values, 1,
+        "only the painted value matches"
+    );
+    assert!(captured.redaction.mask_count >= 1);
+    browser.close().unwrap();
+    lifecycle.assert_cleaned();
+}
+
+/// The frame's content box starts 50px in: a 20px border plus 30px padding.
+const PADDED_FRAME_PAGE: &str = r#"<!doctype html><title>Padded frame</title>
+<style>body { margin: 0; font: 16px sans-serif; } iframe { position: absolute; left: 0; top: 0; width: 300px; height: 200px; border: 20px solid #888; padding: 30px; } .result { position: absolute; left: 0; margin: 0; }</style>
+<iframe title="Padded frame" srcdoc="<style>body { margin: 0; font: 20px monospace; } button { display: block; width: 120px; height: 40px; margin: 0; } p { margin: 0; }</style><button onclick='parent.document.querySelector(&quot;#framed&quot;).textContent = &quot;Framed click&quot;'>Framed button</button><p>framed-secret</p>"></iframe>
+<p id="framed" class="result" style="top: 400px">Framed pending</p>
+<p id="mask-result" class="result" style="top: 440px">Framed mask pending</p>
+<script>
+  const masks = new Map();
+  new MutationObserver(records => {
+    for (const record of records) {
+      for (const node of record.addedNodes) if (node.hasAttribute?.('data-manuvra-mask')) masks.set(node, node.getBoundingClientRect());
+      for (const node of record.removedNodes) if (masks.has(node)) {
+        const mask = masks.get(node); masks.delete(node);
+        const inner = document.querySelector('iframe').contentDocument, range = inner.createRange();
+        range.selectNodeContents(inner.querySelector('p'));
+        const text = range.getBoundingClientRect(), left = text.left + 50, top = text.top + 50;
+        const covered = mask.left <= left && mask.top <= top && mask.right >= left + text.width && mask.bottom >= top + text.height;
+        document.querySelector('#mask-result').textContent = `Framed mask covered: ${covered}`;
+      }
+    }
+  }).observe(document.documentElement, {childList: true});
+</script>"#;
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn frame_geometry_starts_at_the_content_box_for_rects_clicks_and_masks() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(PADDED_FRAME_PAGE);
+    let mut browser = launch_headless();
+    let lifecycle = BrowserLifecycle::observe();
+    browser.navigate(&server.url()).unwrap();
+    let observed = browser.observe().unwrap();
+    let button = candidate(&observed, "Framed button").expect("framed button");
+    assert_eq!(
+        (
+            button.rect.x,
+            button.rect.y,
+            button.rect.width,
+            button.rect.height
+        ),
+        (50.0, 50.0, 120.0, 40.0)
+    );
+    browser
+        .perform(
+            prepared(
+                &observed,
+                "Framed button",
+                PreparedOperation::Click,
+                None,
+                None,
+                1,
+            ),
+            &InputCancellation::default(),
+        )
+        .unwrap();
+    let clicked = browser.observe().unwrap();
+    assert!(
+        has_line(&clicked, "Framed click"),
+        "{}",
+        clicked.visible_text
+    );
+    let captured = browser.capture_redacted(&["framed-secret".into()]).unwrap();
+    assert!(captured.redaction.verifies(1));
+    assert_eq!(captured.redaction.matched_values, 1);
+    let after = browser.observe().unwrap();
+    assert!(
+        has_line(&after, "Framed mask covered: true"),
+        "{}",
+        after.visible_text
+    );
+    browser.close().unwrap();
+    lifecycle.assert_cleaned();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn navigation_that_chrome_reports_as_failed_is_an_error() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+    let refused = format!("http://{}/", closed.local_addr().unwrap());
+    drop(closed);
+    let server =
+        FixtureServer::with_body("<!doctype html><title>Reachable</title><p>Reachable</p>");
+    let mut browser = launch_headless();
+    let lifecycle = BrowserLifecycle::observe();
+    assert!(
+        matches!(
+            browser.navigate(&refused),
+            Err(BrowserError::Control(message)) if message.starts_with("navigation failed: net::ERR_")
+        ),
+        "a refused connection is not a loaded document"
+    );
+    browser.navigate(&server.url()).unwrap();
+    assert!(has_line(&browser.observe().unwrap(), "Reachable"));
+    browser.close().unwrap();
+    lifecycle.assert_cleaned();
+}
+
+/// Attaching and detaching 1500 frames emits about 16,500 CDP events, more than
+/// the journal retains, after the input that started it has settled.
+const FRAME_CHURN_PAGE: &str = r#"<!doctype html><title>Frame churn</title>
+<button id="churn">Churn frames</button><button id="count">Count</button>
+<p id="state">Churn idle</p><p id="counted">Count: 0</p>
+<script>
+  let count = 0;
+  document.querySelector('#count').addEventListener('click', () => { document.querySelector('#counted').textContent = `Count: ${++count}`; });
+  document.querySelector('#churn').addEventListener('click', () => setTimeout(() => {
+    for (let index = 0; index < 1500; index += 1) { const frame = document.createElement('iframe'); document.body.append(frame); frame.remove(); }
+    document.querySelector('#state').textContent = 'Churn finished';
+  }, 500));
+</script>"#;
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn inputs_and_navigation_keep_working_after_the_journal_evicts_old_events() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(FRAME_CHURN_PAGE);
+    let mut browser = launch_headless();
+    let lifecycle = BrowserLifecycle::observe();
+    browser.navigate(&server.url()).unwrap();
+    let observed = browser.observe().unwrap();
+    let cancellation = InputCancellation::default();
+    browser
+        .perform(
+            prepared(
+                &observed,
+                "Churn frames",
+                PreparedOperation::Click,
+                None,
+                None,
+                1,
+            ),
+            &cancellation,
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut observed = browser.observe().unwrap();
+    while !has_line(&observed, "Churn finished") {
+        assert!(Instant::now() < deadline, "frame churn did not finish");
+        thread::sleep(Duration::from_millis(100));
+        observed = browser.observe().unwrap();
+    }
+    for sequence in 2..4 {
+        browser
+            .perform(
+                prepared(
+                    &observed,
+                    "Count",
+                    PreparedOperation::Click,
+                    None,
+                    None,
+                    sequence,
+                ),
+                &cancellation,
+            )
+            .unwrap();
+        observed = browser.observe().unwrap();
+    }
+    assert!(has_line(&observed, "Count: 2"), "{}", observed.visible_text);
+    browser.capture().unwrap();
+    browser.navigate(&server.url()).unwrap();
+    assert!(has_line(&browser.observe().unwrap(), "Churn idle"));
+    browser.close().unwrap();
     lifecycle.assert_cleaned();
 }

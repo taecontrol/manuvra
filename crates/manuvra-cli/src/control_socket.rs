@@ -26,27 +26,31 @@ impl AuthenticatedListener {
         Ok(Self(listener))
     }
 
-    pub fn accept(&self) -> Result<UnixStream, String> {
-        let (stream, _) = self.0.accept().map_err(|error| error.to_string())?;
-        crate::socket_auth::authenticate_current_user(&stream)?;
-        Ok(stream)
-    }
-
     pub fn set_nonblocking(&self) -> Result<(), String> {
         self.0
             .set_nonblocking(true)
             .map_err(|error| error.to_string())
     }
 
-    pub fn try_accept(&self) -> Result<Option<UnixStream>, String> {
+    /// Accepts one pending connection. `Ok(None)` means no connection is waiting on a
+    /// nonblocking listener; neither failure closes the listener.
+    pub fn try_accept(&self) -> Result<Option<UnixStream>, AcceptFailure> {
         match self.0.accept() {
-            Ok((stream, _)) => {
-                crate::socket_auth::authenticate_current_user(&stream).map(|()| Some(stream))
-            }
+            Ok((stream, _)) => crate::socket_auth::authenticate_current_user(&stream)
+                .map(|()| Some(stream))
+                .map_err(|_| AcceptFailure::Rejected),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-            Err(error) => Err(error.to_string()),
+            Err(_) => Err(AcceptFailure::Unavailable),
         }
     }
+}
+
+#[derive(Debug)]
+pub enum AcceptFailure {
+    /// The peer failed authentication; its connection was dropped unread.
+    Rejected,
+    /// Accepting failed, possibly transiently (for example descriptor exhaustion).
+    Unavailable,
 }
 
 pub fn write_frame<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<(), String> {
@@ -169,7 +173,7 @@ mod tests {
             let mut stream = UnixStream::connect(client_socket).unwrap();
             stream.write_all(b"frame").unwrap();
         });
-        let mut stream = listener.accept().unwrap();
+        let mut stream = listener.try_accept().unwrap().unwrap();
         let mut bytes = Vec::new();
         stream.read_to_end(&mut bytes).unwrap();
         client.join().unwrap();
@@ -224,21 +228,25 @@ mod tests {
     fn frame_deadline_rejects_a_slow_incomplete_peer_without_waiting_for_eof() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         client.write_all(b"{").unwrap();
+        // The peer keeps the frame open until the reader hangs up, so only the reader's own
+        // deadline can end the read.
         let trickle = std::thread::spawn(move || {
-            for _ in 0..20 {
-                std::thread::sleep(Duration::from_millis(40));
+            let hang_up = Instant::now() + Duration::from_secs(60);
+            while Instant::now() < hang_up {
+                std::thread::sleep(Duration::from_millis(20));
                 if client.write_all(b" ").is_err() {
-                    break;
+                    return true;
                 }
             }
+            false
         });
         let started = Instant::now();
         let error = read_frame::<serde_json::Value>(&mut server).unwrap_err();
         let elapsed = started.elapsed();
+        assert!(!trickle.is_finished(), "the read outlived its peer");
         drop(server);
-        trickle.join().unwrap();
-        assert!(elapsed >= Duration::from_millis(200));
-        assert!(elapsed < Duration::from_secs(1));
+        assert!(trickle.join().unwrap(), "the peer was still writing");
+        assert!(elapsed >= CONTROL_READ_TIMEOUT);
         assert!(error.contains("control frame read deadline elapsed"));
     }
 
@@ -300,7 +308,7 @@ mod tests {
             command.env("TMPDIR", temporary);
         }
         let mut child = command.spawn().unwrap();
-        let mut stream = listener.accept().unwrap();
+        let mut stream = listener.try_accept().unwrap().unwrap();
         let mut bytes = Vec::new();
         stream.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, b"cross-process frame");

@@ -555,10 +555,6 @@ impl Job {
             .find_map(|step| step.first_missing_value(&self.values))
     }
 
-    pub fn first_unsupported_feature(&self) -> Option<&'static str> {
-        None
-    }
-
     fn expectation_ids(&self) -> impl Iterator<Item = &str> {
         self.expectations
             .iter()
@@ -1014,14 +1010,45 @@ mod tests {
         let DoneCondition::Structured(parsed) = &job.steps[0].done_when else {
             panic!("structured done condition");
         };
-        assert_eq!(
-            parsed[4],
+        let expected = [
+            Assertion::TextVisible(TextVisible {
+                text_visible: "Saved".into(),
+                scope: Some(AssertionScope::Viewport(ViewportScope::Viewport)),
+            }),
+            Assertion::TextAbsent(TextAbsent {
+                text_absent: "Error".into(),
+                scope: Some(AssertionScope::Dialog(DialogScope {
+                    dialog: "Create".into(),
+                })),
+            }),
+            Assertion::FieldNonempty(FieldNonempty {
+                field: "Name".into(),
+                nonempty: RequiredTrue,
+                dialog: Some("Create".into()),
+                role: Some("textbox".into()),
+            }),
+            Assertion::FieldEqualsValue(FieldEqualsValue {
+                field: "Name".into(),
+                equals_value: "account_name".into(),
+                dialog: None,
+                role: None,
+            }),
             Assertion::Focused(Focused {
                 focused: "Save".into(),
                 dialog: Some("Create".into()),
                 role: Some("button".into()),
-            })
-        );
+            }),
+            Assertion::DialogOpen(DialogOpen {
+                dialog_open: "Create".into(),
+            }),
+            Assertion::DialogClosed(DialogClosed {
+                dialog_closed: "Other".into(),
+            }),
+            Assertion::UrlContains(UrlContains {
+                url_contains: "/accounts".into(),
+            }),
+        ];
+        assert_eq!(parsed.as_slice(), expected.as_slice());
     }
 
     #[test]
@@ -1074,8 +1101,11 @@ mod tests {
     }
 
     #[test]
-    fn accepts_the_design_brief_job_fixture() {
-        let job = Job::parse(include_bytes!("../tests/fixtures/create-account.json")).unwrap();
+    fn accepts_the_create_account_job_fixture() {
+        let job = Job::parse(include_bytes!(
+            "../../../tests/live/money/create-account.json"
+        ))
+        .unwrap();
         assert_eq!(job.steps.len(), 9);
         assert_eq!(job.expectations.len(), 2);
         assert_eq!(job.first_missing_value(), None);
@@ -1179,24 +1209,6 @@ mod tests {
             "future_addition": true
         });
         assert!(serde_json::from_value::<RunResult>(output).is_ok());
-    }
-
-    #[test]
-    fn accepted_job_features_are_supported_by_current_build() {
-        let mut natural = valid_job();
-        natural["steps"][0]["done_when"] = json!("The account exists");
-        assert_eq!(parse(&natural).unwrap().first_unsupported_feature(), None);
-
-        let mut expectation = valid_job();
-        expectation["expectations"] = json!([{"id": "account", "claim": "Account exists"}]);
-        assert_eq!(
-            parse(&expectation).unwrap().first_unsupported_feature(),
-            None
-        );
-
-        let mut option = valid_job();
-        option["options"]["pause_timeout_ms"] = json!(100_000);
-        assert_eq!(parse(&option).unwrap().first_unsupported_feature(), None);
     }
 
     #[test]
