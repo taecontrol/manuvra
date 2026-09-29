@@ -909,12 +909,7 @@ mod tests {
 
     fn hover_page() -> Observation {
         let mut page = observation();
-        page.hover_regions = vec![HoverRegion {
-            index: 1,
-            name: "Groceries".into(),
-            reveals_on_hover: vec!["Actions for Groceries".into()],
-            node_id: 41,
-        }];
+        page.hover_regions = vec![crate::test_support::hover_region(1, "Groceries", 41)];
         page
     }
 

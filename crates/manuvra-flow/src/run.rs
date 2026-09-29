@@ -5801,14 +5801,7 @@ mod tests {
         }
     }
 
-    fn hover_region(index: u64, name: &str, node_id: u64) -> manuvra_chrome::HoverRegion {
-        manuvra_chrome::HoverRegion {
-            index,
-            name: name.into(),
-            reveals_on_hover: vec![format!("Actions for {name}")],
-            node_id,
-        }
-    }
+    use crate::test_support::hover_region;
 
     /// The Groceries and Rent rows before any hover: their action buttons are hidden.
     fn plan_before_hover() -> Observation {

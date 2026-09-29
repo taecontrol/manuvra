@@ -3,6 +3,8 @@ pub mod evidence;
 pub mod judgment;
 pub mod policy;
 pub mod run;
+#[cfg(test)]
+mod test_support;
 pub mod values;
 pub mod verification;
 
