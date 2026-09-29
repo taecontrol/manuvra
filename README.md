@@ -210,12 +210,33 @@ make test
 make crap
 ```
 
-`make live` uses `/bin/bash`, builds a release binary, and runs the Money journey matrix against fresh fixtures. Set `MONEY_DIR` explicitly to a disposable Money checkout and provide `TYPESAFE_API_KEY` in the environment. The checkout must have its documented Node and pnpm application-driver dependencies ready. The command also requires `jq`, `grep`, `rg`, native `date`, `shasum`, and `nc`, Rust build tools, Google Chrome, and a headed desktop. On Linux the matrix requires `XDG_RUNTIME_DIR` and passes it to Manuvra. On macOS it requires `TMPDIR` and leaves `XDG_RUNTIME_DIR` unset so Manuvra exercises its private `TMPDIR` runtime fallback. It runs the create-unit, create-account, and record-transaction journeys three times each, followed by one forced escalation round trip. It retains timestamped, redacted Evidence and a `report.json` under `.work/live/money-journey/`; the report records the source revision, release-binary digest, Bash version, Run classifications, application persistence checks, and cleanup results.
-
-The Linux keyboard matrix uses real Jev and Chromium with four synthetic journeys, five fresh Runs each: `escape-popover` closes a popover with Escape, `tab-enter-save` tabs to Save and activates it with Enter, `caller-execute-enter` does the same with a forced stop before Enter and one `execute` disposition, and `listbox-choice` chooses Beta in a combobox with arrow, Home, or End keys followed by Enter. Their jobs are `tests/live/keyboard-<journey>.json`. Run the matrix in an interactive Bash shell that loads `TYPESAFE_API_KEY`:
+`fmt`, `lint`, and `test` also check the CRAP gate tool in `tools/crap-gate`, which is outside the workspace. `make crap` needs the Rust `llvm-tools-preview` component, `cargo-crap` 0.4.3, and `cargo-llvm-cov` 0.9.0, the versions CI installs:
 
 ```bash
-bash -ic 'python3 scripts/live-keyboard-matrix.py'
+rustup component add llvm-tools-preview
+cargo install cargo-crap --version 0.4.3 --locked
+cargo install cargo-llvm-cov --version 0.9.0 --locked
+```
+
+`make live-self-test` checks the live-suite harnesses against synthetic input without a provider key, browser, or Money checkout. CI runs it on Linux and macOS.
+
+The live suites use real Jev judgments and a real browser against synthetic fixtures. Each needs `TYPESAFE_API_KEY` exported in the environment and retains timestamped, redacted Evidence under `.work/live/`. `make live-all` runs every suite below in sequence.
+
+`make live` uses `/bin/bash`, builds a release binary, and runs the Money journey matrix against fresh fixtures. Set `MONEY_DIR` explicitly to a disposable Money checkout and provide `TYPESAFE_API_KEY` in the environment. The checkout must have its documented Node and pnpm application-driver dependencies ready. The command also requires `jq`, `grep`, `rg`, native `date`, `shasum`, and `nc`, Rust build tools, Google Chrome, and a headed desktop. On Linux the matrix requires `XDG_RUNTIME_DIR` and passes it to Manuvra. On macOS it requires `TMPDIR` and leaves `XDG_RUNTIME_DIR` unset so Manuvra exercises its private `TMPDIR` runtime fallback. It runs the create-unit, create-account, and record-transaction journeys three times each, one create-account journey whose account name is classified, and one forced escalation round trip. The classified Run must keep the name out of its results, state, and Evidence. It retains timestamped, redacted Evidence and a `report.json` under `.work/live/money-journey/`; the report records the source revision, release-binary digest, Bash version, Run classifications, application persistence checks, and cleanup results.
+
+The remaining Money suites run on Linux with the same `MONEY_DIR`, `TYPESAFE_API_KEY`, and headed desktop:
+
+- `make live-observation` runs read-only observation jobs, including classified rendered text and a provider key stand-in that must never be exported.
+- `make live-natural-done` runs the create-account journey three times with natural-language done conditions. A Run passes, or stops without preparing an action the job does not intend.
+- `make live-resume-dispositions` needs `XDG_RUNTIME_DIR`. It races two resumes for one escalation, then checks request replay, stale escalations, and request conflicts.
+- `make live-run-lifecycle` needs `XDG_RUNTIME_DIR`. It follows one forced-pause Run through attach, expiry, retry, and process exit.
+
+`make live-hover` runs the hover-reveal journey three times on Linux in headless Chromium against `tests/fixtures/browser-hover-reveal.html` and needs no Money checkout. Every Run must pass.
+
+The Linux keyboard matrix uses real Jev and Chromium with four synthetic journeys, five fresh Runs each: `escape-popover` closes a popover with Escape, `tab-enter-save` tabs to Save and activates it with Enter, `caller-execute-enter` does the same with a forced stop before Enter and one `execute` disposition, and `listbox-choice` chooses Beta in a combobox with arrow, Home, or End keys followed by Enter. Their jobs are `tests/live/keyboard-<journey>.json`. Run it with `make live-keyboard`, for example from an interactive Bash shell that loads `TYPESAFE_API_KEY`:
+
+```bash
+bash -ic 'make live-keyboard'
 ```
 
 Every invocation first runs the detector self-test, which classifies synthetic Evidence and browser facts without a browser or provider. Run only the self-test with `python3 scripts/live-keyboard-matrix.py --self-test-detectors`.
