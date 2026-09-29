@@ -364,7 +364,7 @@ fn page_changed_since(client: &CdpClient, fence: u64) -> bool {
             .any(|event| crate::transport::is_relevant_event(event) && !is_mask_insertion(event))
 }
 
-fn is_mask_insertion(event: &crate::JournalEvent) -> bool {
+fn is_mask_insertion(event: &crate::transport::JournalEvent) -> bool {
     crate::transport::event_method(event) == Some("DOM.childNodeInserted")
         && crate::transport::event_params(event)
             .pointer("/node/attributes")
@@ -756,7 +756,7 @@ fn settle_input_navigation(client: &CdpClient, fence: u64) -> Result<(), Browser
     }
 }
 
-fn starts_navigation(event: &crate::JournalEvent) -> bool {
+fn starts_navigation(event: &crate::transport::JournalEvent) -> bool {
     matches!(
         crate::transport::event_method(event),
         Some(
@@ -791,7 +791,7 @@ fn wait_for_loading(client: &CdpClient, fence: u64) -> Result<(), BrowserError> 
     }
 }
 
-fn loading_frames(events: &[crate::JournalEvent]) -> HashSet<&str> {
+fn loading_frames(events: &[crate::transport::JournalEvent]) -> HashSet<&str> {
     let mut loading = HashSet::new();
     for event in events {
         let frame = crate::transport::event_params(event)
@@ -813,7 +813,7 @@ fn loading_frames(events: &[crate::JournalEvent]) -> HashSet<&str> {
 fn update_quiet_since(
     quiet_since: &mut Option<Instant>,
     ready: bool,
-    events: &[crate::JournalEvent],
+    events: &[crate::transport::JournalEvent],
 ) {
     if events.iter().any(crate::transport::is_relevant_event) {
         *quiet_since = None
@@ -822,7 +822,9 @@ fn update_quiet_since(
     }
 }
 
-fn require_navigation_journal(snapshot: &crate::JournalSnapshot) -> Result<(), BrowserError> {
+fn require_navigation_journal(
+    snapshot: &crate::transport::JournalSnapshot,
+) -> Result<(), BrowserError> {
     if snapshot.overflowed {
         Err(BrowserError::Control(
             "CDP journal overflowed during navigation".into(),
@@ -1447,8 +1449,8 @@ mod tests {
         assert_eq!(
             wait_for_endpoint(&mut child, temporary.path(), Duration::from_millis(50))
                 .unwrap()
-                .port(),
-            45678
+                .label(),
+            "127.0.0.1:45678"
         );
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();

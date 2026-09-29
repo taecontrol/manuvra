@@ -1,13 +1,12 @@
 //! Low-level Chromium DevTools Protocol building blocks for Manuvra.
 
-pub mod endpoint;
-pub mod input;
-pub mod observation;
-pub mod owned;
-pub mod page;
-pub mod transport;
+mod endpoint;
+mod input;
+mod observation;
+mod owned;
+mod page;
+mod transport;
 
-pub use endpoint::{Endpoint, EndpointError};
 pub use input::{
     InputCancellation, Key, PerformError, PerformFact, PreparedInput, PreparedOperation,
 };
@@ -16,7 +15,7 @@ pub use observation::{
     SelectOption, ViewportState,
 };
 pub use owned::{
-    BrowserConfig, BrowserError, BrowserProvenance, CapturedPage, OwnedBrowser, RedactionProof,
+    BrowserConfig, BrowserError, BrowserProvenance, CapturedPage, OwnedBrowser, ProvenanceViewport,
+    RedactionProof,
 };
-pub use page::{PageError, Screenshot};
-pub use transport::{CdpClient, CommandFailure, CommandOutcome, JournalEvent, JournalSnapshot};
+pub use page::Screenshot;

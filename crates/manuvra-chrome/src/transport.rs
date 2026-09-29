@@ -245,6 +245,7 @@ impl CdpClient {
             .contains(method)
     }
 
+    #[cfg(test)]
     pub fn is_disconnected(&self) -> bool {
         self.disconnected.load(Ordering::SeqCst)
     }
@@ -882,8 +883,8 @@ pub(crate) mod test_support {
             }
         }
 
-        pub fn endpoint(&self) -> crate::Endpoint {
-            crate::Endpoint::parse(&self.address.to_string()).unwrap()
+        pub fn endpoint(&self) -> crate::endpoint::Endpoint {
+            crate::endpoint::Endpoint::parse(&self.address.to_string()).unwrap()
         }
 
         pub fn ws_url(&self) -> String {
