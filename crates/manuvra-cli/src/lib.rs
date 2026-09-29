@@ -1,21 +1,16 @@
 mod client;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-#[allow(dead_code)]
 mod control_socket;
 mod evidence;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod host;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-#[cfg_attr(target_os = "macos", allow(dead_code))]
 mod process;
 mod recovery;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-#[allow(dead_code)]
 mod runtime;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-#[allow(dead_code)]
 mod socket_auth;
-#[cfg_attr(target_os = "macos", allow(dead_code))]
 mod store;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod watchdog;
@@ -463,12 +458,6 @@ fn admission_stop(prepared: &Prepared) -> Option<evidence::BlockedStop> {
         .job
         .first_missing_value()
         .map(|missing| evidence::BlockedStop::missing_value(missing.value_name, missing.step_id))
-        .or_else(|| {
-            prepared
-                .job
-                .first_unsupported_feature()
-                .map(evidence::BlockedStop::unsupported)
-        })
 }
 
 fn publish_admission_stop(
@@ -1126,7 +1115,6 @@ fn validate_request_id(request_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn validate_run_id(run_id: &str) -> Result<(), String> {
     let suffix = run_id.strip_prefix("r_").ok_or_else(|| {
         "run_id must use the generated r_ followed by 16 ASCII alphanumeric characters format"

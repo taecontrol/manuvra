@@ -16,7 +16,7 @@ pub fn run_dir(run_id: &str) -> Result<PathBuf, String> {
 }
 
 pub(crate) fn run_dir_under(root: &Path, run_id: &str) -> Result<PathBuf, String> {
-    validate_run_id(run_id)?;
+    crate::validate_run_id(run_id)?;
     let manuvra = root.join("manuvra");
     let runs = manuvra.join("runs");
     let directory = runs.join(run_id);
@@ -73,15 +73,6 @@ pub fn sweep_recorded_run(socket: &Path, run_id: &str) -> Result<(), String> {
     run_dir.map_or_else(|| remove_dead_socket(socket), sweep_dead_run)
 }
 
-fn validate_run_id(run_id: &str) -> Result<(), String> {
-    let valid = run_id.len() == 18
-        && run_id.starts_with("r_")
-        && run_id[2..].bytes().all(|byte| byte.is_ascii_alphanumeric());
-    valid
-        .then_some(())
-        .ok_or_else(|| "runtime Run id must be r_ plus 16 ASCII alphanumerics".into())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,15 +82,18 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn fixed_run_id_shape_is_required() {
-        assert!(validate_run_id("r_1234567890abcdef").is_ok());
+    fn run_directory_requires_the_generated_run_id_shape() {
         for invalid in [
             "r_1234567890abcde",
             "r_1234567890abcdefg",
             "x_1234567890abcdef",
             "r_1234567890abcde-",
+            "r_../../../../etc",
         ] {
-            assert!(validate_run_id(invalid).is_err(), "{invalid}");
+            assert!(
+                run_dir_under(Path::new("/nonexistent-runtime"), invalid).is_err(),
+                "{invalid}"
+            );
         }
     }
 

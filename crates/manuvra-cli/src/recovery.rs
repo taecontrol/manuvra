@@ -100,7 +100,7 @@ fn validate_flow_artifact_shape(manifest: &Manifest, result: &Value) -> Result<(
     let admission_reason = result
         .pointer("/reason/code")
         .and_then(Value::as_str)
-        .is_some_and(|code| matches!(code, "missing_value" | "unsupported_in_this_build"));
+        .is_some_and(|code| code == "missing_value");
     let admission_cleanup = result.pointer("/cleanup/browser").and_then(Value::as_str)
         == Some("not_started")
         && result.pointer("/cleanup/profile").and_then(Value::as_str) == Some("not_created");

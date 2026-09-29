@@ -555,10 +555,6 @@ impl Job {
             .find_map(|step| step.first_missing_value(&self.values))
     }
 
-    pub fn first_unsupported_feature(&self) -> Option<&'static str> {
-        None
-    }
-
     fn expectation_ids(&self) -> impl Iterator<Item = &str> {
         self.expectations
             .iter()
@@ -1179,24 +1175,6 @@ mod tests {
             "future_addition": true
         });
         assert!(serde_json::from_value::<RunResult>(output).is_ok());
-    }
-
-    #[test]
-    fn accepted_job_features_are_supported_by_current_build() {
-        let mut natural = valid_job();
-        natural["steps"][0]["done_when"] = json!("The account exists");
-        assert_eq!(parse(&natural).unwrap().first_unsupported_feature(), None);
-
-        let mut expectation = valid_job();
-        expectation["expectations"] = json!([{"id": "account", "claim": "Account exists"}]);
-        assert_eq!(
-            parse(&expectation).unwrap().first_unsupported_feature(),
-            None
-        );
-
-        let mut option = valid_job();
-        option["options"]["pause_timeout_ms"] = json!(100_000);
-        assert_eq!(parse(&option).unwrap().first_unsupported_feature(), None);
     }
 
     #[test]
