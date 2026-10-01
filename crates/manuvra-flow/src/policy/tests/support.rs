@@ -75,7 +75,6 @@ pub(crate) fn judgments(operation: &str) -> Judgments {
         select_target: choice("1"),
         type_value: choice("name"),
         key: choice("Escape"),
-        hover_target: None,
         step_done: 0.5,
         usage: BTreeMap::new(),
         request_id: None,
@@ -183,8 +182,10 @@ pub(crate) fn hover_page() -> Observation {
 }
 
 pub(crate) fn hover(target: Option<&str>) -> Judgments {
-    let mut judgment = judgments("HOVER");
-    judgment.hover_target = target.map(choice);
+    let mut judgment = judgments("CLICK");
+    judgment.click_target = target
+        .map(choice)
+        .unwrap_or_else(|| choice("NO_CLICK_TARGET"));
     judgment
 }
 

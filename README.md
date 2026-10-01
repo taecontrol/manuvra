@@ -231,7 +231,7 @@ The remaining Money suites run on Linux with the same `MONEY_DIR`, `TYPESAFE_API
 - `make live-resume-dispositions` needs `XDG_RUNTIME_DIR`. It races two resumes for one escalation, then checks request replay, stale escalations, and request conflicts.
 - `make live-run-lifecycle` needs `XDG_RUNTIME_DIR`. It follows one forced-pause Run through attach, expiry, retry, and process exit.
 
-`make live-hover` runs the hover-reveal journey three times on Linux in headless Chromium against `tests/browser/hover-reveal.html` and needs no Money checkout. Every Run must pass.
+`make live-hover` runs the row-action, insertion-gap, selected-row twin, token-sequence, and project-options journeys three times each on Linux in headless Chromium and needs no Money checkout. Every Run counts. Project options may stop safely at `target_below_gate` with no execute candidate; all other journeys must pass. The report records each reveal operation’s confidence.
 
 The Linux keyboard matrix uses real Jev and Chromium with four synthetic journeys, five fresh Runs each: `escape-popover` closes a popover with Escape, `tab-enter-save` tabs to Save and activates it with Enter, `caller-execute-enter` does the same with a forced stop before Enter and one `execute` disposition, and `listbox-choice` chooses Beta in a combobox with arrow, Home, or End keys followed by Enter. Their jobs are `tests/live/keyboard/<journey>.json`. Run it with `make live-keyboard`, for example from an interactive Bash shell that loads `TYPESAFE_API_KEY`:
 

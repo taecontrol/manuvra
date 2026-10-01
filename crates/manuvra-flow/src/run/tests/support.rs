@@ -192,7 +192,6 @@ pub(crate) struct Turn {
     type_value: &'static str,
     key: &'static str,
     key_confidence: f64,
-    hover_target: Option<&'static str>,
     noul: f64,
 }
 
@@ -208,7 +207,6 @@ impl Turn {
             type_value: "NONE_FITS",
             key: "Escape",
             key_confidence: 1.0,
-            hover_target: None,
             noul: 0.01,
         }
     }
@@ -224,11 +222,8 @@ impl Turn {
         Self::new("SCROLL_DOWN")
     }
 
-    pub(crate) fn hover(region: &'static str) -> Self {
-        Self {
-            hover_target: Some(region),
-            ..Self::new("HOVER")
-        }
+    pub(crate) fn hover(reveal: &'static str) -> Self {
+        Self::click(reveal)
     }
 
     pub(crate) fn type_text() -> Self {
@@ -295,7 +290,6 @@ impl Turn {
             "select_target" => (self.select_target, 1.0),
             "type_value" => (self.type_value, 1.0),
             "key" => (self.key, self.key_confidence),
-            "hover_target" => (self.hover_target?, 1.0),
             other => panic!("unscripted question {other}"),
         };
         Some(manuvra_jev::Answer::Choice {
@@ -846,7 +840,7 @@ pub(crate) fn key_job(id: &str, goal: &str, done_when: Value, mutation_limit: u8
 }
 
 pub(crate) fn low_hover_turn() -> Turn {
-    Turn::hover("R1").confidence(0.59)
+    Turn::hover("R1_1").confidence(0.59)
 }
 
 /// A run paused on a below-gate `HOVER` escalation offering the Groceries region.
@@ -949,7 +943,6 @@ pub(crate) fn mutation_judgments(operation: &str, confidence: f64) -> judgment::
         select_target: choice("1"),
         type_value: choice("name"),
         key: choice("Escape"),
-        hover_target: None,
         step_done: 0.0,
         usage: BTreeMap::new(),
         request_id: None,

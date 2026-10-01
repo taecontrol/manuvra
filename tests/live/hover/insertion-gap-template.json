@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "target": {
+    "kind": "browser",
+    "url": "http://127.0.0.1:4480/insertion-gaps.html"
+  },
+  "context": {
+    "journey": "insertion-gap",
+    "revision": "{{revision}}",
+    "environment": "synthetic fixture on a temporary local port",
+    "actor": "synthetic user",
+    "authority": "act in this fixture only"
+  },
+  "steps": [
+    {
+      "id": "s1",
+      "goal": "Start inserting a new block between Primer bloque and Segundo bloque.",
+      "done_when": [
+        {
+          "text_visible": "Elige el tipo de bloque"
+        }
+      ]
+    }
+  ],
+  "options": {
+    "allowed_origins": [
+      "http://127.0.0.1:4480"
+    ],
+    "viewport": {
+      "width": 1120,
+      "height": 780
+    }
+  }
+}

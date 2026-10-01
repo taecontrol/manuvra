@@ -743,7 +743,7 @@ mod tests {
             ForcedStop {
                 job: force_stop(click_job()),
                 pages: vec![plan_before_hover(), plan_groceries_revealed()],
-                turns: vec![Turn::hover("R1"), Turn::click("2")],
+                turns: vec![Turn::hover("R1_1"), Turn::click("2")],
                 dispatches: vec![performed(&["mouse_move"])],
                 execute_first: false,
                 dispatched: vec![PreparedOperation::Hover],
@@ -819,7 +819,7 @@ mod tests {
             performed(&["mouse_move"]),
             performed(&["mouse_press", "mouse_release"]),
         ]);
-        let provider = ScriptedProvider::new([Turn::hover("R1"), Turn::click("2")]);
+        let provider = ScriptedProvider::new([Turn::hover("R1_1"), Turn::click("2")]);
 
         let artifacts = driven(
             &click_job(),
@@ -848,8 +848,7 @@ mod tests {
                 "final_verification_observation",
             ]
         );
-        let groceries =
-            json!({"index":1,"name":"Groceries","reveals_on_hover":["Actions for Groceries"]});
+        let groceries = json!({"index":1,"name":"Groceries","reveal":"Actions for Groceries","reveals_on_hover":["Actions for Groceries"]});
         assert_eq!(artifacts.trace[1]["hover_target"], groceries);
         assert_eq!(artifacts.trace[2]["fact"]["hover_target"], groceries);
         assert_eq!(artifacts.trace[2]["fact"]["outcome"], "observed");
@@ -873,7 +872,10 @@ mod tests {
             ]
         );
         let requests = provider.requests.lock().unwrap();
-        assert!(requests[0]["questions"]["operation"]["criteria"]["HOVER"].is_string());
+        assert_eq!(
+            requests[0]["questions"]["click_target"]["criteria"]["R1_1"]["revealed_by_hover"],
+            true
+        );
         assert_eq!(
             requests[1]["questions"]["click_target"]["criteria"]["2"]["name"],
             "Actions for Groceries"
@@ -884,7 +886,7 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|action| action.as_str().unwrap().contains(
-                    r#""hover_target":{"index":1,"name":"Groceries","reveals_on_hover":["Actions for Groceries"]}"#
+                    r#""hover_target":{"index":1,"name":"Groceries","reveal":"Actions for Groceries","reveals_on_hover":["Actions for Groceries"]}"#
                 ))
         );
     }
@@ -907,7 +909,7 @@ mod tests {
                 performed(&["mouse_release"]),
             ]);
             let provider =
-                ScriptedProvider::new([Turn::hover("R1"), Turn::hover("R1"), Turn::click("2")]);
+                ScriptedProvider::new([Turn::hover("R1_1"), Turn::hover("R1_1"), Turn::click("2")]);
 
             let artifacts = driven(
                 &click_job(),
@@ -942,14 +944,8 @@ mod tests {
         let cancellation = manuvra_chrome::InputCancellation::default();
         let mut policy = policy::Policy::new(&job.options, "http://127.0.0.1:4351/");
         let mut artifacts = RunArtifacts::new(&job, &redactor);
-        let judgments = judgment::Judgments {
-            hover_target: Some(judgment::ChoiceJudgment {
-                choice: "R1".into(),
-                probabilities: BTreeMap::from([("R1".into(), 1.0)]),
-                confidence: 1.0,
-            }),
-            ..mutation_judgments("HOVER", 1.0)
-        };
+        let mut judgments = mutation_judgments("CLICK", 1.0);
+        judgments.click_target.choice = "R1_1".into();
         let policy::Next::Mutate(permit) = policy.decide(
             &job.steps[0],
             &plan_before_hover(),
@@ -1262,5 +1258,23 @@ mod tests {
             let stop = artifacts.stop.unwrap();
             assert_eq!((stop.code, stop.state), (code, RunState::Blocked));
         }
+    }
+    #[test]
+    fn a_reveal_that_exposes_nothing_stops_on_replay_without_clicking() {
+        let browser =
+            FakeBrowser::new([plan_before_hover()]).dispatching([performed(&["mouse_move"])]);
+        let provider = ScriptedProvider::new([Turn::hover("R1_1")]);
+        let artifacts = driven(
+            &click_job(),
+            &browser,
+            &provider,
+            &mut MemoryJournal::default(),
+        );
+        assert_eq!(artifacts.stop.unwrap().code, "replay_forbidden");
+        assert_eq!(browser.dispatched(), 1);
+        assert_eq!(provider.calls(), 2);
+        let inputs = browser.inputs.lock().unwrap();
+        assert_eq!(inputs[0].operation, PreparedOperation::Hover);
+        assert!(artifacts.pending.unwrap().candidate.is_none());
     }
 }

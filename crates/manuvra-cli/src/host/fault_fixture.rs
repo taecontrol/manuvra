@@ -418,7 +418,6 @@ fn fault_judgments() -> manuvra_flow::judgment::Judgments {
         select_target: choice("NO_SELECT_TARGET"),
         type_value: choice("NONE_FITS"),
         key: choice("Escape"),
-        hover_target: None,
         step_done: 0.0,
         usage: BTreeMap::new(),
         request_id: None,

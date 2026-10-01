@@ -595,7 +595,7 @@ mod tests {
         let artifacts = driven(
             &job,
             &browser,
-            &ScriptedProvider::new([Turn::hover("R1")]),
+            &ScriptedProvider::new([Turn::hover("R1_1")]),
             &mut MemoryJournal::default(),
         );
         assert_eq!(
@@ -715,7 +715,7 @@ mod tests {
         );
         assert_eq!(
             journal.entries[0]["hover_target"],
-            json!({"index":1,"name":"Groceries","reveals_on_hover":["Actions for Groceries"]})
+            json!({"index":1,"name":"Groceries","reveals_on_hover":["Actions for Groceries"],"reveal":"Actions for Groceries"})
         );
         let inputs = browser.inputs.lock().unwrap();
         assert_eq!(

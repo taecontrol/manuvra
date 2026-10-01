@@ -2182,3 +2182,46 @@ fn recycled_virtualized_control_changes_container_while_its_node_stays_the_same(
     browser.close().unwrap();
     lifecycle.assert_cleaned();
 }
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn a_region_with_separate_hover_points_reveals_its_second_control_only() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(
+        r#"<!doctype html><style>
+      fieldset{width:400px}.group{display:inline-block;padding:20px;margin:20px}
+      .group button{opacity:0}.group:hover button{opacity:1}
+      </style><fieldset><legend>Tools</legend><span class="group"><button>Edit</button></span><div class="group"><button>Delete</button></div></fieldset>"#,
+    );
+    let mut browser = launch_headless();
+    let lifecycle = BrowserLifecycle::observe();
+    browser.navigate(&server.url()).unwrap();
+    let observed = browser.observe().unwrap();
+    assert_eq!(observed.hover_regions.len(), 1);
+    let region = &observed.hover_regions[0];
+    assert_eq!(region.reveals_on_hover, ["Edit", "Delete"]);
+    assert_eq!(region.reveal_roles, ["button", "button"]);
+    assert_eq!(region.reveal_node_ids.len(), 2);
+    assert_eq!(region.node_id, region.reveal_node_ids[0]);
+    browser
+        .perform(
+            PreparedInput {
+                document_id: observed.document_id,
+                node_id: region.reveal_node_ids[1],
+                operation: PreparedOperation::Hover,
+                text: None,
+                previous_text: None,
+                option_node_id: None,
+                combobox: false,
+                action_sequence: 1,
+                focus_anchor: None,
+            },
+            &InputCancellation::default(),
+        )
+        .unwrap();
+    let after = browser.observe().unwrap();
+    assert!(candidate(&after, "Delete").is_some());
+    assert!(candidate(&after, "Edit").is_none());
+    browser.close().unwrap();
+    lifecycle.assert_cleaned();
+}

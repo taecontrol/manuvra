@@ -151,7 +151,7 @@ When an offered candidate carries `target_container`, use that container label t
 
 A `target_below_gate` escalation offers `retry_observation` and `abort`, with resolved contenders and no candidate to execute. Inspect the contenders; retry the observation, or abort and start a job with a clearer step. Caller authority cannot replace an ambiguous target.
 
-An offered `HOVER` candidate names a hover region in `hover_target.name` and the controls it reveals in `hover_target.reveals_on_hover`. Execute it when a revealed control is the one the step needs. The hover only reveals those controls; Manuvra then continues the step on its own.
+An offered `HOVER` candidate names a hover region in `hover_target.name` and the chosen control in `hover_target.reveal`; `hover_target.reveals_on_hover` lists all controls in that region. Execute it when the chosen control is the one the step needs. The hover only reveals those controls; Manuvra then continues the step on its own.
 
 Example `execute` disposition:
 

@@ -2,7 +2,7 @@
 //! the key choice's validity and gate.
 
 use super::surface::selected_surface;
-use super::targeting::selected_target;
+use super::targeting::{dispatched_operation, selected_target};
 use super::{Next, PolicyStop};
 use crate::judgment::{Judgments, Operation, selected_operation};
 use crate::verification::DoneResult;
@@ -43,8 +43,7 @@ pub(super) fn ready_operation(
     if let Some(surface) = selected_surface(observation, judgments, operation) {
         return Err(Next::Stop(PolicyStop::UnsupportedSurface(surface)));
     }
-    let operation =
-        operation.ok_or(Next::Stop(PolicyStop::Blocked("provider_invalid_response")))?;
+    let operation = dispatched_operation(observation, judgments).map_err(Next::Stop)?;
     target_preflight(observation, judgments, operation, already_reobserved)?;
     if let Some(next) = operation_gate(judgments, operation, already_reobserved) {
         return Err(next);
@@ -498,7 +497,7 @@ mod tests {
     #[test]
     fn hover_follows_done_first_and_the_operation_gate() {
         let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
-        let selected = hover(Some("R1"));
+        let selected = hover(Some("R1_1"));
         let decide = |policy: &mut Policy, done, done_reobserved, judgment: &Judgments, gate| {
             policy.decide(
                 &natural_step(),
@@ -538,7 +537,10 @@ mod tests {
     fn hover_clears_a_lower_operation_gate_than_every_other_operation() {
         let gated = |operation: &str, confidence: f64, page: &Observation| {
             let mut judgment = judgments(operation);
-            judgment.hover_target = Some(choice("R1"));
+            if operation == "HOVER" {
+                judgment.operation = choice("CLICK");
+                judgment.click_target = choice("R1_1");
+            }
             judgment.operation.confidence = confidence;
             let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
             [false, true].map(|reobserved| {

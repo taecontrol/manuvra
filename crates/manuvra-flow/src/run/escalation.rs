@@ -69,9 +69,13 @@ pub(super) fn escalate(
 
 fn resolved_click_contenders(observation: &Observation, judgments: &judgment::Judgments) -> Value {
     judgments.click_target.probabilities.iter().filter_map(|(key, probability)| {
-        let index = key.parse::<u64>().ok()?;
-        let element = observation.elements.iter().find(|e| e.index == index)?;
-        Some(json!({"key":key,"probability":probability,"role":element.role,"name":element.name,"container":element.container}))
+        let mut contender = match crate::policy::click_choice(observation, key)? {
+            crate::policy::ClickChoice::Element(element) => json!({"role":element.role,"name":element.name,"container":element.container}),
+            crate::policy::ClickChoice::Reveal { region, offset } => json!({"role":region.reveal_roles[offset],"name":region.reveals_on_hover[offset],"container":region.name,"revealed_by_hover":true}),
+        };
+        contender["key"] = json!(key);
+        contender["probability"] = json!(probability);
+        Some(contender)
     }).collect()
 }
 
@@ -361,7 +365,7 @@ mod tests {
         let offered = json!({
             "id":"c_1","operation":"HOVER","target_name":null,"target_role":null,
             "target_dialog":null,"target_input_type":null,"value_name":null,
-            "hover_target":{"name":"Groceries","reveals_on_hover":["Actions for Groceries"]}
+            "hover_target":{"name":"Groceries","reveals_on_hover":["Actions for Groceries"],"reveal":"Actions for Groceries"}
         });
         assert_eq!(escalation["offered_candidate"], offered);
         assert_eq!(escalation["candidates"], json!([offered]));
@@ -399,5 +403,19 @@ mod tests {
         let exported = payload.to_string();
         assert!(!exported.contains("Groceries"));
         assert!(!redactor.contains_export_leak(exported.as_bytes()));
+    }
+    #[test]
+    fn resolved_contenders_decode_reveal_keys_alongside_visible_targets() {
+        let mut page = plan_before_hover();
+        let mut answer = mutation_judgments("CLICK", 1.0);
+        answer.click_target.probabilities =
+            BTreeMap::from([("R2_1".into(), 0.4), ("1".into(), 0.6)]);
+        page.hover_regions[1].reveal_roles[0] = "menuitem".into();
+        let contenders = resolved_click_contenders(&page, &answer);
+        assert_eq!(
+            contenders[1],
+            json!({"key":"R2_1","probability":0.4,"role":"menuitem","name":"Actions for Rent","container":"Rent","revealed_by_hover":true})
+        );
+        assert_eq!(contenders[0]["key"], "1");
     }
 }

@@ -100,11 +100,17 @@ pub(crate) struct HoverRevealFixture {
 
 impl HoverRevealFixture {
     pub(crate) fn start() -> Self {
+        Self::with_body(include_str!(
+            "../../../../../tests/browser/hover-reveal.html"
+        ))
+    }
+
+    pub(crate) fn with_body(body: &str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
         let stop = Arc::new(AtomicBool::new(false));
-        let body = include_str!("../../../../../tests/browser/hover-reveal.html").to_owned();
+        let body = body.to_owned();
         Self {
             port,
             worker: Some(spawn_page_server(listener, body, Arc::clone(&stop))),
@@ -221,30 +227,15 @@ impl RowActionProvider {
             .expect("scripted goal")
     }
 
-    fn choose(request: &Value, wanted: &str) -> (&'static str, String, String) {
-        let key_where = |question: &str, matches: &dyn Fn(&Value) -> bool| {
-            request["questions"][question]["criteria"]
-                .as_object()
-                .and_then(|criteria| {
-                    criteria
-                        .iter()
-                        .find(|(_, criterion)| matches(criterion))
-                        .map(|(key, _)| key.clone())
-                })
-        };
-        if let Some(key) = key_where("click_target", &|criterion| {
-            criterion["name"] == wanted && criterion["disabled"] == false
-        }) {
-            return ("CLICK", key, "NO_HOVER_TARGET".into());
-        }
-        key_where("hover_target", &|criterion| {
-            criterion["reveals_on_hover"]
-                .as_array()
-                .is_some_and(|reveals| reveals.iter().any(|name| name == wanted))
-        })
-        .map_or(("BLOCKED", String::new(), String::new()), |key| {
-            ("HOVER", "NO_CLICK_TARGET".into(), key)
-        })
+    fn choose(request: &Value, wanted: &str) -> (&'static str, String) {
+        request["questions"]["click_target"]["criteria"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .find(|(_, criterion)| criterion["name"] == wanted && criterion["disabled"] == false)
+            .map_or(("BLOCKED", String::new()), |(key, _)| {
+                ("CLICK", key.clone())
+            })
     }
 
     pub(crate) fn calls(&self) -> usize {
@@ -259,13 +250,13 @@ impl manuvra_jev::Evaluator for RowActionProvider {
         _deadline: Instant,
     ) -> Result<manuvra_jev::Evaluation, manuvra_jev::JevError> {
         let wanted = self.wanted_control(request);
-        let (operation, click, hover) = Self::choose(request, wanted);
+        let (operation, click) = Self::choose(request, wanted);
         let expanded = request["state"]["page"]["elements"]
             .as_array()
             .unwrap()
             .iter()
             .any(|element| element["name"] == wanted && element["expanded"] == true);
-        let target_name = if operation == "HOVER" { &hover } else { &click };
+        let target_name = &click;
         self.choices.lock().unwrap().push((
             operation.to_owned(),
             target_name.clone(),
@@ -276,7 +267,7 @@ impl manuvra_jev::Evaluator for RowActionProvider {
             probabilities: BTreeMap::from([(selected.into(), 0.9)]),
             confidence: 0.9,
         };
-        let mut answers = BTreeMap::from([
+        let answers = BTreeMap::from([
             ("operation".into(), choice(operation)),
             ("click_target".into(), choice(&click)),
             ("type_target".into(), choice("NO_TYPE_TEXT_TARGET")),
@@ -290,9 +281,6 @@ impl manuvra_jev::Evaluator for RowActionProvider {
                 },
             ),
         ]);
-        if request["questions"].get("hover_target").is_some() {
-            answers.insert("hover_target".into(), choice(&hover));
-        }
         Ok(manuvra_jev::Evaluation {
             answers,
             usage: BTreeMap::new(),

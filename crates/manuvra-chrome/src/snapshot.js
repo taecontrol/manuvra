@@ -189,8 +189,11 @@
     const labeled = revealingRegion(element);
     const revealRegion = labeled || (hoverRevealed(element) ? unlabeledRegion(element) : null); if (!revealRegion) continue;
     const container = containerNode(element), region = container || revealRegion;
-    if (!regionRecords.has(region)) regionRecords.set(region, {name:(container ? containerLabel(container) : labeled ? (region.getAttribute('aria-label') || region.innerText.replace(/\s+/g,' ').trim()) : regionName(region)).slice(0,REGION_NAME_LIMIT),reveals_on_hover:[],node_id:nodeId(element)});
-    regionRecords.get(region).reveals_on_hover.push(name(element) || role(element));
+    if (!regionRecords.has(region)) regionRecords.set(region, {name:(container ? containerLabel(container) : labeled ? (region.getAttribute('aria-label') || region.innerText.replace(/\s+/g,' ').trim()) : regionName(region)).slice(0,REGION_NAME_LIMIT),reveals_on_hover:[],reveal_roles:[],reveal_node_ids:[],node_id:nodeId(element)});
+    const record = regionRecords.get(region);
+    record.reveals_on_hover.push(name(element) || role(element));
+    record.reveal_roles.push(role(element));
+    record.reveal_node_ids.push(nodeId(element));
   }
   const hoverRegions = [...regionRecords.values()].slice(0, REGION_LIMIT).map((record, offset) => ({index:offset + 1, ...record}));
 

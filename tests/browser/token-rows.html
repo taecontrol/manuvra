@@ -1,0 +1,12 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Tokens</title><style>
+body{font:14px sans-serif;margin:16px} .row{display:grid;grid-template-columns:220px 260px 80px;padding:6px;border-bottom:1px solid #eee}
+.opacity-0{opacity:0} .group:hover .group-hover\:opacity-100{opacity:1}
+</style></head><body><h1>API tokens</h1><div id="t"><div class="row"><b>Name</b><b>Created</b><b></b></div></div><p id="toast"></p>
+<script>
+for (const [n, d] of [['Production token','2026-01-04'],['Staging token','2026-03-19'],['Development token','2026-07-02']]) {
+  const r = document.createElement('div'); r.className = 'row group';
+  r.innerHTML = `<span>${n}</span><span>${d}</span><button class="opacity-0 group-hover:opacity-100">Copy</button>`;
+  r.querySelector('button').onclick = () => { toast.textContent = `Copied ${n}`; };
+  t.append(r);
+}
+</script></body></html>

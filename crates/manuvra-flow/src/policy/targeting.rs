@@ -2,7 +2,7 @@
 //! observation, and the native select option a `SELECT` needs.
 
 use super::{Candidate, Policy, PolicyStop};
-use crate::judgment::{ChoiceJudgment, Judgments, Operation, hover_region_key};
+use crate::judgment::{ChoiceJudgment, Judgments, Operation, selected_operation};
 use manuvra_chrome::{Element, HoverRegion, Observation, SelectOption};
 
 pub(super) fn selected_target<'a>(
@@ -28,16 +28,74 @@ pub(super) fn selected_element<'a>(
     parse_target(observation, &answer.choice)
 }
 
-/// The listed hover region named by the `hover_target` answer, if any.
-pub(super) fn selected_hover_region<'a>(
-    observation: &'a Observation,
-    judgments: &Judgments,
-) -> Option<&'a HoverRegion> {
-    let choice = &judgments.hover_target.as_ref()?.choice;
-    observation
+/// A click choice resolves to a visible element or to one hidden control to reveal.
+#[derive(Debug)]
+pub(crate) enum ClickChoice<'a> {
+    Element(&'a Element),
+    Reveal {
+        region: &'a HoverRegion,
+        offset: usize,
+    },
+}
+
+pub(crate) fn reveal_key(region: u64, offset: usize) -> String {
+    format!("R{region}_{}", offset + 1)
+}
+
+pub(crate) fn click_choice<'a>(observation: &'a Observation, key: &str) -> Option<ClickChoice<'a>> {
+    if let Some(element) = parse_target(observation, key) {
+        return Some(ClickChoice::Element(element));
+    }
+    reveal_choice(observation, key)
+}
+
+fn reveal_choice<'a>(observation: &'a Observation, key: &str) -> Option<ClickChoice<'a>> {
+    let (index, offset) = parse_reveal_key(key)?;
+    let region = observation
         .hover_regions
         .iter()
-        .find(|region| hover_region_key(region) == *choice)
+        .find(|region| region.index == index)?;
+    if reveal_key(index, offset) != key
+        || offset >= region.reveals_on_hover.len()
+        || offset >= region.reveal_roles.len()
+        || offset >= region.reveal_node_ids.len()
+    {
+        return None;
+    }
+    Some(ClickChoice::Reveal { region, offset })
+}
+
+fn parse_reveal_key(key: &str) -> Option<(u64, usize)> {
+    let (region, ordinal) = key.strip_prefix('R')?.split_once('_')?;
+    let index = region.parse::<u64>().ok()?;
+    let offset = ordinal.parse::<usize>().ok()?.checked_sub(1)?;
+    Some((index, offset))
+}
+
+pub(super) fn selected_reveal<'a>(
+    observation: &'a Observation,
+    judgments: &Judgments,
+) -> Option<(&'a HoverRegion, usize)> {
+    match click_choice(observation, &judgments.click_target.choice)? {
+        ClickChoice::Reveal { region, offset } => Some((region, offset)),
+        ClickChoice::Element(_) => None,
+    }
+}
+
+pub(super) fn dispatched_operation(
+    observation: &Observation,
+    judgments: &Judgments,
+) -> Result<Operation, PolicyStop> {
+    let operation = selected_operation(judgments)
+        .map_err(|_| PolicyStop::Blocked("provider_invalid_response"))?;
+    if operation != Operation::Click {
+        return Ok(operation);
+    }
+    match click_choice(observation, &judgments.click_target.choice) {
+        Some(ClickChoice::Element(_)) => Ok(Operation::Click),
+        Some(ClickChoice::Reveal { .. }) => Ok(Operation::Hover),
+        None => Err(PolicyStop::Blocked("provider_invalid_response")),
+    }
 }
 
 pub(super) fn selected_value(
@@ -158,7 +216,16 @@ mod tests {
 
     #[test]
     fn missing_or_unlisted_hover_target_is_an_invalid_provider_response() {
-        for target in [None, Some("R9"), Some("1"), Some("2")] {
+        for target in [
+            None,
+            Some("R9_1"),
+            Some("R1_0"),
+            Some("R1_2"),
+            Some("R01_1"),
+            Some("R1"),
+            Some("R1_1x"),
+            Some("999"),
+        ] {
             let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
             assert!(
                 matches!(
@@ -169,5 +236,48 @@ mod tests {
             );
             assert_eq!(policy.actions, 0);
         }
+    }
+    #[test]
+    fn reveal_keys_round_trip_to_the_chosen_control_and_bare_hover_is_rejected() {
+        let mut page = hover_page();
+        page.hover_regions[0].reveals_on_hover.push("Delete".into());
+        page.hover_regions[0].reveal_roles.push("button".into());
+        page.hover_regions[0].reveal_node_ids.push(43);
+        for (offset, name) in [(0, "Actions for Groceries"), (1, "Delete")] {
+            let key = reveal_key(1, offset);
+            let Some(ClickChoice::Reveal {
+                region,
+                offset: actual,
+            }) = click_choice(&page, &key)
+            else {
+                panic!("reveal {key}");
+            };
+            assert_eq!(actual, offset);
+            assert_eq!(region.reveals_on_hover[actual], name);
+            let mut answer = hover(Some(&key));
+            answer.click_target.confidence = 0.01;
+            answer.operation.confidence = 0.60;
+            let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+            assert_eq!(
+                minted(decide_not_done(&mut policy, &step(), &page, &answer, false)).operation(),
+                Operation::Hover
+            );
+            assert_eq!(
+                policy.caller_candidate(&page, &answer).unwrap().operation,
+                Operation::Hover
+            );
+        }
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        let raw = judgments("HOVER");
+        assert!(matches!(
+            decide_not_done(&mut policy, &step(), &page, &raw, false),
+            Next::Stop(PolicyStop::Blocked("provider_invalid_response"))
+        ));
+        assert_eq!(
+            policy.caller_candidate(&page, &raw),
+            Err(PolicyStop::Blocked("provider_invalid_response"))
+        );
+        page.hover_regions[0].reveal_node_ids.clear();
+        assert!(click_choice(&page, "R1_1").is_none());
     }
 }

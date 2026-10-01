@@ -1,4 +1,4 @@
-use manuvra_chrome::{HoverRegion, Observation};
+use manuvra_chrome::Observation;
 use manuvra_contract::{Job, JobValue};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -100,14 +100,6 @@ impl<'a> Values<'a> {
             }
         }
         view
-    }
-
-    /// A hover region as the provider sees it: masked page text, without its dispatch identity.
-    pub(crate) fn hover_region_view(&self, region: &HoverRegion) -> Value {
-        json!({
-            "name":self.mask(&region.name),
-            "reveals_on_hover":region.reveals_on_hover.iter().map(|name|self.mask(name)).collect::<Vec<_>>(),
-        })
     }
 
     pub fn descriptions(&self) -> Value {

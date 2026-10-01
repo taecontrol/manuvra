@@ -9,5 +9,7 @@ pub(crate) fn hover_region(index: u64, name: &str, node_id: u64) -> HoverRegion 
         name: name.into(),
         reveals_on_hover: vec![format!("Actions for {name}")],
         node_id,
+        reveal_roles: vec!["button".into()],
+        reveal_node_ids: vec![node_id],
     }
 }

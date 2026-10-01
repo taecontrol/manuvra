@@ -1,0 +1,12 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Rows</title><style>
+body{font:14px sans-serif;margin:16px} li{display:flex;gap:12px;padding:6px;border-bottom:1px solid #eee;width:360px}
+li .edit{opacity:0} li:hover .edit, li.selected .edit{opacity:1} li.selected{background:#eef}
+</style></head><body><h1>Rows</h1><ul id="l"></ul><h2 id="h"></h2>
+<script>
+for (const n of ['Alpha','Bravo','Charlie']) {
+  const li = document.createElement('li'); if (n === 'Alpha') li.className = 'selected';
+  li.innerHTML = `<span>${n}</span><button class="edit">Edit</button>`;
+  li.querySelector('button').onclick = () => { h.textContent = `Editing ${n}`; };
+  l.append(li);
+}
+</script></body></html>

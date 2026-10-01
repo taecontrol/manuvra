@@ -1029,6 +1029,8 @@ mod tests {
             name: "Groceries".into(),
             reveals_on_hover: vec!["Actions for Groceries".into()],
             node_id: 41,
+            reveal_roles: vec!["button".into()],
+            reveal_node_ids: vec![41],
         }];
         let request = expectation_request(&expectations, &with_regions, &values);
         assert_eq!(

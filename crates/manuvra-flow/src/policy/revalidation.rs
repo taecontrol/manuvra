@@ -231,7 +231,7 @@ mod tests {
     fn caller_hover_authority_revalidates_region_identity_budgets_origin_and_replay() {
         let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
         let candidate = policy
-            .caller_candidate(&hover_page(), &hover(Some("R1")))
+            .caller_candidate(&hover_page(), &hover(Some("R1_1")))
             .unwrap();
         let mut remounted = hover_page();
         remounted.hover_regions[0].node_id = 77;
@@ -294,7 +294,7 @@ mod tests {
             &mut policy,
             &step(),
             &hover_page(),
-            &hover(Some("R1")),
+            &hover(Some("R1_1")),
             false,
         ))
         .consume();

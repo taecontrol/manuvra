@@ -18,7 +18,8 @@ impl Policy {
             }
             Operation::Hover => candidate
                 .hover_region(observation)
-                .map(|region| hover_replay_key(observation, region)),
+                .zip(candidate.hover_target.as_ref())
+                .map(|(region, target)| hover_replay_key(observation, region, &target.reveal)),
             Operation::PressKey => {
                 let state = candidate.focus_anchor.as_ref().map(focus_state);
                 Some(self.key_digest(observation, candidate, state))
@@ -73,7 +74,7 @@ fn replay_key(observation: &Observation, target: &Element, candidate: &Candidate
 
 /// The same region in an unchanged region list is one hover; any change to the list's names or
 /// reveals makes it a new one.
-fn hover_replay_key(observation: &Observation, region: &HoverRegion) -> String {
+fn hover_replay_key(observation: &Observation, region: &HoverRegion, reveal: &str) -> String {
     let listed: Vec<_> = observation
         .hover_regions
         .iter()
@@ -83,6 +84,7 @@ fn hover_replay_key(observation: &Observation, region: &HoverRegion) -> String {
         "operation":Operation::Hover,
         "route":observation.route,
         "region_name":region.name,
+        "reveal":reveal,
         "reveals_on_hover":region.reveals_on_hover,
         "hover_regions":hex::encode(Sha256::digest(serde_json::Value::from(listed).to_string().as_bytes())),
     });
@@ -549,7 +551,7 @@ mod tests {
             &mut policy,
             &step(),
             &hover_page(),
-            &hover(Some("R1")),
+            &hover(Some("R1_1")),
             false,
         ));
         assert!(matches!(
@@ -557,7 +559,7 @@ mod tests {
                 &mut policy,
                 &step(),
                 &hover_page(),
-                &hover(Some("R1")),
+                &hover(Some("R1_1")),
                 false
             ),
             Next::Stop(PolicyStop::Uncertain("replay_forbidden"))
@@ -566,8 +568,9 @@ mod tests {
         let mut remounted = hover_page();
         remounted.document_id = "new-document".into();
         remounted.hover_regions[0].node_id = 99;
+        remounted.hover_regions[0].reveal_node_ids[0] = 99;
         assert!(matches!(
-            decide_not_done(&mut policy, &later, &remounted, &hover(Some("R1")), false),
+            decide_not_done(&mut policy, &later, &remounted, &hover(Some("R1_1")), false),
             Next::Stop(PolicyStop::Uncertain("replay_forbidden"))
         ));
         let mut changed = hover_page();
@@ -576,8 +579,33 @@ mod tests {
             &mut policy,
             &later,
             &changed,
-            &hover(Some("R1")),
+            &hover(Some("R1_1")),
             false,
         ));
+    }
+    #[test]
+    fn different_controls_in_one_region_have_distinct_hover_replay_keys() {
+        let mut page = hover_page();
+        page.hover_regions[0].reveals_on_hover.push("Delete".into());
+        page.hover_regions[0].reveal_roles.push("button".into());
+        page.hover_regions[0].reveal_node_ids.push(99);
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        let first = minted(decide_not_done(
+            &mut policy,
+            &step(),
+            &page,
+            &hover(Some("R1_1")),
+            false,
+        ));
+        policy.record_observed(&first.replay_key);
+        let second = minted(decide_not_done(
+            &mut policy,
+            &step(),
+            &page,
+            &hover(Some("R1_2")),
+            false,
+        ));
+        assert_ne!(first.replay_key, second.replay_key);
+        assert_eq!(second.consume().0.hover_target.unwrap().reveal, "Delete");
     }
 }

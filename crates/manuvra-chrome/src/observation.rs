@@ -38,14 +38,18 @@ pub struct Observation {
 }
 
 /// A visible container holding controls that are hidden by opacity until the pointer is over it.
-/// Its hidden controls are never candidates; hovering the region reveals them.
+/// Hidden controls are reveal choices; policy hovers before judging the visible click.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HoverRegion {
     pub index: u64,
     pub name: String,
     pub reveals_on_hover: Vec<String>,
-    /// The first hidden control, whose center is the hover point. Internal to dispatch; never
-    /// persisted or published.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reveal_roles: Vec<String>,
+    /// Hidden controls aligned with their names and roles. Internal dispatch identity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reveal_node_ids: Vec<u64>,
+    /// The first hidden control, retained for region observation compatibility.
     pub node_id: u64,
 }
 
@@ -378,6 +382,8 @@ mod tests {
                 name: "Groceries".into(),
                 reveals_on_hover: vec!["Actions for Groceries".into()],
                 node_id: 42,
+                reveal_roles: Vec::new(),
+                reveal_node_ids: Vec::new(),
             }]
         );
         assert!(observation.hover_regions_truncated);

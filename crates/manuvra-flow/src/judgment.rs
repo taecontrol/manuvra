@@ -1,5 +1,5 @@
 use crate::values::Values;
-use manuvra_chrome::{Element, HoverRegion, Observation};
+use manuvra_chrome::{Element, Observation};
 use manuvra_contract::{DoneCondition, Step};
 use manuvra_jev::{Answer, Evaluation, Evaluator, JevError};
 use serde::{Deserialize, Serialize};
@@ -48,9 +48,6 @@ pub struct Judgments {
     pub select_target: ChoiceJudgment,
     pub type_value: ChoiceJudgment,
     pub key: ChoiceJudgment,
-    /// The hover region choice, asked only when the observation lists hover regions.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hover_target: Option<ChoiceJudgment>,
     pub step_done: f64,
     pub usage: BTreeMap<String, u64>,
     pub request_id: Option<String>,
@@ -119,40 +116,18 @@ pub fn request(
         request["questions"]["click_target"]["instructions"]["rules"] =
             json!(contested_target_rules());
     }
-    offer_hover(&mut request, step, observation, values);
+    if !observation.hover_regions.is_empty() {
+        request["questions"]["click_target"]["instructions"]["rules"] =
+            json!(reveal_target_rules());
+        request["questions"]["operation"]["criteria"]["CLICK"] = json!(
+            "Click a control or option listed as a click target that directly advances this step, including targets marked revealed_by_hover, which code reveals before clicking. Use this for goals that say open, choose, confirm, use, or submit."
+        );
+    }
     request
 }
 
-/// Offers `HOVER` only when the observation lists hover regions, adding exactly
-/// `page.hover_regions`, the operation criterion, and the `hover_target` question. Only the
-/// judgment request offers `HOVER`, so only it lists the regions.
-fn offer_hover(request: &mut Value, step: &Step, observation: &Observation, values: &Values<'_>) {
-    if observation.hover_regions.is_empty() {
-        return;
-    }
-    request["state"]["page"]["hover_regions"] = observation
-        .hover_regions
-        .iter()
-        .map(|region| {
-            let mut listed = values.hover_region_view(region);
-            listed["key"] = Value::String(hover_region_key(region));
-            listed
-        })
-        .collect();
-    let criteria: Map<String, Value> = observation
-        .hover_regions
-        .iter()
-        .map(|region| (hover_region_key(region), values.hover_region_view(region)))
-        .collect();
-    request["questions"]["operation"]["criteria"]["HOVER"] = json!(
-        "Move the pointer over a listed hover region. Use this when the control this step needs is not among the visible CLICK targets but appears in a hover region's reveals_on_hover, including for goals that say open, choose, or use. Never choose this when the control this step needs is already among the visible CLICK targets and is not in any hover region's reveals_on_hover."
-    );
-    request["questions"]["hover_target"] = json!({"type":"choice","instructions":{"premise":"The operation is HOVER","rules":"Assume the named operation was selected independently. Choose the hover region that reveals the control that directly advances only the current step.","goal":values.mask(&step.goal)},"criteria":criteria});
-}
-
-/// The provider-facing key of a hover region, distinct from element indices.
-pub(crate) fn hover_region_key(region: &HoverRegion) -> String {
-    format!("R{}", region.index)
+fn reveal_target_rules() -> &'static str {
+    "Assume the named operation was selected independently. Choose the target that directly advances only the current step. A target's container names the row, card, or item it belongs to; when the step names an item, choose the target whose container is that item, even if another target with the same name is visible. Targets marked revealed_by_hover are valid: code reveals them before clicking. Do not select a field already equal to the required caller value."
 }
 
 fn step_done_question(step: &Step, values: &Values<'_>) -> Value {
@@ -222,6 +197,9 @@ fn target_criteria(observation: &Observation, operation: &str, values: &Values<'
             );
         }
     }
+    if operation == "CLICK" {
+        offer_reveals(&mut criteria, observation, values);
+    }
     if criteria.is_empty() {
         criteria.insert(
             format!("NO_{operation}_TARGET"),
@@ -229,6 +207,26 @@ fn target_criteria(observation: &Observation, operation: &str, values: &Values<'
         );
     }
     Value::Object(criteria)
+}
+
+fn offer_reveals(
+    criteria: &mut Map<String, Value>,
+    observation: &Observation,
+    values: &Values<'_>,
+) {
+    for region in &observation.hover_regions {
+        for (offset, name) in region.reveals_on_hover.iter().enumerate() {
+            if let Some(role) = region.reveal_roles.get(offset) {
+                criteria.insert(
+                    crate::policy::reveal_key(region.index, offset),
+                    json!({
+                        "role":role,"name":values.mask(name),"container":values.mask(&region.name),
+                        "dialog":null,"disabled":false,"revealed_by_hover":true,
+                    }),
+                );
+            }
+        }
+    }
 }
 
 fn target_description(element: &Element, observation: &Observation, values: &Values<'_>) -> Value {
@@ -249,7 +247,6 @@ fn consume(request: Value, evaluation: Evaluation) -> Result<Judgments, JevError
         select_target,
         type_value: choice(&evaluation, "type_value")?,
         key: choice(&evaluation, "key")?,
-        hover_target: optional_choice(&evaluation, "hover_target")?,
         step_done: noul(&evaluation, "step_done")?,
         usage: evaluation.usage,
         request_id: evaluation.request_id,
@@ -285,14 +282,6 @@ fn choice(evaluation: &Evaluation, id: &str) -> Result<ChoiceJudgment, JevError>
     }
 }
 
-fn optional_choice(evaluation: &Evaluation, id: &str) -> Result<Option<ChoiceJudgment>, JevError> {
-    evaluation
-        .answers
-        .contains_key(id)
-        .then(|| choice(evaluation, id))
-        .transpose()
-}
-
 fn noul(evaluation: &Evaluation, id: &str) -> Result<f64, JevError> {
     match evaluation.answers.get(id) {
         Some(Answer::Noul { noul }) => Ok(*noul),
@@ -303,6 +292,11 @@ fn noul(evaluation: &Evaluation, id: &str) -> Result<f64, JevError> {
 }
 
 pub fn selected_operation(judgments: &Judgments) -> Result<Operation, JevError> {
+    if judgments.operation.choice == "HOVER" {
+        return Err(JevError::InvalidResponse(
+            "operation was outside the closed roster".into(),
+        ));
+    }
     serde_json::from_value(Value::String(judgments.operation.choice.clone()))
         .map_err(|_| JevError::InvalidResponse("operation was outside the closed roster".into()))
 }
@@ -609,73 +603,62 @@ mod tests {
                 name: "Savings 4417".into(),
                 reveals_on_hover: vec!["Actions for Savings 4417".into()],
                 node_id: 41,
+                reveal_roles: vec!["button".into()],
+                reveal_node_ids: vec![41],
             },
             HoverRegion {
                 index: 2,
                 name: "Rent".into(),
                 reveals_on_hover: vec!["Actions for Rent".into(), "Rename Rent".into()],
                 node_id: 42,
+                reveal_roles: vec!["button".into(), "button".into()],
+                reveal_node_ids: vec![42, 43],
             },
         ];
         observation
     }
 
-    fn without(value: &Value, path: &str, key: &str) -> Value {
-        let mut value = value.clone();
-        value
-            .pointer_mut(path)
-            .and_then(Value::as_object_mut)
-            .unwrap()
-            .remove(key)
-            .expect("added item");
-        value
-    }
-
     #[test]
-    fn request_with_hover_regions_adds_exactly_the_three_hover_items_with_masked_region_text() {
+    fn request_with_regions_pins_reveal_additions_and_masked_container_text() {
         let job = golden_job();
-        let values = Values::new(&job);
-        let plain = request(&job.steps[0], &golden_observation(), &[], &values);
+        let recent = [json!({"event":"action_fact","fact":{"target_name":"Savings 4417"}})];
+        let plain = request(
+            &job.steps[0],
+            &golden_observation(),
+            &recent,
+            &Values::new(&job),
+        );
         let offered = request(
             &job.steps[0],
             &with_hover_regions(golden_observation()),
-            &[],
-            &values,
+            &recent,
+            &Values::new(&job),
         );
-
-        let stripped = without(&offered, "/state/page", "hover_regions");
-        let stripped = without(&stripped, "/questions/operation/criteria", "HOVER");
-        let stripped = without(&stripped, "/questions", "hover_target");
+        assert_eq!(
+            offered.to_string(),
+            include_str!("../tests/fixtures/judgment-request-with-reveal-targets.json").trim_end()
+        );
+        assert_eq!(
+            offered["questions"]["click_target"]["criteria"]["R1_1"],
+            json!({"role":"button","name":"Actions for <value:account>","container":"<value:account>","dialog":null,"disabled":false,"revealed_by_hover":true})
+        );
+        assert_eq!(
+            offered["questions"]["click_target"]["criteria"]["R2_2"]["name"],
+            "Rename Rent"
+        );
+        assert!(offered["state"]["page"].get("hover_regions").is_none());
+        assert!(offered["questions"].get("hover_target").is_none());
+        assert!(
+            offered["questions"]["operation"]["criteria"]
+                .get("HOVER")
+                .is_none()
+        );
+        let mut stripped = offered.clone();
+        stripped["questions"]["click_target"] = plain["questions"]["click_target"].clone();
+        stripped["questions"]["operation"]["criteria"]["CLICK"] =
+            plain["questions"]["operation"]["criteria"]["CLICK"].clone();
         assert_eq!(stripped, plain);
-        assert_eq!(
-            offered["state"]["page"]["hover_regions"],
-            json!([
-                {"key":"R1","name":"<value:account>","reveals_on_hover":["Actions for <value:account>"]},
-                {"key":"R2","name":"Rent","reveals_on_hover":["Actions for Rent","Rename Rent"]}
-            ])
-        );
-        assert_eq!(
-            offered["questions"]["operation"]["criteria"]["HOVER"],
-            "Move the pointer over a listed hover region. Use this when the control this step needs is not among the visible CLICK targets but appears in a hover region's reveals_on_hover, including for goals that say open, choose, or use. Never choose this when the control this step needs is already among the visible CLICK targets and is not in any hover region's reveals_on_hover."
-        );
-        assert_eq!(
-            offered["questions"]["hover_target"],
-            json!({
-                "type":"choice",
-                "instructions":{
-                    "premise":"The operation is HOVER",
-                    "rules":"Assume the named operation was selected independently. Choose the hover region that reveals the control that directly advances only the current step.",
-                    "goal":"Open the actions menu for <value:account>"
-                },
-                "criteria":{
-                    "R1":{"name":"<value:account>","reveals_on_hover":["Actions for <value:account>"]},
-                    "R2":{"name":"Rent","reveals_on_hover":["Actions for Rent","Rename Rent"]}
-                }
-            })
-        );
-        let body = offered.to_string();
-        assert!(!body.contains("\"node_id\""));
-        assert!(!body.contains("\"41\"") && !body.contains(":41"));
+        assert!(!offered.to_string().contains("node_id"));
     }
 
     fn evaluation_with(extra: Option<(&str, Answer)>) -> Evaluation {
@@ -705,38 +688,33 @@ mod tests {
     }
 
     #[test]
-    fn hover_target_is_parsed_only_when_answered_and_must_be_a_choice() {
+    fn decisions_keep_raw_reveal_answers_and_reject_a_bare_hover() {
         let answered = consume(
             Value::Null,
             evaluation_with(Some((
-                "hover_target",
+                "operation",
                 Answer::Choice {
-                    choice: "R2".into(),
-                    probabilities: BTreeMap::from([("R2".into(), 1.0)]),
-                    confidence: 1.0,
+                    choice: "CLICK".into(),
+                    probabilities: BTreeMap::from([("CLICK".into(), 0.61)]),
+                    confidence: 0.61,
                 },
             ))),
         )
         .unwrap();
-        assert_eq!(answered.hover_target.as_ref().unwrap().choice, "R2");
-        assert_eq!(selected_operation(&answered), Ok(Operation::Hover));
-
-        let unasked = consume(Value::Null, evaluation_with(None)).unwrap();
-        assert!(unasked.hover_target.is_none());
+        assert_eq!(answered.operation.choice, "CLICK");
+        assert_eq!(answered.operation.confidence, 0.61);
+        assert_eq!(selected_operation(&answered), Ok(Operation::Click));
+        let bare = consume(Value::Null, evaluation_with(None)).unwrap();
+        assert!(matches!(
+            selected_operation(&bare),
+            Err(JevError::InvalidResponse(_))
+        ));
         assert!(
-            serde_json::to_value(&unasked)
+            serde_json::to_value(&bare)
                 .unwrap()
                 .get("hover_target")
                 .is_none()
         );
-
-        assert!(matches!(
-            consume(
-                Value::Null,
-                evaluation_with(Some(("hover_target", Answer::Noul { noul: 0.5 })))
-            ),
-            Err(JevError::InvalidResponse(_))
-        ));
     }
 
     #[test]
@@ -811,7 +789,6 @@ mod tests {
                 probabilities: BTreeMap::new(),
                 confidence: 1.0,
             },
-            hover_target: None,
             step_done: 0.0,
             usage: BTreeMap::new(),
             request_id: None,

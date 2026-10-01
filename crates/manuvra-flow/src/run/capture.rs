@@ -354,12 +354,16 @@ mod tests {
                 name: "Groceries".into(),
                 reveals_on_hover: vec!["Actions for Groceries".into()],
                 node_id: 981_723,
+                reveal_roles: vec!["button".into()],
+                reveal_node_ids: vec![981_723],
             },
             manuvra_chrome::HoverRegion {
                 index: 2,
                 name: "Rent".into(),
                 reveals_on_hover: vec!["Actions for Rent".into(), "Pin Rent".into()],
                 node_id: 981_724,
+                reveal_roles: vec!["button".into(), "button".into()],
+                reveal_node_ids: vec![981_724, 981_725],
             },
         ];
         observation.hover_regions_truncated = true;

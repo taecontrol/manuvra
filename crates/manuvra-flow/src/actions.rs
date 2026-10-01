@@ -2,7 +2,7 @@ use crate::judgment::Operation;
 use crate::policy::{HoverTarget, Permit, offered_select_option};
 use crate::values::Values;
 use manuvra_chrome::{
-    Element, HoverRegion, InputCancellation, Observation, PerformError, PerformFact, PreparedInput,
+    Element, InputCancellation, Observation, PerformError, PerformFact, PreparedInput,
     PreparedOperation,
 };
 use serde::{Deserialize, Serialize};
@@ -211,7 +211,7 @@ fn prepare(
 ) -> Result<PreparedAction, ActionStop> {
     let (candidate, document_id, replay_key, action_sequence) = permit.consume();
     let target = prepared_target(&candidate, observation)?;
-    let region = prepared_hover_region(&candidate, observation)?;
+    let hover_node = prepared_hover_node(&candidate, observation)?;
     let text = resolved_text(&candidate, values)?;
     let option_node_id = selected_option_identity(&candidate, target, text)?;
     let focus_anchor = candidate.focus_anchor.clone();
@@ -219,7 +219,7 @@ fn prepare(
     let operation = prepared_operation(candidate.operation, candidate.key, target)?;
     let input = PreparedInput {
         document_id,
-        node_id: input_node_id(target, region),
+        node_id: input_node_id(target, hover_node),
         operation,
         text: text.map(str::to_owned),
         previous_text: target.map(|target| target.value.clone()),
@@ -289,25 +289,25 @@ fn prepared_target<'a>(
         .ok_or(ActionStop::InvalidPermit)
 }
 
-/// A `HOVER` dispatches to its region's first hidden control, which must still be the observed
+/// A `HOVER` dispatches to its chosen hidden control, which must still be in the observed
 /// region the permit named.
-fn prepared_hover_region<'a>(
+fn prepared_hover_node(
     candidate: &crate::policy::Candidate,
-    observation: &'a Observation,
-) -> Result<Option<&'a HoverRegion>, ActionStop> {
+    observation: &Observation,
+) -> Result<Option<u64>, ActionStop> {
     if candidate.operation != Operation::Hover {
         return Ok(None);
     }
     candidate
-        .hover_region(observation)
+        .hover_node_id(observation)
         .map(Some)
         .ok_or(ActionStop::InvalidPermit)
 }
 
-fn input_node_id(target: Option<&Element>, region: Option<&HoverRegion>) -> u64 {
+fn input_node_id(target: Option<&Element>, hover_node: Option<u64>) -> u64 {
     target
         .map(|target| target.node_id)
-        .or_else(|| region.map(|region| region.node_id))
+        .or(hover_node)
         .unwrap_or(0)
 }
 
@@ -591,7 +591,6 @@ mod tests {
             select_target: c("1"),
             type_value: c("name"),
             key: c("Escape"),
-            hover_target: None,
             step_done: 0.,
             usage: BTreeMap::new(),
             request_id: None,
@@ -932,19 +931,22 @@ mod tests {
     }
 
     fn hover_permit(page: &Observation) -> Permit {
+        hover_permit_choice(page, "R1_1")
+    }
+
+    fn hover_permit_choice(page: &Observation, choice: &str) -> Permit {
         let c = |s: &str| ChoiceJudgment {
             choice: s.into(),
             probabilities: BTreeMap::from([(s.into(), 1.)]),
             confidence: 1.,
         };
         let j = Judgments {
-            operation: c("HOVER"),
-            click_target: c("NO_CLICK_TARGET"),
+            operation: c("CLICK"),
+            click_target: c(choice),
             type_target: c("NO_TYPE_TEXT_TARGET"),
             select_target: c("NO_SELECT_TARGET"),
             type_value: c("NONE_FITS"),
             key: c("Escape"),
-            hover_target: Some(c("R1")),
             step_done: 0.,
             usage: BTreeMap::new(),
             request_id: None,
@@ -993,8 +995,7 @@ mod tests {
         assert_eq!(input.document_id, "d");
         assert_eq!(input.text, None);
         assert_eq!(input.previous_text, None);
-        let named =
-            json!({"index":1,"name":"Groceries","reveals_on_hover":["Actions for Groceries"]});
+        let named = json!({"index":1,"name":"Groceries","reveals_on_hover":["Actions for Groceries"],"reveal":"Actions for Groceries"});
         assert_eq!(journal.entries[0]["event"], "action_prepared");
         assert_eq!(journal.entries[0]["operation"], "HOVER");
         assert_eq!(journal.entries[0]["target"], Value::Null);
@@ -1135,6 +1136,40 @@ mod tests {
         assert_eq!(
             prepared_fallback(Operation::Hover),
             Ok(PreparedOperation::Hover)
+        );
+    }
+    #[test]
+    fn selecting_the_second_reveal_dispatches_to_its_node_and_records_its_name() {
+        let mut page = hover_page();
+        page.hover_regions[0]
+            .reveals_on_hover
+            .push("Delete Groceries".into());
+        page.hover_regions[0].reveal_roles.push("button".into());
+        page.hover_regions[0].reveal_node_ids.push(99);
+        let permit = hover_permit_choice(&page, "R1_2");
+        let capture = CapturingPerformer(Mutex::new(None));
+        let mut journal = FakeJournal::default();
+        perform(
+            permit,
+            &capture,
+            &page,
+            &Values::new(&job()),
+            &mut journal,
+            &InputCancellation::default(),
+        )
+        .unwrap();
+        let input = capture.0.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            (input.operation, input.node_id),
+            (PreparedOperation::Hover, 99)
+        );
+        assert_eq!(
+            journal.entries[0]["hover_target"]["reveal"],
+            "Delete Groceries"
+        );
+        assert_eq!(
+            journal.entries[1]["fact"]["hover_target"]["reveal"],
+            "Delete Groceries"
         );
     }
 }
