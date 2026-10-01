@@ -377,12 +377,16 @@ no_internal_identity_in "$live_root" || identity_clean=false
 jq -s --argjson key_clean "$key_clean" --argjson identity_clean "$identity_clean" \
   --slurpfile cleanup "$live_root/cleanup.json" '
   {schema_version:1,journey:"hover_reveal",runs:.,
-   passed:([.[] | select(.ok)] | length),total:length,
+   passed:([.[] | select(.outcome == "passed")] | length),
+   stopped:([.[] | select(.outcome | startswith("stopped_"))] | length),
+   failed:([.[] | select(.outcome == "failed")] | length),
+   assisted:([.[] | select(.caller_assisted)] | length),
+   accepted:([.[] | select(.ok)] | length),total:length,
    provider_key_absent:$key_clean,internal_identity_absent:$identity_clean,cleanup:$cleanup[0]}
 ' "$live_root/matrix.jsonl" >"$live_root/matrix.json"
 
 echo "$live_root"
 jq -e --argjson runs "$((runs * 5))" '
-  .total == $runs and .passed == $runs and .provider_key_absent and .internal_identity_absent and
+  .total == $runs and .accepted == $runs and .provider_key_absent and .internal_identity_absent and
   .cleanup.fixture_server_stopped and (.cleanup.leftover_pids | length == 0)
 ' "$live_root/matrix.json" >/dev/null
