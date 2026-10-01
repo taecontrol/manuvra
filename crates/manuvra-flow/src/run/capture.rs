@@ -150,6 +150,9 @@ fn exported_hover_regions(raw: &Observation, redactor: &Redactor) -> Vec<(String
     if raw.hover_regions_truncated {
         fields.push(("hover_regions_truncated".to_owned(), Value::Bool(true)));
     }
+    if raw.hover_rules_unreadable {
+        fields.push(("hover_rules_unreadable".to_owned(), Value::Bool(true)));
+    }
     fields
 }
 
@@ -178,6 +181,25 @@ mod tests {
     use super::*;
     use crate::run::tests::support::*;
     use manuvra_chrome::{Element, FocusAnchor, Rect};
+
+    #[test]
+    fn unreadable_hover_rules_are_evidence_only_and_leave_done_coverage_intact() {
+        let job = job("Ready");
+        let redactor = Redactor::for_job(&job).unwrap();
+        let mut observation = text_field("");
+        let baseline = redacted_observation(&observation, &redactor).unwrap();
+        observation.hover_rules_unreadable = true;
+        let mut exported = redacted_observation(&observation, &redactor).unwrap();
+        assert_eq!(
+            exported
+                .as_object_mut()
+                .unwrap()
+                .remove("hover_rules_unreadable"),
+            Some(json!(true))
+        );
+        assert_eq!(exported, baseline);
+        assert_eq!(observation.coverage, manuvra_chrome::Coverage::default());
+    }
 
     #[test]
     fn exported_observation_keeps_public_indices_but_omits_browser_identity() {

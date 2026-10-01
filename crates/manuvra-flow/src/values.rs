@@ -220,6 +220,7 @@ mod tests {
             coverage: Coverage::default(),
             hover_regions: Vec::new(),
             hover_regions_truncated: false,
+            hover_rules_unreadable: false,
         };
         let view = Values::new(&job).model_view(&observation);
         assert_eq!(view["focus_anchor"]["name"], "<value:secret_name>");

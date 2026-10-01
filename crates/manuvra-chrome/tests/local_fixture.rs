@@ -191,8 +191,13 @@ fn serve_fixture(stream: &mut TcpStream, body: &str, slow: Option<SlowPath>) {
     {
         thread::sleep(delay);
     }
+    let content_type = if target.split('?').next().unwrap().ends_with(".css") {
+        "text/css"
+    } else {
+        "text/html"
+    };
     let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
     );
@@ -1837,6 +1842,178 @@ fn inputs_and_navigation_keep_working_after_the_journal_evicts_old_events() {
     browser.capture().unwrap();
     browser.navigate(&server.url()).unwrap();
     assert!(has_line(&browser.observe().unwrap(), "Churn idle"));
+    browser.close().unwrap();
+    lifecycle.assert_cleaned();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn production_snapshot_detects_cssom_reveals_without_listing_opacity_overlays() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(include_str!(
+        "../../../tests/browser/hover-reveal-patterns.html"
+    ));
+    let mut browser = OwnedBrowser::launch(BrowserConfig {
+        explicit_binary: None,
+        headless: true,
+        width: 1120,
+        height: 1400,
+        inherit_process_group: false,
+    })
+    .unwrap();
+    let lifecycle = BrowserLifecycle::observe();
+    let expected = [
+        vec![
+            "p-tw4",
+            "p-tw3",
+            "p-wrapper-desc",
+            "p-child",
+            "p-self",
+            "p-is-list",
+            "p-where-list",
+            "p-not-hover",
+            "p-insertrule",
+            "p-adopted",
+            "p-wrapper",
+            "p-shadow",
+            "p-shadow-host",
+            "p-iframe",
+        ],
+        vec![
+            "p-media-fine",
+            "p-nested",
+            "p-nested-media",
+            "p-transition",
+            "p-deep",
+            "p-container",
+        ],
+        vec![
+            "q-global-link-wins",
+            "n-specificity-loses",
+            "p-both-important",
+            "p-layered-hide",
+            "p-later-layer",
+            "p-inline-important-hover",
+            "p-pointer-events-none",
+        ],
+    ];
+    for (group, expected) in expected.into_iter().enumerate() {
+        browser
+            .navigate(&format!("{}?group={group}", server.url()))
+            .unwrap();
+        let observation = browser.observe().unwrap();
+        let mut found: Vec<_> = observation
+            .hover_regions
+            .iter()
+            .flat_map(|region| region.reveals_on_hover.iter().map(String::as_str))
+            .collect();
+        found.sort_unstable();
+        let mut expected = expected;
+        expected.sort_unstable();
+        assert_eq!(found, expected, "group {group}");
+        assert!(!observation.hover_rules_unreadable);
+        assert!(!observation.hover_regions_truncated);
+    }
+    browser.close().unwrap();
+    lifecycle.assert_cleaned();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn production_snapshot_lists_insertion_gaps_and_hover_reveals_the_selected_gap() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server =
+        FixtureServer::with_body(include_str!("../../../tests/browser/insertion-gaps.html"));
+    let mut browser = OwnedBrowser::launch(BrowserConfig {
+        explicit_binary: None,
+        headless: true,
+        width: 1120,
+        height: 780,
+        inherit_process_group: false,
+    })
+    .unwrap();
+    let lifecycle = BrowserLifecycle::observe();
+    browser.navigate(&server.url()).unwrap();
+    let observation = browser.observe().unwrap();
+    assert_eq!(observation.hover_regions.len(), 3);
+    let region = observation
+        .hover_regions
+        .iter()
+        .find(|region| region.name == "between “Primer bloque” and “Segundo bloque”")
+        .unwrap();
+    browser
+        .perform(
+            PreparedInput {
+                document_id: observation.document_id.clone(),
+                node_id: region.node_id,
+                operation: PreparedOperation::Hover,
+                text: None,
+                previous_text: None,
+                option_node_id: None,
+                combobox: false,
+                action_sequence: 1,
+                focus_anchor: None,
+            },
+            &InputCancellation::default(),
+        )
+        .unwrap();
+    let revealed = browser.observe().unwrap();
+    assert_eq!(
+        revealed
+            .elements
+            .iter()
+            .filter(|element| element.name == "+ Insertar")
+            .count(),
+        1
+    );
+    browser.close().unwrap();
+    lifecycle.assert_cleaned();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn insertion_reveals_work_with_development_and_native_nested_utilities() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let fixture = include_str!("../../../tests/browser/insertion-gaps.html");
+    let start = fixture.find("<style>").unwrap() + "<style>".len();
+    let end = fixture.find("</style>").unwrap();
+    let mut browser = launch_headless();
+    let lifecycle = BrowserLifecycle::observe();
+    for css in [
+        include_str!("../../../tests/browser/hover-utilities-dev.css"),
+        include_str!("../../../tests/browser/hover-utilities-nested.css"),
+    ] {
+        let body =
+            Box::leak(format!("{}{}{}", &fixture[..start], css, &fixture[end..]).into_boxed_str());
+        let server = FixtureServer::with_body(body);
+        browser.navigate(&server.url()).unwrap();
+        let observation = browser.observe().unwrap();
+        assert_eq!(observation.hover_regions.len(), 3);
+        assert_eq!(
+            observation.hover_regions[1].name,
+            "between “Primer bloque” and “Segundo bloque”"
+        );
+    }
+    browser.close().unwrap();
+    lifecycle.assert_cleaned();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn unreadable_hover_stylesheets_preserve_coverage_and_legacy_regions() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let css = FixtureServer::with_body(".remote:hover button { opacity: 1 }");
+    let body = Box::leak(format!(r#"<!doctype html><link rel="stylesheet" href="{}remote.css"><style>button {{opacity:0}}</style><ul><li aria-label="Legacy">Legacy <button>Actions</button></li></ul><div class="remote">Unlabeled <button>Remote</button></div><p>Ready</p>"#, css.url()).into_boxed_str());
+    let server = FixtureServer::with_body(body);
+    let mut browser = launch_headless();
+    let lifecycle = BrowserLifecycle::observe();
+    browser.navigate(&server.url()).unwrap();
+    let observation = browser.observe().unwrap();
+    assert!(observation.hover_rules_unreadable);
+    assert_eq!(observation.coverage, manuvra_chrome::Coverage::default());
+    assert_eq!(observation.hover_regions.len(), 1);
+    assert_eq!(observation.hover_regions[0].name, "Legacy");
+    assert!(has_line(&observation, "Ready"));
     browser.close().unwrap();
     lifecycle.assert_cleaned();
 }

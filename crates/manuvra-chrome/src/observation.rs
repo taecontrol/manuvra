@@ -32,6 +32,9 @@ pub struct Observation {
     /// More hover regions existed than the snapshot lists. This is not a coverage gap.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hover_regions_truncated: bool,
+    /// CSSOM hover rules could not be read. Detection-only; not a coverage gap.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hover_rules_unreadable: bool,
 }
 
 /// A visible container holding controls that are hidden by opacity until the pointer is over it.
@@ -343,9 +346,11 @@ mod tests {
 
         assert!(observation.hover_regions.is_empty());
         assert!(!observation.hover_regions_truncated);
+        assert!(!observation.hover_rules_unreadable);
         let serialized = serde_json::to_value(&observation).unwrap();
         assert!(serialized.get("hover_regions").is_none());
         assert!(serialized.get("hover_regions_truncated").is_none());
+        assert!(serialized.get("hover_rules_unreadable").is_none());
     }
 
     #[test]

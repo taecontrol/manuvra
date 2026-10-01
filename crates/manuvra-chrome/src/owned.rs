@@ -1231,6 +1231,29 @@ mod tests {
     }
 
     #[test]
+    fn observation_uses_one_snapshot_round_trip_when_focus_is_absent() {
+        let chrome = ScriptedChrome::start();
+        chrome.reply(
+            "Runtime.evaluate",
+            json!({"result":{"value":snapshot_value()}}),
+        );
+        let browser = browser_with_client(chrome.connect_raw());
+        browser.observe().unwrap();
+        assert_eq!(
+            chrome
+                .commands()
+                .iter()
+                .map(|(method, _)| method.as_str())
+                .collect::<Vec<_>>(),
+            ["Runtime.evaluate"]
+        );
+        assert_eq!(
+            chrome.received("Runtime.evaluate")[0]["params"]["expression"],
+            SNAPSHOT
+        );
+    }
+
+    #[test]
     fn observation_reports_popups_and_focus_inside_a_closed_shadow_host() {
         let chrome = ScriptedChrome::start();
         let mut snapshot = snapshot_value();

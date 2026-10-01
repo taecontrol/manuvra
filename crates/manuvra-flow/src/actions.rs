@@ -564,6 +564,7 @@ mod tests {
             coverage: Coverage::default(),
             hover_regions: Vec::new(),
             hover_regions_truncated: false,
+            hover_rules_unreadable: false,
         }
     }
     fn permit(job: &Job, obs: &Observation) -> Permit {
