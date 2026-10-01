@@ -2,6 +2,10 @@
 <style>
 body{font:14px sans-serif;margin:24px}.case{padding:6px;height:32px}
 @layer earlier,later;
+.hover-important button,.hover-layer button{opacity:0}
+.hover-important:hover button{opacity:1}.hover-important:hover button{opacity:0!important}
+@layer earlier{.hover-layer:hover button{opacity:1}}
+@layer later{.hover-layer:hover button{opacity:0}}
 @layer later{.layer-positive:hover button{opacity:1}}
 @layer earlier{@layer first{.layer-positive button{opacity:0}}}
 @layer earlier{@layer first{.layer-negative button{opacity:0}}}
@@ -22,6 +26,8 @@ body{font:14px sans-serif;margin:24px}.case{padding:6px;height:32px}
 .invalid-rewrite button{opacity:0}.\:hover:hover{opacity:1}
 </style>
 <style media="(hover:none)">.media-negative:hover button{opacity:1}</style>
+<div class="case hover-important">Competing important hover<button>Hover important blocked</button></div>
+<div class="case hover-layer">Competing later layer hover<button>Hover layer blocked</button></div>
 <div class="case layer-positive">Later outer layer<button>Layer reveal</button></div>
 <div class="case layer-negative">Earlier outer layer<button>Layer blocked</button></div>
 <div class="case important-positive">Important earlier layer<button>Important reveal</button></div>

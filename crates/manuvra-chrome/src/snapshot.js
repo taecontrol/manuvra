@@ -171,7 +171,8 @@
     for (let i = 0; i < Math.max(x.length, y.length); i++) { if (x[i] !== y[i]) return (x[i] ?? 0) > (y[i] ?? 0); } return true; };
   const safeMatches = (node, sel) => { try { return node.matches(sel); } catch (_) { return false; } };
   const siblingHover = (sel) => /:hover(?![\w-])[\s\S]*[~+]/.test(sel.replace(/\[[^\]]*\]|"[^"\\]*(?:\\.[^"\\]*)*"|'[^'\\]*(?:\\.[^'\\]*)*'/g, ''));
-  const remainingOpacity = (node) => { const rules = baseRules.filter(r => r.root === node.getRootNode() && safeMatches(node, r.s));
+  const hoveredMatch = (node, rule) => rule.root === node.getRootNode() && !/:not\(\s*:hover\s*\)/.test(rule.s) && !siblingHover(rule.s) && safeMatches(node, rule.s.replace(/:hover(?![\w-])/g, ':is(*)'));
+  const remainingOpacity = (node) => { const rules = [...baseRules.filter(r => r.root === node.getRootNode() && safeMatches(node, r.s)), ...hoverRules.filter(r => hoveredMatch(node, r))];
     const inline = parseFloat(node.style?.opacity);
     if (Number.isFinite(inline)) rules.push({o:inline, inline:true, important:node.style.getPropertyPriority('opacity') === 'important'});
     return rules.reduce((winner, rule) => !winner || beats(rule, winner) ? rule : winner, null)?.o ?? 1; };
@@ -179,7 +180,7 @@
     if (rule.root !== node.getRootNode()) return false;
     if (/:not\(\s*:hover\s*\)/.test(rule.s)) return false;
     if (!(rule.o > 0) || siblingHover(rule.s) || !safeMatches(node, rule.s.replace(/:hover(?![\w-])/g, ':is(*)'))) return false;
-    const hides = hideRules.filter(h => h.root === node.getRootNode() && safeMatches(node, h.s));
+    const hides = [...hideRules.filter(h => h.root === node.getRootNode() && safeMatches(node, h.s)), ...hoverRules.filter(h => h.o === 0 && hoveredMatch(node, h))];
     if (node.style?.opacity === '0') hides.push({inline:true, important:node.style.getPropertyPriority('opacity') === 'important'});
     return hides.every(h => beats(rule, h)); }) || hoverRules.find(rule => rule.root === node.getRootNode() && rule.o === 0 && /:not\(\s*:hover\s*\)/.test(rule.s) && !siblingHover(rule.s) && safeMatches(node, rule.s.replace(/:not\(\s*:hover\s*\)/g, ':is(*)')) && remainingOpacity(node) > 0);
   const opacityCarriers = (element) => ancestors(element).filter(node => node.nodeType === 1 && parseFloat(viewOf(node).getComputedStyle(node).opacity) === 0);

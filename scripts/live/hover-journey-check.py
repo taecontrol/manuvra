@@ -81,6 +81,8 @@ def self_test():
             for reobserved, values in [(False, first), (True, redraw)] for value in values]}]}
     assert confidence_budget([report([0.59] + [0.60] * 19)])["ok"]
     assert not confidence_budget([report([0.59] * 19)])["ok"]
+    assert not confidence_budget([report([0.59] + [0.60] * 18)])["ok"]
+    assert not confidence_budget([report([0.59] + [0.60] * 18, [0.60])])["ok"]
     assert not confidence_budget([report([0.60] * 20, [0.59])])["ok"]
     assert confidence_budget([report([0.59]), report([0.60] * 19, [0.60])])["ok"]
     assert not confidence_budget([report([])])["ok"]
@@ -92,6 +94,19 @@ def self_test():
     assert not evaluate("selected-row-twin", result, {}, events, [], {})["ok"]
     events[0]["hover_target"]["reveal"] = "Edit"
     assert evaluate("selected-row-twin", result, {}, events, [], {})["ok"]
+    stop = {"state": "uncertain", "reason": {"code": "click_target_unavailable"},
+            "escalation": {"dispositions": ["retry_observation", "abort"]}}
+    aborted = {"state": "aborted"}
+    assert evaluate("virtualized-rows", aborted, stop, [], [], {})["ok"]
+    for changed in [dict(stop, state="blocked"), dict(stop, reason={"code": "target_below_gate"}),
+                    dict(stop, escalation={"dispositions": ["execute", "abort"]})]:
+        assert not evaluate("virtualized-rows", aborted, changed, [], [], {})["ok"]
+    assert not evaluate("virtualized-rows", aborted, stop, [], [], {"offered_candidate": {"operation": "CLICK"}})["ok"]
+    assert not evaluate("virtualized-rows", aborted, stop, events[1:], [], {})["ok"]
+    bravo = [{"event": "action_prepared", "operation": "CLICK", "target": {"name": "Edit", "container": "Bravo"}}]
+    assert evaluate("virtualized-rows", result, {}, bravo, [], {})["ok"]
+    bravo[0]["target"]["container"] = "Alpha"
+    assert not evaluate("virtualized-rows", result, {}, bravo, [], {})["ok"]
     print("hover journey and pooled confidence budget checks passed")
 
 
