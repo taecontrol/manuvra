@@ -99,6 +99,12 @@ impl<'a> Values<'a> {
                 listed["container"] = json!(self.mask(container));
             }
         }
+        if !observation.hover_regions.is_empty() {
+            view["hover_regions"] = json!(observation.hover_regions.iter().map(|region| json!({
+                "index": region.index, "name": self.mask(&region.name),
+                "reveals_on_hover": region.reveals_on_hover.iter().map(|name| self.mask(name)).collect::<Vec<_>>()
+            })).collect::<Vec<_>>());
+        }
         view
     }
 

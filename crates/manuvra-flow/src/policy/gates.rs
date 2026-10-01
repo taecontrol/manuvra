@@ -124,33 +124,36 @@ mod tests {
 
     #[test]
     fn contested_click_target_gate_precedes_operation_gate_and_preserves_invalid_targets() {
-        let mut page = observation("CLICK", "button");
-        page.elements[0].shares_name = true;
-        let mut click = judgments("CLICK");
-        click.click_target.confidence = 0.69;
-        click.operation.confidence = 0.40;
-        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
-        assert!(matches!(
-            decide_not_done(&mut policy, &step(), &page, &click, false),
-            Next::ReobserveOperation
-        ));
-        assert!(matches!(
-            decide_not_done(&mut policy, &step(), &page, &click, true),
-            Next::Stop(PolicyStop::Uncertain("target_below_gate"))
-        ));
-        click.click_target.choice = "999".into();
-        assert!(matches!(
-            decide_not_done(&mut policy, &step(), &page, &click, true),
-            Next::Stop(PolicyStop::Blocked("provider_invalid_response"))
-        ));
-        click.click_target.choice = "1".into();
-        click.click_target.confidence = 0.70;
-        assert!(matches!(
-            decide_not_done(&mut policy, &step(), &page, &click, true),
-            Next::Stop(PolicyStop::Uncertain("operation_below_gate"))
-        ));
-        click.operation.confidence = 0.70;
-        minted(decide_not_done(&mut policy, &step(), &page, &click, true));
+        for singleton in [false, true] {
+            let mut page = observation("CLICK", "button");
+            page.elements[0].shares_name = !singleton;
+            page.elements[0].container = singleton.then(|| "Alpha".into());
+            let mut click = judgments("CLICK");
+            click.click_target.confidence = 0.69;
+            click.operation.confidence = 0.40;
+            let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+            assert!(matches!(
+                decide_not_done(&mut policy, &step(), &page, &click, false),
+                Next::ReobserveOperation
+            ));
+            assert!(matches!(
+                decide_not_done(&mut policy, &step(), &page, &click, true),
+                Next::Stop(PolicyStop::Uncertain("target_below_gate"))
+            ));
+            click.click_target.choice = "999".into();
+            assert!(matches!(
+                decide_not_done(&mut policy, &step(), &page, &click, true),
+                Next::Stop(PolicyStop::Blocked("provider_invalid_response"))
+            ));
+            click.click_target.choice = "1".into();
+            click.click_target.confidence = 0.70;
+            assert!(matches!(
+                decide_not_done(&mut policy, &step(), &page, &click, true),
+                Next::Stop(PolicyStop::Uncertain("operation_below_gate"))
+            ));
+            click.operation.confidence = 0.70;
+            minted(decide_not_done(&mut policy, &step(), &page, &click, true));
+        }
     }
 
     #[test]

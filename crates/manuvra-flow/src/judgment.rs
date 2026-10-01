@@ -662,7 +662,10 @@ mod tests {
             offered["questions"]["click_target"]["criteria"]["R2_2"]["name"],
             "Rename Rent"
         );
-        assert!(offered["state"]["page"].get("hover_regions").is_none());
+        assert_eq!(
+            offered["state"]["page"]["hover_regions"][0]["name"],
+            "<value:account>"
+        );
         assert!(offered["questions"].get("hover_target").is_none());
         assert!(
             offered["questions"]["operation"]["criteria"]
@@ -670,6 +673,10 @@ mod tests {
                 .is_none()
         );
         let mut stripped = offered.clone();
+        stripped["state"]["page"]
+            .as_object_mut()
+            .unwrap()
+            .remove("hover_regions");
         stripped["questions"]["click_target"] = plain["questions"]["click_target"].clone();
         stripped["questions"]["operation"]["criteria"]["CLICK"] =
             plain["questions"]["operation"]["criteria"]["CLICK"].clone();
@@ -974,6 +981,7 @@ mod tests {
         let job = golden_job();
         let mut page = golden_observation();
         page.elements[0].container = Some("Savings 4417".into());
+        page.elements[1].container = Some("Secret field container".into());
         let actual = request(&job.steps[0], &page, &[], &Values::new(&job));
         assert_eq!(
             actual["questions"]["click_target"]["criteria"]["1"]["container"],
@@ -987,6 +995,30 @@ mod tests {
             actual["questions"]["click_target"]["criteria"]
                 .get("NO_CLICK_TARGET")
                 .is_some()
+        );
+        assert!(
+            !actual["state"]["page"]["elements"][1]
+                .as_object()
+                .unwrap()
+                .contains_key("container")
+        );
+        assert!(
+            !actual["questions"]["type_target"]["criteria"]["2"]
+                .as_object()
+                .unwrap()
+                .contains_key("container")
+        );
+        assert!(
+            actual["questions"]["click_target"]["instructions"]["rules"]
+                .as_str()
+                .unwrap()
+                .contains("If the required item is not listed, choose NO_CLICK_TARGET")
+        );
+        assert!(
+            actual["questions"]["operation"]["criteria"]["CLICK"]
+                .as_str()
+                .unwrap()
+                .contains("choose SCROLL_DOWN to look for it instead")
         );
         assert!(!actual.to_string().contains("Savings 4417"));
     }
