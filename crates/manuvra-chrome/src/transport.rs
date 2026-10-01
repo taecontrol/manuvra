@@ -743,6 +743,38 @@ mod tests {
     }
 
     #[test]
+    fn scripted_http_waits_for_complete_request_headers() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        let chrome = super::test_support::ScriptedChrome::start();
+        let mut stream = TcpStream::connect(chrome.address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        stream
+            .write_all(b"GET /json/list HTTP/1.1\r\nHost: 127.0.0.1")
+            .unwrap();
+        let mut byte = [0];
+        let error = stream.read(&mut byte).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ));
+
+        stream.write_all(b"\r\nConnection: close\r\n\r\n").unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        let (head, body) = response.split_once("\r\n\r\n").unwrap();
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"));
+        let listed: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(listed[0]["id"], "page-1");
+    }
+
+    #[test]
     fn scripted_chrome_confirms_rejects_and_records_injected_events() {
         let chrome = super::test_support::ScriptedChrome::start();
         chrome.reject("Runtime.evaluate");
@@ -829,7 +861,7 @@ pub(crate) mod test_support {
     use super::{CdpClient, Message};
     use serde_json::{Value, json};
     use std::collections::{HashMap, HashSet, VecDeque};
-    use std::io::{Read, Write};
+    use std::io::{self, BufRead, BufReader, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1099,9 +1131,24 @@ pub(crate) mod test_support {
         )
     }
 
+    pub(crate) fn read_http_request_head(stream: &mut TcpStream) -> io::Result<String> {
+        let mut reader = BufReader::new(stream);
+        let mut head = String::new();
+        // Closing with unread request bytes can reset the connection while the
+        // discovery client is still sending headers. Consume the complete head.
+        while !head.ends_with("\r\n\r\n") {
+            if reader.read_line(&mut head)? == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "incomplete HTTP request headers",
+                ));
+            }
+        }
+        Ok(head)
+    }
+
     fn handle_http(mut stream: TcpStream, script: Arc<Mutex<Script>>) {
-        let mut request = [0_u8; 2048];
-        if stream.read(&mut request).unwrap_or(0) == 0 {
+        if read_http_request_head(&mut stream).is_err() {
             return;
         }
         if let Some(raw) = script.lock().expect("scripted Chrome").raw_http.clone() {

@@ -967,7 +967,7 @@ fn mask_provider_key(message: &str, key: Option<&str>) -> String {
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
-    use crate::transport::test_support::ScriptedChrome;
+    use crate::transport::test_support::{ScriptedChrome, read_http_request_head};
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
     use std::process::Command;
@@ -1587,11 +1587,11 @@ mod tests {
         let worker = thread::spawn(move || {
             for _ in 0..2 {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut line = String::new();
-                BufReader::new(stream.try_clone().unwrap())
-                    .read_line(&mut line)
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
-                let body = if line.contains("/json/version") {
+                let head = read_http_request_head(&mut stream).unwrap();
+                let body = if head.starts_with("GET /json/version ") {
                     json!({"Browser":"Chromium Test"}).to_string()
                 } else {
                     json!([{"type":"page","webSocketDebuggerUrl":"ws://127.0.0.1/devtools/page/1"}])
@@ -1610,12 +1610,13 @@ mod tests {
             &mut child,
             &Endpoint::parse(&address.to_string()).unwrap(),
             Duration::from_secs(1),
-        )
-        .unwrap();
+        );
         child.kill().unwrap();
         child.wait().unwrap();
         worker.join().unwrap();
+        let page = page.unwrap();
         assert_eq!(page.0, "ws://127.0.0.1/devtools/page/1");
+        assert_eq!(page.1, "Chromium Test");
     }
 
     fn assert_exits(pid: u32) {
