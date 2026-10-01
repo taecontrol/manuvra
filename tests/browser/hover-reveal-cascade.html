@@ -26,7 +26,8 @@ body{font:14px sans-serif;margin:24px}.case{padding:3px;height:28px}
 .disabled-sheet button{opacity:0}
 .root-negative-valid button{opacity:0!important}
 .root-negative:hover button{opacity:1}
-.root-positive button{opacity:0!important}
+.root-positive button{opacity:0!important}.root-positive:hover button{opacity:0!important}
+.layer-positive .peer-hide:hover ~ button{opacity:0!important}
 .invalid-rewrite button{opacity:0}.\:hover:hover{opacity:1}
 </style>
 <style id="disabled">.disabled-sheet:hover button{opacity:1}</style>
@@ -37,7 +38,7 @@ body{font:14px sans-serif;margin:24px}.case{padding:3px;height:28px}
 <div class="case negative-competing">Negative competing hover<button>Negative competing blocked</button></div>
 <div class="case negative-sibling">Negative sibling<i class="negative-peer">Peer</i><button>Negative sibling blocked</button></div>
 <div class="case disabled-sheet">Disabled sheet<button>Disabled blocked</button></div>
-<div class="case layer-positive">Later outer layer<button>Layer reveal</button></div>
+<div class="case layer-positive">Later outer layer<i class="peer-hide">Peer</i><button>Layer reveal</button></div>
 <div class="case layer-negative">Earlier outer layer<button>Layer blocked</button></div>
 <div class="case important-positive">Important earlier layer<button>Important reveal</button></div>
 <div class="case media-negative">Inactive sheet<button>Media blocked</button></div>
