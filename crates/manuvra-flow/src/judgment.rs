@@ -220,7 +220,7 @@ fn offer_reveals(
                 criteria.insert(
                     crate::policy::reveal_key(region.index, offset),
                     json!({
-                        "role":role,"name":values.mask(name),"container":values.mask(&region.name),
+                        "role":values.mask(role),"name":values.mask(name),"container":values.mask(&region.name),
                         "dialog":null,"disabled":false,"revealed_by_hover":true,
                     }),
                 );
@@ -933,5 +933,24 @@ mod tests {
             operation_hint("Choose End date", &observation),
             Some("CLICK")
         );
+    }
+    #[test]
+    fn classified_hidden_control_roles_are_masked_before_the_provider_request() {
+        let mut job = golden_job();
+        job.values.insert(
+            "hidden_role".into(),
+            serde_json::from_value(json!({
+                "value":"classified-role-742","description":"Classified role","secret":true,
+            }))
+            .unwrap(),
+        );
+        let mut page = with_hover_regions(golden_observation());
+        page.hover_regions[0].reveal_roles[0] = "classified-role-742".into();
+        let request = request(&job.steps[0], &page, &[], &Values::new(&job));
+        assert_eq!(
+            request["questions"]["click_target"]["criteria"]["R1_1"]["role"],
+            "<value:hidden_role>"
+        );
+        assert!(!request.to_string().contains("classified-role-742"));
     }
 }
