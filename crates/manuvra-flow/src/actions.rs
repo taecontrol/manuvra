@@ -691,7 +691,7 @@ mod tests {
             role: "textbox".into(),
             name: "Name".into(),
             in_dialog: None,
-            container: None,
+            container: Some("Alpha".into()),
             covered: true,
             surface: None,
             active_descendant: None,
@@ -746,6 +746,8 @@ mod tests {
             &InputCancellation::default(),
         )
         .unwrap();
+        assert_eq!(fact.target_container.as_deref(), Some("Alpha"));
+        assert_eq!(complete.entries[1]["fact"]["target_container"], "Alpha");
         assert_eq!(fact.key, Some(manuvra_chrome::Key::Escape));
         assert_eq!(fact.outcome, Outcome::Observed);
         assert_eq!(complete.entries[1]["fact"]["key"], "Escape");

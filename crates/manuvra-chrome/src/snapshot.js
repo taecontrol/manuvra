@@ -98,7 +98,7 @@
     return peers.length >= 2 && peers.includes(n); };
   const containerNode = (control) => { let n = up(control);
     while (n && n.nodeType === 1 && n.tagName !== 'BODY' && n.tagName !== 'HTML') { if (isDialog(n)) return null;
-      if (semantic(n) || repeated(n)) return n; n = up(n); } return null; };
+      if (!n.matches('td,th,[role="cell"],[role="gridcell"],[role="columnheader"]') && (semantic(n) || repeated(n))) return n; n = up(n); } return null; };
   const containerLabel = (node) => { const byId = (node.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean).map(id => node.getRootNode().getElementById?.(id)?.textContent?.trim()).filter(Boolean).join(' ');
     const heading = node.querySelector('h1,h2,h3,h4,h5,h6,[role="heading"]')?.textContent?.replace(/\s+/g,' ').trim();
     const first = segments(node)[0]?.text;
@@ -136,42 +136,54 @@
   const revealingRegion = (element) => ancestors(element).slice(1).find(node => node.checkVisibility({checkOpacity:true}) &&
     (node.matches('li,tr,[role=row],[role=listitem]') || node.hasAttribute('aria-label')));
   // Opacity reveals inferred from CSSOM hover rules, importance, and layers.
-  const hoverRules = [], hideRules = []; let hoverRulesUnreadable = false;
+  const hoverRules = [], baseRules = [], hideRules = []; let hoverRulesUnreadable = false;
   const viewOf = (node) => (node.ownerDocument || node).defaultView || window;
   for (const context of contexts) {
-    const root = context.root, win = viewOf(root), layerOrder = new Map(); let anonLayer = 0;
+    const root = context.root, win = viewOf(root), layerOrder = new Map(), layerCounts = new Map(); let anonLayer = 0;
+    // A child's position belongs to its parent; registering it never reorders root layers.
+    const registerLayer = (name) => { let parent = '', path = [];
+      for (const part of name.split('.')) { const qualified = parent ? parent + '.' + part : part;
+        if (!layerOrder.has(qualified)) { const next = layerCounts.get(parent) || 0; layerCounts.set(parent, next + 1); layerOrder.set(qualified, [...path, next]); }
+        path = layerOrder.get(qualified); parent = qualified; } };
     const sheets = [...(root.styleSheets || []), ...(root.adoptedStyleSheets || [])];
     const consider = (sel, style, layer) => { if (!style || style.opacity === '') return;
       const record = {s:sel, o:parseFloat(style.opacity), important:style.getPropertyPriority('opacity') === 'important', layer, layerOrder, root};
-      if (/:hover(?![\w-])/.test(sel)) hoverRules.push(record); else if (record.o === 0) hideRules.push(record); };
+      if (/:hover(?![\w-])/.test(sel)) hoverRules.push(record); else if (Number.isFinite(record.o)) { baseRules.push(record); if (record.o === 0) hideRules.push(record); } };
     const walk = (rules, parent, layer) => { for (const r of rules) { try {
-      if (win.CSSLayerStatementRule && r instanceof win.CSSLayerStatementRule) { for (const n of r.nameList) { const k = (layer ? layer + '.' : '') + n; if (!layerOrder.has(k)) layerOrder.set(k, layerOrder.size); } continue; }
+      if (win.CSSLayerStatementRule && r instanceof win.CSSLayerStatementRule) { for (const n of r.nameList) { const k = (layer ? layer + '.' : '') + n; registerLayer(k); } continue; }
       let childLayer = layer;
-      if (win.CSSLayerBlockRule && r instanceof win.CSSLayerBlockRule) { childLayer = (layer ? layer + '.' : '') + (r.name || ('anon' + (anonLayer++))); if (!layerOrder.has(childLayer)) layerOrder.set(childLayer, layerOrder.size); }
+      if (win.CSSLayerBlockRule && r instanceof win.CSSLayerBlockRule) { childLayer = (layer ? layer + '.' : '') + (r.name || ('\0anon' + (anonLayer++))); registerLayer(childLayer); }
       if (win.CSSMediaRule && r instanceof win.CSSMediaRule && !win.matchMedia(r.media.mediaText).matches) continue;
+      if (win.CSSSupportsRule && r instanceof win.CSSSupportsRule && !win.CSS.supports(r.conditionText)) continue;
       let own = null;
       if (win.CSSStyleRule && r instanceof win.CSSStyleRule) { own = parent ? (r.selectorText.includes('&') ? r.selectorText.replaceAll('&', `:is(${parent})`) : `:is(${parent}) ${r.selectorText}`) : r.selectorText; consider(own, r.style, layer); }
       if (win.CSSNestedDeclarations && r instanceof win.CSSNestedDeclarations && parent) consider(parent, r.style, layer);
       if (r.cssRules) walk(r.cssRules, own || parent, childLayer);
       } catch (_) { /* One unsupported rule must not discard the sheet. */ }
     } };
-    for (const sheet of sheets) { try { walk(sheet.cssRules, null, null); } catch (_) { hoverRulesUnreadable = true; } }
+    for (const sheet of sheets) { try { if (!sheet.disabled && (!sheet.media?.mediaText || win.matchMedia(sheet.media.mediaText).matches)) walk(sheet.cssRules, null, null); } catch (_) { hoverRulesUnreadable = true; } }
   }
-  const rank = (r) => { const order = r.layer == null ? null : r.layerOrder.get(r.layer);
-    if (r.inline) return r.important ? [2, 1e9] : [1, 1e9];
-    if (r.important) return [2, order == null ? -1 : 1e6 - order];
-    return [0, order == null ? 1e6 : order]; };
-  const beats = (a, b) => { const x = rank(a), y = rank(b); return x[0] !== y[0] ? x[0] > y[0] : x[1] >= y[1]; };
+  const rank = (r) => { const path = r.layer == null ? [] : r.layerOrder.get(r.layer);
+    if (r.inline) return r.important ? [3] : [1];
+    // The implicit unlayered child comes last normally and first when importance reverses layers.
+    return r.important ? [2, ...path.map(n => -n), -1e9] : [0, ...path, 1e9]; };
+  const beats = (a, b) => { const x = rank(a), y = rank(b);
+    for (let i = 0; i < Math.max(x.length, y.length); i++) { if (x[i] !== y[i]) return (x[i] ?? 0) > (y[i] ?? 0); } return true; };
   const safeMatches = (node, sel) => { try { return node.matches(sel); } catch (_) { return false; } };
+  const siblingHover = (sel) => /:hover(?![\w-])[\s\S]*[~+]/.test(sel.replace(/\[[^\]]*\]|"[^"\\]*(?:\\.[^"\\]*)*"|'[^'\\]*(?:\\.[^'\\]*)*'/g, ''));
+  const remainingOpacity = (node) => { const rules = baseRules.filter(r => r.root === node.getRootNode() && safeMatches(node, r.s));
+    const inline = parseFloat(node.style?.opacity);
+    if (Number.isFinite(inline)) rules.push({o:inline, inline:true, important:node.style.getPropertyPriority('opacity') === 'important'});
+    return rules.reduce((winner, rule) => !winner || beats(rule, winner) ? rule : winner, null)?.o ?? 1; };
   const revealRuleFor = (node) => hoverRules.find(rule => {
     if (rule.root !== node.getRootNode()) return false;
     if (/:not\(\s*:hover\s*\)/.test(rule.s)) return false;
-    if (!(rule.o > 0) || /:hover[)\s]*[~+]/.test(rule.s) || !safeMatches(node, rule.s.replace(/:hover(?![\w-])/g, ':is(*)'))) return false;
+    if (!(rule.o > 0) || siblingHover(rule.s) || !safeMatches(node, rule.s.replace(/:hover(?![\w-])/g, ':is(*)'))) return false;
     const hides = hideRules.filter(h => h.root === node.getRootNode() && safeMatches(node, h.s));
     if (node.style?.opacity === '0') hides.push({inline:true, important:node.style.getPropertyPriority('opacity') === 'important'});
-    return hides.every(h => beats(rule, h)); }) || hoverRules.find(rule => rule.root === node.getRootNode() && rule.o === 0 && /:not\(\s*:hover\s*\)/.test(rule.s) && safeMatches(node, rule.s.replace(/:not\(\s*:hover\s*\)/g, ':is(*)')));
+    return hides.every(h => beats(rule, h)); }) || hoverRules.find(rule => rule.root === node.getRootNode() && rule.o === 0 && /:not\(\s*:hover\s*\)/.test(rule.s) && !siblingHover(rule.s) && safeMatches(node, rule.s.replace(/:not\(\s*:hover\s*\)/g, ':is(*)')) && remainingOpacity(node) > 0);
   const opacityCarriers = (element) => ancestors(element).filter(node => node.nodeType === 1 && parseFloat(viewOf(node).getComputedStyle(node).opacity) === 0);
-  const hoverRevealed = (element) => opacityCarriers(element).some(node => revealRuleFor(node));
+  const hoverRevealed = (element) => opacityCarriers(element).every(node => revealRuleFor(node));
   const unlabeledRegion = (element) => { const carriers = opacityCarriers(element), top = carriers[carriers.length - 1] || element;
     return ancestors(top).slice(1).find(node => node.nodeType === 1 && node.checkVisibility({checkOpacity:true}) && node.getBoundingClientRect().height > 0); };
   const paintedTexts = (root) => { const walker = (root.ownerDocument || document).createTreeWalker(root, NodeFilter.SHOW_TEXT), out = []; let t;

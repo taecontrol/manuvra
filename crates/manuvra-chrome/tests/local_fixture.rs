@@ -2225,3 +2225,153 @@ fn a_region_with_separate_hover_points_reveals_its_second_control_only() {
     browser.close().unwrap();
     lifecycle.assert_cleaned();
 }
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn hover_reveals_respect_layer_hierarchy_conditions_and_stylesheet_roots() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(include_str!(
+        "../../../tests/browser/hover-reveal-cascade.html"
+    ));
+    let mut browser = launch_headless();
+    let lifecycle = BrowserLifecycle::observe();
+    browser.navigate(&server.url()).unwrap();
+    let observed = browser.observe().unwrap();
+    let mut names: Vec<_> = observed
+        .hover_regions
+        .iter()
+        .flat_map(|region| region.reveals_on_hover.iter().map(String::as_str))
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "Important reveal",
+            "Layer reveal",
+            "Negative reveal",
+            "Shadow reveal"
+        ]
+    );
+    for wanted in ["Layer reveal", "Negative reveal", "Shadow reveal"] {
+        let observation = browser.observe().unwrap();
+        let region = observation
+            .hover_regions
+            .iter()
+            .find(|region| region.reveals_on_hover.iter().any(|name| name == wanted))
+            .unwrap();
+        let offset = region
+            .reveals_on_hover
+            .iter()
+            .position(|name| name == wanted)
+            .unwrap();
+        browser
+            .perform(
+                PreparedInput {
+                    document_id: observation.document_id.clone(),
+                    node_id: region.reveal_node_ids[offset],
+                    operation: PreparedOperation::Hover,
+                    text: None,
+                    previous_text: None,
+                    option_node_id: None,
+                    combobox: false,
+                    action_sequence: 1,
+                    focus_anchor: None,
+                },
+                &InputCancellation::default(),
+            )
+            .unwrap();
+        assert!(
+            candidate(&browser.observe().unwrap(), wanted).is_some(),
+            "{wanted}"
+        );
+    }
+    browser.close().unwrap();
+    lifecycle.assert_cleaned();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn container_labels_prefer_accessible_names_and_headings_and_never_stop_at_cells() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(
+        r#"<!doctype html><span id="reference" hidden>Referenced item</span>
+    <article aria-labelledby="reference" aria-label="Fallback item"><p>Painted item</p><button>Referenced action</button></article>
+    <article aria-label="Accessible item"><h2>Painted heading</h2><button>Labeled action</button></article>
+    <fieldset><legend>First painted segment</legend><h2>Heading item</h2><button>Heading action</button></fieldset>
+    <table><tr><td>Alpha</td><td aria-label="Actions">Menu<button>Alpha action</button></td></tr>
+    <tr><td>Bravo</td><td aria-label="Actions">Menu<button>Bravo action</button></td></tr></table>"#,
+    );
+    let mut browser = launch_headless();
+    let lifecycle = BrowserLifecycle::observe();
+    browser.navigate(&server.url()).unwrap();
+    let observed = browser.observe().unwrap();
+    for (control, container) in [
+        ("Referenced action", "Referenced item"),
+        ("Labeled action", "Accessible item"),
+        ("Heading action", "Heading item"),
+        ("Alpha action", "Alpha"),
+        ("Bravo action", "Bravo"),
+    ] {
+        assert_eq!(
+            candidate(&observed, control).unwrap().container.as_deref(),
+            Some(container),
+            "{control}"
+        );
+    }
+    browser.close().unwrap();
+    lifecycle.assert_cleaned();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn focused_control_keeps_its_container_in_the_snapshot() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(
+        r#"<!doctype html><article aria-label="Bravo"><p>Body</p><input aria-label="Name" autofocus></article>"#,
+    );
+    let mut browser = launch_headless();
+    let lifecycle = BrowserLifecycle::observe();
+    browser.navigate(&server.url()).unwrap();
+    let observation = browser.observe().unwrap();
+    assert_eq!(
+        observation.focus_anchor.unwrap().container.as_deref(),
+        Some("Bravo")
+    );
+    browser.close().unwrap();
+    lifecycle.assert_cleaned();
+}
+
+#[test]
+#[ignore = "requires installed Chromium"]
+fn opacity_increase_under_negative_hover_is_not_a_reveal() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(
+        r#"<style>body{margin:24px}.row button{opacity:0}.row:not(:hover) button{opacity:1}</style><div class="row"><span>Alpha</span><button>Edit</button></div>"#,
+    );
+    let mut browser = launch_headless();
+    let lifecycle = BrowserLifecycle::observe();
+    browser.navigate(&server.url()).unwrap();
+    let before = browser.observe().unwrap();
+    let button = before.elements.iter().find(|e| e.name == "Edit").unwrap();
+    browser
+        .perform(
+            PreparedInput {
+                document_id: before.document_id.clone(),
+                node_id: button.node_id,
+                operation: PreparedOperation::Hover,
+                text: None,
+                previous_text: None,
+                option_node_id: None,
+                combobox: false,
+                action_sequence: 1,
+                focus_anchor: None,
+            },
+            &InputCancellation::default(),
+        )
+        .unwrap();
+    let after = browser.observe().unwrap();
+    assert!(after.elements.is_empty());
+    assert!(after.hover_regions.is_empty());
+    browser.close().unwrap();
+    lifecycle.assert_cleaned();
+}

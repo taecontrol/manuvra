@@ -1,0 +1,40 @@
+<!doctype html><meta charset="utf-8"><title>Hover cascade and conditions</title>
+<style>
+body{font:14px sans-serif;margin:24px}.case{padding:6px;height:32px}
+@layer earlier,later;
+@layer later{.layer-positive:hover button{opacity:1}}
+@layer earlier{@layer first{.layer-positive button{opacity:0}}}
+@layer earlier{@layer first{.layer-negative button{opacity:0}}}
+@layer later{.layer-negative button{opacity:0}}
+@layer earlier{@layer second{.layer-negative:hover button{opacity:1}}}
+@layer earlier{@layer first{.important-positive:hover button{opacity:1!important}}}
+@layer later{.important-positive button{opacity:0!important}}
+.media-negative button,.sibling-negative button,.adjacent-negative button,.supports-negative button{opacity:0}
+:is(.peer:hover,.peer:focus) ~ button{opacity:1}
+:where(.next-peer:hover,.next-peer:focus) + button{opacity:1}
+.negative-hide:not(:hover) button{opacity:0}.negative-hide button{opacity:0!important}
+.negative-inline:not(:hover) button{opacity:0}
+.negative-positive button{opacity:1}.negative-positive:not(:hover) button{opacity:0!important}
+@supports (this-property:unsupported){.supports-negative:hover button{opacity:1}}
+.permanent-carrier{opacity:0}.permanent-carrier button{opacity:0}.permanent-carrier:hover button{opacity:1}
+.root-negative:hover button{opacity:1}
+.root-positive button{opacity:0!important}
+.invalid-rewrite button{opacity:0}.\:hover:hover{opacity:1}
+</style>
+<style media="(hover:none)">.media-negative:hover button{opacity:1}</style>
+<div class="case layer-positive">Later outer layer<button>Layer reveal</button></div>
+<div class="case layer-negative">Earlier outer layer<button>Layer blocked</button></div>
+<div class="case important-positive">Important earlier layer<button>Important reveal</button></div>
+<div class="case media-negative">Inactive sheet<button>Media blocked</button></div>
+<div class="case sibling-negative">Functional sibling<i class="peer">Peer</i><button>Sibling blocked</button></div>
+<div class="case adjacent-negative">Functional adjacent<i class="next-peer">Peer</i><button>Adjacent blocked</button></div>
+<div class="case negative-hide">Independent important hide<button>Negative blocked</button></div>
+<div class="case negative-inline">Inline important hide<button style="opacity:0!important">Inline blocked</button></div>
+<div class="case negative-positive">Negative hover removal<button>Negative reveal</button></div>
+<div class="case supports-negative">False supports condition<button>Supports blocked</button></div>
+<div class="case permanent-carrier">Permanent parent<button>Carrier blocked</button></div>
+<div class="case invalid-rewrite">Unsupported rewritten selector<button class=":hover">Rewrite blocked</button></div>
+<section><template shadowrootmode="open"><style>.root-negative button{opacity:0}.root-positive button{opacity:0}.root-positive:hover button{opacity:1}</style>
+<div class="case root-negative">Shadow without its own reveal<button>Shadow blocked</button></div>
+<div class="case root-positive">Shadow with its own reveal<button>Shadow reveal</button></div>
+</template></section>

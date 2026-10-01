@@ -312,4 +312,35 @@ mod tests {
             ));
         }
     }
+    #[test]
+    fn hover_revalidation_keeps_the_second_node_and_the_complete_reveal_roster() {
+        let mut original = hover_page();
+        original.hover_regions[0]
+            .reveals_on_hover
+            .push("Delete".into());
+        original.hover_regions[0].reveal_roles.push("button".into());
+        original.hover_regions[0].reveal_node_ids.push(43);
+        for (choice, second_node_changed) in [("R1_2", true), ("R1_1", false)] {
+            let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+            let candidate = policy
+                .caller_candidate(&original, &hover(Some(choice)))
+                .unwrap();
+            let mut changed = original.clone();
+            if second_node_changed {
+                changed.hover_regions[0].reveal_node_ids[1] = 99;
+            } else {
+                changed.hover_regions[0].reveals_on_hover[1] = "Archive".into();
+            }
+            assert_eq!(candidate.hover_region(&changed), None);
+            assert_eq!(
+                policy.authorize_caller(&step(), &changed, &candidate).err(),
+                Some(PolicyStop::Uncertain("candidate_revalidation_failed"))
+            );
+            assert!(matches!(
+                policy.mint(&changed, candidate),
+                Next::Stop(PolicyStop::Uncertain("candidate_revalidation_failed"))
+            ));
+            assert_eq!(policy.actions, 0);
+        }
+    }
 }

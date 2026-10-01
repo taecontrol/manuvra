@@ -280,4 +280,26 @@ mod tests {
         page.hover_regions[0].reveal_node_ids.clear();
         assert!(click_choice(&page, "R1_1").is_none());
     }
+    #[test]
+    fn reveal_resolution_requires_each_aligned_vector_to_cover_the_choice() {
+        for missing in ["name", "role", "node"] {
+            let mut page = hover_page();
+            match missing {
+                "name" => page.hover_regions[0].reveals_on_hover.clear(),
+                "role" => page.hover_regions[0].reveal_roles.clear(),
+                _ => page.hover_regions[0].reveal_node_ids.clear(),
+            }
+            assert!(click_choice(&page, "R1_1").is_none(), "{missing}");
+            let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+            assert!(matches!(
+                decide_not_done(&mut policy, &step(), &page, &hover(Some("R1_1")), false),
+                Next::Stop(PolicyStop::Blocked("provider_invalid_response"))
+            ));
+            assert_eq!(
+                policy.caller_candidate(&page, &hover(Some("R1_1"))).err(),
+                Some(PolicyStop::Blocked("provider_invalid_response"))
+            );
+            assert_eq!(policy.actions, 0);
+        }
+    }
 }

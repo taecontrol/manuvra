@@ -389,4 +389,24 @@ mod tests {
         assert!(observation.hover_regions_truncated);
         assert!(observation.coverage.viewport_complete);
     }
+    #[test]
+    fn legacy_populated_controls_focus_and_regions_omit_new_default_fields() {
+        let mut legacy = snapshot();
+        legacy["elements"] = json!([{"index":1,"node_id":7,"role":"button","name":"Edit","value":"","input_type":null,"checked":null,"selected":null,"expanded":null,"disabled":false,"in_dialog":null,"rect":{"x":0,"y":0,"width":10,"height":10}}]);
+        legacy["focus_anchor"] = json!({"node_id":7,"context":"main","role":"button","name":"Edit","in_dialog":null,"covered":true});
+        legacy["hover_regions"] =
+            json!([{"index":1,"name":"Alpha","reveals_on_hover":["Edit"],"node_id":7}]);
+        let observed: Observation = serde_json::from_value(legacy).unwrap();
+        let serialized = serde_json::to_value(&observed).unwrap();
+        for field in ["container", "shares_name"] {
+            assert!(serialized["elements"][0].get(field).is_none(), "{field}");
+        }
+        assert!(serialized["focus_anchor"].get("container").is_none());
+        for field in ["reveal_roles", "reveal_node_ids"] {
+            assert!(
+                serialized["hover_regions"][0].get(field).is_none(),
+                "{field}"
+            );
+        }
+    }
 }
