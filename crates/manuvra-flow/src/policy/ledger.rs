@@ -240,7 +240,7 @@ mod tests {
                     &mut policy,
                     &step(),
                     &hover_page(),
-                    &hover(Some("R1")),
+                    &hover(Some("R1_1")),
                     false
                 ),
                 Next::Stop(PolicyStop::Blocked("budget_exhausted"))
@@ -260,7 +260,7 @@ mod tests {
                 &mut policy,
                 &one_mutation_step(),
                 &hover_page(),
-                &hover(Some("R1")),
+                &hover(Some("R1_1")),
                 false
             ),
             Next::Stop(PolicyStop::Blocked("budget_exhausted"))
@@ -274,13 +274,13 @@ mod tests {
                 &mut policy,
                 &step(),
                 &page,
-                &hover(Some("R1")),
+                &hover(Some("R1_1")),
                 false,
             ));
         }
         page.hover_regions[1].name = "Rent 8".into();
         assert!(matches!(
-            decide_not_done(&mut policy, &step(), &page, &hover(Some("R1")), false),
+            decide_not_done(&mut policy, &step(), &page, &hover(Some("R1_1")), false),
             Next::Stop(PolicyStop::Blocked("budget_exhausted"))
         ));
         assert_eq!(policy.step_mutations(), 0);
@@ -293,7 +293,7 @@ mod tests {
             &mut policy,
             &one_mutation_step(),
             &hover_page(),
-            &hover(Some("R1")),
+            &hover(Some("R1_1")),
             false,
         ));
         assert_eq!(policy.step_mutations(), 0);
@@ -322,7 +322,7 @@ mod tests {
             false,
         ));
         assert_eq!(policy.step_mutations(), 1);
-        for fallback in [hover(Some("R1")), judgments("SCROLL_DOWN")] {
+        for fallback in [hover(Some("R1_1")), judgments("SCROLL_DOWN")] {
             let (_, _, replay_key, _) = minted(decide_not_done(
                 &mut policy,
                 &step(),
@@ -340,7 +340,7 @@ mod tests {
             &mut policy,
             &step(),
             &page,
-            &hover(Some("R1")),
+            &hover(Some("R1_1")),
             false,
         ));
     }
@@ -355,7 +355,7 @@ mod tests {
             &mut policy,
             &step(),
             &page,
-            &hover(Some("R1")),
+            &hover(Some("R1_1")),
             false,
         ));
         assert_eq!((policy.step_mutations(), policy.fallbacks), (0, 1));
@@ -375,7 +375,7 @@ mod tests {
 
         policy.begin_step();
         assert!(matches!(
-            decide_not_done(&mut policy, &step(), &page, &hover(Some("R1")), false),
+            decide_not_done(&mut policy, &step(), &page, &hover(Some("R1_1")), false),
             Next::Stop(PolicyStop::Uncertain("replay_forbidden"))
         ));
         minted(decide_not_done(&mut policy, &step(), &page, &escape, false));
@@ -396,7 +396,7 @@ mod tests {
             &mut policy,
             &step(),
             &hover_page(),
-            &hover(Some("R2")),
+            &hover(Some("R2_1")),
             false,
         ));
         let candidate = policy.release_unused(Box::new(permit));

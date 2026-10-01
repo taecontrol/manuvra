@@ -32,17 +32,24 @@ pub struct Observation {
     /// More hover regions existed than the snapshot lists. This is not a coverage gap.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hover_regions_truncated: bool,
+    /// CSSOM hover rules could not be read. Detection-only; not a coverage gap.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hover_rules_unreadable: bool,
 }
 
 /// A visible container holding controls that are hidden by opacity until the pointer is over it.
-/// Its hidden controls are never candidates; hovering the region reveals them.
+/// Hidden controls are reveal choices; policy hovers before judging the visible click.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HoverRegion {
     pub index: u64,
     pub name: String,
     pub reveals_on_hover: Vec<String>,
-    /// The first hidden control, whose center is the hover point. Internal to dispatch; never
-    /// persisted or published.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reveal_roles: Vec<String>,
+    /// Hidden controls aligned with their names and roles. Internal dispatch identity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reveal_node_ids: Vec<u64>,
+    /// The first hidden control, retained for region observation compatibility.
     pub node_id: u64,
 }
 
@@ -53,6 +60,8 @@ pub struct FocusAnchor {
     pub role: String,
     pub name: String,
     pub in_dialog: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
     pub covered: bool,
     #[serde(default)]
     pub surface: Option<FocusSurface>,
@@ -80,6 +89,7 @@ impl FocusAnchor {
             &self.role,
             &self.name,
             &self.in_dialog,
+            &self.container,
             self.covered,
             self.surface,
             self.position,
@@ -89,6 +99,7 @@ impl FocusAnchor {
             &other.role,
             &other.name,
             &other.in_dialog,
+            &other.container,
             other.covered,
             other.surface,
             other.position,
@@ -192,7 +203,11 @@ pub struct Element {
     pub selected: Option<bool>,
     pub expanded: Option<bool>,
     pub disabled: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shares_name: bool,
     pub in_dialog: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
     #[serde(default)]
     pub operations: Vec<String>,
     #[serde(default)]
@@ -343,9 +358,11 @@ mod tests {
 
         assert!(observation.hover_regions.is_empty());
         assert!(!observation.hover_regions_truncated);
+        assert!(!observation.hover_rules_unreadable);
         let serialized = serde_json::to_value(&observation).unwrap();
         assert!(serialized.get("hover_regions").is_none());
         assert!(serialized.get("hover_regions_truncated").is_none());
+        assert!(serialized.get("hover_rules_unreadable").is_none());
     }
 
     #[test]
@@ -365,9 +382,31 @@ mod tests {
                 name: "Groceries".into(),
                 reveals_on_hover: vec!["Actions for Groceries".into()],
                 node_id: 42,
+                reveal_roles: Vec::new(),
+                reveal_node_ids: Vec::new(),
             }]
         );
         assert!(observation.hover_regions_truncated);
         assert!(observation.coverage.viewport_complete);
+    }
+    #[test]
+    fn legacy_populated_controls_focus_and_regions_omit_new_default_fields() {
+        let mut legacy = snapshot();
+        legacy["elements"] = json!([{"index":1,"node_id":7,"role":"button","name":"Edit","value":"","input_type":null,"checked":null,"selected":null,"expanded":null,"disabled":false,"in_dialog":null,"rect":{"x":0,"y":0,"width":10,"height":10}}]);
+        legacy["focus_anchor"] = json!({"node_id":7,"context":"main","role":"button","name":"Edit","in_dialog":null,"covered":true});
+        legacy["hover_regions"] =
+            json!([{"index":1,"name":"Alpha","reveals_on_hover":["Edit"],"node_id":7}]);
+        let observed: Observation = serde_json::from_value(legacy).unwrap();
+        let serialized = serde_json::to_value(&observed).unwrap();
+        for field in ["container", "shares_name"] {
+            assert!(serialized["elements"][0].get(field).is_none(), "{field}");
+        }
+        assert!(serialized["focus_anchor"].get("container").is_none());
+        for field in ["reveal_roles", "reveal_node_ids"] {
+            assert!(
+                serialized["hover_regions"][0].get(field).is_none(),
+                "{field}"
+            );
+        }
     }
 }

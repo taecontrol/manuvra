@@ -23,15 +23,21 @@ _Avoid_: session, execution, attempt
 The Chromium page under Manuvra's control.
 _Avoid_: tab, window, device
 
+**Container**:
+The nearest semantic or repeated item below a dialog that holds a control, excluding cells. Its label prefers `aria-labelledby`, `aria-label`, a heading, then the first painted text segment outside non-link controls (link text counts), or `between “…” and “…”` from neighboring text.
+
 **Hover region**:
-A visible container on the target, such as a list row, holding controls hidden by opacity until the pointer is over it. An observation lists each region with the names of the controls it reveals; those hidden controls are never candidates until a hover reveals them.
+A visible container on the target, such as a list row, holding controls hidden by opacity until the pointer is over it. Its name is the container’s label. An observation lists the controls it reveals. A hidden control can be chosen as a click target: policy hovers first, and the click is judged again on a new observation.
 _Avoid_: hover area, reveal zone, hidden row
+
+**Contested request**:
+A judgment request whose observation lists hover regions or has controls sharing role, name, and dialog among the rendered controls in the document, or has a single click control with a container and no hover regions. The container remains relevant when virtualization leaves only one item rendered.
 
 **Focus anchor**:
 The observed identity of the target's active element: node, role, name, and containing dialog, or no focus when the document or body is active. A key candidate is bound to this anchor and revalidated immediately before dispatch.
 
 **Permit**:
-The single-use authorization minted only by the policy owner after done-first, per-operation confidence gate, budget, replay-ledger and origin checks. No mutation is dispatched without one.
+The single-use authorization minted only by the policy owner after done-first, the target gate for element clicks in contested requests, per-operation confidence gate, budget, replay-ledger and origin checks. No mutation is dispatched without one.
 _Avoid_: lock, lease, approval
 
 **Escalation**:

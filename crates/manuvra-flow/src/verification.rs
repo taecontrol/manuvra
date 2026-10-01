@@ -638,6 +638,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn contested_container_context_does_not_change_final_verification_requests() {
+        let job: manuvra_contract::Job = serde_json::from_value(json!({"schema_version":1,"target":{"kind":"browser","url":"http://example.test/"},"context":{"journey":"j","revision":"r","environment":"e","actor":"a","authority":"a"},"steps":[{"id":"s","goal":"g","done_when":[{"text_visible":"Saved"}]}]})).unwrap();
+        let values = Values::new(&job);
+        let mut page = observation();
+        let before = expectation_request(&[], &page, &values);
+        page.elements[0].container = Some("Alpha".into());
+        page.elements[0].shares_name = true;
+        assert_eq!(expectation_request(&[], &page, &values), before);
+    }
+
     fn observation() -> Observation {
         Observation {
             document_id: "d".into(),
@@ -663,6 +674,8 @@ mod tests {
                 expanded: None,
                 disabled: false,
                 in_dialog: Some("Create account".into()),
+                container: None,
+                shares_name: false,
                 operations: vec!["TYPE_TEXT".into()],
                 select_options: vec![],
                 rect: Rect {
@@ -682,6 +695,7 @@ mod tests {
             coverage: Coverage::default(),
             hover_regions: Vec::new(),
             hover_regions_truncated: false,
+            hover_rules_unreadable: false,
         }
     }
 
@@ -699,6 +713,7 @@ mod tests {
             role: "textbox".into(),
             name: "Account name".into(),
             in_dialog: Some("Create account".into()),
+            container: None,
             covered: true,
             surface: None,
             active_descendant: None,
@@ -1014,6 +1029,8 @@ mod tests {
             name: "Groceries".into(),
             reveals_on_hover: vec!["Actions for Groceries".into()],
             node_id: 41,
+            reveal_roles: vec!["button".into()],
+            reveal_node_ids: vec![41],
         }];
         let request = expectation_request(&expectations, &with_regions, &values);
         assert_eq!(

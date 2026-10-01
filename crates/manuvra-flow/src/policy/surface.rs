@@ -1,7 +1,7 @@
 //! Unsupported surfaces: file inputs, canvas controls, cross-origin frames, closed shadow roots,
 //! and popups, where the policy stops instead of acting.
 
-use super::targeting::{selected_element, selected_hover_region};
+use super::targeting::{selected_element, selected_reveal};
 use crate::judgment::{Judgments, Operation, selected_operation};
 use manuvra_chrome::{FocusAnchor, FocusSurface, Key, Observation};
 
@@ -37,7 +37,7 @@ fn hover_region_selected(
     judgments: &Judgments,
     operation: Option<Operation>,
 ) -> bool {
-    operation == Some(Operation::Hover) && selected_hover_region(observation, judgments).is_some()
+    operation == Some(Operation::Click) && selected_reveal(observation, judgments).is_some()
 }
 
 pub(super) fn key_surface(observation: &Observation, key: Option<Key>) -> Option<&'static str> {
@@ -299,7 +299,7 @@ mod tests {
             &mut policy,
             &step(),
             &canvas,
-            &hover(Some("R1")),
+            &hover(Some("R1_1")),
             false,
         ));
         for unlisted in [None, Some("R9")] {
@@ -310,7 +310,7 @@ mod tests {
             ));
         }
         let mut click = judgments("CLICK");
-        click.hover_target = Some(choice("R1"));
+        click.click_target = choice("1");
         let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
         assert!(matches!(
             decide_not_done(&mut policy, &step(), &canvas, &click, false),

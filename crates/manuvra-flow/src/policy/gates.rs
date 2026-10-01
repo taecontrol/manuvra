@@ -2,6 +2,7 @@
 //! the key choice's validity and gate.
 
 use super::surface::selected_surface;
+use super::targeting::{dispatched_operation, selected_target};
 use super::{Next, PolicyStop};
 use crate::judgment::{Judgments, Operation, selected_operation};
 use crate::verification::DoneResult;
@@ -42,8 +43,8 @@ pub(super) fn ready_operation(
     if let Some(surface) = selected_surface(observation, judgments, operation) {
         return Err(Next::Stop(PolicyStop::UnsupportedSurface(surface)));
     }
-    let operation =
-        operation.ok_or(Next::Stop(PolicyStop::Blocked("provider_invalid_response")))?;
+    let operation = dispatched_operation(observation, judgments).map_err(Next::Stop)?;
+    target_preflight(observation, judgments, operation, already_reobserved)?;
     if let Some(next) = operation_gate(judgments, operation, already_reobserved) {
         return Err(next);
     }
@@ -53,6 +54,33 @@ pub(super) fn ready_operation(
         return Err(next);
     }
     Ok(operation)
+}
+
+fn target_preflight(
+    observation: &Observation,
+    judgments: &Judgments,
+    operation: Operation,
+    already_reobserved: bool,
+) -> Result<(), Next> {
+    if operation != Operation::Click {
+        return Ok(());
+    }
+    selected_target(observation, judgments, operation).map_err(Next::Stop)?;
+    target_gate(observation, judgments, already_reobserved).map_or(Ok(()), Err)
+}
+
+fn target_gate(
+    observation: &Observation,
+    judgments: &Judgments,
+    already_reobserved: bool,
+) -> Option<Next> {
+    (crate::contest::contested(observation) && judgments.click_target.confidence < 0.70).then_some(
+        if already_reobserved {
+            Next::Stop(PolicyStop::Uncertain("target_below_gate"))
+        } else {
+            Next::ReobserveOperation
+        },
+    )
 }
 
 fn key_preflight(judgments: &Judgments, already_reobserved: bool) -> Option<Next> {
@@ -93,6 +121,73 @@ mod tests {
     use manuvra_contract::JobOptions;
     use serde_json::Value;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn contested_click_target_gate_precedes_operation_gate_and_preserves_invalid_targets() {
+        for singleton in [false, true] {
+            let mut page = observation("CLICK", "button");
+            page.elements[0].shares_name = !singleton;
+            page.elements[0].container = singleton.then(|| "Alpha".into());
+            let mut click = judgments("CLICK");
+            click.click_target.confidence = 0.69;
+            click.operation.confidence = 0.40;
+            let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+            assert!(matches!(
+                decide_not_done(&mut policy, &step(), &page, &click, false),
+                Next::ReobserveOperation
+            ));
+            assert!(matches!(
+                decide_not_done(&mut policy, &step(), &page, &click, true),
+                Next::Stop(PolicyStop::Uncertain("target_below_gate"))
+            ));
+            click.click_target.choice = "999".into();
+            assert!(matches!(
+                decide_not_done(&mut policy, &step(), &page, &click, true),
+                Next::Stop(PolicyStop::Blocked("provider_invalid_response"))
+            ));
+            click.click_target.choice = "1".into();
+            click.click_target.confidence = 0.70;
+            assert!(matches!(
+                decide_not_done(&mut policy, &step(), &page, &click, true),
+                Next::Stop(PolicyStop::Uncertain("operation_below_gate"))
+            ));
+            click.operation.confidence = 0.70;
+            minted(decide_not_done(&mut policy, &step(), &page, &click, true));
+        }
+    }
+
+    #[test]
+    fn target_gate_leaves_uncontested_clicks_and_contested_type_and_select_ungated() {
+        let mut click = judgments("CLICK");
+        click.click_target.confidence = 0.01;
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        minted(decide_not_done(
+            &mut policy,
+            &step(),
+            &observation("CLICK", "button"),
+            &click,
+            false,
+        ));
+        let mut page = observation("TYPE_TEXT", "textbox");
+        page.elements[0].shares_name = true;
+        let mut typed = judgments("TYPE_TEXT");
+        typed.type_target.confidence = 0.01;
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        minted(decide_not_done(&mut policy, &step(), &page, &typed, false));
+        let mut page = native_select(&[("Savings", "savings-id", false)]);
+        page.elements[0].shares_name = true;
+        let mut selected = judgments("SELECT");
+        selected.select_target.confidence = 0.01;
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/")
+            .with_provided_values(&provided("Savings"));
+        minted(decide_not_done(
+            &mut policy,
+            &step(),
+            &page,
+            &selected,
+            false,
+        ));
+    }
 
     #[test]
     fn key_gate_reobserves_once_then_stops_with_key_below_gate() {
@@ -405,7 +500,7 @@ mod tests {
     #[test]
     fn hover_follows_done_first_and_the_operation_gate() {
         let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
-        let selected = hover(Some("R1"));
+        let selected = hover(Some("R1_1"));
         let decide = |policy: &mut Policy, done, done_reobserved, judgment: &Judgments, gate| {
             policy.decide(
                 &natural_step(),
@@ -445,7 +540,10 @@ mod tests {
     fn hover_clears_a_lower_operation_gate_than_every_other_operation() {
         let gated = |operation: &str, confidence: f64, page: &Observation| {
             let mut judgment = judgments(operation);
-            judgment.hover_target = Some(choice("R1"));
+            if operation == "HOVER" {
+                judgment.operation = choice("CLICK");
+                judgment.click_target = choice("R1_1");
+            }
             judgment.operation.confidence = confidence;
             let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
             [false, true].map(|reobserved| {

@@ -186,12 +186,12 @@ pub(crate) struct Turn {
     operation: &'static str,
     confidence: f64,
     click_target: &'static str,
+    target_confidence: f64,
     type_target: &'static str,
     select_target: &'static str,
     type_value: &'static str,
     key: &'static str,
     key_confidence: f64,
-    hover_target: Option<&'static str>,
     noul: f64,
 }
 
@@ -201,12 +201,12 @@ impl Turn {
             operation,
             confidence: 0.95,
             click_target: "NO_CLICK_TARGET",
+            target_confidence: 1.0,
             type_target: "NO_TYPE_TEXT_TARGET",
             select_target: "NO_SELECT_TARGET",
             type_value: "NONE_FITS",
             key: "Escape",
             key_confidence: 1.0,
-            hover_target: None,
             noul: 0.01,
         }
     }
@@ -222,11 +222,8 @@ impl Turn {
         Self::new("SCROLL_DOWN")
     }
 
-    pub(crate) fn hover(region: &'static str) -> Self {
-        Self {
-            hover_target: Some(region),
-            ..Self::new("HOVER")
-        }
+    pub(crate) fn hover(reveal: &'static str) -> Self {
+        Self::click(reveal)
     }
 
     pub(crate) fn type_text() -> Self {
@@ -260,6 +257,13 @@ impl Turn {
         }
     }
 
+    pub(crate) fn target_confidence(self, target_confidence: f64) -> Self {
+        Self {
+            target_confidence,
+            ..self
+        }
+    }
+
     pub(crate) fn confidence(self, confidence: f64) -> Self {
         Self { confidence, ..self }
     }
@@ -281,12 +285,11 @@ impl Turn {
         }
         let (selected, confidence) = match id {
             "operation" => (self.operation, self.confidence),
-            "click_target" => (self.click_target, 1.0),
+            "click_target" => (self.click_target, self.target_confidence),
             "type_target" => (self.type_target, 1.0),
             "select_target" => (self.select_target, 1.0),
             "type_value" => (self.type_value, 1.0),
             "key" => (self.key, self.key_confidence),
-            "hover_target" => (self.hover_target?, 1.0),
             other => panic!("unscripted question {other}"),
         };
         Some(manuvra_jev::Answer::Choice {
@@ -633,6 +636,7 @@ pub(crate) fn observed(text: &str) -> Observation {
         coverage: Coverage::default(),
         hover_regions: Vec::new(),
         hover_regions_truncated: false,
+        hover_rules_unreadable: false,
     }
 }
 
@@ -661,6 +665,8 @@ pub(crate) fn element(
         expanded: None,
         disabled: false,
         in_dialog: None,
+        container: None,
+        shares_name: false,
         operations: vec![operation.into()],
         select_options: vec![],
         rect: Rect {
@@ -707,6 +713,7 @@ pub(crate) fn key_observation(name: &str) -> Observation {
         role: "button".into(),
         name: name.into(),
         in_dialog: None,
+        container: None,
         covered: true,
         surface: None,
         active_descendant: None,
@@ -833,7 +840,7 @@ pub(crate) fn key_job(id: &str, goal: &str, done_when: Value, mutation_limit: u8
 }
 
 pub(crate) fn low_hover_turn() -> Turn {
-    Turn::hover("R1").confidence(0.59)
+    Turn::hover("R1_1").confidence(0.59)
 }
 
 /// A run paused on a below-gate `HOVER` escalation offering the Groceries region.
@@ -936,7 +943,6 @@ pub(crate) fn mutation_judgments(operation: &str, confidence: f64) -> judgment::
         select_target: choice("1"),
         type_value: choice("name"),
         key: choice("Escape"),
-        hover_target: None,
         step_done: 0.0,
         usage: BTreeMap::new(),
         request_id: None,

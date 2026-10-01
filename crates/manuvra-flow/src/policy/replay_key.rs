@@ -18,7 +18,8 @@ impl Policy {
             }
             Operation::Hover => candidate
                 .hover_region(observation)
-                .map(|region| hover_replay_key(observation, region)),
+                .zip(candidate.hover_target.as_ref())
+                .map(|(region, target)| hover_replay_key(observation, region, &target.reveal)),
             Operation::PressKey => {
                 let state = candidate.focus_anchor.as_ref().map(focus_state);
                 Some(self.key_digest(observation, candidate, state))
@@ -59,18 +60,21 @@ impl Policy {
 }
 
 fn replay_key(observation: &Observation, target: &Element, candidate: &Candidate) -> String {
-    let stable = serde_json::json!({
+    let mut stable = serde_json::json!({
         "operation":candidate.operation,"target_role":target.role,
         "target_name":target.name.to_ascii_lowercase(),"dialog":target.in_dialog,
         "input_type":target.input_type,"value_name":candidate.value_name,
         "route":observation.route,
     });
+    if let Some(container) = &target.container {
+        stable["container"] = container.to_ascii_lowercase().into();
+    }
     hex::encode(Sha256::digest(stable.to_string().as_bytes()))
 }
 
 /// The same region in an unchanged region list is one hover; any change to the list's names or
 /// reveals makes it a new one.
-fn hover_replay_key(observation: &Observation, region: &HoverRegion) -> String {
+fn hover_replay_key(observation: &Observation, region: &HoverRegion, reveal: &str) -> String {
     let listed: Vec<_> = observation
         .hover_regions
         .iter()
@@ -80,6 +84,7 @@ fn hover_replay_key(observation: &Observation, region: &HoverRegion) -> String {
         "operation":Operation::Hover,
         "route":observation.route,
         "region_name":region.name,
+        "reveal":reveal,
         "reveals_on_hover":region.reveals_on_hover,
         "hover_regions":hex::encode(Sha256::digest(serde_json::Value::from(listed).to_string().as_bytes())),
     });
@@ -97,12 +102,16 @@ fn scroll_replay_key(observation: &Observation, operation: Operation) -> String 
 }
 
 fn focus_identity(anchor: &FocusAnchor) -> serde_json::Value {
-    serde_json::json!({
+    let mut identity = serde_json::json!({
         "role":anchor.role,
         "name":anchor.name.to_ascii_lowercase(),
         "dialog":anchor.in_dialog,
         "position":anchor.position,
-    })
+    });
+    if let Some(container) = &anchor.container {
+        identity["container"] = container.to_ascii_lowercase().into();
+    }
+    identity
 }
 
 /// Anchor state a legitimate repeated key press changes, such as the active option of a
@@ -125,6 +134,65 @@ mod tests {
     use crate::policy::{Next, PolicyStop};
     use crate::test_support::hover_region as region;
     use manuvra_contract::{JobOptions, Step};
+
+    #[test]
+    fn element_replay_without_a_container_keeps_the_legacy_digest() {
+        let page = observation("CLICK", "button");
+        let policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        let candidate = policy.caller_candidate(&page, &judgments("CLICK")).unwrap();
+        assert_eq!(
+            replay_key(&page, &page.elements[0], &candidate),
+            "3e310faef2ed4aaa8b1bb628a34eca1114162ee58242d336a8f7a685360c7f47"
+        );
+    }
+
+    #[test]
+    fn element_replay_distinguishes_containers_and_forbids_each_repeat() {
+        for labels in [
+            [Some("Alpha"), Some("Bravo")],
+            [None, None],
+            [Some("Step 1: Account"), Some("Step 2: Details")],
+        ] {
+            let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+            let mut page = observation("CLICK", "button");
+            page.elements[0].container = labels[0].map(str::to_owned);
+            minted(decide_not_done(
+                &mut policy,
+                &step(),
+                &page,
+                &judgments("CLICK"),
+                false,
+            ));
+            policy.begin_step();
+            page.elements[0].container = labels[1].map(str::to_owned);
+            let next = decide_not_done(&mut policy, &step(), &page, &judgments("CLICK"), false);
+            if labels[0] == labels[1] {
+                assert!(matches!(
+                    next,
+                    Next::Stop(PolicyStop::Uncertain("replay_forbidden"))
+                ));
+            } else {
+                minted(next);
+                assert!(matches!(
+                    decide_not_done(&mut policy, &step(), &page, &judgments("CLICK"), false),
+                    Next::Stop(PolicyStop::Uncertain("replay_forbidden"))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn focus_identity_distinguishes_same_named_controls_in_different_containers() {
+        let mut page = focused("Copy");
+        let anchor = page.focus_anchor.as_mut().unwrap();
+        let legacy = focus_identity(anchor);
+        assert!(legacy.get("container").is_none());
+        anchor.container = Some("Staging".into());
+        let staging = focus_identity(anchor);
+        assert_eq!(staging["container"], "staging");
+        anchor.container = Some("Production".into());
+        assert_ne!(focus_identity(anchor), staging);
+    }
 
     /// How a minted key permit settles before the next beat.
     enum Settle {
@@ -483,7 +551,7 @@ mod tests {
             &mut policy,
             &step(),
             &hover_page(),
-            &hover(Some("R1")),
+            &hover(Some("R1_1")),
             false,
         ));
         assert!(matches!(
@@ -491,7 +559,7 @@ mod tests {
                 &mut policy,
                 &step(),
                 &hover_page(),
-                &hover(Some("R1")),
+                &hover(Some("R1_1")),
                 false
             ),
             Next::Stop(PolicyStop::Uncertain("replay_forbidden"))
@@ -500,8 +568,9 @@ mod tests {
         let mut remounted = hover_page();
         remounted.document_id = "new-document".into();
         remounted.hover_regions[0].node_id = 99;
+        remounted.hover_regions[0].reveal_node_ids[0] = 99;
         assert!(matches!(
-            decide_not_done(&mut policy, &later, &remounted, &hover(Some("R1")), false),
+            decide_not_done(&mut policy, &later, &remounted, &hover(Some("R1_1")), false),
             Next::Stop(PolicyStop::Uncertain("replay_forbidden"))
         ));
         let mut changed = hover_page();
@@ -510,8 +579,33 @@ mod tests {
             &mut policy,
             &later,
             &changed,
-            &hover(Some("R1")),
+            &hover(Some("R1_1")),
             false,
         ));
+    }
+    #[test]
+    fn different_controls_in_one_region_have_distinct_hover_replay_keys() {
+        let mut page = hover_page();
+        page.hover_regions[0].reveals_on_hover.push("Delete".into());
+        page.hover_regions[0].reveal_roles.push("button".into());
+        page.hover_regions[0].reveal_node_ids.push(99);
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        let first = minted(decide_not_done(
+            &mut policy,
+            &step(),
+            &page,
+            &hover(Some("R1_1")),
+            false,
+        ));
+        policy.record_observed(&first.replay_key);
+        let second = minted(decide_not_done(
+            &mut policy,
+            &step(),
+            &page,
+            &hover(Some("R1_2")),
+            false,
+        ));
+        assert_ne!(first.replay_key, second.replay_key);
+        assert_eq!(second.consume().0.hover_target.unwrap().reveal, "Delete");
     }
 }

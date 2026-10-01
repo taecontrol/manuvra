@@ -1,0 +1,14 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Projects</title><style>
+body{font:14px sans-serif;margin:0;display:flex} nav{width:260px;border-right:1px solid #ddd;padding:8px}
+.item{display:flex;justify-content:space-between;padding:6px;border-radius:6px}
+.item{ .more{opacity:0} &:is(:hover,:focus-within) .more{opacity:1} }
+main{padding:16px}
+</style></head><body><nav id="n"><h2>Projects</h2></nav><main><div id="menu" role="menu" hidden></div></main>
+<script>
+for (const p of ['Project Apollo','Project Gemini','Project Mercury']) {
+  const it = document.createElement('div'); it.className = 'item';
+  it.innerHTML = `<a href="#">${p}</a><button class="more" aria-label="More options">⋯</button>`;
+  it.querySelector('button').onclick = () => { menu.hidden = false; menu.innerHTML = `<p>Options for ${p}</p><div role="menuitem" tabindex="0">Rename</div><div role="menuitem" tabindex="0">Archive</div>`; };
+  n.append(it);
+}
+</script></body></html>

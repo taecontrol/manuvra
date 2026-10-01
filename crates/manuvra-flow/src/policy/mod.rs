@@ -10,6 +10,7 @@ mod replay_key;
 mod revalidation;
 mod surface;
 mod targeting;
+pub(crate) use targeting::{ClickChoice, click_choice, reveal_key};
 
 pub(crate) use candidate::Candidate;
 pub use candidate::HoverTarget;
@@ -292,7 +293,7 @@ mod tests {
                 &mut policy,
                 &step(),
                 &hover_page(),
-                &hover(Some("R1")),
+                &hover(Some("R1_1")),
                 false
             ),
             Next::Stop(PolicyStop::Blocked("origin_not_allowed"))
@@ -301,7 +302,7 @@ mod tests {
         popup.coverage.gaps = vec!["popup".into()];
         let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
         assert!(matches!(
-            decide_not_done(&mut policy, &step(), &popup, &hover(Some("R1")), false),
+            decide_not_done(&mut policy, &step(), &popup, &hover(Some("R1_1")), false),
             Next::Stop(PolicyStop::UnsupportedSurface("popup_or_new_tab"))
         ));
         assert_eq!(policy.actions, 0);

@@ -1,0 +1,103 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Hover reveal patterns</title>
+<style>
+body{font:14px sans-serif;margin:8px} .case{display:flex;gap:8px;align-items:center;height:26px;border-bottom:1px solid #eee} .case>span{width:220px} button,a{font-size:12px}
+.o0{opacity:0}
+/* tw4 */
+@layer utilities{ .o0-tw4{opacity:0%} @media (hover:hover){ .gh4\:o100:is(:where(.g4):hover *){opacity:100%} } }
+/* tw3 */
+.g3:hover .gh3\:o100{opacity:1}
+.card:hover .card-actions{opacity:1}
+.tile:hover > .tile-btn{opacity:1}
+.selfbtn:hover{opacity:1}
+.r5:is(:hover,:focus-within) .x5{opacity:1}
+:where(.r6:hover, .r6:focus-within) .x6{opacity:1}
+.x7{opacity:1} .r7:not(:hover) .x7{opacity:0}
+.x8{opacity:var(--o,0)} .r8:hover{--o:1}
+.w10:hover .wrap10{opacity:1}
+@media (hover:hover) and (pointer:fine){ .r13:hover .x13{opacity:1} }
+@layer l{ @supports (display:grid){ .r14:hover .x14{opacity:1} } }
+.r15{ &:hover .x15{opacity:1} }
+.x16{ .r16:hover &{ @media (hover:hover){ opacity:1 } } }
+.x17{transition:opacity .3s} .r17:hover .x17{opacity:1}
+.r18:hover .d1 .d2 .d3 .x18{opacity:1}
+.cq{container-type:inline-size} @container (min-width:10px){ .r19:hover .x19{opacity:1} }
+/* negatives */
+.peer:hover ~ .xn1{opacity:1}
+.lbl:hover + .xn2{opacity:1}
+.rn6:hover .icon6{opacity:1}
+.rn7:hover .xn7{opacity:0}
+@media (hover:none){ .rn8:hover .xn8{opacity:1} }
+.xn9{opacity:0 !important} .rn9:hover .xn9{opacity:1}
+a.gl:hover{opacity:.8}
+.xn11{opacity:0 !important}
+.xn12{opacity:0} .rn12:hover .xn12{opacity:1} .rn12 .xn12.lock{opacity:0 !important}
+
+/* round 2 */
+.hide-spec .x30{opacity:0} .r30:hover .x30b{opacity:1}
+.r31 .x31.x31.x31{opacity:0} .r31:hover .x31{opacity:1}
+.x32{opacity:0 !important} .r32:hover .x32{opacity:1 !important}
+@layer base2{ .x33{opacity:0} } .r33:hover .x33{opacity:1}
+@layer first, second; @layer second{ .r34:hover .x34{opacity:1} } @layer first{ .x34{opacity:0} }
+@layer first{ .r35:hover .x35{opacity:1} } @layer second{ .x35{opacity:0} }
+.r36:hover .x36{opacity:1}
+.r37:hover .x37{opacity:1 !important}
+.x38{opacity:0;pointer-events:none} .r38:hover .x38{opacity:1;pointer-events:auto}
+@layer utilities{ .r39:hover .x39{opacity:1} }
+</style></head><body>
+<div class="case"><span>tw4 group</span><div class="g4"><button aria-label="p-tw4" class="o0-tw4 gh4:o100">x</button></div></div>
+<div class="case"><span>tw3 group</span><div class="g3"><button aria-label="p-tw3" class="o0 gh3:o100">x</button></div></div>
+<div class="case card"><span>plain descendant</span><div class="card-actions o0"><button aria-label="p-wrapper-desc">x</button></div></div>
+<div class="case tile"><span>child combinator</span><button aria-label="p-child" class="tile-btn o0">x</button></div>
+<div class="case"><span>self hover</span><button aria-label="p-self" class="selfbtn o0">x</button></div>
+<div class="case r5"><span>is list</span><button aria-label="p-is-list" class="x5 o0">x</button></div>
+<div class="case r6"><span>where list</span><button aria-label="p-where-list" class="x6 o0">x</button></div>
+<div class="case r7"><span>not hover</span><button aria-label="p-not-hover" class="x7">x</button></div>
+<div class="case r8"><span>css variable</span><button aria-label="p-var" class="x8">x</button></div>
+<div class="case r9"><span>insertRule</span><button aria-label="p-insertrule" class="x9 o0">x</button></div>
+<div class="case r20"><span>adopted sheet</span><button aria-label="p-adopted" class="x20 o0">x</button></div>
+<div class="case"><span>shadow</span><reveal-row></reveal-row></div>
+<div class="case"><span>shadow host</span><host-row></host-row></div>
+<div class="case" style="height:34px"><span>iframe</span><iframe style="height:30px;width:300px;border:0" srcdoc="<style>body{margin:0}.r:hover .x{opacity:1}.x{opacity:0}</style><div class='r'>row <button aria-label='p-iframe' class='x'>x</button></div>"></iframe></div>
+<div class="case w10"><span>wrapper tw</span><div class="wrap10 o0"><button aria-label="p-wrapper">x</button></div></div>
+<div class="case r13"><span>media fine</span><button aria-label="p-media-fine" class="x13 o0">x</button></div>
+<div class="case r14"><span>layer supports</span><button aria-label="p-layer-supports" class="x14 o0">x</button></div>
+<div class="case r15"><span>nested</span><button aria-label="p-nested" class="x15 o0">x</button></div>
+<div class="case r16"><span>nested media</span><button aria-label="p-nested-media" class="x16 o0">x</button></div>
+<div class="case r17"><span>transition</span><button aria-label="p-transition" class="x17 o0">x</button></div>
+<div class="case r18"><span>deep</span><div class="d1"><div class="d2"><div class="d3"><button aria-label="p-deep" class="x18 o0">x</button></div></div></div></div>
+<div class="cq"><div class="case r19"><span>container query</span><button aria-label="p-container" class="x19 o0">x</button></div></div>
+<div class="case"><span>peer hover</span><i class="peer">peer</i><button aria-label="n-peer" class="xn1 o0">x</button></div>
+<div class="case"><span>adjacent</span><i class="lbl">lbl</i><button aria-label="n-adjacent" class="xn2 o0">x</button></div>
+<div class="case"><span>overlay select</span><div style="position:relative;display:inline-block"><select aria-label="n-overlay-select" class="o0" style="position:absolute;inset:0"><option>Sep</option></select><span style="width:auto">September</span></div></div>
+<div class="case"><span>file input</span><label style="position:relative">Upload<input aria-label="n-file" type="file" class="o0" style="position:absolute;inset:0;width:100%"></label></div>
+<div class="case"><span>custom checkbox</span><label style="position:relative"><input aria-label="n-checkbox" type="checkbox" class="o0" style="position:absolute">Accept</label></div>
+<div class="case rn6"><span>other target</span><i class="icon6 o0">i</i><button aria-label="n-other-target" class="o0">x</button></div>
+<div class="case rn7"><span>hover lowers</span><button aria-label="n-hover-lowers" class="xn7 o0">x</button></div>
+<div class="case rn8"><span>media nomatch</span><button aria-label="n-media-nomatch" class="xn8 o0">x</button></div>
+<div class="case rn9"><span>cascade loses</span><button aria-label="n-cascade-loses" class="xn9">x</button></div>
+<div class="case"><span>global link hover wins</span><a href="#" aria-label="q-global-link-wins" class="gl o0">skip</a></div>
+<div class="case"><span>global link hover loses</span><a href="#" aria-label="n-global-link-loses" class="gl xn11">skip</a></div>
+<div class="case"><span>js reveal</span><button aria-label="n-js" class="o0">x</button></div>
+<div class="case"><span>focus only</span><button aria-label="n-focus-only" class="o0" style="" onfocus="this.style.opacity=1">x</button></div>
+<div class="case rn12"><span>locked</span><button aria-label="n-locked" class="xn12 lock">x</button></div>
+
+<div class="case r31"><span>specificity loses</span><button aria-label="n-specificity-loses" class="x31 x31 x31">x</button></div>
+<div class="case r32"><span>both important</span><button aria-label="p-both-important" class="x32">x</button></div>
+<div class="case r33"><span>hide layered hover unlayered</span><button aria-label="p-layered-hide" class="x33">x</button></div>
+<div class="case r34"><span>hover later layer</span><button aria-label="p-later-layer" class="x34">x</button></div>
+<div class="case r35"><span>hover earlier layer</span><button aria-label="n-earlier-layer" class="x35">x</button></div>
+<div class="case r36"><span>inline hide</span><button aria-label="n-inline-hide" class="x36" style="opacity:0">x</button></div>
+<div class="case r37"><span>inline hide important hover</span><button aria-label="p-inline-important-hover" class="x37" style="opacity:0">x</button></div>
+<div class="case r38"><span>pointer-events none</span><button aria-label="p-pointer-events-none" class="x38">x</button></div>
+<div class="case r39"><span>tw4 hover utility, unlayered hide</span><button aria-label="n-tw4-vs-unlayered" class="x39 o0">x</button></div>
+<script>
+const s = document.createElement('style'); document.head.append(s);
+s.sheet.insertRule('.r9:hover .x9{opacity:1}');
+const c = new CSSStyleSheet(); c.replaceSync('.r20:hover .x20{opacity:1}'); document.adoptedStyleSheets = [c];
+customElements.define('reveal-row', class extends HTMLElement { connectedCallback(){ const r = this.attachShadow({mode:'open'}); r.innerHTML = `<style>.w:hover .b{opacity:1}.b{opacity:0}</style><div class="w">row <button aria-label="p-shadow" class="b">x</button></div>`; } });
+customElements.define('host-row', class extends HTMLElement { connectedCallback(){ const r = this.attachShadow({mode:'open'}); r.innerHTML = `<style>:host{display:block}:host(:hover) .b{opacity:1}.b{opacity:0}</style>row <button aria-label="p-shadow-host" class="b">x</button>`; } });
+</script><script>
+// Select one group to keep the observation below its region cap.
+const group = Number(new URLSearchParams(location.search).get('group') || 0);
+[...document.body.children].filter(n => n.tagName !== 'SCRIPT').forEach((n,i) => { if (Math.floor(i / 15) !== group) n.style.display = 'none'; });
+</script></body></html>

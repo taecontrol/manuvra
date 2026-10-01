@@ -80,6 +80,36 @@
   }
   const dialogs = dialogRecords.map(record => record.title);
   const selector = 'a[href],button,input:not([type="hidden"]),textarea,select,summary,[contenteditable="true"],[role="button"],[role="link"],[role="checkbox"],[role="radio"],[role="switch"],[role="tab"],[role="menuitem"],[role="menuitemradio"],[role="option"],[role="combobox"],[role="textbox"],[role="searchbox"],[role="spinbutton"]';
+  const CONTROL = selector;
+  const up = (n) => n.parentElement || n.getRootNode?.()?.host || null;
+  const isDialog = (n) => n.matches?.('dialog,[role="dialog"],[role="alertdialog"]');
+  const nonLinkControl = (n) => n.matches?.(CONTROL) && !n.matches('a[href],[role="link"]');
+  // Painted text segments of `root`, excluding text inside non-link controls and editable fields.
+  const segments = (root, keepControls = false) => { const out = []; const w = (root.ownerDocument || document).createTreeWalker(root, NodeFilter.SHOW_TEXT); let t;
+    while ((t = w.nextNode())) { const v = t.textContent.replace(/\s+/g, ' ').trim(), p = t.parentElement; if (!v || !p || p.closest('script,style,template')) continue;
+      let q = p, skip = false; while (!keepControls && q && q !== root) { if (nonLinkControl(q) || q.matches?.('textarea,[contenteditable="true"]')) { skip = true; break; } q = up(q); }
+      if (!keepControls && nonLinkControl(root)) skip = true;
+      if (!skip && p.checkVisibility({checkVisibilityCSS:true})) out.push({node:t, text:v}); } return out; };
+  const hasOwnText = (n) => segments(n).length > 0 || n.querySelector?.('h1,h2,h3,h4,h5,h6,[role="heading"]');
+  const semantic = (n) => n.matches('li,tr,[role="row"],[role="listitem"],article,[role="article"],fieldset,form') ||
+    ((n.hasAttribute('aria-label') || n.hasAttribute('aria-labelledby')) && !n.matches(CONTROL) && hasOwnText(n));
+  const repeated = (n) => { if (n.matches('td,th,[role="cell"],[role="gridcell"],[role="columnheader"]')) return false; const parent = up(n); if (!parent || !parent.children) return false;
+    const peers = [...parent.children].filter(s => s.tagName === n.tagName && s.querySelector(CONTROL));
+    return peers.length >= 2 && peers.includes(n); };
+  const containerNode = (control) => { let n = up(control);
+    while (n && n.nodeType === 1 && n.tagName !== 'BODY' && n.tagName !== 'HTML') { if (isDialog(n)) return null;
+      if (!n.matches('td,th,[role="cell"],[role="gridcell"],[role="columnheader"]') && (semantic(n) || repeated(n))) return n; n = up(n); } return null; };
+  const containerLabel = (node) => { const byId = (node.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean).map(id => node.getRootNode().getElementById?.(id)?.textContent?.trim()).filter(Boolean).join(' ');
+    const heading = node.querySelector('h1,h2,h3,h4,h5,h6,[role="heading"]')?.textContent?.replace(/\s+/g,' ').trim();
+    const first = segments(node)[0]?.text;
+    let v = byId || node.getAttribute('aria-label') || heading || first;
+    if (!v) { const all = segments(node.ownerDocument.body, true);
+      const before = all.filter(x => !node.contains(x.node) && (node.compareDocumentPosition(x.node) & Node.DOCUMENT_POSITION_PRECEDING)).pop();
+      const after = all.find(x => !node.contains(x.node) && (node.compareDocumentPosition(x.node) & Node.DOCUMENT_POSITION_FOLLOWING));
+      v = `between “${(before?.text || 'start').slice(0,60)}” and “${(after?.text || 'end').slice(0,60)}”`; }
+    return v.replace(/\s+/g, ' ').slice(0, 120); };
+  const containerOf = (control) => { const node = containerNode(control); return node ? containerLabel(node) : null; };
+
   const elements = [], elementIndices = new Map(), seenElements = new Set(); let index = 1;
   for (const context of contexts) for (const element of context.root.querySelectorAll(selector)) {
     if (seenElements.has(element) || !visible(element, context)) continue; seenElements.add(element);
@@ -89,20 +119,97 @@
     const rect = element.getBoundingClientRect(), containingDialog = nearestDialog(element), current = index++;
     elementIndices.set(element, current); const boolAttr = key => element.hasAttribute(key) ? element.getAttribute(key) !== 'false' : null;
     const selectOptions = element.tagName === 'SELECT' ? [...element.options].map(option => ({node_id:nodeId(option),label:option.label||option.textContent.trim(),value:String(option.value),disabled:Boolean(option.disabled),selected:Boolean(option.selected)})) : [];
-    elements.push({index:current,node_id:nodeId(element),context:context.context,role:elementRole,name:name(element)||elementRole,input_type:element.tagName==='INPUT'?element.type:null,value:'value' in element?String(element.value):(element.isContentEditable?element.innerText.trim():''),checked:'checked' in element?Boolean(element.checked):boolAttr('aria-checked'),selected:'selected' in element?Boolean(element.selected):boolAttr('aria-selected'),expanded:boolAttr('aria-expanded'),disabled:Boolean(element.disabled)||element.getAttribute('aria-disabled')==='true',in_dialog:containingDialog?dialogTitle(containingDialog):null,operations,select_options:selectOptions,rect:{x:rect.x+context.offsetX,y:rect.y+context.offsetY,width:rect.width,height:rect.height}});
+    elements.push({index:current,node_id:nodeId(element),context:context.context,role:elementRole,name:name(element)||elementRole,input_type:element.tagName==='INPUT'?element.type:null,value:'value' in element?String(element.value):(element.isContentEditable?element.innerText.trim():''),checked:'checked' in element?Boolean(element.checked):boolAttr('aria-checked'),selected:'selected' in element?Boolean(element.selected):boolAttr('aria-selected'),expanded:boolAttr('aria-expanded'),disabled:Boolean(element.disabled)||element.getAttribute('aria-disabled')==='true',in_dialog:containingDialog?dialogTitle(containingDialog):null,container:containerOf(element),operations,select_options:selectOptions,rect:{x:rect.x+context.offsetX,y:rect.y+context.offsetY,width:rect.width,height:rect.height}});
   }
+
+  // Twins include opacity-hidden and offscreen controls, but never display:none controls.
+  const twinCounts = new Map(), twinKey = (element) => JSON.stringify([role(element), (name(element) || role(element)).toLowerCase(), nearestDialog(element) ? dialogTitle(nearestDialog(element)) : null]);
+  for (const context of contexts) for (const element of context.root.querySelectorAll(selector)) {
+    if (!element.checkVisibility({checkVisibilityCSS:true})) continue;
+    const key = twinKey(element); twinCounts.set(key, (twinCounts.get(key) || 0) + 1);
+  }
+  for (const [element, index] of elementIndices) elements[index - 1].shares_name = twinCounts.get(twinKey(element)) > 1;
 
   const REGION_LIMIT = 20, REGION_NAME_LIMIT = 120;
   const hiddenByOpacity = (element, context) => inViewport(element, context) && element.checkVisibility({checkVisibilityCSS:true}) &&
     !element.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}) && !ancestors(element).some(node => node.matches?.('[aria-hidden="true"],[inert]'));
   const revealingRegion = (element) => ancestors(element).slice(1).find(node => node.checkVisibility({checkOpacity:true}) &&
     (node.matches('li,tr,[role=row],[role=listitem]') || node.hasAttribute('aria-label')));
+  // Opacity reveals inferred from CSSOM hover rules, importance, and layers.
+  const hoverRules = [], baseRules = [], hideRules = []; let hoverRulesUnreadable = false, ruleOrder = 0;
+  const viewOf = (node) => (node.ownerDocument || node).defaultView || window;
+  for (const context of contexts) {
+    const root = context.root, win = viewOf(root), layerOrder = new Map(), layerCounts = new Map(); let anonLayer = 0;
+    // A child's position belongs to its parent; registering it never reorders root layers.
+    const registerLayer = (name) => { let parent = '', path = [];
+      for (const part of name.split('.')) { const qualified = parent ? parent + '.' + part : part;
+        if (!layerOrder.has(qualified)) { const next = layerCounts.get(parent) || 0; layerCounts.set(parent, next + 1); layerOrder.set(qualified, [...path, next]); }
+        path = layerOrder.get(qualified); parent = qualified; } };
+    const sheets = [...(root.styleSheets || []), ...(root.adoptedStyleSheets || [])];
+    const consider = (sel, style, layer) => { if (!style || style.opacity === '') return;
+      const record = {s:sel, order:ruleOrder++, o:parseFloat(style.opacity), important:style.getPropertyPriority('opacity') === 'important', layer, layerOrder, root};
+      if (/:hover(?![\w-])/.test(sel)) hoverRules.push(record); else if (Number.isFinite(record.o)) { baseRules.push(record); if (record.o === 0) hideRules.push(record); } };
+    const walk = (rules, parent, layer) => { for (const r of rules) { try {
+      if (win.CSSLayerStatementRule && r instanceof win.CSSLayerStatementRule) { for (const n of r.nameList) { const k = (layer ? layer + '.' : '') + n; registerLayer(k); } continue; }
+      let childLayer = layer;
+      if (win.CSSLayerBlockRule && r instanceof win.CSSLayerBlockRule) { childLayer = (layer ? layer + '.' : '') + (r.name || ('\0anon' + (anonLayer++))); registerLayer(childLayer); }
+      if (win.CSSMediaRule && r instanceof win.CSSMediaRule && !win.matchMedia(r.media.mediaText).matches) continue;
+      if (win.CSSSupportsRule && r instanceof win.CSSSupportsRule && !win.CSS.supports(r.conditionText)) continue;
+      let own = null;
+      if (win.CSSStyleRule && r instanceof win.CSSStyleRule) { own = parent ? (r.selectorText.includes('&') ? r.selectorText.replaceAll('&', `:is(${parent})`) : `:is(${parent}) ${r.selectorText}`) : r.selectorText; consider(own, r.style, layer); }
+      if (win.CSSNestedDeclarations && r instanceof win.CSSNestedDeclarations && parent) consider(parent, r.style, layer);
+      if (r.cssRules) walk(r.cssRules, own || parent, childLayer);
+      } catch (_) { /* One unsupported rule must not discard the sheet. */ }
+    } };
+    for (const sheet of sheets) { try { if (!sheet.disabled && (!sheet.media?.mediaText || win.matchMedia(sheet.media.mediaText).matches)) walk(sheet.cssRules, null, null); } catch (_) { hoverRulesUnreadable = true; } }
+  }
+  const rank = (r) => { const path = r.layer == null ? [] : r.layerOrder.get(r.layer);
+    if (r.inline) return r.important ? [3] : [1];
+    // The implicit unlayered child comes last normally and first when importance reverses layers.
+    return r.important ? [2, ...path.map(n => -n), -1e9] : [0, ...path, 1e9]; };
+  const beats = (a, b) => { const x = rank(a), y = rank(b);
+    for (let i = 0; i < Math.max(x.length, y.length); i++) { if (x[i] !== y[i]) return (x[i] ?? 0) > (y[i] ?? 0); }
+    // Identical selectors have equal specificity, so their later declaration wins.
+    // Comparing different selectors still keeps the bounded V3 specificity approximation.
+    return a.s && a.s === b.s ? a.order >= b.order : true; };
+  const safeMatches = (node, sel) => { try { return node.matches(sel); } catch (_) { return false; } };
+  const siblingHover = (sel) => /:hover(?![\w-])[\s\S]*[~+]/.test(sel.replace(/\[[^\]]*\]|"[^"\\]*(?:\\.[^"\\]*)*"|'[^'\\]*(?:\\.[^'\\]*)*'/g, ''));
+  const hoveredMatch = (node, rule) => rule.root === node.getRootNode() && !/:not\(\s*:hover\s*\)/.test(rule.s) && !siblingHover(rule.s) && safeMatches(node, rule.s.replace(/:hover(?![\w-])/g, ':is(*)'));
+  const remainingOpacity = (node) => { const rules = [...baseRules.filter(r => r.root === node.getRootNode() && safeMatches(node, r.s)), ...hoverRules.filter(r => hoveredMatch(node, r))];
+    const inline = parseFloat(node.style?.opacity);
+    if (Number.isFinite(inline)) rules.push({o:inline, inline:true, important:node.style.getPropertyPriority('opacity') === 'important'});
+    return rules.reduce((winner, rule) => !winner || beats(rule, winner) ? rule : winner, null)?.o ?? 1; };
+  const revealRuleFor = (node) => hoverRules.find(rule => {
+    if (rule.root !== node.getRootNode()) return false;
+    if (/:not\(\s*:hover\s*\)/.test(rule.s)) return false;
+    if (!(rule.o > 0) || siblingHover(rule.s) || !safeMatches(node, rule.s.replace(/:hover(?![\w-])/g, ':is(*)'))) return false;
+    const hides = [...hideRules.filter(h => h.root === node.getRootNode() && safeMatches(node, h.s)), ...hoverRules.filter(h => h.o === 0 && hoveredMatch(node, h))];
+    if (node.style?.opacity === '0') hides.push({inline:true, important:node.style.getPropertyPriority('opacity') === 'important'});
+    return hides.every(h => beats(rule, h)); }) || hoverRules.find(rule => rule.root === node.getRootNode() && rule.o === 0 && /:not\(\s*:hover\s*\)/.test(rule.s) && !siblingHover(rule.s) && safeMatches(node, rule.s.replace(/:not\(\s*:hover\s*\)/g, ':is(*)')) && remainingOpacity(node) > 0);
+  const opacityCarriers = (element) => ancestors(element).filter(node => node.nodeType === 1 && parseFloat(viewOf(node).getComputedStyle(node).opacity) === 0);
+  const hoverRevealed = (element) => opacityCarriers(element).every(node => revealRuleFor(node));
+  const unlabeledRegion = (element) => { const carriers = opacityCarriers(element), top = carriers[carriers.length - 1] || element;
+    return ancestors(top).slice(1).find(node => node.nodeType === 1 && node.checkVisibility({checkOpacity:true}) && node.getBoundingClientRect().height > 0); };
+  const paintedTexts = (root) => { const walker = (root.ownerDocument || document).createTreeWalker(root, NodeFilter.SHOW_TEXT), out = []; let t;
+    while ((t = walker.nextNode())) { const v = t.textContent.replace(/\s+/g,' ').trim(), p = t.parentElement; if (v && p && !p.closest('script,style') && p.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) out.push({node:t, text:v}); } return out; };
+  const regionName = (region) => { const own = paintedTexts(region).map(x => x.text).join(' ');
+    if (region.getAttribute('aria-label')) return region.getAttribute('aria-label'); if (own) return own;
+    const all = paintedTexts(region.ownerDocument.body);
+    const before = all.filter(x => !region.contains(x.node) && (region.compareDocumentPosition(x.node) & Node.DOCUMENT_POSITION_PRECEDING)).pop();
+    const after = all.find(x => !region.contains(x.node) && (region.compareDocumentPosition(x.node) & Node.DOCUMENT_POSITION_FOLLOWING));
+    return `between “${(before?.text || 'start').slice(0,60)}” and “${(after?.text || 'end').slice(0,60)}”`; };
+
   const regionRecords = new Map(), seenHidden = new Set();
   for (const context of contexts) for (const element of context.root.querySelectorAll(selector)) {
     if (seenHidden.has(element) || !hiddenByOpacity(element, context)) continue; seenHidden.add(element);
-    const region = revealingRegion(element); if (!region) continue;
-    if (!regionRecords.has(region)) regionRecords.set(region, {name:(region.getAttribute('aria-label') || region.innerText.replace(/\s+/g,' ').trim()).slice(0,REGION_NAME_LIMIT),reveals_on_hover:[],node_id:nodeId(element)});
-    regionRecords.get(region).reveals_on_hover.push(name(element) || role(element));
+    const labeled = revealingRegion(element);
+    const revealRegion = labeled || (hoverRevealed(element) ? unlabeledRegion(element) : null); if (!revealRegion) continue;
+    const container = containerNode(element), region = container || revealRegion;
+    if (!regionRecords.has(region)) regionRecords.set(region, {name:(container ? containerLabel(container) : labeled ? (region.getAttribute('aria-label') || region.innerText.replace(/\s+/g,' ').trim()) : regionName(region)).slice(0,REGION_NAME_LIMIT),reveals_on_hover:[],reveal_roles:[],reveal_node_ids:[],node_id:nodeId(element)});
+    const record = regionRecords.get(region);
+    record.reveals_on_hover.push(name(element) || role(element));
+    record.reveal_roles.push(role(element));
+    record.reveal_node_ids.push(nodeId(element));
   }
   const hoverRegions = [...regionRecords.values()].slice(0, REGION_LIMIT).map((record, offset) => ({index:offset + 1, ...record}));
 
@@ -161,7 +268,7 @@
     const container = active.parentElement?.closest('[role="tree"],[role="treegrid"],[role="grid"],[role="listbox"],[role="menu"],[role="menubar"],[role="tablist"],[role="radiogroup"],[role="toolbar"]') || active.parentElement;
     const siblingIndex = container ? [...container.querySelectorAll('*')].filter(element => role(element) === anchorRole).indexOf(active) + 1 : 0;
     const position = indexed ? null : posinset > 0 ? posinset : siblingIndex || null;
-    focusAnchor = {active_descendant:activeDescendant,expanded:boolAttr('aria-expanded'),selected:'selected' in active ? Boolean(active.selected) : boolAttr('aria-selected'),checked:'checked' in active ? Boolean(active.checked) : boolAttr('aria-checked'),position,node_id:nodeId(active),context:context?.context || 'main',role:anchorRole,name:indexed?.name || (active === containingDialog ? dialog : ariaName),in_dialog:indexed?.in_dialog || dialog,covered:!closed && !crossOrigin,surface:crossOrigin?'cross_origin_frame':closed?'closed_shadow_root':active.tagName==='CANVAS'?'canvas':null};
+    focusAnchor = {active_descendant:activeDescendant,expanded:boolAttr('aria-expanded'),selected:'selected' in active ? Boolean(active.selected) : boolAttr('aria-selected'),checked:'checked' in active ? Boolean(active.checked) : boolAttr('aria-checked'),position,node_id:nodeId(active),context:context?.context || 'main',role:anchorRole,name:indexed?.name || (active === containingDialog ? dialog : ariaName),in_dialog:indexed?.in_dialog || dialog,container:containerOf(active),covered:!closed && !crossOrigin,surface:crossOrigin?'cross_origin_frame':closed?'closed_shadow_root':active.tagName==='CANVAS'?'canvas':null};
   }
   for (const context of contexts) for (const element of context.root.querySelectorAll('*')) {
     if (element.tagName === 'CANVAS') gaps.push('canvas');
@@ -178,5 +285,5 @@
     dialogTexts[record.title] = text.slice(0,TEXT_LIMIT);
   }
   const finalGaps = [...new Set(gaps)], truncated = finalGaps.some(gap => gap.endsWith('_truncated'));
-  return {document_id:String(performance.timeOrigin),url:location.href,route:location.pathname+location.search,title:document.title,dialogs,focused,focus_anchor:focusAnchor,visible_text:visibleText.join('\n'),covered_text:coveredText.join('\n'),dialog_texts:dialogTexts,elements,viewport:{width:innerWidth,height:innerHeight,scroll_x:scrollX,scroll_y:scrollY,document_height:document.documentElement.scrollHeight},coverage:{viewport_complete:!truncated,open_shadow_roots:true,slots:true,same_origin_frames:!finalGaps.includes('cross_origin_frame'),gaps:finalGaps},hover_regions:hoverRegions,hover_regions_truncated:regionRecords.size > REGION_LIMIT};
+  return {document_id:String(performance.timeOrigin),url:location.href,route:location.pathname+location.search,title:document.title,dialogs,focused,focus_anchor:focusAnchor,visible_text:visibleText.join('\n'),covered_text:coveredText.join('\n'),dialog_texts:dialogTexts,elements,viewport:{width:innerWidth,height:innerHeight,scroll_x:scrollX,scroll_y:scrollY,document_height:document.documentElement.scrollHeight},coverage:{viewport_complete:!truncated,open_shadow_roots:true,slots:true,same_origin_frames:!finalGaps.includes('cross_origin_frame'),gaps:finalGaps},hover_rules_unreadable:hoverRulesUnreadable,hover_regions:hoverRegions,hover_regions_truncated:regionRecords.size > REGION_LIMIT};
 })()

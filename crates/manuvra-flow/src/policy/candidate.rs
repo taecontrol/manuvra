@@ -1,10 +1,8 @@
 //! Candidates: the operation and target a permit would authorize, built from the provider's
 //! judgments on an observation, and the redacted form a caller is offered.
 
-use super::targeting::{selected_hover_region, selected_target, selected_value};
+use super::targeting::{dispatched_operation, selected_reveal, selected_target, selected_value};
 use super::{Policy, PolicyStop};
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
-use crate::judgment::selected_operation;
 use crate::judgment::{Judgments, Operation};
 use manuvra_chrome::{FocusAnchor, HoverRegion, Key, Observation};
 use serde::{Deserialize, Serialize};
@@ -18,6 +16,7 @@ pub(crate) struct Candidate {
     pub(super) target_identity: TargetIdentity,
     pub(crate) target_role: Option<String>,
     pub(crate) target_dialog: Option<String>,
+    pub(crate) target_container: Option<String>,
     pub(crate) target_input_type: Option<String>,
     pub(crate) value_name: Option<String>,
     pub(crate) key: Option<Key>,
@@ -26,12 +25,13 @@ pub(crate) struct Candidate {
 }
 
 /// The hover region a `HOVER` candidate targets, as recorded in evidence. Its dispatch identity,
-/// the region's first hidden control, stays in the candidate's target identity.
+/// the chosen hidden control, stays in the candidate's target identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HoverTarget {
     pub index: u64,
     pub name: String,
     pub reveals_on_hover: Vec<String>,
+    pub reveal: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +48,8 @@ struct OfferedCandidate<'a> {
     target_name: Option<&'a str>,
     target_role: Option<&'a str>,
     target_dialog: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_container: Option<&'a str>,
     target_input_type: Option<&'a str>,
     value_name: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -65,6 +67,7 @@ struct OfferedCandidate<'a> {
 struct OfferedHoverTarget<'a> {
     name: &'a str,
     reveals_on_hover: &'a [String],
+    reveal: &'a str,
 }
 
 impl Candidate {
@@ -76,6 +79,7 @@ impl Candidate {
             target_name: self.target_name.as_deref(),
             target_role: self.target_role.as_deref(),
             target_dialog: self.target_dialog.as_deref(),
+            target_container: self.target_container.as_deref(),
             target_input_type: self.target_input_type.as_deref(),
             value_name: self.value_name.as_deref(),
             key: self.key,
@@ -87,6 +91,7 @@ impl Candidate {
             hover_target: self.hover_target.as_ref().map(|region| OfferedHoverTarget {
                 name: &region.name,
                 reveals_on_hover: &region.reveals_on_hover,
+                reveal: &region.reveal,
             }),
         })
         .expect("offered candidate is serializable")
@@ -101,10 +106,22 @@ impl Candidate {
             .iter()
             .find(|region| {
                 region.index == wanted.index
-                    && Some(region.node_id) == self.target_identity.node_id
+                    && region.reveal_node_ids.first() == Some(&region.node_id)
+                    && region
+                        .reveal_node_ids
+                        .iter()
+                        .zip(&region.reveals_on_hover)
+                        .any(|(node, name)| {
+                            Some(*node) == self.target_identity.node_id && *name == wanted.reveal
+                        })
                     && region.name == wanted.name
                     && region.reveals_on_hover == wanted.reveals_on_hover
             })
+    }
+    /// The chosen hidden node, only while its complete region identity still matches.
+    pub(crate) fn hover_node_id(&self, observation: &Observation) -> Option<u64> {
+        self.hover_region(observation)?;
+        self.target_identity.node_id
     }
 }
 
@@ -115,8 +132,7 @@ impl Policy {
         observation: &Observation,
         judgments: &Judgments,
     ) -> Result<Candidate, PolicyStop> {
-        let operation = selected_operation(judgments)
-            .map_err(|_| PolicyStop::Blocked("provider_invalid_response"))?;
+        let operation = dispatched_operation(observation, judgments)?;
         match operation {
             Operation::Click
             | Operation::TypeText
@@ -162,6 +178,7 @@ impl Policy {
             },
             target_role: Some(target.role.clone()),
             target_dialog: target.in_dialog.clone(),
+            target_container: target.container.clone(),
             target_input_type: target.input_type.clone(),
             value_name,
             key: None,
@@ -189,6 +206,7 @@ impl Policy {
             },
             target_role: anchor.as_ref().map(|anchor| anchor.role.clone()),
             target_dialog: anchor.as_ref().and_then(|anchor| anchor.in_dialog.clone()),
+            target_container: anchor.as_ref().and_then(|anchor| anchor.container.clone()),
             target_input_type: None,
             value_name: None,
             key: Some(key),
@@ -220,14 +238,15 @@ impl Policy {
         observation: &Observation,
         judgments: &Judgments,
     ) -> Result<Candidate, PolicyStop> {
-        let region = selected_hover_region(observation, judgments)
+        let (region, offset) = selected_reveal(observation, judgments)
             .ok_or(PolicyStop::Blocked("provider_invalid_response"))?;
         let mut candidate = self.untargeted_candidate(observation, Operation::Hover);
-        candidate.target_identity.node_id = Some(region.node_id);
+        candidate.target_identity.node_id = Some(region.reveal_node_ids[offset]);
         candidate.hover_target = Some(HoverTarget {
             index: region.index,
             name: region.name.clone(),
             reveals_on_hover: region.reveals_on_hover.clone(),
+            reveal: region.reveals_on_hover[offset].clone(),
         });
         Ok(candidate)
     }
@@ -244,6 +263,7 @@ impl Policy {
             },
             target_role: None,
             target_dialog: None,
+            target_container: None,
             target_input_type: None,
             value_name: None,
             key: None,
@@ -268,7 +288,7 @@ mod tests {
             &mut policy,
             &step(),
             &hover_page(),
-            &hover(Some("R2")),
+            &hover(Some("R2_1")),
             false,
         ));
         assert_eq!(permit.operation(), Operation::Hover);
@@ -283,6 +303,7 @@ mod tests {
                 index: 2,
                 name: "Rent".into(),
                 reveals_on_hover: vec!["Actions for Rent".into()],
+                reveal: "Actions for Rent".into(),
             })
         );
         assert_eq!(
@@ -298,7 +319,7 @@ mod tests {
     fn a_hover_below_the_gate_is_offered_by_region_name_and_reveals_only() {
         let policy = Policy::new(&JobOptions::default(), "http://example.test/");
         let candidate = policy
-            .caller_candidate(&hover_page(), &hover(Some("R2")))
+            .caller_candidate(&hover_page(), &hover(Some("R2_1")))
             .unwrap();
         assert_eq!(candidate.operation, Operation::Hover);
         assert_eq!(
@@ -310,10 +331,10 @@ mod tests {
             serde_json::json!({
                 "id":"c_1","operation":"HOVER","target_name":null,"target_role":null,
                 "target_dialog":null,"target_input_type":null,"value_name":null,
-                "hover_target":{"name":"Rent","reveals_on_hover":["Actions for Rent"]}
+                "hover_target":{"name":"Rent","reveals_on_hover":["Actions for Rent"],"reveal":"Actions for Rent"}
             })
         );
-        for unlisted in [None, Some("R9")] {
+        for unlisted in [Some("NOT_LISTED"), Some("R9")] {
             assert_eq!(
                 policy.caller_candidate(&hover_page(), &hover(unlisted)),
                 Err(PolicyStop::Blocked("provider_invalid_response"))

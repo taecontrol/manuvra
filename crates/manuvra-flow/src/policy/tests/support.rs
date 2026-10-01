@@ -36,6 +36,8 @@ pub(crate) fn observation(operation: &str, role: &str) -> Observation {
             expanded: Some(false),
             disabled: false,
             in_dialog: None,
+            container: None,
+            shares_name: false,
             operations: vec![operation.into()],
             select_options: vec![],
             rect: Rect {
@@ -55,6 +57,7 @@ pub(crate) fn observation(operation: &str, role: &str) -> Observation {
         coverage: Coverage::default(),
         hover_regions: Vec::new(),
         hover_regions_truncated: false,
+        hover_rules_unreadable: false,
     }
 }
 pub(crate) fn choice(value: &str) -> ChoiceJudgment {
@@ -72,7 +75,6 @@ pub(crate) fn judgments(operation: &str) -> Judgments {
         select_target: choice("1"),
         type_value: choice("name"),
         key: choice("Escape"),
-        hover_target: None,
         step_done: 0.5,
         usage: BTreeMap::new(),
         request_id: None,
@@ -89,6 +91,7 @@ pub(crate) fn focused(name: &str) -> Observation {
         role: "button".into(),
         name: name.into(),
         in_dialog: None,
+        container: None,
         covered: true,
         surface: None,
         active_descendant: None,
@@ -179,8 +182,10 @@ pub(crate) fn hover_page() -> Observation {
 }
 
 pub(crate) fn hover(target: Option<&str>) -> Judgments {
-    let mut judgment = judgments("HOVER");
-    judgment.hover_target = target.map(choice);
+    let mut judgment = judgments("CLICK");
+    judgment.click_target = target
+        .map(choice)
+        .unwrap_or_else(|| choice("NO_CLICK_TARGET"));
     judgment
 }
 

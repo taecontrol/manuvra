@@ -1,4 +1,4 @@
-use manuvra_chrome::{HoverRegion, Observation};
+use manuvra_chrome::Observation;
 use manuvra_contract::{Job, JobValue};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -87,12 +87,25 @@ impl<'a> Values<'a> {
         })
     }
 
-    /// A hover region as the provider sees it: masked page text, without its dispatch identity.
-    pub(crate) fn hover_region_view(&self, region: &HoverRegion) -> Value {
-        json!({
-            "name":self.mask(&region.name),
-            "reveals_on_hover":region.reveals_on_hover.iter().map(|name|self.mask(name)).collect::<Vec<_>>(),
-        })
+    /// Judgment-only context. Final verification retains the original page view.
+    pub(crate) fn judgment_view(&self, observation: &Observation) -> Value {
+        let mut view = self.model_view(observation);
+        for (element, listed) in observation
+            .elements
+            .iter()
+            .zip(view["elements"].as_array_mut().into_iter().flatten())
+        {
+            if let Some(container) = crate::contest::container_for(element, observation) {
+                listed["container"] = json!(self.mask(container));
+            }
+        }
+        if !observation.hover_regions.is_empty() {
+            view["hover_regions"] = json!(observation.hover_regions.iter().map(|region| json!({
+                "index": region.index, "name": self.mask(&region.name),
+                "reveals_on_hover": region.reveals_on_hover.iter().map(|name| self.mask(name)).collect::<Vec<_>>()
+            })).collect::<Vec<_>>());
+        }
+        view
     }
 
     pub fn descriptions(&self) -> Value {
@@ -171,6 +184,7 @@ mod tests {
                 role: "textbox".into(),
                 name: "raw-secret-742".into(),
                 in_dialog: None,
+                container: None,
                 covered: true,
                 surface: None,
                 active_descendant: Some(manuvra_chrome::ActiveDescendant {
@@ -201,6 +215,8 @@ mod tests {
                 expanded: None,
                 disabled: false,
                 in_dialog: Some("Edit raw-secret-742".into()),
+                container: None,
+                shares_name: false,
                 operations: vec!["TYPE_TEXT".into()],
                 select_options: vec![],
                 rect: Rect {
@@ -220,6 +236,7 @@ mod tests {
             coverage: Coverage::default(),
             hover_regions: Vec::new(),
             hover_regions_truncated: false,
+            hover_rules_unreadable: false,
         };
         let view = Values::new(&job).model_view(&observation);
         assert_eq!(view["focus_anchor"]["name"], "<value:secret_name>");
@@ -296,6 +313,8 @@ mod tests {
             expanded: None,
             disabled: false,
             in_dialog: None,
+            container: None,
+            shares_name: false,
             operations: vec!["SELECT".into()],
             select_options: vec![SelectOption {
                 node_id: 812_345,

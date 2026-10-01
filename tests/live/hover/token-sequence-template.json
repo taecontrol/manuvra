@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "target": {
+    "kind": "browser",
+    "url": "http://127.0.0.1:4480/token-rows.html"
+  },
+  "context": {
+    "journey": "token-sequence",
+    "revision": "{{revision}}",
+    "environment": "synthetic fixture on a temporary local port",
+    "actor": "synthetic user",
+    "authority": "act in this fixture only"
+  },
+  "steps": [
+    {
+      "id": "s1",
+      "goal": "Copy the staging token.",
+      "done_when": [
+        {
+          "text_visible": "Copied Staging"
+        }
+      ]
+    },
+    {
+      "id": "s2",
+      "goal": "Copy the production token.",
+      "done_when": [
+        {
+          "text_visible": "Copied Production"
+        }
+      ]
+    }
+  ],
+  "options": {
+    "allowed_origins": [
+      "http://127.0.0.1:4480"
+    ],
+    "viewport": {
+      "width": 1120,
+      "height": 780
+    }
+  }
+}

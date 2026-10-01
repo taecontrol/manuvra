@@ -771,6 +771,7 @@ mod tests {
                 role: "button".into(),
                 name: "Open".into(),
                 in_dialog: None,
+                container: None,
                 covered: true,
                 surface: None,
                 active_descendant: None,
@@ -828,6 +829,7 @@ mod tests {
         for change in [
             (|anchor: &mut FocusAnchor| anchor.name = "Other".into()) as fn(&mut FocusAnchor),
             |anchor| anchor.node_id = 8,
+            |anchor| anchor.container = Some("Other row".into()),
             |anchor| anchor.expanded = Some(true),
             |anchor| anchor.selected = Some(true),
             |anchor| anchor.checked = Some(false),

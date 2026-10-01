@@ -76,7 +76,7 @@ fn redacted_observation(raw: &Observation, redactor: &Redactor) -> Result<Value,
         .elements
         .iter()
         .map(|element| {
-            json!({
+            let mut exported = json!({
                 "index":element.index,
                 "role":element.role,
                 "name":redact(&element.name),
@@ -95,7 +95,14 @@ fn redacted_observation(raw: &Observation, redactor: &Redactor) -> Result<Value,
                     "selected":option.selected,
                 })).collect::<Vec<_>>(),
                 "rect":element.rect,
-            })
+            });
+            if let Some(container) = &element.container {
+                exported["container"] = json!(redact(container));
+            }
+            if element.shares_name {
+                exported["shares_name"] = json!(true);
+            }
+            exported
         })
         .collect::<Vec<_>>();
     let mut exported = json!({
@@ -122,6 +129,13 @@ fn redacted_observation(raw: &Observation, redactor: &Redactor) -> Result<Value,
         "viewport":raw.viewport,
         "coverage":raw.coverage,
     });
+    if let Some(container) = raw
+        .focus_anchor
+        .as_ref()
+        .and_then(|anchor| anchor.container.as_ref())
+    {
+        exported["focus_anchor"]["container"] = json!(redact(container));
+    }
     if let Value::Object(fields) = &mut exported {
         fields.extend(exported_hover_regions(raw, redactor));
     }
@@ -149,6 +163,9 @@ fn exported_hover_regions(raw: &Observation, redactor: &Redactor) -> Vec<(String
     }
     if raw.hover_regions_truncated {
         fields.push(("hover_regions_truncated".to_owned(), Value::Bool(true)));
+    }
+    if raw.hover_rules_unreadable {
+        fields.push(("hover_rules_unreadable".to_owned(), Value::Bool(true)));
     }
     fields
 }
@@ -180,6 +197,25 @@ mod tests {
     use manuvra_chrome::{Element, FocusAnchor, Rect};
 
     #[test]
+    fn unreadable_hover_rules_are_evidence_only_and_leave_done_coverage_intact() {
+        let job = job("Ready");
+        let redactor = Redactor::for_job(&job).unwrap();
+        let mut observation = text_field("");
+        let baseline = redacted_observation(&observation, &redactor).unwrap();
+        observation.hover_rules_unreadable = true;
+        let mut exported = redacted_observation(&observation, &redactor).unwrap();
+        assert_eq!(
+            exported
+                .as_object_mut()
+                .unwrap()
+                .remove("hover_rules_unreadable"),
+            Some(json!(true))
+        );
+        assert_eq!(exported, baseline);
+        assert_eq!(observation.coverage, manuvra_chrome::Coverage::default());
+    }
+
+    #[test]
     fn exported_observation_keeps_public_indices_but_omits_browser_identity() {
         let mut job = mutation_job();
         job.values.get_mut("name").unwrap().secret = true;
@@ -187,6 +223,8 @@ mod tests {
         let mut observation = text_field("");
         observation.document_id = "internal-document-token".into();
         observation.elements[0].node_id = 981_723;
+        observation.elements[0].container = Some("Wanted".into());
+        observation.elements[0].shares_name = true;
         observation.elements[0].context = "main/shadow:981723".into();
         observation.focus_anchor = Some(FocusAnchor {
             node_id: 981_723,
@@ -194,6 +232,7 @@ mod tests {
             role: "textbox".into(),
             name: "Wanted".into(),
             in_dialog: None,
+            container: Some("Wanted".into()),
             covered: true,
             surface: None,
             active_descendant: None,
@@ -207,6 +246,19 @@ mod tests {
 
         assert_eq!(exported["elements"][0]["index"], 1);
         assert_eq!(exported["elements"][0]["name"], "Name");
+        assert_eq!(exported["elements"][0]["shares_name"], true);
+        assert!(
+            exported["elements"][0]["container"]
+                .as_str()
+                .unwrap()
+                .contains("<masked:")
+        );
+        assert!(
+            exported["focus_anchor"]["container"]
+                .as_str()
+                .unwrap()
+                .contains("<masked:")
+        );
         assert!(!text.contains("internal-document-token"));
         assert!(!text.contains("981723"));
         assert!(!text.contains("document_id"));
@@ -243,6 +295,8 @@ mod tests {
             expanded: Some(true),
             disabled: false,
             in_dialog: Some("Confirm Wanted".into()),
+            container: None,
+            shares_name: false,
             operations: vec!["SELECT".into()],
             select_options: vec![manuvra_chrome::SelectOption {
                 node_id: 9,
@@ -300,12 +354,16 @@ mod tests {
                 name: "Groceries".into(),
                 reveals_on_hover: vec!["Actions for Groceries".into()],
                 node_id: 981_723,
+                reveal_roles: vec!["button".into()],
+                reveal_node_ids: vec![981_723],
             },
             manuvra_chrome::HoverRegion {
                 index: 2,
                 name: "Rent".into(),
                 reveals_on_hover: vec!["Actions for Rent".into(), "Pin Rent".into()],
                 node_id: 981_724,
+                reveal_roles: vec!["button".into(), "button".into()],
+                reveal_node_ids: vec![981_724, 981_725],
             },
         ];
         observation.hover_regions_truncated = true;

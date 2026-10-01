@@ -380,6 +380,8 @@ fn fault_observation() -> manuvra_flow::Observation {
             expanded: None,
             disabled: false,
             in_dialog: None,
+            container: None,
+            shares_name: false,
             operations: vec!["CLICK".into()],
             select_options: vec![],
             rect: manuvra_flow::Rect {
@@ -399,6 +401,7 @@ fn fault_observation() -> manuvra_flow::Observation {
         coverage: manuvra_flow::Coverage::default(),
         hover_regions: Vec::new(),
         hover_regions_truncated: false,
+        hover_rules_unreadable: false,
     }
 }
 
@@ -415,7 +418,6 @@ fn fault_judgments() -> manuvra_flow::judgment::Judgments {
         select_target: choice("NO_SELECT_TARGET"),
         type_value: choice("NONE_FITS"),
         key: choice("Escape"),
-        hover_target: None,
         step_done: 0.0,
         usage: BTreeMap::new(),
         request_id: None,

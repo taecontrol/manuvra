@@ -550,14 +550,13 @@ mod tests {
         let (_, _, before_rent_hover) = choices
             .iter()
             .find(|(operation, target, request)| {
-                operation == "HOVER"
+                operation == "CLICK"
                     && request["state"]["current_step"]["goal"]
                         == "Open the actions menu for the Rent category."
-                    && request["state"]["page"]["hover_regions"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .any(|region| region["key"] == *target && region["name"] == "Rent")
+                    && request["questions"]["click_target"]["criteria"][target]["container"]
+                        == "Rent"
+                    && request["questions"]["click_target"]["criteria"][target]["revealed_by_hover"]
+                        == true
             })
             .expect("the Rent row was hovered");
         let visible: Vec<_> = before_rent_hover["state"]["page"]["elements"]
@@ -943,7 +942,7 @@ mod tests {
             let run = run_loop(
                 &click_job(),
                 &mut browser,
-                &ScriptedProvider::new([Turn::hover("R1")]),
+                &ScriptedProvider::new([Turn::hover("R1_1")]),
                 &ScriptedControl::default(),
                 &mut journal,
             );
@@ -1050,6 +1049,92 @@ mod tests {
         assert_eq!(
             hosted_termination_fields(HostedTermination::WatchdogLost),
             (RunState::Blocked, "watchdog_lost", 3)
+        );
+    }
+    #[test]
+    #[ignore = "requires the local Chromium executable"]
+    fn hosted_reveal_clicks_bravo_while_alphas_twin_is_already_visible() {
+        let fixture = HoverRevealFixture::with_body(include_str!(
+            "../../../../tests/browser/selected-row-twin.html"
+        ));
+        let url = fixture.url();
+        let job = parse_job(
+            json!({"schema_version":1,"target":{"kind":"browser","url":url},"context":{"journey":"row twin","revision":"fixture","environment":"local Chromium","actor":"synthetic","authority":"edit Bravo"},"steps":[{"id":"edit","goal":"Edit the Bravo row.","done_when":[{"text_visible":"Editing Bravo"}]}]}),
+        );
+        let mut browser = LiveBrowser::open(&url);
+        let provider = ScriptedProvider::new([Turn::hover("R1_1"), Turn::click("2")]);
+        let mut journal = MemoryJournal::default();
+        let run = run_loop(
+            &job,
+            &mut browser,
+            &provider,
+            &ScriptedControl::default(),
+            &mut journal,
+        );
+        assert_eq!(run.state(), "passed", "{}", run.outcome.result);
+        assert_eq!(
+            journal
+                .prepared()
+                .iter()
+                .map(|e| e["operation"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["HOVER", "CLICK"]
+        );
+        assert_eq!(journal.prepared()[0]["hover_target"]["name"], "Bravo");
+        assert_eq!(journal.prepared()[1]["target"]["container"], "Bravo");
+        assert!(
+            browser
+                .final_page
+                .unwrap()
+                .visible_text
+                .contains("Editing Bravo")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the local Chromium executable"]
+    fn hosted_ambiguous_project_link_stops_without_execute_or_browser_input() {
+        let fixture = HoverRevealFixture::with_body(include_str!(
+            "../../../../tests/browser/project-sidebar.html"
+        ));
+        let url = fixture.url();
+        let job = parse_job(
+            json!({"schema_version":1,"target":{"kind":"browser","url":url},"context":{"journey":"project options","revision":"fixture","environment":"local Chromium","actor":"synthetic","authority":"open Gemini options"},"steps":[{"id":"open","goal":"Open more options for Project Gemini.","done_when":[{"text_visible":"Options for Project Gemini"}]}]}),
+        );
+        let browser = LiveBrowser::open(&url);
+        let redactor = Redactor::for_job(&job).unwrap();
+        let mut machine = HostedMachine::new(&job, &redactor);
+        let provider = ScriptedProvider::new([Turn::click("2").target_confidence(0.69)]);
+        let mut journal = MemoryJournal::default();
+        machine.drive(
+            &browser,
+            &provider,
+            &mut journal,
+            &manuvra_chrome::InputCancellation::default(),
+            None,
+            &ScriptedControl::default(),
+        );
+        assert_eq!(
+            machine.artifacts.stop.as_ref().unwrap().code,
+            "target_below_gate"
+        );
+        assert_eq!(provider.calls(), 2);
+        assert!(journal.entries.is_empty());
+        assert!(
+            machine
+                .artifacts
+                .pending
+                .as_ref()
+                .unwrap()
+                .candidate
+                .is_none()
+        );
+        assert_eq!(
+            machine.artifacts.escalation.as_ref().unwrap().dispositions,
+            [
+                manuvra_contract::DispositionKind::RetryObservation,
+                manuvra_contract::DispositionKind::Abort
+            ]
         );
     }
 }

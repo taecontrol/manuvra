@@ -1,4 +1,5 @@
 pub mod actions;
+mod contest;
 pub mod evidence;
 pub mod judgment;
 pub mod policy;

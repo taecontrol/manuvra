@@ -101,6 +101,7 @@ fn candidate_semantics_match(target: &Element, candidate: &Candidate) -> bool {
     Some(target.name.as_str()) == candidate.target_name.as_deref()
         && Some(target.role.as_str()) == candidate.target_role.as_deref()
         && target.in_dialog == candidate.target_dialog
+        && target.container == candidate.target_container
         && target.input_type == candidate.target_input_type
 }
 
@@ -187,6 +188,14 @@ mod tests {
             policy.authorize_caller(&step(), &renamed, &candidate),
             Err(PolicyStop::Uncertain("candidate_revalidation_failed"))
         ));
+        let mut recycled = original.clone();
+        recycled.elements[0].container = Some("Different row".into());
+        assert_eq!(
+            policy
+                .authorize_caller(&step(), &recycled, &candidate)
+                .err(),
+            Some(PolicyStop::Uncertain("candidate_revalidation_failed"))
+        );
         let permit = policy
             .authorize_caller(&step(), &original, &candidate)
             .expect("unchanged candidate receives caller authority");
@@ -222,7 +231,7 @@ mod tests {
     fn caller_hover_authority_revalidates_region_identity_budgets_origin_and_replay() {
         let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
         let candidate = policy
-            .caller_candidate(&hover_page(), &hover(Some("R1")))
+            .caller_candidate(&hover_page(), &hover(Some("R1_1")))
             .unwrap();
         let mut remounted = hover_page();
         remounted.hover_regions[0].node_id = 77;
@@ -285,7 +294,7 @@ mod tests {
             &mut policy,
             &step(),
             &hover_page(),
-            &hover(Some("R1")),
+            &hover(Some("R1_1")),
             false,
         ))
         .consume();
@@ -301,6 +310,37 @@ mod tests {
                 policy.mint(&changed, candidate.clone()),
                 Next::Stop(PolicyStop::Uncertain("candidate_revalidation_failed"))
             ));
+        }
+    }
+    #[test]
+    fn hover_revalidation_keeps_the_second_node_and_the_complete_reveal_roster() {
+        let mut original = hover_page();
+        original.hover_regions[0]
+            .reveals_on_hover
+            .push("Delete".into());
+        original.hover_regions[0].reveal_roles.push("button".into());
+        original.hover_regions[0].reveal_node_ids.push(43);
+        for (choice, second_node_changed) in [("R1_2", true), ("R1_1", false)] {
+            let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+            let candidate = policy
+                .caller_candidate(&original, &hover(Some(choice)))
+                .unwrap();
+            let mut changed = original.clone();
+            if second_node_changed {
+                changed.hover_regions[0].reveal_node_ids[1] = 99;
+            } else {
+                changed.hover_regions[0].reveals_on_hover[1] = "Archive".into();
+            }
+            assert_eq!(candidate.hover_region(&changed), None);
+            assert_eq!(
+                policy.authorize_caller(&step(), &changed, &candidate).err(),
+                Some(PolicyStop::Uncertain("candidate_revalidation_failed"))
+            );
+            assert!(matches!(
+                policy.mint(&changed, candidate),
+                Next::Stop(PolicyStop::Uncertain("candidate_revalidation_failed"))
+            ));
+            assert_eq!(policy.actions, 0);
         }
     }
 }

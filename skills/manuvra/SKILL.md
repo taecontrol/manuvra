@@ -147,7 +147,13 @@ For an uncertain run, create a disposition matching `manuvra schema disposition`
 - `retry_observation`: use when fresher browser evidence can resolve the uncertainty.
 - `abort`: use when authority, intent, or safe continuation is absent.
 
-An offered `HOVER` candidate names a hover region in `hover_target.name` and the controls it reveals in `hover_target.reveals_on_hover`. Execute it when a revealed control is the one the step needs. The hover only reveals those controls; Manuvra then continues the step on its own.
+When an offered candidate carries `target_container`, use that container label to distinguish controls with the same name before choosing `execute`.
+
+A `target_below_gate` escalation offers `retry_observation` and `abort`, with resolved contenders and no candidate to execute. Inspect the contenders; retry the observation, or abort and start a job with a clearer step. Caller authority cannot replace an ambiguous target.
+
+A `click_target_unavailable` escalation means none of the listed controls matched the requested item. It offers only retry observation or abort; inspect the snapshot and clarify or navigate to the item before another job.
+
+An offered `HOVER` candidate names a hover region in `hover_target.name` and the chosen control in `hover_target.reveal`; `hover_target.reveals_on_hover` lists all controls in that region. Execute it when the chosen control is the one the step needs. The hover only reveals those controls; Manuvra then continues the step on its own.
 
 Example `execute` disposition:
 

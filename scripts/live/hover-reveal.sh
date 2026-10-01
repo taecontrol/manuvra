@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Release gate for hover-revealed controls: the synthetic row-action journey runs three times with
-# Jev against tests/browser/hover-reveal.html. Every run counts. A failed or stopped run is
+# Release gate for hover-revealed controls: six synthetic journeys run three times with
+# Jev against local fixtures. Every run counts. A failed or stopped run is
 # recorded with its evidence and is never retried or discarded; the script exits nonzero if any run
 # fails a check.
 set -euo pipefail
@@ -86,17 +86,8 @@ done
 origin="http://127.0.0.1:$port"
 curl -fsS -o /dev/null "$origin/hover-reveal.html"
 
-job="$live_root/job.json"
-jq --arg origin "$origin" --arg revision "$revision" '
-  .target.url = ($origin + "/hover-reveal.html") |
-  .context.revision = $revision |
-  .options.allowed_origins = [$origin]
-' "$repo_root/tests/live/hover/reveal-template.json" >"$job"
-if grep -q -F '{{' "$job"; then
-  echo "job template placeholder left unresolved" >&2
-  exit 1
-fi
-
+job=
+journey=
 wait_terminal() {
   local run_id=$1 result=$2 label=$3
   local state attempt code next
@@ -130,7 +121,7 @@ manifest_is_complete() {
 every_step_and_expectation_satisfied() {
   jq -e --slurpfile job "$2" '
     [.verdict.steps[] | [.id, .result]] == [$job[0].steps[] | [.id, "satisfied"]] and
-    [.verdict.expectations[] | [.id, .result]] == [$job[0].expectations[] | [.id, "satisfied"]]
+    [.verdict.expectations[] | [.id, .result]] == [$job[0].expectations[]? | [.id, "satisfied"]]
   ' "$1" >/dev/null
 }
 
@@ -201,7 +192,7 @@ absent_from() {
 }
 
 no_internal_identity_in() {
-  absent_from -- '"(document_id|node_id|target_node_id)"' "$1"
+  absent_from -- '"(document_id|node_id|target_node_id|reveal_node_ids)"' "$1"
 }
 
 no_provider_key_in() {
@@ -244,7 +235,7 @@ check() {
 
 run_case() {
   local index=$1
-  local label="run-$index"
+  local label="$journey-$index"
   local case_root="$live_root/$label"
   active_state="$case_root/state"
   active_runtime="$scratch/$label"
@@ -289,21 +280,28 @@ run_case() {
   active_run=
   ended=$(date +%s%3N)
 
+  if [[ "$journey" == row-actions || ! -f "$case_root/stop.json" ]]; then
   check passed jq -e '.state == "passed" and .terminal == true and .verdict.overall == "satisfied"' "$result"
   check caller_assisted_false jq -e '.verdict.caller_assisted == false' "$result"
   check steps_satisfied every_step_and_expectation_satisfied "$result" "$job"
-  check manifest_complete manifest_is_complete "$result"
-  check manifest_covers_journey manifest_covers_journey "$result"
+  if [[ "$journey" == row-actions ]]; then
+    check manifest_covers_journey manifest_covers_journey "$result"
+  fi
+  fi
 
+  check manifest_complete manifest_is_complete "$result"
   local manifest trace observation=
   manifest=$(jq -r '.evidence.manifest // empty' "$result")
   trace=$(jq -r '.artifacts[] | select(.role == "trace") | .path' "$manifest" 2>/dev/null || true)
   if [[ -f "$trace" ]]; then
+    if [[ "$journey" == row-actions ]]; then
     check hover_sequence hover_sequence_holds "$trace"
     observation=$(observation_before_rent_hover "$trace" "$manifest" || true)
     check observation_before_rent_hover_lists_groceries_actions \
       rent_hover_started_from_groceries_revealed "$observation"
     check no_groceries_click_from_step_two no_groceries_click_from_rent_step "$trace"
+    fi
+    check journey_actions python3 "$repo_root/scripts/live/hover-journey-check.py" "$journey" "$case_root" "$result"
   else
     check trace_present false
   fi
@@ -319,22 +317,18 @@ run_case() {
   if [[ -n "$manifest" && -f "$manifest" ]]; then
     mapfile -t decision_files < <(jq -r '.artifacts[] | select(.role == "decision") | .path' "$manifest")
   fi
-  # Each decision shows the target question its chosen operation consumed, not the others.
   if ((${#decision_files[@]})); then
-    decisions=$(jq -c -n '[inputs | .request.state.page as $page | {
-        decision: (input_filename | split("/") | last),
-        goal: .request.state.current_step.goal,
-        operation: .operation.choice,
-        operation_confidence: .operation.confidence
-      } + if .operation.choice == "HOVER" then {
-        hover_region: (.hover_target.choice as $key | [$page.hover_regions[]? | select(.key == $key) | .name] | first),
-        hover_confidence: .hover_target.confidence
-      } elif .operation.choice == "CLICK" then {
-        click_target: (.click_target.choice as $key | [$page.elements[]? | select("\(.index)" == $key) | .name] | first),
-        click_target_confidence: .click_target.confidence
-      } else {} end | with_entries(select(.value != null))]' "${decision_files[@]}")
+    decisions=$(jq -c -n '[inputs | .click_target.choice as $key | .request.questions.click_target.criteria[$key] as $target | {
+        decision:(input_filename | split("/") | last),goal:.request.state.current_step.goal,
+        operation:.operation.choice,operation_confidence:.operation.confidence,
+        click_target:$target,click_target_confidence:.click_target.confidence
+    }]' "${decision_files[@]}")
   fi
-  jq -n --arg label "$label" --arg run_id "$run_id" --arg outcome "$outcome" \
+  local reveal_decisions='[]'
+  if [[ -f "$case_root/journey-checks.json" ]]; then
+    reveal_decisions=$(jq -c '.reveal_decisions' "$case_root/journey-checks.json")
+  fi
+  jq -n --argjson reveal_decisions "$reveal_decisions" --arg label "$label" --arg journey "$journey" --arg run_id "$run_id" --arg outcome "$outcome" \
     --arg state "$(jq -r '.state' "$result")" \
     --argjson caller_assisted "$(jq '.verdict.caller_assisted' "$result")" \
     --argjson steps "$(jq -c '[.verdict.steps[]? | {id, result}]' "$result")" \
@@ -342,13 +336,26 @@ run_case() {
     --arg observation_before_rent_hover "$observation" \
     --argjson checks "$(jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | {key: .[0], value: .[1]}) | from_entries' "$checks")" \
     --argjson ok "$run_ok" --argjson wall_ms "$((ended - started))" \
-    '{label:$label,run_id:$run_id,outcome:$outcome,state:$state,caller_assisted:$caller_assisted,steps:$steps,actions:$actions,observation_before_rent_hover:$observation_before_rent_hover,decisions:$decisions,checks:$checks,ok:$ok,wall_ms:$wall_ms}' \
+    '{journey:$journey,reveal_decisions:$reveal_decisions,label:$label,run_id:$run_id,outcome:$outcome,state:$state,caller_assisted:$caller_assisted,steps:$steps,actions:$actions,observation_before_rent_hover:$observation_before_rent_hover,decisions:$decisions,checks:$checks,ok:$ok,wall_ms:$wall_ms}' \
     >>"$live_root/matrix.jsonl"
   rm -rf "$active_runtime"
 }
 
-for index in $(seq 1 "$runs"); do
-  run_case "$index"
+for journey in row-actions insertion-gap selected-row-twin token-sequence project-options virtualized-rows; do
+  template="$repo_root/tests/live/hover/$journey-template.json"
+  [[ "$journey" != row-actions ]] || template="$repo_root/tests/live/hover/reveal-template.json"
+  job="$live_root/$journey-job.json"
+  jq --arg origin "$origin" --arg revision "$revision" '
+    .target.url = ($origin + "/" + (.target.url | split("/") | last)) |
+    .context.revision = $revision | .options.allowed_origins = [$origin]
+  ' "$template" >"$job"
+  if grep -q -F '{{' "$job"; then
+    echo "job template placeholder left unresolved" >&2
+    exit 1
+  fi
+  for index in $(seq 1 "$runs"); do
+    run_case "$index"
+  done
 done
 
 kill "$server_pid" 2>/dev/null || true
@@ -370,12 +377,18 @@ no_internal_identity_in "$live_root" || identity_clean=false
 jq -s --argjson key_clean "$key_clean" --argjson identity_clean "$identity_clean" \
   --slurpfile cleanup "$live_root/cleanup.json" '
   {schema_version:1,journey:"hover_reveal",runs:.,
-   passed:([.[] | select(.ok)] | length),total:length,
+   passed:([.[] | select(.outcome == "passed")] | length),
+   stopped:([.[] | select(.outcome | startswith("stopped_"))] | length),
+   failed:([.[] | select(.outcome == "failed")] | length),
+   assisted:([.[] | select(.caller_assisted)] | length),
+   harness_failures:([.[] | select(.outcome == "harness_failure")] | length),
+   accepted:([.[] | select(.ok)] | length),total:length,
    provider_key_absent:$key_clean,internal_identity_absent:$identity_clean,cleanup:$cleanup[0]}
 ' "$live_root/matrix.jsonl" >"$live_root/matrix.json"
 
 echo "$live_root"
-jq -e --argjson runs "$runs" '
-  .total == $runs and .passed == $runs and .provider_key_absent and .internal_identity_absent and
+jq -e --argjson runs "$((runs * 6))" '
+  (.passed + .stopped + .failed + .harness_failures == .total) and
+  .total == $runs and .accepted == $runs and .provider_key_absent and .internal_identity_absent and
   .cleanup.fixture_server_stopped and (.cleanup.leftover_pids | length == 0)
 ' "$live_root/matrix.json" >/dev/null
