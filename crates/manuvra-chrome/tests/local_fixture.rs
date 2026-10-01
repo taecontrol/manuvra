@@ -2249,6 +2249,7 @@ fn hover_reveals_respect_layer_hierarchy_conditions_and_stylesheet_roots() {
             "Important reveal",
             "Layer reveal",
             "Negative reveal",
+            "Shadow negative reveal",
             "Shadow reveal"
         ]
     );

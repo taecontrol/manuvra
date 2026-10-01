@@ -105,6 +105,8 @@ def self_test():
     assert not evaluate("virtualized-rows", aborted, stop, events[1:], [], {})["ok"]
     bravo = [{"event": "action_prepared", "operation": "CLICK", "target": {"name": "Edit", "container": "Bravo"}}]
     assert evaluate("virtualized-rows", result, {}, bravo, [], {})["ok"]
+    assert not evaluate("virtualized-rows", result, {}, [], [], {})["ok"]
+    assert not evaluate("virtualized-rows", result, {}, bravo * 2, [], {})["ok"]
     bravo[0]["target"]["container"] = "Alpha"
     assert not evaluate("virtualized-rows", result, {}, bravo, [], {})["ok"]
     print("hover journey and pooled confidence budget checks passed")

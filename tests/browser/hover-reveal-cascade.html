@@ -1,6 +1,6 @@
 <!doctype html><meta charset="utf-8"><title>Hover cascade and conditions</title>
 <style>
-body{font:14px sans-serif;margin:24px}.case{padding:6px;height:32px}
+body{font:14px sans-serif;margin:24px}.case{padding:3px;height:28px}
 @layer earlier,later;
 .hover-important button,.hover-layer button{opacity:0}
 .hover-important:hover button{opacity:1}.hover-important:hover button{opacity:0!important}
@@ -21,13 +21,20 @@ body{font:14px sans-serif;margin:24px}.case{padding:6px;height:32px}
 .negative-positive button{opacity:1}.negative-positive:not(:hover) button{opacity:0!important}
 @supports (this-property:unsupported){.supports-negative:hover button{opacity:1}}
 .permanent-carrier{opacity:0}.permanent-carrier button{opacity:0}.permanent-carrier:hover button{opacity:1}
+.negative-sibling button{opacity:1}.negative-peer:not(:hover) ~ button{opacity:0}
+.disabled-sheet button{opacity:0}
+.root-negative-valid button{opacity:0!important}
 .root-negative:hover button{opacity:1}
 .root-positive button{opacity:0!important}
 .invalid-rewrite button{opacity:0}.\:hover:hover{opacity:1}
 </style>
+<style id="disabled">.disabled-sheet:hover button{opacity:1}</style>
+<script>document.querySelector("#disabled").sheet.disabled=true</script>
 <style media="(hover:none)">.media-negative:hover button{opacity:1}</style>
 <div class="case hover-important">Competing important hover<button>Hover important blocked</button></div>
 <div class="case hover-layer">Competing later layer hover<button>Hover layer blocked</button></div>
+<div class="case negative-sibling">Negative sibling<i class="negative-peer">Peer</i><button>Negative sibling blocked</button></div>
+<div class="case disabled-sheet">Disabled sheet<button>Disabled blocked</button></div>
 <div class="case layer-positive">Later outer layer<button>Layer reveal</button></div>
 <div class="case layer-negative">Earlier outer layer<button>Layer blocked</button></div>
 <div class="case important-positive">Important earlier layer<button>Important reveal</button></div>
@@ -40,7 +47,8 @@ body{font:14px sans-serif;margin:24px}.case{padding:6px;height:32px}
 <div class="case supports-negative">False supports condition<button>Supports blocked</button></div>
 <div class="case permanent-carrier">Permanent parent<button>Carrier blocked</button></div>
 <div class="case invalid-rewrite">Unsupported rewritten selector<button class=":hover">Rewrite blocked</button></div>
-<section><template shadowrootmode="open"><style>.root-negative button{opacity:0}.root-positive button{opacity:0}.root-positive:hover button{opacity:1}</style>
+<section><template shadowrootmode="open"><style>.root-negative-valid:not(:hover) button{opacity:0!important}.root-negative button{opacity:0}.root-positive button{opacity:0}.root-positive:hover button{opacity:1}</style>
+<div class="case root-negative-valid">Shadow negative removal<button>Shadow negative reveal</button></div>
 <div class="case root-negative">Shadow without its own reveal<button>Shadow blocked</button></div>
 <div class="case root-positive">Shadow with its own reveal<button>Shadow reveal</button></div>
 </template></section>

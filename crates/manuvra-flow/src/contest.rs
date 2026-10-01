@@ -66,4 +66,27 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn singleton_context_requires_a_container_and_exactly_one_click_choice() {
+        let original: Observation = serde_json::from_value(serde_json::json!({
+            "document_id":"d","url":"http://example.test/","route":"/","title":"Ready","focused":null,
+            "viewport":{"width":1120,"height":780,"scroll_x":0,"scroll_y":0,"document_height":780},
+            "elements":[{"index":1,"node_id":7,"role":"button","name":"Edit","operations":["CLICK"],"value":"","input_type":null,"checked":null,"selected":null,"expanded":null,"disabled":false,"in_dialog":null,"rect":{"x":0,"y":0,"width":10,"height":10}}]
+        })).unwrap();
+        assert!(!singleton_context(&original));
+        assert!(!contested(&original));
+        let mut one = original.clone();
+        one.elements[0].container = Some("Alpha".into());
+        assert!(singleton_context(&one));
+        assert_eq!(container_for(&one.elements[0], &one), Some("Alpha"));
+        let mut many = one.clone();
+        let mut second = many.elements[0].clone();
+        second.index = 2;
+        second.node_id = 8;
+        second.name = "Delete".into();
+        many.elements.push(second);
+        assert!(!singleton_context(&many));
+        assert!(!contested(&many));
+        assert_eq!(container_for(&many.elements[0], &many), None);
+    }
 }
