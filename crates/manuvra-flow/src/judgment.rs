@@ -116,7 +116,11 @@ pub fn request(
         request["questions"]["click_target"]["instructions"]["rules"] =
             json!(contested_target_rules());
     }
-    if crate::contest::contested(observation) && observation.hover_regions.is_empty() {
+    if crate::contest::singleton_context(observation) {
+        request["questions"]["click_target"]["instructions"]["rules"] = json!(format!(
+            "{} If the required item is not listed, choose NO_CLICK_TARGET; never substitute another item's control.",
+            contested_target_rules()
+        ));
         request["questions"]["operation"]["criteria"]["CLICK"] = json!(
             "Click a listed control that belongs to the item required by this step. When NO_CLICK_TARGET fits because that item is absent, choose SCROLL_DOWN to look for it instead of clicking another item."
         );
@@ -132,7 +136,7 @@ pub fn request(
 }
 
 fn reveal_target_rules() -> &'static str {
-    "Assume the named operation was selected independently. Choose the target that directly advances only the current step. A target's container names the row, card, or item it belongs to; when the step names an item, choose the target whose container is that item, even if another target with the same name is visible. If the required item is not listed, choose NO_CLICK_TARGET; never substitute another item's control. Targets marked revealed_by_hover are valid: code reveals them before clicking. Do not select a field already equal to the required caller value."
+    "Assume the named operation was selected independently. Choose the target that directly advances only the current step. A target's container names the row, card, or item it belongs to; when the step names an item, choose the target whose container is that item, even if another target with the same name is visible. Targets marked revealed_by_hover are valid: code reveals them before clicking. Do not select a field already equal to the required caller value."
 }
 
 fn step_done_question(step: &Step, values: &Values<'_>) -> Value {
@@ -189,7 +193,7 @@ fn native_select_matches_goal(goal: &str, observation: &Observation) -> bool {
 }
 
 fn contested_target_rules() -> &'static str {
-    "Assume the named operation was selected independently. Choose the visible target that directly advances only the current step. A target's container names the row, card, or item it belongs to; when the step names an item, choose the target whose container is that item, even if another target with the same name is visible. If the required item is not listed, choose NO_CLICK_TARGET; never substitute another item's control. Do not select a field already equal to the required caller value."
+    "Assume the named operation was selected independently. Choose the visible target that directly advances only the current step. A target's container names the row, card, or item it belongs to; when the step names an item, choose the target whose container is that item, even if another target with the same name is visible. Do not select a field already equal to the required caller value."
 }
 
 fn target_criteria(observation: &Observation, operation: &str, values: &Values<'_>) -> Value {
@@ -205,7 +209,7 @@ fn target_criteria(observation: &Observation, operation: &str, values: &Values<'
     if operation == "CLICK" {
         offer_reveals(&mut criteria, observation, values);
     }
-    if operation == "CLICK" && crate::contest::contested(observation) {
+    if operation == "CLICK" && crate::contest::singleton_context(observation) {
         criteria.insert("NO_CLICK_TARGET".into(), Value::String("None of the listed controls belongs to the item required by this step. Scroll to find the required item instead of clicking another item.".into()));
     }
     if criteria.is_empty() {

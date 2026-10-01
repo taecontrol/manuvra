@@ -31,7 +31,7 @@ A visible container on the target, such as a list row, holding controls hidden b
 _Avoid_: hover area, reveal zone, hidden row
 
 **Contested request**:
-A judgment request whose observation lists hover regions or has controls sharing role, name, and dialog among the rendered controls in the document, or has a click control with a container. The container remains relevant when virtualization leaves only one item rendered.
+A judgment request whose observation lists hover regions or has controls sharing role, name, and dialog among the rendered controls in the document, or has a single click control with a container and no hover regions. The container remains relevant when virtualization leaves only one item rendered.
 
 **Focus anchor**:
 The observed identity of the target's active element: node, role, name, and containing dialog, or no focus when the document or body is active. A key candidate is bound to this anchor and revalidated immediately before dispatch.

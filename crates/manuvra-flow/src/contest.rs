@@ -3,19 +3,30 @@ use manuvra_chrome::{Element, Observation};
 
 pub(crate) fn contested(observation: &Observation) -> bool {
     !observation.hover_regions.is_empty()
-        || observation
-            .elements
-            .iter()
-            .any(|e| e.shares_name || contextual_click(e))
+        || observation.elements.iter().any(|e| e.shares_name)
+        || singleton_context(observation)
 }
 
 pub(crate) fn container_for<'a>(
     element: &'a Element,
     observation: &Observation,
 ) -> Option<&'a str> {
-    (contested(observation) && (element.shares_name || contextual_click(element)))
-        .then_some(element.container.as_deref())
-        .flatten()
+    (contested(observation)
+        && (element.shares_name || (singleton_context(observation) && contextual_click(element))))
+    .then_some(element.container.as_deref())
+    .flatten()
+}
+
+/// A sole click target can be the wrong virtualized item despite having no rendered twin.
+pub(crate) fn singleton_context(observation: &Observation) -> bool {
+    if !observation.hover_regions.is_empty() {
+        return false;
+    }
+    let mut clicks = observation
+        .elements
+        .iter()
+        .filter(|e| e.operations.iter().any(|op| op == "CLICK"));
+    clicks.next().is_some_and(contextual_click) && clicks.next().is_none()
 }
 
 fn contextual_click(element: &Element) -> bool {
@@ -46,10 +57,10 @@ mod tests {
                     if regions {
                         page.hover_regions.push(hover_region(1, "Bravo", 8));
                     }
-                    assert_eq!(contested(&page), regions || twins || click);
+                    assert_eq!(contested(&page), regions || twins || (click && !regions));
                     assert_eq!(
                         container_for(&page.elements[0], &page),
-                        (twins || click).then_some("Alpha")
+                        (twins || (click && !regions)).then_some("Alpha")
                     );
                 }
             }
