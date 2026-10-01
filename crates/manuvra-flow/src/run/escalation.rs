@@ -28,10 +28,15 @@ pub(super) fn escalate(
     let id = format!("e_{}", artifacts.escalations.len() + 1);
     let stopped = stopped_at();
     let offered_candidate = pending.candidate.as_ref().map(policy::Candidate::offered);
-    let candidates = offered_candidate.as_ref().map_or_else(
+    let mut candidates = offered_candidate.as_ref().map_or_else(
         || judgments.map(|value|json!({"operation":value.operation,"click_target":value.click_target,"type_target":value.type_target,"select_target":value.select_target,"type_value":value.type_value,"key":value.key})).unwrap_or_else(||json!({})),
         |candidate| json!([candidate]),
     );
+    if reason == "target_below_gate"
+        && let Some(judgments) = judgments
+    {
+        candidates["contenders"] = resolved_click_contenders(&pending.observation, judgments);
+    }
     let latest = latest_observation(artifacts);
     let decision = judgments.and_then(|_| {
         artifacts
@@ -60,6 +65,14 @@ pub(super) fn escalate(
         basis: None,
     };
     Stop::uncertain(reason, step_detail(redactor, step))
+}
+
+fn resolved_click_contenders(observation: &Observation, judgments: &judgment::Judgments) -> Value {
+    judgments.click_target.probabilities.iter().filter_map(|(key, probability)| {
+        let index = key.parse::<u64>().ok()?;
+        let element = observation.elements.iter().find(|e| e.index == index)?;
+        Some(json!({"key":key,"probability":probability,"role":element.role,"name":element.name,"container":element.container}))
+    }).collect()
 }
 
 pub(super) fn allowed_dispositions(
@@ -209,6 +222,79 @@ fn empty_observation() -> Observation {
 mod tests {
     use super::*;
     use crate::run::tests::support::*;
+
+    #[test]
+    fn target_below_gate_reobserves_once_resolves_contenders_and_refuses_execute() {
+        let mut job = click_job();
+        job.values.insert(
+            "row".into(),
+            serde_json::from_value(
+                json!({"value":"private-row","description":"row","secret":true}),
+            )
+            .unwrap(),
+        );
+        let redactor = Redactor::for_job(&job).unwrap();
+        let mut page = observed("Plan");
+        let mut target = button(1, 7, "Actions for Groceries");
+        target.shares_name = true;
+        target.container = Some("private-row".into());
+        page.elements.push(target);
+        let browser = FakeBrowser::new([page]);
+        let provider =
+            ScriptedProvider::new([Turn::click("1").target_confidence(0.69).confidence(0.4)]);
+        let mut machine = super::super::machine::HostedMachine::new(&job, &redactor);
+        let mut journal = MemoryJournal::default();
+        drive(&mut machine, &browser, &provider, &mut journal);
+        assert_eq!(
+            machine.artifacts.stop.as_ref().unwrap().code,
+            "target_below_gate"
+        );
+        assert_eq!(provider.calls(), 2);
+        assert_eq!(browser.dispatched(), 0);
+        assert_eq!(
+            machine.artifacts.escalation.as_ref().unwrap().dispositions,
+            [DispositionKind::RetryObservation, DispositionKind::Abort]
+        );
+        assert!(
+            machine
+                .artifacts
+                .pending
+                .as_ref()
+                .unwrap()
+                .candidate
+                .is_none()
+        );
+        let payload = &machine.artifacts.escalations[0].1;
+        assert_eq!(payload["offered_candidate"], Value::Null);
+        assert_eq!(payload["candidates"]["contenders"][0]["role"], "button");
+        assert_eq!(
+            payload["candidates"]["contenders"][0]["name"],
+            "Actions for Groceries"
+        );
+        assert!(
+            payload["candidates"]["contenders"][0]["container"]
+                .as_str()
+                .unwrap()
+                .contains("<masked:")
+        );
+        assert!(!payload.to_string().contains("private-row"));
+        assert!(
+            machine
+                .apply(
+                    request("e_1", execute("c_1")),
+                    &browser,
+                    &provider,
+                    &mut journal,
+                    &manuvra_chrome::InputCancellation::default()
+                )
+                .is_none()
+        );
+        assert_eq!(
+            machine.artifacts.stop.as_ref().unwrap().code,
+            "candidate_not_offered"
+        );
+        assert_eq!(browser.dispatched(), 0);
+    }
 
     #[test]
     fn low_key_confidence_offers_a_focus_bound_candidate_without_dispatch() {

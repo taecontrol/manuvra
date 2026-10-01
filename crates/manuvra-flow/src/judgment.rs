@@ -92,7 +92,7 @@ pub fn request(
         "state":{
             "current_step":{"goal":values.mask(&step.goal),"done_when":values.mask(&serde_json::to_string(&step.done_when).unwrap_or_default())},
             "code_facts":{"operation_hint_from_atomic_goal":operation_hint(&step.goal,observation)},
-            "page":values.model_view(observation),
+            "page":values.judgment_view(observation),
             "recent_actions":recent_actions.iter().rev().take(8).map(|value|values.mask(&value.to_string())).collect::<Vec<_>>(),
             "provided_values":values.descriptions()
         },
@@ -115,6 +115,10 @@ pub fn request(
             "key":{"type":"choice","instructions":{"premise":"The operation is PRESS_KEY","rules":"Choose one key for the current observation, not the whole step. For a goal that asks for arrows and Enter to choose an option, inspect the focused element's active_descendant: use an arrow to reach the named option, then use Enter when that option is active.","goal":values.mask(&step.goal)},"criteria":{"Escape":"Close the focused overlay with Escape.","Tab":"Move focus forward with Tab.","Shift+Tab":"Move focus backward with Shift+Tab.","Enter":"Activate the focused control or its active descendant with Enter.","Space":"Activate the focused control with Space.","ArrowUp":"Move to the previous option with ArrowUp.","ArrowDown":"Move to the next option with ArrowDown.","ArrowLeft":"Move left in a composite widget with ArrowLeft.","ArrowRight":"Move right in a composite widget with ArrowRight.","Home":"Move to the first option with Home.","End":"Move to the last option with End."}}
         }
     });
+    if crate::contest::contested(observation) && observation.hover_regions.is_empty() {
+        request["questions"]["click_target"]["instructions"]["rules"] =
+            json!(contested_target_rules());
+    }
     offer_hover(&mut request, step, observation, values);
     request
 }
@@ -204,13 +208,17 @@ fn native_select_matches_goal(goal: &str, observation: &Observation) -> bool {
     goal.contains(&first.name.to_ascii_lowercase()) || selects.next().is_none()
 }
 
+fn contested_target_rules() -> &'static str {
+    "Assume the named operation was selected independently. Choose the visible target that directly advances only the current step. A target's container names the row, card, or item it belongs to; when the step names an item, choose the target whose container is that item, even if another target with the same name is visible. Do not select a field already equal to the required caller value."
+}
+
 fn target_criteria(observation: &Observation, operation: &str, values: &Values<'_>) -> Value {
     let mut criteria = Map::new();
     for element in &observation.elements {
         if element.operations.iter().any(|item| item == operation) {
             criteria.insert(
                 element.index.to_string(),
-                target_description(element, values),
+                target_description(element, observation, values),
             );
         }
     }
@@ -223,8 +231,12 @@ fn target_criteria(observation: &Observation, operation: &str, values: &Values<'
     Value::Object(criteria)
 }
 
-fn target_description(element: &Element, values: &Values<'_>) -> Value {
-    json!({"role":element.role,"name":values.mask(&element.name),"dialog":element.in_dialog.as_ref().map(|value|values.mask(value)),"disabled":element.disabled})
+fn target_description(element: &Element, observation: &Observation, values: &Values<'_>) -> Value {
+    let mut view = json!({"role":element.role,"name":values.mask(&element.name),"dialog":element.in_dialog.as_ref().map(|value|values.mask(value)),"disabled":element.disabled});
+    if let Some(container) = crate::contest::container_for(element, observation) {
+        view["container"] = json!(values.mask(container));
+    }
+    view
 }
 
 fn consume(request: Value, evaluation: Evaluation) -> Result<Judgments, JevError> {
@@ -542,6 +554,51 @@ mod tests {
             request.to_string(),
             include_str!("../tests/fixtures/judgment-request-without-hover-regions.json")
                 .trim_end()
+        );
+    }
+
+    #[test]
+    fn uncontested_request_with_containers_stays_byte_identical() {
+        let job = golden_job();
+        let mut page = golden_observation();
+        for e in &mut page.elements {
+            e.container = Some("Savings 4417".into());
+        }
+        let recent = [json!({"event":"action_fact","fact":{"target_name":"Savings 4417"}})];
+        assert_eq!(
+            request(&job.steps[0], &page, &recent, &Values::new(&job)).to_string(),
+            include_str!("../tests/fixtures/judgment-request-without-hover-regions.json")
+                .trim_end()
+        );
+    }
+
+    #[test]
+    fn contested_visible_twins_have_masked_containers_and_click_only_wording() {
+        let job = golden_job();
+        let mut page = golden_observation();
+        page.elements[0].container = Some("Savings 4417".into());
+        page.elements[0].shares_name = true;
+        let mut twin = page.elements[0].clone();
+        twin.index = 4;
+        twin.node_id = 104;
+        twin.container = Some("Rent".into());
+        page.elements.push(twin);
+        let recent = [json!({"event":"action_fact","fact":{"target_name":"Savings 4417"}})];
+        let actual = request(&job.steps[0], &page, &recent, &Values::new(&job));
+        assert_eq!(
+            actual.to_string(),
+            include_str!("../tests/fixtures/judgment-request-with-visible-twins.json").trim_end()
+        );
+        assert!(
+            actual["state"]["page"]["elements"][1]
+                .get("container")
+                .is_none()
+        );
+        assert!(
+            actual["questions"]["type_target"]["instructions"]["rules"]
+                .as_str()
+                .unwrap()
+                .contains("Choose the visible target")
         );
     }
 

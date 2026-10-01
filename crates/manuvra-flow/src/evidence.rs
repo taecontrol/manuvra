@@ -328,6 +328,9 @@ fn is_protocol_collision(value: &str) -> bool {
         "container",
         "target_container",
         "shares_name",
+        "target_below_gate",
+        "contenders",
+        "probability",
         "reveals_on_hover",
         "hover_target",
         "running",
@@ -1305,7 +1308,7 @@ mod tests {
 
     #[test]
     fn classified_values_equal_to_hover_vocabulary_do_not_trip_the_leak_scan() {
-        let exported = br#"{"hover_regions":[{"index":1,"name":"Groceries","reveals_on_hover":["Actions"]}],"hover_regions_truncated":true,"hover_rules_unreadable":true,"container":"Alpha","target_container":"Alpha","shares_name":true,"hover_target":"R1","operation":"HOVER"}"#;
+        let exported = br#"{"hover_regions":[{"index":1,"name":"Groceries","reveals_on_hover":["Actions"]}],"hover_regions_truncated":true,"hover_rules_unreadable":true,"container":"Alpha","target_container":"Alpha","shares_name":true,"gate_reason":"target_below_gate","contenders":[{"probability":0.69}],"hover_target":"R1","operation":"HOVER"}"#;
         for owned in [
             "hover_regions",
             "hover_regions_truncated",
@@ -1313,6 +1316,9 @@ mod tests {
             "container",
             "target_container",
             "shares_name",
+            "target_below_gate",
+            "contenders",
+            "probability",
             "reveals_on_hover",
             "hover_target",
             "HOVER",

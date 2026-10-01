@@ -638,6 +638,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn contested_container_context_does_not_change_final_verification_requests() {
+        let job: manuvra_contract::Job = serde_json::from_value(json!({"schema_version":1,"target":{"kind":"browser","url":"http://example.test/"},"context":{"journey":"j","revision":"r","environment":"e","actor":"a","authority":"a"},"steps":[{"id":"s","goal":"g","done_when":[{"text_visible":"Saved"}]}]})).unwrap();
+        let values = Values::new(&job);
+        let mut page = observation();
+        let before = expectation_request(&[], &page, &values);
+        page.elements[0].container = Some("Alpha".into());
+        page.elements[0].shares_name = true;
+        assert_eq!(expectation_request(&[], &page, &values), before);
+    }
+
     fn observation() -> Observation {
         Observation {
             document_id: "d".into(),

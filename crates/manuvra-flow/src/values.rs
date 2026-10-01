@@ -87,6 +87,21 @@ impl<'a> Values<'a> {
         })
     }
 
+    /// Judgment-only context. Final verification retains the original page view.
+    pub(crate) fn judgment_view(&self, observation: &Observation) -> Value {
+        let mut view = self.model_view(observation);
+        for (element, listed) in observation
+            .elements
+            .iter()
+            .zip(view["elements"].as_array_mut().into_iter().flatten())
+        {
+            if let Some(container) = crate::contest::container_for(element, observation) {
+                listed["container"] = json!(self.mask(container));
+            }
+        }
+        view
+    }
+
     /// A hover region as the provider sees it: masked page text, without its dispatch identity.
     pub(crate) fn hover_region_view(&self, region: &HoverRegion) -> Value {
         json!({

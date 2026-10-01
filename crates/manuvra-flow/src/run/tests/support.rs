@@ -186,6 +186,7 @@ pub(crate) struct Turn {
     operation: &'static str,
     confidence: f64,
     click_target: &'static str,
+    target_confidence: f64,
     type_target: &'static str,
     select_target: &'static str,
     type_value: &'static str,
@@ -201,6 +202,7 @@ impl Turn {
             operation,
             confidence: 0.95,
             click_target: "NO_CLICK_TARGET",
+            target_confidence: 1.0,
             type_target: "NO_TYPE_TEXT_TARGET",
             select_target: "NO_SELECT_TARGET",
             type_value: "NONE_FITS",
@@ -260,6 +262,13 @@ impl Turn {
         }
     }
 
+    pub(crate) fn target_confidence(self, target_confidence: f64) -> Self {
+        Self {
+            target_confidence,
+            ..self
+        }
+    }
+
     pub(crate) fn confidence(self, confidence: f64) -> Self {
         Self { confidence, ..self }
     }
@@ -281,7 +290,7 @@ impl Turn {
         }
         let (selected, confidence) = match id {
             "operation" => (self.operation, self.confidence),
-            "click_target" => (self.click_target, 1.0),
+            "click_target" => (self.click_target, self.target_confidence),
             "type_target" => (self.type_target, 1.0),
             "select_target" => (self.select_target, 1.0),
             "type_value" => (self.type_value, 1.0),
