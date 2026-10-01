@@ -7,21 +7,6 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-preflight_fixture
-require_command cargo
-require_command shasum
-require_provider_key
-stamp=$(date +%Y%m%d-%H%M%S)-$$
-evidence_root="$repo_root/.work/live/natural-done/$stamp"
-state_root="$evidence_root/state"
-report="$evidence_root/matrix.jsonl"
-mkdir -p "$evidence_root" "$state_root"
-trap cleanup_active_fixture EXIT
-
-cargo build --locked --manifest-path "$repo_root/Cargo.toml" --bin manuvra
-cargo test --locked --manifest-path "$repo_root/Cargo.toml" -p manuvra-chrome \
-  --test local_fixture -- --ignored
-manuvra="$repo_root/target/debug/manuvra"
 
 expected_target() {
   case "$1" in
@@ -46,7 +31,7 @@ expected_operation() {
 }
 
 # An offered candidate must be the step's intended operation. Without one, the escalation's
-# `candidates` holds Jev's judgments, whose chosen operation and target must still fit the step.
+# `candidates` holds Jev's judgments. An abstention grants no mutation authority.
 assert_correct_stop() {
   local output=$1 payload run_dir step operation target_choice snapshot target_name expected
   payload=$(jq -r '.escalation.payload' "$output")
@@ -64,9 +49,13 @@ assert_correct_stop() {
   fi
   step=$(jq -r '.step_id' "$payload")
   operation=$(jq -r '.candidates.operation.choice' "$payload")
-  [[ "$operation" == "$(expected_operation "$step")" ]]
+  [[ "$operation" == "$(expected_operation "$step")" ]] || return 1
   if [[ "$operation" == CLICK ]]; then
     target_choice=$(jq -r '.candidates.click_target.choice' "$payload")
+    if [[ "$target_choice" == NO_CLICK_TARGET ]]; then
+      jq -e '.gate_reason == "done_uncertain" or .gate_reason == "click_target_unavailable"' "$payload" >/dev/null
+      return
+    fi
   else
     target_choice=$(jq -r '.candidates.type_target.choice' "$payload")
   fi
@@ -83,7 +72,7 @@ assert_actions_correct() {
   run_dir=$(dirname "$(jq -r '.evidence.manifest' "$output")")
   trace="$run_dir/trace.jsonl"
   while IFS=$'\t' read -r step operation target; do
-    [[ "$operation" == "$(expected_operation "$step")" ]]
+    [[ "$operation" == "$(expected_operation "$step")" ]] || return 1
     expected=$(expected_target "$step")
     [[ "${target,,}" == *"${expected,,}"* ]]
   done < <(jq -rs '
@@ -146,6 +135,45 @@ run_case() {
     '{journey:"create-account-natural-language",run:$iteration,classification:$classification,state:$state,exit_code:$exit_code,wall_ms:$wall_ms,active_ms:$active_ms,accounts:$accounts,units:$units,cleanup:$cleanup}' \
     >>"$report"
 }
+
+if [[ ${1:-} == --self-test ]]; then
+  self_test_root=$(mktemp -d)
+  for reason in done_uncertain click_target_unavailable provider_invalid_response; do
+    jq -n --arg reason "$reason" '{phase:"step",step_id:"currency",gate_reason:$reason,
+      offered_candidate:null,candidates:{operation:{choice:"CLICK"},click_target:{choice:"NO_CLICK_TARGET"}}}' >"$self_test_root/payload.json"
+    jq -n --arg payload "$self_test_root/payload.json" '{escalation:{payload:$payload}}' >"$self_test_root/output.json"
+    if assert_correct_stop "$self_test_root/output.json"; then
+      [[ "$reason" != provider_invalid_response ]]
+    else
+      [[ "$reason" == provider_invalid_response ]]
+    fi
+  done
+  for invalid in wrong_operation wrong_candidate; do
+    jq -n --arg invalid "$invalid" '{phase:"step",step_id:"currency",gate_reason:"done_uncertain",
+      offered_candidate:(if $invalid == "wrong_candidate" then {operation:"CLICK",target_name:"Wrong item"} else null end),
+      candidates:{operation:{choice:(if $invalid == "wrong_operation" then "TYPE_TEXT" else "CLICK" end)},click_target:{choice:"NO_CLICK_TARGET"}}}' >"$self_test_root/payload.json"
+    if assert_correct_stop "$self_test_root/output.json"; then exit 1; fi
+  done
+  rm -rf "$self_test_root"
+  echo "natural-language abstention checks passed"
+  exit 0
+fi
+
+preflight_fixture
+require_command cargo
+require_command shasum
+require_provider_key
+stamp=$(date +%Y%m%d-%H%M%S)-$$
+evidence_root="$repo_root/.work/live/natural-done/$stamp"
+state_root="$evidence_root/state"
+report="$evidence_root/matrix.jsonl"
+mkdir -p "$evidence_root" "$state_root"
+trap cleanup_active_fixture EXIT
+
+cargo build --locked --manifest-path "$repo_root/Cargo.toml" --bin manuvra
+cargo test --locked --manifest-path "$repo_root/Cargo.toml" -p manuvra-chrome \
+  --test local_fixture -- --ignored
+manuvra="$repo_root/target/debug/manuvra"
 
 for iteration in 1 2 3; do run_case "$iteration"; done
 
