@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Release gate for hover-revealed controls: five synthetic journeys run three times with
+# Release gate for hover-revealed controls: six synthetic journeys run three times with
 # Jev against local fixtures. Every run counts. A failed or stopped run is
 # recorded with its evidence and is never retried or discarded; the script exits nonzero if any run
 # fails a check.
@@ -341,7 +341,7 @@ run_case() {
   rm -rf "$active_runtime"
 }
 
-for journey in row-actions insertion-gap selected-row-twin token-sequence project-options; do
+for journey in row-actions insertion-gap selected-row-twin token-sequence project-options virtualized-rows; do
   template="$repo_root/tests/live/hover/$journey-template.json"
   [[ "$journey" != row-actions ]] || template="$repo_root/tests/live/hover/reveal-template.json"
   job="$live_root/$journey-job.json"
@@ -386,7 +386,7 @@ jq -s --argjson key_clean "$key_clean" --argjson identity_clean "$identity_clean
 ' "$live_root/matrix.jsonl" >"$live_root/matrix.json"
 
 echo "$live_root"
-jq -e --argjson runs "$((runs * 5))" '
+jq -e --argjson runs "$((runs * 6))" '
   .total == $runs and .accepted == $runs and .provider_key_absent and .internal_identity_absent and
   .cleanup.fixture_server_stopped and (.cleanup.leftover_pids | length == 0)
 ' "$live_root/matrix.json" >/dev/null

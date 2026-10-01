@@ -116,6 +116,11 @@ pub fn request(
         request["questions"]["click_target"]["instructions"]["rules"] =
             json!(contested_target_rules());
     }
+    if crate::contest::contested(observation) && observation.hover_regions.is_empty() {
+        request["questions"]["operation"]["criteria"]["CLICK"] = json!(
+            "Click a listed control that belongs to the item required by this step. When NO_CLICK_TARGET fits because that item is absent, choose SCROLL_DOWN to look for it instead of clicking another item."
+        );
+    }
     if !observation.hover_regions.is_empty() {
         request["questions"]["click_target"]["instructions"]["rules"] =
             json!(reveal_target_rules());
@@ -127,7 +132,7 @@ pub fn request(
 }
 
 fn reveal_target_rules() -> &'static str {
-    "Assume the named operation was selected independently. Choose the target that directly advances only the current step. A target's container names the row, card, or item it belongs to; when the step names an item, choose the target whose container is that item, even if another target with the same name is visible. Targets marked revealed_by_hover are valid: code reveals them before clicking. Do not select a field already equal to the required caller value."
+    "Assume the named operation was selected independently. Choose the target that directly advances only the current step. A target's container names the row, card, or item it belongs to; when the step names an item, choose the target whose container is that item, even if another target with the same name is visible. If the required item is not listed, choose NO_CLICK_TARGET; never substitute another item's control. Targets marked revealed_by_hover are valid: code reveals them before clicking. Do not select a field already equal to the required caller value."
 }
 
 fn step_done_question(step: &Step, values: &Values<'_>) -> Value {
@@ -184,7 +189,7 @@ fn native_select_matches_goal(goal: &str, observation: &Observation) -> bool {
 }
 
 fn contested_target_rules() -> &'static str {
-    "Assume the named operation was selected independently. Choose the visible target that directly advances only the current step. A target's container names the row, card, or item it belongs to; when the step names an item, choose the target whose container is that item, even if another target with the same name is visible. Do not select a field already equal to the required caller value."
+    "Assume the named operation was selected independently. Choose the visible target that directly advances only the current step. A target's container names the row, card, or item it belongs to; when the step names an item, choose the target whose container is that item, even if another target with the same name is visible. If the required item is not listed, choose NO_CLICK_TARGET; never substitute another item's control. Do not select a field already equal to the required caller value."
 }
 
 fn target_criteria(observation: &Observation, operation: &str, values: &Values<'_>) -> Value {
@@ -199,6 +204,9 @@ fn target_criteria(observation: &Observation, operation: &str, values: &Values<'
     }
     if operation == "CLICK" {
         offer_reveals(&mut criteria, observation, values);
+    }
+    if operation == "CLICK" && crate::contest::contested(observation) {
+        criteria.insert("NO_CLICK_TARGET".into(), Value::String("None of the listed controls belongs to the item required by this step. Scroll to find the required item instead of clicking another item.".into()));
     }
     if criteria.is_empty() {
         criteria.insert(
@@ -552,10 +560,14 @@ mod tests {
     }
 
     #[test]
-    fn uncontested_request_with_containers_stays_byte_identical() {
+    fn unique_fields_with_containers_leave_an_uncontested_request_byte_identical() {
         let job = golden_job();
         let mut page = golden_observation();
-        for e in &mut page.elements {
+        for e in page
+            .elements
+            .iter_mut()
+            .filter(|e| !e.operations.iter().any(|op| op == "CLICK"))
+        {
             e.container = Some("Savings 4417".into());
         }
         let recent = [json!({"event":"action_fact","fact":{"target_name":"Savings 4417"}})];
@@ -952,5 +964,26 @@ mod tests {
             "<value:hidden_role>"
         );
         assert!(!request.to_string().contains("classified-role-742"));
+    }
+    #[test]
+    fn unique_contained_clicks_offer_a_masked_container_and_an_absent_target_choice() {
+        let job = golden_job();
+        let mut page = golden_observation();
+        page.elements[0].container = Some("Savings 4417".into());
+        let actual = request(&job.steps[0], &page, &[], &Values::new(&job));
+        assert_eq!(
+            actual["questions"]["click_target"]["criteria"]["1"]["container"],
+            "<value:account>"
+        );
+        assert_eq!(
+            actual["state"]["page"]["elements"][0]["container"],
+            "<value:account>"
+        );
+        assert!(
+            actual["questions"]["click_target"]["criteria"]
+                .get("NO_CLICK_TARGET")
+                .is_some()
+        );
+        assert!(!actual.to_string().contains("Savings 4417"));
     }
 }

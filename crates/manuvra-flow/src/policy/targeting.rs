@@ -94,6 +94,9 @@ pub(super) fn dispatched_operation(
     match click_choice(observation, &judgments.click_target.choice) {
         Some(ClickChoice::Element(_)) => Ok(Operation::Click),
         Some(ClickChoice::Reveal { .. }) => Ok(Operation::Hover),
+        None if judgments.click_target.choice == "NO_CLICK_TARGET" => {
+            Err(PolicyStop::Uncertain("click_target_unavailable"))
+        }
         None => Err(PolicyStop::Blocked("provider_invalid_response")),
     }
 }
@@ -217,7 +220,7 @@ mod tests {
     #[test]
     fn missing_or_unlisted_hover_target_is_an_invalid_provider_response() {
         for target in [
-            None,
+            Some("NOT_LISTED"),
             Some("R9_1"),
             Some("R1_0"),
             Some("R1_2"),
@@ -298,6 +301,26 @@ mod tests {
             assert_eq!(
                 policy.caller_candidate(&page, &hover(Some("R1_1"))).err(),
                 Some(PolicyStop::Blocked("provider_invalid_response"))
+            );
+            assert_eq!(policy.actions, 0);
+        }
+    }
+    #[test]
+    fn an_absent_click_target_stops_without_autonomous_or_caller_authority() {
+        let mut page = observation("CLICK", "button");
+        page.elements[0].container = Some("Alpha".into());
+        let mut answer = judgments("CLICK");
+        answer.click_target.choice = "NO_CLICK_TARGET".into();
+        let mut policy = Policy::new(&JobOptions::default(), "http://example.test/");
+        for confidence in [0.1, 1.0] {
+            answer.operation.confidence = confidence;
+            assert!(matches!(
+                decide_not_done(&mut policy, &step(), &page, &answer, false),
+                Next::Stop(PolicyStop::Uncertain("click_target_unavailable"))
+            ));
+            assert_eq!(
+                policy.caller_candidate(&page, &answer).err(),
+                Some(PolicyStop::Uncertain("click_target_unavailable"))
             );
             assert_eq!(policy.actions, 0);
         }

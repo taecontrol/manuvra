@@ -334,7 +334,7 @@ mod tests {
                 "hover_target":{"name":"Rent","reveals_on_hover":["Actions for Rent"],"reveal":"Actions for Rent"}
             })
         );
-        for unlisted in [None, Some("R9")] {
+        for unlisted in [Some("NOT_LISTED"), Some("R9")] {
             assert_eq!(
                 policy.caller_candidate(&hover_page(), &hover(unlisted)),
                 Err(PolicyStop::Blocked("provider_invalid_response"))

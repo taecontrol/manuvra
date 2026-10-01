@@ -418,4 +418,44 @@ mod tests {
         );
         assert_eq!(contenders[0]["key"], "1");
     }
+    #[test]
+    fn an_absent_item_never_offers_a_click_under_caller_authority() {
+        let job = click_job();
+        let redactor = Redactor::for_job(&job).unwrap();
+        let mut page = observed("Alpha");
+        let mut target = button(1, 7, "Edit");
+        target.container = Some("Alpha".into());
+        page.elements.push(target);
+        let browser = FakeBrowser::new([page]);
+        let provider = ScriptedProvider::new([Turn::click("NO_CLICK_TARGET").confidence(0.4)]);
+        let mut machine = super::super::machine::HostedMachine::new(&job, &redactor);
+        drive(
+            &mut machine,
+            &browser,
+            &provider,
+            &mut MemoryJournal::default(),
+        );
+        assert_eq!(
+            machine.artifacts.stop.as_ref().unwrap().code,
+            "click_target_unavailable"
+        );
+        assert_eq!(browser.dispatched(), 0);
+        assert_eq!(
+            machine.artifacts.escalation.as_ref().unwrap().dispositions,
+            [DispositionKind::RetryObservation, DispositionKind::Abort]
+        );
+        assert!(
+            machine
+                .artifacts
+                .pending
+                .as_ref()
+                .unwrap()
+                .candidate
+                .is_none()
+        );
+        assert_eq!(
+            machine.artifacts.escalations[0].1["offered_candidate"],
+            Value::Null
+        );
+    }
 }

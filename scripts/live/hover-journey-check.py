@@ -10,9 +10,9 @@ def evaluate(journey, result, stop, events, decisions, escalation):
     clicks = [event for event in actions if event["operation"] == "CLICK"]
     passed = result["state"] == "passed"
     safe_stop = (
-        journey == "project-options"
+        journey in ("project-options", "virtualized-rows")
         and stop.get("state") == "uncertain"
-        and stop.get("reason", {}).get("code") == "target_below_gate"
+        and stop.get("reason", {}).get("code") == ("click_target_unavailable" if journey == "virtualized-rows" else "target_below_gate")
         and stop.get("escalation", {}).get("dispositions") == ["retry_observation", "abort"]
         and escalation.get("offered_candidate") is None
         and not clicks
@@ -39,6 +39,9 @@ def evaluate(journey, result, stop, events, decisions, escalation):
         checks["no_project_link_click"] = all(event["target"]["role"] != "link" for event in clicks)
         checks["gemini_reveal_then_more_or_safe_stop"] = safe_stop or signatures == [
             ("HOVER", "Project Gemini", None, None, "More options"), ("CLICK", None, "More options", "Project Gemini", None)]
+    elif journey == "virtualized-rows":
+        checks["no_wrong_item_click"] = all(event["target"].get("container") == "Bravo" for event in clicks)
+        checks["reached_bravo_or_safe_stop"] = safe_stop or (passed and len(clicks) == 1)
     reveal_decisions = []
     previous = None
     for decision in decisions:
