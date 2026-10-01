@@ -56,6 +56,8 @@ pub struct FocusAnchor {
     pub role: String,
     pub name: String,
     pub in_dialog: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
     pub covered: bool,
     #[serde(default)]
     pub surface: Option<FocusSurface>,
@@ -83,6 +85,7 @@ impl FocusAnchor {
             &self.role,
             &self.name,
             &self.in_dialog,
+            &self.container,
             self.covered,
             self.surface,
             self.position,
@@ -92,6 +95,7 @@ impl FocusAnchor {
             &other.role,
             &other.name,
             &other.in_dialog,
+            &other.container,
             other.covered,
             other.surface,
             other.position,
@@ -195,7 +199,11 @@ pub struct Element {
     pub selected: Option<bool>,
     pub expanded: Option<bool>,
     pub disabled: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shares_name: bool,
     pub in_dialog: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
     #[serde(default)]
     pub operations: Vec<String>,
     #[serde(default)]

@@ -368,6 +368,7 @@ mod tests {
                 role: "textbox".into(),
                 name: "provider-secret-419".into(),
                 in_dialog: None,
+                container: None,
                 covered: true,
                 surface: None,
                 active_descendant: None,
@@ -392,6 +393,8 @@ mod tests {
                 expanded: None,
                 disabled: false,
                 in_dialog: None,
+                container: None,
+                shares_name: false,
                 operations: vec!["TYPE_TEXT".into()],
                 select_options: vec![],
                 rect: Rect {
@@ -466,6 +469,8 @@ mod tests {
             expanded: (role == "button").then_some(false),
             disabled: false,
             in_dialog: (index == 3).then(|| "Edit Savings 4417".into()),
+            container: None,
+            shares_name: false,
             operations: vec![operation.into()],
             select_options: if operation == "SELECT" {
                 vec![SelectOption {
@@ -796,6 +801,8 @@ mod tests {
             expanded: None,
             disabled: false,
             in_dialog: None,
+            container: None,
+            shares_name: false,
             operations: vec!["SELECT".into()],
             select_options: vec![SelectOption {
                 node_id: 2,

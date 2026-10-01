@@ -171,6 +171,7 @@ mod tests {
                 role: "textbox".into(),
                 name: "raw-secret-742".into(),
                 in_dialog: None,
+                container: None,
                 covered: true,
                 surface: None,
                 active_descendant: Some(manuvra_chrome::ActiveDescendant {
@@ -201,6 +202,8 @@ mod tests {
                 expanded: None,
                 disabled: false,
                 in_dialog: Some("Edit raw-secret-742".into()),
+                container: None,
+                shares_name: false,
                 operations: vec!["TYPE_TEXT".into()],
                 select_options: vec![],
                 rect: Rect {
@@ -297,6 +300,8 @@ mod tests {
             expanded: None,
             disabled: false,
             in_dialog: None,
+            container: None,
+            shares_name: false,
             operations: vec!["SELECT".into()],
             select_options: vec![SelectOption {
                 node_id: 812_345,

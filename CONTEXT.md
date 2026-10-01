@@ -23,6 +23,9 @@ _Avoid_: session, execution, attempt
 The Chromium page under Manuvra's control.
 _Avoid_: tab, window, device
 
+**Container**:
+The nearest semantic or repeated item below a dialog that holds a control, excluding cells. Its label prefers `aria-labelledby`, `aria-label`, a heading, then the first painted text segment outside non-link controls (link text counts), or `between “…” and “…”` from neighboring text.
+
 **Hover region**:
 A visible container on the target, such as a list row, holding controls hidden by opacity until the pointer is over it. An observation lists each region with the names of the controls it reveals; those hidden controls are never candidates until a hover reveals them.
 _Avoid_: hover area, reveal zone, hidden row

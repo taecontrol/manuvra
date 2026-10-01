@@ -1,0 +1,5 @@
+<!doctype html><meta charset="utf-8"><title>Virtualized rows</title>
+<style>body{font:16px sans-serif}ul{position:sticky;top:0}li{padding:20px}#spacer{height:1600px}</style>
+<ul><li aria-label="Alpha"><span id="label">Alpha</span> <button onclick="document.querySelector('#result').textContent='Edited '+document.querySelector('#label').textContent">Edit</button></li></ul>
+<p id="result">Ready</p><div id="spacer"></div>
+<script>addEventListener('scroll',()=>{const text=scrollY>0?'Bravo':'Alpha';document.querySelector('li').setAttribute('aria-label',text);document.querySelector('#label').textContent=text})</script>

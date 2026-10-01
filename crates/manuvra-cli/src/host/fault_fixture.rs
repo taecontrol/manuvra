@@ -380,6 +380,8 @@ fn fault_observation() -> manuvra_flow::Observation {
             expanded: None,
             disabled: false,
             in_dialog: None,
+            container: None,
+            shares_name: false,
             operations: vec!["CLICK".into()],
             select_options: vec![],
             rect: manuvra_flow::Rect {

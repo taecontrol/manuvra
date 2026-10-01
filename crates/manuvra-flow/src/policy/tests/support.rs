@@ -36,6 +36,8 @@ pub(crate) fn observation(operation: &str, role: &str) -> Observation {
             expanded: Some(false),
             disabled: false,
             in_dialog: None,
+            container: None,
+            shares_name: false,
             operations: vec![operation.into()],
             select_options: vec![],
             rect: Rect {
@@ -90,6 +92,7 @@ pub(crate) fn focused(name: &str) -> Observation {
         role: "button".into(),
         name: name.into(),
         in_dialog: None,
+        container: None,
         covered: true,
         surface: None,
         active_descendant: None,

@@ -662,6 +662,8 @@ pub(crate) fn element(
         expanded: None,
         disabled: false,
         in_dialog: None,
+        container: None,
+        shares_name: false,
         operations: vec![operation.into()],
         select_options: vec![],
         rect: Rect {
@@ -708,6 +710,7 @@ pub(crate) fn key_observation(name: &str) -> Observation {
         role: "button".into(),
         name: name.into(),
         in_dialog: None,
+        container: None,
         covered: true,
         surface: None,
         active_descendant: None,

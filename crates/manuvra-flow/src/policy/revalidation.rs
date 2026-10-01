@@ -101,6 +101,7 @@ fn candidate_semantics_match(target: &Element, candidate: &Candidate) -> bool {
     Some(target.name.as_str()) == candidate.target_name.as_deref()
         && Some(target.role.as_str()) == candidate.target_role.as_deref()
         && target.in_dialog == candidate.target_dialog
+        && target.container == candidate.target_container
         && target.input_type == candidate.target_input_type
 }
 
@@ -187,6 +188,14 @@ mod tests {
             policy.authorize_caller(&step(), &renamed, &candidate),
             Err(PolicyStop::Uncertain("candidate_revalidation_failed"))
         ));
+        let mut recycled = original.clone();
+        recycled.elements[0].container = Some("Different row".into());
+        assert_eq!(
+            policy
+                .authorize_caller(&step(), &recycled, &candidate)
+                .err(),
+            Some(PolicyStop::Uncertain("candidate_revalidation_failed"))
+        );
         let permit = policy
             .authorize_caller(&step(), &original, &candidate)
             .expect("unchanged candidate receives caller authority");

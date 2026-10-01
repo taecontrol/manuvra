@@ -24,6 +24,8 @@ pub struct ActionFact {
     pub candidate_id: String,
     pub operation: Operation,
     pub target_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_container: Option<String>,
     /// The hover region a `HOVER` targeted, naming the controls it reveals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hover_target: Option<HoverTarget>,
@@ -247,6 +249,9 @@ fn prepared_evidence(
     basis: &str,
 ) -> Value {
     let mut evidence = json!({"event":"action_prepared","action_sequence":action_sequence,"candidate_id":candidate.id,"operation":candidate.operation,"target":target.map(|target|json!({"role":target.role,"name":target.name,"dialog":target.in_dialog})),"value_name":candidate.value_name,"replay_key":replay_key,"outcome":"not_performed","basis":basis});
+    if let Some(container) = target.and_then(|target| target.container.as_ref()) {
+        evidence["target"]["container"] = json!(container);
+    }
     if let Some(hover_target) = &candidate.hover_target {
         evidence["hover_target"] = json!(hover_target);
     }
@@ -414,6 +419,7 @@ fn action_fact(
         candidate_id: prepared.candidate.id,
         operation: prepared.candidate.operation,
         target_name: prepared.candidate.target_name,
+        target_container: prepared.candidate.target_container,
         hover_target: prepared.candidate.hover_target,
         value_name: prepared.candidate.value_name,
         key: prepared.candidate.key,
@@ -545,6 +551,8 @@ mod tests {
                 expanded: None,
                 disabled: false,
                 in_dialog: None,
+                container: None,
+                shares_name: false,
                 operations: vec!["TYPE_TEXT".into()],
                 select_options: vec![],
                 rect: Rect {
@@ -684,6 +692,7 @@ mod tests {
             role: "textbox".into(),
             name: "Name".into(),
             in_dialog: None,
+            container: None,
             covered: true,
             surface: None,
             active_descendant: None,
@@ -747,6 +756,28 @@ mod tests {
     #[should_panic(expected = "input operation")]
     fn fallback_operation_mapping_rejects_internal_misrouting() {
         let _ = prepared_fallback(Operation::Click);
+    }
+
+    #[test]
+    fn action_and_offer_record_the_control_container() {
+        let job = job();
+        let mut obs = observation();
+        obs.elements[0].container = Some("Staging".into());
+        let (candidate, _, _, _) = permit(&job, &obs).consume();
+        assert_eq!(candidate.offered()["target_container"], "Staging");
+        let mut journal = FakeJournal::default();
+        let fact = perform(
+            permit(&job, &obs),
+            &CountingPerformer(&AtomicUsize::new(0)),
+            &obs,
+            &Values::new(&job),
+            &mut journal,
+            &InputCancellation::default(),
+        )
+        .unwrap();
+        assert_eq!(journal.entries[0]["target"]["container"], "Staging");
+        assert_eq!(fact.target_container.as_deref(), Some("Staging"));
+        assert_eq!(journal.entries[1]["fact"]["target_container"], "Staging");
     }
 
     #[test]

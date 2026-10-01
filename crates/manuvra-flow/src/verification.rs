@@ -663,6 +663,8 @@ mod tests {
                 expanded: None,
                 disabled: false,
                 in_dialog: Some("Create account".into()),
+                container: None,
+                shares_name: false,
                 operations: vec!["TYPE_TEXT".into()],
                 select_options: vec![],
                 rect: Rect {
@@ -700,6 +702,7 @@ mod tests {
             role: "textbox".into(),
             name: "Account name".into(),
             in_dialog: Some("Create account".into()),
+            container: None,
             covered: true,
             surface: None,
             active_descendant: None,

@@ -80,6 +80,36 @@
   }
   const dialogs = dialogRecords.map(record => record.title);
   const selector = 'a[href],button,input:not([type="hidden"]),textarea,select,summary,[contenteditable="true"],[role="button"],[role="link"],[role="checkbox"],[role="radio"],[role="switch"],[role="tab"],[role="menuitem"],[role="menuitemradio"],[role="option"],[role="combobox"],[role="textbox"],[role="searchbox"],[role="spinbutton"]';
+  const CONTROL = selector;
+  const up = (n) => n.parentElement || n.getRootNode?.()?.host || null;
+  const isDialog = (n) => n.matches?.('dialog,[role="dialog"],[role="alertdialog"]');
+  const nonLinkControl = (n) => n.matches?.(CONTROL) && !n.matches('a[href],[role="link"]');
+  // Painted text segments of `root`, excluding text inside non-link controls and editable fields.
+  const segments = (root, keepControls = false) => { const out = []; const w = (root.ownerDocument || document).createTreeWalker(root, NodeFilter.SHOW_TEXT); let t;
+    while ((t = w.nextNode())) { const v = t.textContent.replace(/\s+/g, ' ').trim(), p = t.parentElement; if (!v || !p || p.closest('script,style,template')) continue;
+      let q = p, skip = false; while (!keepControls && q && q !== root) { if (nonLinkControl(q) || q.matches?.('textarea,[contenteditable="true"]')) { skip = true; break; } q = up(q); }
+      if (!keepControls && nonLinkControl(root)) skip = true;
+      if (!skip && p.checkVisibility({checkVisibilityCSS:true})) out.push({node:t, text:v}); } return out; };
+  const hasOwnText = (n) => segments(n).length > 0 || n.querySelector?.('h1,h2,h3,h4,h5,h6,[role="heading"]');
+  const semantic = (n) => n.matches('li,tr,[role="row"],[role="listitem"],article,[role="article"],fieldset,form') ||
+    ((n.hasAttribute('aria-label') || n.hasAttribute('aria-labelledby')) && !n.matches(CONTROL) && hasOwnText(n));
+  const repeated = (n) => { if (n.matches('td,th,[role="cell"],[role="gridcell"],[role="columnheader"]')) return false; const parent = up(n); if (!parent || !parent.children) return false;
+    const peers = [...parent.children].filter(s => s.tagName === n.tagName && s.querySelector(CONTROL));
+    return peers.length >= 2 && peers.includes(n); };
+  const containerNode = (control) => { let n = up(control);
+    while (n && n.nodeType === 1 && n.tagName !== 'BODY' && n.tagName !== 'HTML') { if (isDialog(n)) return null;
+      if (semantic(n) || repeated(n)) return n; n = up(n); } return null; };
+  const containerLabel = (node) => { const byId = (node.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean).map(id => node.getRootNode().getElementById?.(id)?.textContent?.trim()).filter(Boolean).join(' ');
+    const heading = node.querySelector('h1,h2,h3,h4,h5,h6,[role="heading"]')?.textContent?.replace(/\s+/g,' ').trim();
+    const first = segments(node)[0]?.text;
+    let v = byId || node.getAttribute('aria-label') || heading || first;
+    if (!v) { const all = segments(node.ownerDocument.body, true);
+      const before = all.filter(x => !node.contains(x.node) && (node.compareDocumentPosition(x.node) & Node.DOCUMENT_POSITION_PRECEDING)).pop();
+      const after = all.find(x => !node.contains(x.node) && (node.compareDocumentPosition(x.node) & Node.DOCUMENT_POSITION_FOLLOWING));
+      v = `between “${(before?.text || 'start').slice(0,60)}” and “${(after?.text || 'end').slice(0,60)}”`; }
+    return v.replace(/\s+/g, ' ').slice(0, 120); };
+  const containerOf = (control) => { const node = containerNode(control); return node ? containerLabel(node) : null; };
+
   const elements = [], elementIndices = new Map(), seenElements = new Set(); let index = 1;
   for (const context of contexts) for (const element of context.root.querySelectorAll(selector)) {
     if (seenElements.has(element) || !visible(element, context)) continue; seenElements.add(element);
@@ -89,8 +119,16 @@
     const rect = element.getBoundingClientRect(), containingDialog = nearestDialog(element), current = index++;
     elementIndices.set(element, current); const boolAttr = key => element.hasAttribute(key) ? element.getAttribute(key) !== 'false' : null;
     const selectOptions = element.tagName === 'SELECT' ? [...element.options].map(option => ({node_id:nodeId(option),label:option.label||option.textContent.trim(),value:String(option.value),disabled:Boolean(option.disabled),selected:Boolean(option.selected)})) : [];
-    elements.push({index:current,node_id:nodeId(element),context:context.context,role:elementRole,name:name(element)||elementRole,input_type:element.tagName==='INPUT'?element.type:null,value:'value' in element?String(element.value):(element.isContentEditable?element.innerText.trim():''),checked:'checked' in element?Boolean(element.checked):boolAttr('aria-checked'),selected:'selected' in element?Boolean(element.selected):boolAttr('aria-selected'),expanded:boolAttr('aria-expanded'),disabled:Boolean(element.disabled)||element.getAttribute('aria-disabled')==='true',in_dialog:containingDialog?dialogTitle(containingDialog):null,operations,select_options:selectOptions,rect:{x:rect.x+context.offsetX,y:rect.y+context.offsetY,width:rect.width,height:rect.height}});
+    elements.push({index:current,node_id:nodeId(element),context:context.context,role:elementRole,name:name(element)||elementRole,input_type:element.tagName==='INPUT'?element.type:null,value:'value' in element?String(element.value):(element.isContentEditable?element.innerText.trim():''),checked:'checked' in element?Boolean(element.checked):boolAttr('aria-checked'),selected:'selected' in element?Boolean(element.selected):boolAttr('aria-selected'),expanded:boolAttr('aria-expanded'),disabled:Boolean(element.disabled)||element.getAttribute('aria-disabled')==='true',in_dialog:containingDialog?dialogTitle(containingDialog):null,container:containerOf(element),operations,select_options:selectOptions,rect:{x:rect.x+context.offsetX,y:rect.y+context.offsetY,width:rect.width,height:rect.height}});
   }
+
+  // Twins include opacity-hidden and offscreen controls, but never display:none controls.
+  const twinCounts = new Map(), twinKey = (element) => JSON.stringify([role(element), (name(element) || role(element)).toLowerCase(), nearestDialog(element) ? dialogTitle(nearestDialog(element)) : null]);
+  for (const context of contexts) for (const element of context.root.querySelectorAll(selector)) {
+    if (!element.checkVisibility({checkVisibilityCSS:true})) continue;
+    const key = twinKey(element); twinCounts.set(key, (twinCounts.get(key) || 0) + 1);
+  }
+  for (const [element, index] of elementIndices) elements[index - 1].shares_name = twinCounts.get(twinKey(element)) > 1;
 
   const REGION_LIMIT = 20, REGION_NAME_LIMIT = 120;
   const hiddenByOpacity = (element, context) => inViewport(element, context) && element.checkVisibility({checkVisibilityCSS:true}) &&
@@ -149,8 +187,9 @@
   for (const context of contexts) for (const element of context.root.querySelectorAll(selector)) {
     if (seenHidden.has(element) || !hiddenByOpacity(element, context)) continue; seenHidden.add(element);
     const labeled = revealingRegion(element);
-    const region = labeled || (hoverRevealed(element) ? unlabeledRegion(element) : null); if (!region) continue;
-    if (!regionRecords.has(region)) regionRecords.set(region, {name:(labeled ? (region.getAttribute('aria-label') || region.innerText.replace(/\s+/g,' ').trim()) : regionName(region)).slice(0,REGION_NAME_LIMIT),reveals_on_hover:[],node_id:nodeId(element)});
+    const revealRegion = labeled || (hoverRevealed(element) ? unlabeledRegion(element) : null); if (!revealRegion) continue;
+    const container = containerNode(element), region = container || revealRegion;
+    if (!regionRecords.has(region)) regionRecords.set(region, {name:(container ? containerLabel(container) : labeled ? (region.getAttribute('aria-label') || region.innerText.replace(/\s+/g,' ').trim()) : regionName(region)).slice(0,REGION_NAME_LIMIT),reveals_on_hover:[],node_id:nodeId(element)});
     regionRecords.get(region).reveals_on_hover.push(name(element) || role(element));
   }
   const hoverRegions = [...regionRecords.values()].slice(0, REGION_LIMIT).map((record, offset) => ({index:offset + 1, ...record}));
@@ -210,7 +249,7 @@
     const container = active.parentElement?.closest('[role="tree"],[role="treegrid"],[role="grid"],[role="listbox"],[role="menu"],[role="menubar"],[role="tablist"],[role="radiogroup"],[role="toolbar"]') || active.parentElement;
     const siblingIndex = container ? [...container.querySelectorAll('*')].filter(element => role(element) === anchorRole).indexOf(active) + 1 : 0;
     const position = indexed ? null : posinset > 0 ? posinset : siblingIndex || null;
-    focusAnchor = {active_descendant:activeDescendant,expanded:boolAttr('aria-expanded'),selected:'selected' in active ? Boolean(active.selected) : boolAttr('aria-selected'),checked:'checked' in active ? Boolean(active.checked) : boolAttr('aria-checked'),position,node_id:nodeId(active),context:context?.context || 'main',role:anchorRole,name:indexed?.name || (active === containingDialog ? dialog : ariaName),in_dialog:indexed?.in_dialog || dialog,covered:!closed && !crossOrigin,surface:crossOrigin?'cross_origin_frame':closed?'closed_shadow_root':active.tagName==='CANVAS'?'canvas':null};
+    focusAnchor = {active_descendant:activeDescendant,expanded:boolAttr('aria-expanded'),selected:'selected' in active ? Boolean(active.selected) : boolAttr('aria-selected'),checked:'checked' in active ? Boolean(active.checked) : boolAttr('aria-checked'),position,node_id:nodeId(active),context:context?.context || 'main',role:anchorRole,name:indexed?.name || (active === containingDialog ? dialog : ariaName),in_dialog:indexed?.in_dialog || dialog,container:containerOf(active),covered:!closed && !crossOrigin,surface:crossOrigin?'cross_origin_frame':closed?'closed_shadow_root':active.tagName==='CANVAS'?'canvas':null};
   }
   for (const context of contexts) for (const element of context.root.querySelectorAll('*')) {
     if (element.tagName === 'CANVAS') gaps.push('canvas');

@@ -2017,3 +2017,168 @@ fn unreadable_hover_stylesheets_preserve_coverage_and_legacy_regions() {
     browser.close().unwrap();
     lifecycle.assert_cleaned();
 }
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn containers_match_semantic_and_repeated_items_before_and_after_hover() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server =
+        FixtureServer::with_body(include_str!("../../../tests/browser/row-containers.html"));
+    let mut browser = OwnedBrowser::launch(BrowserConfig {
+        explicit_binary: None,
+        headless: true,
+        width: 1120,
+        height: 1800,
+        inherit_process_group: false,
+    })
+    .unwrap();
+    let lifecycle = BrowserLifecycle::observe();
+    browser.navigate(&server.url()).unwrap();
+    let page = browser.observe().unwrap();
+    let expected = [
+        ("Edit", Some("Alpha")),
+        ("Invoice 42", Some("Invoice 42")),
+        ("Edit", Some("Invoice 42")),
+        ("Edit", Some("Invoice 43")),
+        ("Copy", Some("Production token")),
+        ("Copy", Some("Staging token")),
+        ("Copy", Some("Development token")),
+        ("Next", Some("Step 1: Account")),
+        ("Delete", None),
+        ("Remove", Some("Cart item: Shoes")),
+        ("Remove", Some("Cart item: Hat")),
+        ("Home", Some("nav")),
+        ("Settings", Some("nav")),
+        ("Open", Some("Report")),
+        ("Off", Some("Wifi")),
+        ("On", Some("Bluetooth")),
+    ];
+    for (name, container) in expected {
+        assert!(
+            page.elements
+                .iter()
+                .any(|e| e.name == name && e.container.as_deref() == container),
+            "missing {name} in {container:?}: {:?}",
+            page.elements
+        );
+    }
+    assert_eq!(
+        page.elements
+            .iter()
+            .filter(|e| e.name == "Open" && e.container.as_deref() == Some("Report"))
+            .count(),
+        2
+    );
+    let regions = [
+        ("Bravo", "Edit"),
+        ("Sunset at the beach", "Delete"),
+        ("City at night", "Delete"),
+        ("between “insertion gaps” and “Primer bloque”", "+ Insertar"),
+        ("between “Primer bloque” and “Segundo bloque”", "+ Insertar"),
+        ("Row one", "Archive"),
+        ("Row two", "Archive"),
+    ];
+    assert_eq!(page.hover_regions.len(), regions.len());
+    for (container, name) in regions {
+        let page = browser.observe().unwrap();
+        let region = page
+            .hover_regions
+            .iter()
+            .find(|region| region.name == container)
+            .unwrap();
+        assert_eq!(region.reveals_on_hover, [name]);
+        browser
+            .perform(
+                PreparedInput {
+                    document_id: page.document_id.clone(),
+                    node_id: region.node_id,
+                    operation: PreparedOperation::Hover,
+                    text: None,
+                    previous_text: None,
+                    option_node_id: None,
+                    combobox: false,
+                    action_sequence: 1,
+                    focus_anchor: None,
+                },
+                &InputCancellation::default(),
+            )
+            .unwrap();
+        let after = browser.observe().unwrap();
+        assert!(
+            after
+                .elements
+                .iter()
+                .any(|e| e.name == name && e.container.as_deref() == Some(container)),
+            "revealed {name} lost {container}"
+        );
+    }
+    browser.close().unwrap();
+    lifecycle.assert_cleaned();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn container_grouping_and_twins_include_hidden_and_offscreen_controls() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(
+        r#"<!doctype html><style>.row{height:50px}.hidden{opacity:0}.row:hover .hidden{opacity:1}</style>
+    <ul aria-label="Rows"><div class="row">Alpha<button>Edit</button></div><div class="row">Bravo<button class="hidden">Edit</button><button class="hidden">Near</button></div></ul>
+    <section aria-label="Tokens"><div class="row">Staging<button class="hidden">Copy</button></div><div class="row">Production<button class="hidden">Copy</button></div></section>
+    <button>Near</button><button>Unique</button><button style="display:none">Unique</button><button>Far</button><div style="margin-top:1800px"><button>Edit</button><button>Far</button></div>"#,
+    );
+    let mut browser = launch_headless();
+    let lifecycle = BrowserLifecycle::observe();
+    browser.navigate(&server.url()).unwrap();
+    let page = browser.observe().unwrap();
+    assert!(candidate(&page, "Edit").unwrap().shares_name);
+    assert!(!candidate(&page, "Unique").unwrap().shares_name);
+    assert!(candidate(&page, "Far").unwrap().shares_name);
+    assert!(candidate(&page, "Near").unwrap().shares_name);
+    assert_eq!(
+        page.hover_regions
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Bravo", "Staging", "Production"]
+    );
+    browser.close().unwrap();
+    lifecycle.assert_cleaned();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn recycled_virtualized_control_changes_container_while_its_node_stays_the_same() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server =
+        FixtureServer::with_body(include_str!("../../../tests/browser/virtualized-rows.html"));
+    let mut browser = launch_headless();
+    let lifecycle = BrowserLifecycle::observe();
+    browser.navigate(&server.url()).unwrap();
+    let before = browser.observe().unwrap();
+    let old = candidate(&before, "Edit").unwrap();
+    assert_eq!(old.container.as_deref(), Some("Alpha"));
+    assert!(!old.shares_name);
+    browser
+        .perform(
+            PreparedInput {
+                document_id: before.document_id.clone(),
+                node_id: 0,
+                operation: PreparedOperation::ScrollDown,
+                text: None,
+                previous_text: None,
+                option_node_id: None,
+                combobox: false,
+                action_sequence: 1,
+                focus_anchor: None,
+            },
+            &InputCancellation::default(),
+        )
+        .unwrap();
+    let after = browser.observe().unwrap();
+    let new = candidate(&after, "Edit").unwrap();
+    assert_eq!(new.node_id, old.node_id);
+    assert_eq!(new.container.as_deref(), Some("Bravo"));
+    assert!(!new.shares_name);
+    browser.close().unwrap();
+    lifecycle.assert_cleaned();
+}
