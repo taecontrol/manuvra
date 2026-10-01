@@ -57,7 +57,7 @@ mod tests {
                     if regions {
                         page.hover_regions.push(hover_region(1, "Bravo", 8));
                     }
-                    assert_eq!(contested(&page), regions || twins || (click && !regions));
+                    assert_eq!(contested(&page), regions || twins || click);
                     assert_eq!(
                         container_for(&page.elements[0], &page),
                         (twins || (click && !regions)).then_some("Alpha")
