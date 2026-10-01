@@ -1,7 +1,11 @@
 <!doctype html><meta charset="utf-8"><title>Hover cascade and conditions</title>
 <style>
-body{font:14px sans-serif;margin:24px}.case{padding:3px;height:28px}
+body{font:14px sans-serif;margin:24px}.case{padding:2px;height:24px}
 @layer earlier,later;
+.hover-equal button,.hover-equal-important button,.hover-equal-positive button{opacity:0}
+.hover-equal:hover button{opacity:1}.hover-equal:hover button{opacity:0}
+.hover-equal-important:hover button{opacity:1!important}.hover-equal-important:hover button{opacity:0!important}
+.hover-equal-positive:hover button{opacity:0}.hover-equal-positive:hover button{opacity:1}
 .hover-important button,.hover-layer button{opacity:0}
 .hover-important:hover button{opacity:1}.hover-important:hover button{opacity:0!important}
 @layer earlier{.hover-layer:hover button{opacity:1}}
@@ -35,6 +39,9 @@ body{font:14px sans-serif;margin:24px}.case{padding:3px;height:28px}
 <style media="(hover:none)">.media-negative:hover button{opacity:1}</style>
 <div class="case hover-important">Competing important hover<button>Hover important blocked</button></div>
 <div class="case hover-layer">Competing later layer hover<button>Hover layer blocked</button></div>
+<div class="case hover-equal">Equal hover source order<button>Equal hover blocked</button></div>
+<div class="case hover-equal-important">Equal important source order<button>Equal important blocked</button></div>
+<div class="case hover-equal-positive">Later identical reveal<button>Late reveal</button></div>
 <div class="case negative-competing">Negative competing hover<button>Negative competing blocked</button></div>
 <div class="case negative-sibling">Negative sibling<i class="negative-peer">Peer</i><button>Negative sibling blocked</button></div>
 <div class="case disabled-sheet">Disabled sheet<button>Disabled blocked</button></div>

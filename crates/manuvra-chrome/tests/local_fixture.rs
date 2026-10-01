@@ -2247,13 +2247,19 @@ fn hover_reveals_respect_layer_hierarchy_conditions_and_stylesheet_roots() {
         names,
         [
             "Important reveal",
+            "Late reveal",
             "Layer reveal",
             "Negative reveal",
             "Shadow negative reveal",
             "Shadow reveal"
         ]
     );
-    for wanted in ["Layer reveal", "Negative reveal", "Shadow reveal"] {
+    for wanted in [
+        "Late reveal",
+        "Layer reveal",
+        "Negative reveal",
+        "Shadow reveal",
+    ] {
         let observation = browser.observe().unwrap();
         let region = observation
             .hover_regions

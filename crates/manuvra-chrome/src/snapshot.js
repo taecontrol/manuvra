@@ -136,7 +136,7 @@
   const revealingRegion = (element) => ancestors(element).slice(1).find(node => node.checkVisibility({checkOpacity:true}) &&
     (node.matches('li,tr,[role=row],[role=listitem]') || node.hasAttribute('aria-label')));
   // Opacity reveals inferred from CSSOM hover rules, importance, and layers.
-  const hoverRules = [], baseRules = [], hideRules = []; let hoverRulesUnreadable = false;
+  const hoverRules = [], baseRules = [], hideRules = []; let hoverRulesUnreadable = false, ruleOrder = 0;
   const viewOf = (node) => (node.ownerDocument || node).defaultView || window;
   for (const context of contexts) {
     const root = context.root, win = viewOf(root), layerOrder = new Map(), layerCounts = new Map(); let anonLayer = 0;
@@ -147,7 +147,7 @@
         path = layerOrder.get(qualified); parent = qualified; } };
     const sheets = [...(root.styleSheets || []), ...(root.adoptedStyleSheets || [])];
     const consider = (sel, style, layer) => { if (!style || style.opacity === '') return;
-      const record = {s:sel, o:parseFloat(style.opacity), important:style.getPropertyPriority('opacity') === 'important', layer, layerOrder, root};
+      const record = {s:sel, order:ruleOrder++, o:parseFloat(style.opacity), important:style.getPropertyPriority('opacity') === 'important', layer, layerOrder, root};
       if (/:hover(?![\w-])/.test(sel)) hoverRules.push(record); else if (Number.isFinite(record.o)) { baseRules.push(record); if (record.o === 0) hideRules.push(record); } };
     const walk = (rules, parent, layer) => { for (const r of rules) { try {
       if (win.CSSLayerStatementRule && r instanceof win.CSSLayerStatementRule) { for (const n of r.nameList) { const k = (layer ? layer + '.' : '') + n; registerLayer(k); } continue; }
@@ -168,7 +168,10 @@
     // The implicit unlayered child comes last normally and first when importance reverses layers.
     return r.important ? [2, ...path.map(n => -n), -1e9] : [0, ...path, 1e9]; };
   const beats = (a, b) => { const x = rank(a), y = rank(b);
-    for (let i = 0; i < Math.max(x.length, y.length); i++) { if (x[i] !== y[i]) return (x[i] ?? 0) > (y[i] ?? 0); } return true; };
+    for (let i = 0; i < Math.max(x.length, y.length); i++) { if (x[i] !== y[i]) return (x[i] ?? 0) > (y[i] ?? 0); }
+    // Identical selectors have equal specificity, so their later declaration wins.
+    // Comparing different selectors still keeps the bounded V3 specificity approximation.
+    return a.s && a.s === b.s ? a.order >= b.order : true; };
   const safeMatches = (node, sel) => { try { return node.matches(sel); } catch (_) { return false; } };
   const siblingHover = (sel) => /:hover(?![\w-])[\s\S]*[~+]/.test(sel.replace(/\[[^\]]*\]|"[^"\\]*(?:\\.[^"\\]*)*"|'[^'\\]*(?:\\.[^'\\]*)*'/g, ''));
   const hoveredMatch = (node, rule) => rule.root === node.getRootNode() && !/:not\(\s*:hover\s*\)/.test(rule.s) && !siblingHover(rule.s) && safeMatches(node, rule.s.replace(/:hover(?![\w-])/g, ':is(*)'));
