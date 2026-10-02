@@ -3132,6 +3132,8 @@ fn scaled_frame_wheel_reaches_the_selected_region_and_reports_its_movement() {
         ("none;scale:.5", "none"),
         ("none;scale:.5 1", "none"),
         ("none;zoom:.5", "none"),
+        ("scale3d(.5,.5,.5)", "none"),
+        ("none;scale:.5 .5 .5", "none"),
         (
             "rotate(20deg) scale(.5);padding:50px;border:20px solid black",
             "none",
@@ -3155,15 +3157,19 @@ fn scaled_frame_wheel_reaches_the_selected_region_and_reports_its_movement() {
             assert_eq!(observed.scroll_regions[0].rect.height, 75.0);
         }
         if frame_transform == "rotate(20deg) scale(.5)" {
+            // The main viewport cuts the rotated top-left corner at x=0.
+            let angle = 20_f64.to_radians();
+            let height = (500.0 * angle.sin() + 250.0 * angle.cos()) / 2.0 - 50.0 / angle.cos();
             assert!(
-                observed.scroll_regions[0].rect.height > 150.0
-                    && observed.scroll_regions[0].rect.height < 160.0
+                (observed.scroll_regions[0].rect.height - height).abs() < 0.01,
+                "{:?}",
+                observed.scroll_regions[0].rect
             );
         }
         if frame_transform.contains("padding:50px") {
             let angle = 20_f64.to_radians();
             let expected_y = if frame_transform.starts_with("rotate(-") {
-                (170.0 * angle.cos() - 570.0 * angle.sin()) / 2.0
+                0.0
             } else {
                 (70.0 * angle.sin() + 170.0 * angle.cos()) / 2.0
             };
@@ -3172,6 +3178,16 @@ fn scaled_frame_wheel_reaches_the_selected_region_and_reports_its_movement() {
                 "{:?}",
                 observed.scroll_regions[0].rect
             );
+            if frame_transform.starts_with("rotate(-") {
+                let expected_x = (70.0 * angle.cos() + 170.0 * angle.sin()) / 2.0;
+                assert!((observed.scroll_regions[0].rect.x - expected_x).abs() < 0.01);
+                assert!(
+                    (observed.scroll_regions[0].rect.height
+                        - (320.0 * angle.cos() - 70.0 * angle.sin()) / 2.0)
+                        .abs()
+                        < 0.01
+                );
+            }
         }
         let fact = browser
             .perform(
@@ -3320,7 +3336,7 @@ fn unverifiable_frame_geometry_cannot_publish_window_scroll_authority() {
         "transform:rotateY(30deg)",
         "perspective:500px",
         "rotate:x 20deg",
-        "scale:1 1 2",
+        "transform:perspective(500px)",
         "transform:scale(0)",
     ] {
         let body = framed_scroll_page(200, 180).replace("border:0", &format!("border:0;{css}"));
@@ -3341,9 +3357,11 @@ fn transformed_region_clipping_uses_client_dimensions_in_the_same_coordinate_spa
         ("scale(2)", 300.0),
         ("none;zoom:.5", 75.0),
         ("none;scale:.5", 75.0),
+        ("scale3d(.5,.5,.5)", 75.0),
+        ("none;scale:.5 .5 .5", 75.0),
     ] {
         let body = format!(
-            r#"<!doctype html><style>body{{margin:0;overflow:hidden}}#region{{position:absolute;top:40px;left:40px;width:300px;height:150px;overflow:auto;transform:{transform};transform-origin:top left}}button{{display:block;height:30px;width:200px;margin:0;line-height:30px;padding:0}}</style><div id="region" aria-label="Rows"></div><script>for(let i=1;i<=12;i++){{const b=document.createElement('button');b.textContent='Row '+i;region.append(b)}}</script>"#
+            r#"<!doctype html><style>body{{margin:0;overflow:hidden}}#region{{position:absolute;top:40px;left:40px;width:300px;height:150px;border:10px solid black;scrollbar-width:none;overflow:auto;transform:{transform};transform-origin:top left}}button{{display:block;height:30px;width:200px;margin:0;line-height:30px;padding:0}}</style><div id="region" aria-label="Rows"></div><script>for(let i=1;i<=12;i++){{const b=document.createElement('button');b.textContent='Row '+i;region.append(b)}}</script>"#
         );
         let server = FixtureServer::with_body(Box::leak(body.into_boxed_str()));
         browser.navigate(&server.url()).unwrap();
@@ -3356,6 +3374,16 @@ fn transformed_region_clipping_uses_client_dimensions_in_the_same_coordinate_spa
         );
         assert!(!observed.visible_text.contains("Row 6"));
         assert_eq!(observed.scroll_regions[0].rect.height, expected_height);
+        let origin = if transform == "none;zoom:.5" {
+            25.0
+        } else if transform == "scale(2)" {
+            60.0
+        } else {
+            45.0
+        };
+        assert_eq!(observed.scroll_regions[0].rect.x, origin);
+        assert_eq!(observed.scroll_regions[0].rect.y, origin);
+        assert_eq!(observed.scroll_regions[0].rect.width, expected_height * 2.0);
         let fact = browser
             .perform(
                 prepared_scroll(&observed, false, 1),
@@ -3435,7 +3463,7 @@ fn unverifiable_client_geometry_cannot_publish_scroll_authority() {
         "transform:rotateY(30deg)",
         "perspective:500px",
         "rotate:x 20deg",
-        "scale:1 1 2",
+        "transform:perspective(500px)",
         "transform:scale(0)",
     ] {
         let body = format!(
@@ -3445,5 +3473,113 @@ fn unverifiable_client_geometry_cannot_publish_scroll_authority() {
         browser.navigate(&server.url()).unwrap();
         assert!(browser.observe().is_err(), "{css}");
     }
+    browser.close().unwrap();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn rotated_clipping_excludes_controls_and_text_outside_the_client_box() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let mut browser = launch_headless();
+    for angle in [30, 45, -30] {
+        let body = format!(
+            r#"<!doctype html><style>body{{margin:0;overflow:hidden}}#region{{position:absolute;left:400px;top:200px;width:300px;height:150px;overflow:auto;transform:rotate({angle}deg);transform-origin:top left}}button,span{{position:absolute;left:180px;width:90px;height:20px}}button{{font-size:8px}}span{{left:100px}}</style><div id="region" aria-label="Rotated"><div style="height:1000px"></div><button style="top:40px">VISIBLE GOAL</button><button style="top:170px">CLIPPED GOAL</button><span style="top:200px">CLIPPED TEXT</span><span aria-hidden="true" style="top:230px">CLIPPED COVERED</span><span style="top:140px">PARTLY VISIBLE TEXT</span></div>"#
+        );
+        let server = FixtureServer::with_body(Box::leak(body.into_boxed_str()));
+        browser.navigate(&server.url()).unwrap();
+        let observed = browser.observe().unwrap();
+        assert_eq!(
+            observed
+                .elements
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            ["VISIBLE GOAL"],
+            "{angle}"
+        );
+        if angle != 45 {
+            assert!(!observed.visible_text.contains("CLIPPED GOAL"), "{angle}");
+        }
+        assert!(!observed.visible_text.contains("CLIPPED TEXT"), "{angle}");
+        assert!(!observed.covered_text.contains("CLIPPED"), "{angle}");
+        assert!(
+            observed.visible_text.contains("PARTLY VISIBLE TEXT"),
+            "{angle}"
+        );
+        let fact = browser
+            .perform(
+                prepared_scroll(&observed, false, 1),
+                &InputCancellation::default(),
+            )
+            .unwrap();
+        assert!((fact.scroll_readback[0].after - 142.0).abs() <= 1.0);
+        assert!(
+            browser
+                .observe()
+                .unwrap()
+                .elements
+                .iter()
+                .any(|e| e.name == "CLIPPED GOAL")
+        );
+    }
+    browser.close().unwrap();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn partially_visible_regions_keep_overlapping_views_at_small_heights() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let mut browser = launch_headless();
+    for (height, distance) in [(4, 2.0), (20, 12.0), (40, 32.0), (48, 40.0), (150, 142.0)] {
+        let body = format!(
+            r#"<!doctype html><style>body{{margin:0;overflow:hidden}}#region{{position:fixed;left:40px;top:calc(100vh - {height}px);width:200px;height:300px;overflow:auto}}button{{display:block;height:2px;width:150px;margin:0;padding:0;border:0;font-size:1px}}</style><div id="region" aria-label="Rows"></div><script>for(let i=1;i<=1000;i++){{let b=document.createElement('button');b.textContent='Option '+i;region.append(b)}}</script>"#
+        );
+        let server = FixtureServer::with_body(Box::leak(body.into_boxed_str()));
+        browser.navigate(&server.url()).unwrap();
+        let observed = browser.observe().unwrap();
+        assert_eq!(observed.scroll_regions[0].rect.height, height as f64);
+        let last_visible = observed.elements.last().unwrap().name.clone();
+        let fact = browser
+            .perform(
+                prepared_scroll(&observed, false, 1),
+                &InputCancellation::default(),
+            )
+            .unwrap();
+        assert!(
+            (fact.scroll_readback[0].after - distance).abs() <= 0.01,
+            "height {height}: {fact:?}"
+        );
+        let after = browser.observe().unwrap();
+        assert!(
+            after.elements.iter().any(|e| e.name == last_visible),
+            "height {height}"
+        );
+        assert_eq!(after.viewport.scroll_y, 0.0);
+    }
+    browser.close().unwrap();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn nested_zoomed_frames_accumulate_native_wheel_units() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let child=r#"<!doctype html><body style="margin:0"><div aria-label="Nested rows" style="height:100px;width:180px;overflow:auto"><div style="height:1000px">Rows</div></div>"#.replace('"',"&quot;");
+    let parent=format!(r#"<!doctype html><body style="margin:0"><iframe style="position:absolute;left:30px;top:30px;width:200px;height:120px;border:0;transform:none;zoom:.5;transform-origin:top left" srcdoc="{child}"></iframe>"#).replace('&',"&amp;").replace('"',"&quot;");
+    let page = format!(
+        r#"<!doctype html><iframe style="position:absolute;left:600px;top:50px;width:300px;height:200px;border:0;transform:none;zoom:.5;transform-origin:top left" srcdoc="{parent}"></iframe>"#
+    );
+    let server = FixtureServer::with_body(Box::leak(page.into_boxed_str()));
+    let mut browser = launch_headless();
+    browser.navigate(&server.url()).unwrap();
+    let observed = browser.observe().unwrap();
+    assert_eq!(observed.scroll_regions.len(), 1);
+    let fact = browser
+        .perform(
+            prepared_scroll(&observed, false, 1),
+            &InputCancellation::default(),
+        )
+        .unwrap();
+    assert!((fact.scroll_readback[0].after - 92.0).abs() <= 1.0);
+    assert_eq!(fact.scroll_readback.last().unwrap().after, 0.0);
     browser.close().unwrap();
 }

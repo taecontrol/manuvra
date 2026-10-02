@@ -18,7 +18,7 @@
       }
       positions.push({node:null,identity:{overlay:null,document:true},before:scrollY});
       cache.scrollReadback={documentId,positions};
-      return {ok:true,x,y,delta:direction*Math.max(40,r.wheel_height-8)*r.wheel_scale};
+      return {ok:true,x,y,delta:direction*Math.max(Math.min(40,r.wheel_height/2),r.wheel_height-8)*r.wheel_scale};
     }
   }
   return {ok:false,reason:'covered'};

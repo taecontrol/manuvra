@@ -19,13 +19,49 @@
     const x=Math.min(...points.map(p=>p.x)), y=Math.min(...points.map(p=>p.y));
     return {x,y,width:Math.max(...points.map(p=>p.x))-x,height:Math.max(...points.map(p=>p.y))-y};
   };
+  const rectPoints = r => [{x:r.x,y:r.y},{x:r.x+r.width,y:r.y},{x:r.x+r.width,y:r.y+r.height},{x:r.x,y:r.y+r.height}];
+  const pointBounds = points => {
+    if(!points.length)return {x:0,y:0,width:0,height:0};
+    const x=Math.min(...points.map(p=>p.x)),y=Math.min(...points.map(p=>p.y));
+    return {x,y,width:Math.max(...points.map(p=>p.x))-x,height:Math.max(...points.map(p=>p.y))-y};
+  };
+  // Clip a polygon against each affine client edge in its own coordinate space.
+  const clipEdge = (points,inverse,axis,limit,greater) => {
+    const out=[],distance=p=>(inverse.transformPoint(p)[axis]-limit)*(greater?1:-1);
+    if(!points.length)return out;
+    let previous=points.at(-1),before=distance(previous);
+    for(const point of points) {
+      const after=distance(point);
+      if((before>=0)!==(after>=0)) {
+        const fraction=before/(before-after);
+        out.push({x:previous.x+(point.x-previous.x)*fraction,y:previous.y+(point.y-previous.y)*fraction});
+      }
+      if(after>=0)out.push(point);
+      previous=point;before=after;
+    }
+    return out;
+  };
+  const clippedPolygon = (points,bounds) => {
+    const identity=new DOMMatrix();
+    for(const [axis,limit,greater] of [['x',bounds.left,true],['x',bounds.right,false],['y',bounds.top,true],['y',bounds.bottom,false]])
+      points=clipEdge(points,identity,axis,limit,greater);
+    for(const {box,clipX,clipY} of bounds.clips) {
+      const inverse=box.matrix.inverse();
+      if(clipX) {points=clipEdge(points,inverse,'x',0,true);points=clipEdge(points,inverse,'x',box.width,false);}
+      if(clipY) {points=clipEdge(points,inverse,'y',0,true);points=clipEdge(points,inverse,'y',box.height,false);}
+    }
+    return points;
+  };
+  const polygonArea = points => Math.abs(points.reduce((sum,p,i)=>{const q=points[(i+1)%points.length];return sum+p.x*q.y-q.x*p.y;},0))/2;
   // Keep client dimensions and DOMRects in explicit coordinate spaces.
   const elementGeometry = element => {
     let matrix = new DOMMatrix(), zoom = 1;
     for (let node=element;node;node=node.parentElement || node.getRootNode()?.host) {
       const css=node.ownerDocument.defaultView.getComputedStyle(node);
       const transform=new DOMMatrix(css.transform==='none'?undefined:css.transform);
-      if (!transform.is2D || css.perspective!=='none') return null;
+      // A matrix3d used for a flat scale animation is still an affine X/Y map.
+      const planar=[transform.m13,transform.m14,transform.m23,transform.m24,transform.m31,transform.m32,transform.m34].every(value=>value===0) && transform.m44===1;
+      if (!planar || css.perspective!=='none') return null;
       let rotation=new DOMMatrix(), scaling=new DOMMatrix();
       if (css.rotate!=='none') {
         const parts=css.rotate.split(/\s+/), angle=parts.at(-1);
@@ -34,7 +70,6 @@
       }
       if (css.scale!=='none') {
         const parts=css.scale.split(/\s+/).map(Number);
-        if (parts.length>2 && parts[2]!==1) return null;
         scaling=scaling.scale(parts[0],parts[1]??parts[0]);
       }
       const nodeZoom=parseFloat(css.zoom)||1;zoom*=nodeZoom;
@@ -63,21 +98,20 @@
       frames.unshift({frame,owner}); owner = frame.ownerDocument;
     }
     let matrix=new DOMMatrix(),zoom=1;
-    const bounds={left:0,top:0,right:innerWidth,bottom:innerHeight};
+    const viewports=[];
     for (const entry of frames) {
       entry.parentMatrix=matrix;
+      const parent=entry.frame.ownerDocument.defaultView;
+      viewports.push({matrix,width:parent.innerWidth,height:parent.innerHeight});
       const geometry=elementGeometry(entry.frame);if(!geometry)return null;
       const css=entry.frame.ownerDocument.defaultView.getComputedStyle(entry.frame);
       const local=geometry.matrix.translate(entry.frame.clientLeft+parseFloat(css.paddingLeft),entry.frame.clientTop+parseFloat(css.paddingTop));
       matrix=matrix.multiply(local);zoom*=geometry.zoom;
-      const viewport=mappedRect({x:0,y:0,width:entry.owner.defaultView.innerWidth,height:entry.owner.defaultView.innerHeight},matrix);
-      bounds.left=Math.max(bounds.left,viewport.x);bounds.top=Math.max(bounds.top,viewport.y);
-      bounds.right=Math.min(bounds.right,viewport.x+viewport.width);bounds.bottom=Math.min(bounds.bottom,viewport.y+viewport.height);
     }
-    const visible=bounds.right>bounds.left && bounds.bottom>bounds.top ? mappedRect({x:bounds.left,y:bounds.top,width:bounds.right-bounds.left,height:bounds.bottom-bounds.top},matrix.inverse()) : {x:0,y:0,width:0,height:0};
     const view=(root.ownerDocument || root).defaultView;
-    const viewportBounds={left:Math.max(0,visible.x),top:Math.max(0,visible.y),right:Math.min(view.innerWidth,visible.x+visible.width),bottom:Math.min(view.innerHeight,visible.y+visible.height)};
-    return {matrix,zoom,bounds,viewportBounds,frames};
+    const viewportBounds={left:0,top:0,right:view.innerWidth,bottom:view.innerHeight};
+    const viewportClips=viewports.map(box=>({box:{...box,matrix:matrix.inverse().multiply(box.matrix)},clipX:true,clipY:true}));
+    return {matrix,zoom,viewportBounds,viewportClips,frames};
   };
   const hitAt = (region,x,y) => {
     const context=frameContext(region.getRootNode());if(!context)return null;
@@ -97,7 +131,7 @@
     if (!root || seenRoots.has(root)) return;
     const geometry=frameContext(root);
     if(!geometry) {unverifiableFrameGeometry=true;return;}
-    seenRoots.add(root); contexts.push({root, context, offsetX, offsetY, viewportBounds:geometry.viewportBounds});
+    seenRoots.add(root); contexts.push({root, context, offsetX, offsetY, viewportBounds:geometry.viewportBounds,viewportClips:geometry.viewportClips});
     if (root.defaultView?.__manuvraClosedShadowRoots > 0) gaps.push('closed_shadow_root');
     for (const element of root.querySelectorAll('*')) {
       if (element.shadowRoot) visit(element.shadowRoot, `${context}/shadow:${nodeId(element)}`, offsetX, offsetY);
@@ -126,7 +160,7 @@
   // Only ancestors below the containing block can be escaped by positioned descendants.
   const clippingRect = (element, context, viewport = true, clipSelf = false) => {
     const windowBounds = context.viewportBounds || {left:-context.offsetX,top:-context.offsetY,right:innerWidth-context.offsetX,bottom:innerHeight-context.offsetY};
-    const bounds = viewport ? {...windowBounds} : {left:-Infinity,top:-Infinity,right:Infinity,bottom:Infinity};
+    const bounds = {...(viewport ? windowBounds : {left:-Infinity,top:-Infinity,right:Infinity,bottom:Infinity}),clips:viewport?[...(context.viewportClips || [])]:[]};
     let current = element;
     while (current) {
       const style = viewOfElement(current).getComputedStyle(current);
@@ -141,23 +175,20 @@
       const rootStyle = viewOfElement(next).getComputedStyle(next.ownerDocument.documentElement);
       const viewportOverflow = next === next.ownerDocument.documentElement || (next === next.ownerDocument.body && rootStyle.overflowX === 'visible' && rootStyle.overflowY === 'visible');
       if (viewportOverflow) {current = next; continue;}
-      if(css.overflowX !== 'visible' || css.overflowY !== 'visible') {
-        const box=clientBox(next),r=mappedRect({x:0,y:0,width:box.width,height:box.height},box.matrix);
-        if (css.overflowX !== 'visible') { bounds.left = Math.max(bounds.left,r.x); bounds.right = Math.min(bounds.right,r.x+r.width); }
-        if (css.overflowY !== 'visible') { bounds.top = Math.max(bounds.top,r.y); bounds.bottom = Math.min(bounds.bottom,r.y+r.height); }
-      }
+      if(css.overflowX !== 'visible' || css.overflowY !== 'visible')
+        bounds.clips.push({box:clientBox(next),clipX:css.overflowX!=='visible',clipY:css.overflowY!=='visible'});
       current = next;
     }
     return bounds;
   };
   const inViewport = (element, context) => {
     const r = element.getBoundingClientRect(), b = clippingRect(element, context);
-    return r.width > 0 && r.height > 0 && r.bottom > b.top && r.right > b.left && r.top < b.bottom && r.left < b.right;
+    return r.width > 0 && r.height > 0 && polygonArea(clippedPolygon(rectPoints(r),b)) > 0;
   };
   const centerUnclipped = (element, context) => {
     const r = element.getBoundingClientRect(), b = clippingRect(element, context, false), x = r.x+r.width/2, y = r.y+r.height/2;
     // Keep the existing viewport-intersection rule; apply centers only to ancestor clipping.
-    return x >= b.left && x < b.right && y >= b.top && y < b.bottom;
+    return b.clips.every(({box,clipX,clipY})=>{const point=box.matrix.inverse().transformPoint({x,y});return (!clipX || point.x>=0 && point.x<box.width) && (!clipY || point.y>=0 && point.y<box.height);});
   };
   const rendered = (element, context) => Boolean(element) && element.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}) && inViewport(element, context) && centerUnclipped(element, context);
   const visible = (element, context) => rendered(element, context) && !ancestors(element).some(node => node.matches?.('[aria-hidden="true"],[inert]'));
@@ -362,13 +393,11 @@
   const scrollVisibleRect = element => {
     if (!scrollContexts.has(element.getRootNode())) return null;
     const context = frameContext(element.getRootNode()); if (!context) return null;
-    const box=clientBox(element),r=mappedRect({x:0,y:0,width:box.width,height:box.height},box.matrix),b=clippingRect(element,context);
-    const x=Math.max(r.x,b.left),y=Math.max(r.y,b.top);
-    const right=Math.min(r.x+r.width,b.right),bottom=Math.min(r.y+r.height,b.bottom);
-    const clipped={x,y,width:Math.max(0,right-x),height:Math.max(0,bottom-y)};
-    const rect=mappedRect(clipped,context.matrix),local=mappedRect(clipped,box.matrix.inverse());
+    const box=clientBox(element),b=clippingRect(element,context);
+    const points=clippedPolygon(rectPoints({x:0,y:0,width:box.width,height:box.height}).map(p=>box.matrix.transformPoint(p)),b);
+    const rect=pointBounds(points.map(p=>context.matrix.transformPoint(p))),local=pointBounds(points.map(p=>box.matrix.inverse().transformPoint(p)));
     // Transforms change geometry; CSS zoom also changes the units of a delivered wheel.
-    return {...rect,wheel_height:Math.max(0,Math.min(box.height,local.y+local.height)-Math.max(0,local.y)),wheel_scale:context.zoom*box.zoom};
+    return {...rect,wheel_height:local.height,wheel_scale:context.zoom*box.zoom};
   };
   for (const context of contexts) scrollContexts.set(context.root,context);
   cache.scrollConnected = element => Boolean(element?.isConnected && frameContext(element.getRootNode()));
@@ -408,7 +437,7 @@
       const value = current.textContent.replace(/\s+/g,' ').trim(), parent = current.parentElement;
       if (!value || !parent || parent.closest('script,style,noscript,template')) continue;
       range.selectNodeContents(current); const bounds = clippingRect(parent, context, true, true);
-      const intersects = [...range.getClientRects()].some(r => r.width > 0 && r.height > 0 && r.bottom > bounds.top && r.right > bounds.left && r.top < bounds.bottom && r.left < bounds.right);
+      const intersects = [...range.getClientRects()].some(r => r.width > 0 && r.height > 0 && polygonArea(clippedPolygon(rectPoints(r),bounds)) > 0);
       if (!intersects || !parent.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) continue;
       if (!ancestors(parent).some(node => node.matches?.('[aria-hidden="true"],[inert]'))) visibleLength = appendText(visibleText, value, 'visible_text', visibleLength);
       else coveredLength = appendText(coveredText, value, 'covered_text', coveredLength);
