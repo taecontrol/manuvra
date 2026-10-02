@@ -358,9 +358,19 @@ enum Lifecycle {
 
 fn retry_profile_removal(
     mut remove: impl FnMut() -> std::io::Result<()>,
-    _deadline: Instant,
+    deadline: Instant,
 ) -> std::io::Result<()> {
-    remove()
+    loop {
+        match remove() {
+            Err(error)
+                if error.raw_os_error() == Some(libc::ENOTEMPTY) && Instant::now() < deadline =>
+            {
+                // A Chromium descendant may finish a profile write after the leader exits.
+                thread::sleep(Duration::from_millis(20));
+            }
+            result => return result,
+        }
+    }
 }
 
 fn require_committed_navigation(navigated: &Value) -> Result<(), BrowserError> {
