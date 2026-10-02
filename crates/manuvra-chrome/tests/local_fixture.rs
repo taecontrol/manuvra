@@ -3100,3 +3100,189 @@ fn readback_rejects_stale_capture_identity_and_never_settled_positions() {
     }
     browser.close().unwrap();
 }
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn direct_text_clips_to_its_own_parent_overflow_box() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(
+        r#"<!doctype html><style>body{margin:0}.region{height:60px;width:300px;overflow:auto;line-height:20px}</style><div class="region"><div style="height:100px">Visible block</div>CLIPPED SENTINEL</div><div class="region" aria-hidden="true"><div style="height:100px">Covered block</div>COVERED SENTINEL</div>"#,
+    );
+    let mut browser = launch_headless();
+    browser.navigate(&server.url()).unwrap();
+    let observed = browser.observe().unwrap();
+    assert!(observed.visible_text.contains("Visible block"));
+    assert!(!observed.visible_text.contains("CLIPPED SENTINEL"));
+    assert!(!observed.covered_text.contains("COVERED SENTINEL"));
+    browser.close().unwrap();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn scaled_frame_wheel_reaches_the_selected_region_and_reports_its_movement() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let child = r#"<!doctype html><style>body{margin:0}#target,#wrong{position:absolute;left:0;height:150px;overflow:auto}#target{top:100px;width:500px}#wrong{top:300px;width:600px}</style><div id="target" aria-label="Target"><div style="height:1000px">Rows</div></div><textarea id="wrong" aria-label="Wrong"></textarea><output id="result">Wrong: 0</output><script>wrong.value='Wrong\n'.repeat(100);wrong.addEventListener('scroll',()=>result.textContent='Wrong: '+wrong.scrollTop)</script>"#.replace('"',"&quot;");
+    let mut browser = launch_headless();
+    for (frame_transform, ancestor_transform) in [
+        ("scale(.5)", "none"),
+        ("none", "scale(.5)"),
+        ("rotate(20deg) scale(.5)", "none"),
+        ("scale(2)", "none"),
+    ] {
+        let body = format!(
+            r#"<!doctype html><style>body{{margin:0;overflow:hidden}}#wrapper{{transform:{ancestor_transform};transform-origin:top left}}iframe{{width:600px;height:600px;border:0;transform:{frame_transform};transform-origin:top left}}</style><div id="wrapper"><iframe srcdoc="{child}"></iframe></div>"#
+        );
+        let server = FixtureServer::with_body(Box::leak(body.into_boxed_str()));
+        browser.navigate(&server.url()).unwrap();
+        let observed = browser.observe().unwrap();
+        assert_eq!(observed.scroll_regions.len(), 1);
+        let fact = browser
+            .perform(
+                prepared_scroll(&observed, false, 1),
+                &InputCancellation::default(),
+            )
+            .unwrap();
+        assert!(
+            (fact.scroll_readback[0].after - 142.0).abs() <= 1.0,
+            "{frame_transform} / {ancestor_transform}: {fact:?}"
+        );
+        let after = browser.observe().unwrap();
+        assert!(after.visible_text.contains("Wrong: 0"));
+        assert_eq!(after.viewport.scroll_y, 0.0);
+    }
+    browser.close().unwrap();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn open_shadow_scroll_reaches_the_region() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(
+        r#"<!doctype html><div id="host"></div><script>host.attachShadow({mode:'open'}).innerHTML='<div aria-label="Shadow rows" style="height:100px;width:200px;overflow:auto"><div style="height:1000px">Rows</div></div>'</script>"#,
+    );
+    let mut browser = launch_headless();
+    browser.navigate(&server.url()).unwrap();
+    let observed = browser.observe().unwrap();
+    assert_eq!(observed.scroll_regions.len(), 1);
+    browser
+        .perform(
+            prepared_scroll(&observed, false, 1),
+            &InputCancellation::default(),
+        )
+        .unwrap();
+    assert!(browser.observe().unwrap().scroll_regions[0].scroll_top > 0.0);
+    browser.close().unwrap();
+}
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn nested_frame_scroll_checks_every_outer_hit() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let child=r#"<!doctype html><body style="margin:0"><div aria-label="Nested rows" style="height:100px;width:180px;overflow:auto"><div style="height:1000px">Rows</div></div>"#.replace('"',"&quot;");
+    let parent=format!(r#"<!doctype html><body style="margin:0"><iframe style="position:absolute;left:30px;top:30px;width:200px;height:120px;border:0" srcdoc="{child}"></iframe>"#).replace('&',"&amp;").replace('"',"&quot;");
+    let page = format!(
+        r#"<!doctype html><iframe style="position:absolute;left:50px;top:50px;width:300px;height:200px;border:0" srcdoc="{parent}"></iframe><div style="position:absolute;left:50px;top:50px;width:300px;height:200px;background:white;z-index:20">Cover</div>"#
+    );
+    let server = FixtureServer::with_body(Box::leak(page.into_boxed_str()));
+    let mut browser = launch_headless();
+    browser.navigate(&server.url()).unwrap();
+    let observed = browser.observe().unwrap();
+    assert_eq!(observed.scroll_regions.len(), 1);
+    assert!(matches!(
+        browser.perform(
+            prepared_scroll(&observed, false, 1),
+            &InputCancellation::default()
+        ),
+        Err(PerformError::Rejected(_))
+    ));
+    browser.close().unwrap();
+}
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn frame_width_bounds_region_geometry() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let body = framed_scroll_page(200, 180).replace("width:180px", "width:600px");
+    let server = FixtureServer::with_body(Box::leak(body.into_boxed_str()));
+    let mut browser = launch_headless();
+    browser.navigate(&server.url()).unwrap();
+    let observed = browser.observe().unwrap();
+    assert_eq!(observed.scroll_regions.len(), 1);
+    assert_eq!(observed.scroll_regions[0].rect.width, 220.0);
+    browser.close().unwrap();
+}
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn covered_frame_does_not_publish_child_overlay() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let child=r#"<!doctype html><body style="margin:0"><div role="dialog" aria-modal="true" aria-label="Covered nested choices" style="height:100px;width:180px;background:white">Choices</div>"#.replace('"',"&quot;");
+    let body = format!(
+        r#"<!doctype html><iframe style="position:absolute;left:50px;top:50px;width:300px;height:200px;border:0" srcdoc="{child}"></iframe><div style="position:fixed;left:50px;top:50px;width:300px;height:200px;z-index:10;background:white">Cover</div>"#
+    );
+    let server = FixtureServer::with_body(Box::leak(body.into_boxed_str()));
+    let mut browser = launch_headless();
+    browser.navigate(&server.url()).unwrap();
+    assert!(browser.observe().unwrap().overlay.is_none());
+    browser.close().unwrap();
+}
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn zero_height_region_rejects_wheel() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(
+        r#"<!doctype html><div id="region" aria-label="Rows" style="height:100px;width:200px;overflow:auto;border:10px solid black"><div style="height:1000px">Rows</div></div><button onclick="region.style.height='0px'">Hide rows</button>"#,
+    );
+    let mut browser = launch_headless();
+    browser.navigate(&server.url()).unwrap();
+    let observed = browser.observe().unwrap();
+    browser
+        .perform(
+            prepared(
+                &observed,
+                "Hide rows",
+                PreparedOperation::Click,
+                None,
+                None,
+                1,
+            ),
+            &InputCancellation::default(),
+        )
+        .unwrap();
+    assert!(matches!(
+        browser.perform(
+            prepared_scroll(&observed, false, 2),
+            &InputCancellation::default()
+        ),
+        Err(PerformError::Rejected(_))
+    ));
+    browser.close().unwrap();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn an_offscreen_frame_has_no_scroll_region_or_visible_child_text() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let body = framed_scroll_page(200, 180).replace(
+        "border:0",
+        "border:0;transform:rotate(20deg);transform-origin:top left",
+    ) + "<script>frame.style.left=(innerWidth+70)+'px'</script>";
+    let server = FixtureServer::with_body(Box::leak(body.into_boxed_str()));
+    let mut browser = launch_headless();
+    browser.navigate(&server.url()).unwrap();
+    let observed = browser.observe().unwrap();
+    assert!(observed.scroll_regions.is_empty());
+    assert!(!observed.visible_text.contains("Row "));
+    assert!(!observed.elements.iter().any(|e| e.name.starts_with("Row ")));
+    browser.close().unwrap();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn unverifiable_frame_geometry_cannot_publish_window_scroll_authority() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let body =
+        framed_scroll_page(200, 180).replace("border:0", "border:0;transform:rotateY(30deg)");
+    let server = FixtureServer::with_body(Box::leak(body.into_boxed_str()));
+    let mut browser = launch_headless();
+    browser.navigate(&server.url()).unwrap();
+    assert!(browser.observe().is_err());
+    browser.close().unwrap();
+}

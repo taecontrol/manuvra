@@ -8,12 +8,47 @@
   for (const [id, element] of cache.nodes) if (!element.isConnected) cache.nodes.delete(id);
 
   const gaps = [], contexts = [], seenRoots = new Set();
+  let unverifiableFrameGeometry = false;
   // A frame's document starts at its content box, inside the border and padding.
   const frameOrigin = (frame) => {
     const rect = frame.getBoundingClientRect(), style = frame.ownerDocument.defaultView.getComputedStyle(frame);
     return {x: rect.x + frame.clientLeft + parseFloat(style.paddingLeft), y: rect.y + frame.clientTop + parseFloat(style.paddingTop)};
   };
-  // Rebuild frame geometry at dispatch; a snapshot's offsets cannot authorize a later wheel.
+  const mappedRect = (rect,matrix) => {
+    const points = [[rect.x,rect.y],[rect.x+rect.width,rect.y],[rect.x,rect.y+rect.height],[rect.x+rect.width,rect.y+rect.height]].map(([x,y])=>matrix.transformPoint({x,y}));
+    const x=Math.min(...points.map(p=>p.x)), y=Math.min(...points.map(p=>p.y));
+    return {x,y,width:Math.max(...points.map(p=>p.x))-x,height:Math.max(...points.map(p=>p.y))-y};
+  };
+  // A frame's affine map includes transforms on its ancestors, not just its own CSS.
+  const frameMatrix = frame => {
+    let matrix = new DOMMatrix();
+    for (let node=frame;node;node=node.parentElement || node.getRootNode()?.host) {
+      const css=node.ownerDocument.defaultView.getComputedStyle(node);
+      const transform=new DOMMatrix(css.transform==='none'?undefined:css.transform);
+      if (!transform.is2D || css.perspective!=='none') return null;
+      let rotation=new DOMMatrix(), scaling=new DOMMatrix();
+      if (css.rotate!=='none') {
+        const parts=css.rotate.split(/\s+/), angle=parts.at(-1);
+        if (parts.length>2 || parts.length===2 && parts[0]!=='z') return null;
+        rotation=rotation.rotate(parseFloat(angle)*(angle.endsWith('turn')?360:angle.endsWith('rad')?180/Math.PI:1));
+      }
+      if (css.scale!=='none') {
+        const parts=css.scale.split(/\s+/).map(Number);
+        if (parts.length>2 && parts[2]!==1) return null;
+        scaling=scaling.scale(parts[0],parts[1]??parts[0]);
+      }
+      matrix=new DOMMatrix().scale(parseFloat(css.zoom)||1).multiply(rotation).multiply(scaling).multiply(transform).multiply(matrix);
+    }
+    const css=frame.ownerDocument.defaultView.getComputedStyle(frame), rect=frame.getBoundingClientRect();
+    const width=parseFloat(css.width)+(css.boxSizing==='border-box'?0:parseFloat(css.paddingLeft)+parseFloat(css.paddingRight)+parseFloat(css.borderLeftWidth)+parseFloat(css.borderRightWidth));
+    const height=parseFloat(css.height)+(css.boxSizing==='border-box'?0:parseFloat(css.paddingTop)+parseFloat(css.paddingBottom)+parseFloat(css.borderTopWidth)+parseFloat(css.borderBottomWidth));
+    const linear=new DOMMatrix([matrix.a,matrix.b,matrix.c,matrix.d,0,0]);
+    const box=mappedRect({x:0,y:0,width,height},linear);
+    linear.e=rect.x-box.x;linear.f=rect.y-box.y;
+    const result=linear.translate(frame.clientLeft+parseFloat(css.paddingLeft),frame.clientTop+parseFloat(css.paddingTop));
+    return Number.isFinite(result.inverse().a)?result:null;
+  };
+  // Rebuild frame geometry at dispatch; a snapshot cannot authorize a later wheel.
   const frameContext = root => {
     let owner = root.ownerDocument || root;
     const frames = [];
@@ -22,34 +57,40 @@
       if (!frame?.isConnected || frame.contentDocument !== owner) return null;
       frames.unshift({frame,owner}); owner = frame.ownerDocument;
     }
-    let offsetX = 0, offsetY = 0;
-    const bounds = {left:0,top:0,right:innerWidth,bottom:innerHeight};
-    for (const {frame,owner} of frames) {
-      const origin = frameOrigin(frame); offsetX += origin.x; offsetY += origin.y;
-      bounds.left = Math.max(bounds.left,offsetX); bounds.top = Math.max(bounds.top,offsetY);
-      bounds.right = Math.min(bounds.right,offsetX+owner.defaultView.innerWidth);
-      bounds.bottom = Math.min(bounds.bottom,offsetY+owner.defaultView.innerHeight);
+    let matrix=new DOMMatrix();
+    const bounds={left:0,top:0,right:innerWidth,bottom:innerHeight};
+    for (const entry of frames) {
+      entry.parentMatrix=matrix;
+      const local=frameMatrix(entry.frame);if(!local)return null;
+      matrix=matrix.multiply(local);
+      const viewport=mappedRect({x:0,y:0,width:entry.owner.defaultView.innerWidth,height:entry.owner.defaultView.innerHeight},matrix);
+      bounds.left=Math.max(bounds.left,viewport.x);bounds.top=Math.max(bounds.top,viewport.y);
+      bounds.right=Math.min(bounds.right,viewport.x+viewport.width);bounds.bottom=Math.min(bounds.bottom,viewport.y+viewport.height);
     }
-    return {offsetX,offsetY,bounds,frames};
+    const visible=bounds.right>bounds.left && bounds.bottom>bounds.top ? mappedRect({x:bounds.left,y:bounds.top,width:bounds.right-bounds.left,height:bounds.bottom-bounds.top},matrix.inverse()) : {x:0,y:0,width:0,height:0};
+    const view=(root.ownerDocument || root).defaultView;
+    const viewportBounds={left:Math.max(0,visible.x),top:Math.max(0,visible.y),right:Math.min(view.innerWidth,visible.x+visible.width),bottom:Math.min(view.innerHeight,visible.y+visible.height)};
+    return {matrix,bounds,viewportBounds,frames};
   };
   const hitAt = (region,x,y) => {
-    const root = region.getRootNode(), context = frameContext(root);
-    if (!context) return null;
-    const deepHit = (owner,x,y) => {
-      let hit = owner.elementFromPoint(x,y), next;
-      while (hit?.shadowRoot && (next = hit.shadowRoot.elementFromPoint(x,y)) && next !== hit) hit = next;
+    const context=frameContext(region.getRootNode());if(!context)return null;
+    const deepHit=(owner,x,y)=> {
+      let hit=owner.elementFromPoint(x,y),next;
+      while(hit?.shadowRoot && (next=hit.shadowRoot.elementFromPoint(x,y)) && next!==hit) hit=next;
       return hit;
     };
-    let offsetX = 0, offsetY = 0;
-    for (const {frame} of context.frames) {
-      if (deepHit(frame.ownerDocument,x-offsetX,y-offsetY) !== frame) return null;
-      const origin = frameOrigin(frame); offsetX += origin.x; offsetY += origin.y;
+    for(const {frame,parentMatrix} of context.frames) {
+      const point=parentMatrix.inverse().transformPoint({x,y});
+      if(deepHit(frame.ownerDocument,point.x,point.y)!==frame)return null;
     }
-    return deepHit(region.ownerDocument,x-context.offsetX,y-context.offsetY);
+    const point=context.matrix.inverse().transformPoint({x,y});
+    return deepHit(region.ownerDocument,point.x,point.y);
   };
   const visit = (root, context, offsetX, offsetY) => {
     if (!root || seenRoots.has(root)) return;
-    seenRoots.add(root); contexts.push({root, context, offsetX, offsetY, bounds:frameContext(root)?.bounds});
+    const geometry=frameContext(root);
+    if(!geometry) {unverifiableFrameGeometry=true;return;}
+    seenRoots.add(root); contexts.push({root, context, offsetX, offsetY, viewportBounds:geometry.viewportBounds});
     if (root.defaultView?.__manuvraClosedShadowRoots > 0) gaps.push('closed_shadow_root');
     for (const element of root.querySelectorAll('*')) {
       if (element.shadowRoot) visit(element.shadowRoot, `${context}/shadow:${nodeId(element)}`, offsetX, offsetY);
@@ -62,6 +103,7 @@
     }
   };
   visit(document, 'main', 0, 0);
+  if(unverifiableFrameGeometry)return null;
 
   const ancestors = (element) => {
     const values = []; let current = element;
@@ -75,9 +117,9 @@
   const nearestDialog = (element) => ancestors(element).find(node => node.matches?.('dialog,[role="dialog"],[role="alertdialog"]')) || null;
   const viewOfElement = element => element.ownerDocument.defaultView;
   // Only ancestors below the containing block can be escaped by positioned descendants.
-  const clippingRect = (element, context, viewport = true) => {
-    const windowBounds = context.bounds || {left:0,top:0,right:innerWidth,bottom:innerHeight};
-    const bounds = viewport ? {left:windowBounds.left-context.offsetX, top:windowBounds.top-context.offsetY, right:windowBounds.right-context.offsetX, bottom:windowBounds.bottom-context.offsetY} : {left:-Infinity,top:-Infinity,right:Infinity,bottom:Infinity};
+  const clippingRect = (element, context, viewport = true, clipSelf = false) => {
+    const windowBounds = context.viewportBounds || {left:-context.offsetX,top:-context.offsetY,right:innerWidth-context.offsetX,bottom:innerHeight-context.offsetY};
+    const bounds = viewport ? {...windowBounds} : {left:-Infinity,top:-Infinity,right:Infinity,bottom:Infinity};
     let current = element;
     while (current) {
       const style = viewOfElement(current).getComputedStyle(current);
@@ -85,6 +127,7 @@
       const parent = current.parentElement || current.getRootNode()?.host;
       let next = parent;
       if (positioned) next = current.offsetParent;
+      if (clipSelf) {next = current; clipSelf = false;}
       if (!next || next.ownerDocument !== element.ownerDocument) break;
       const css = viewOfElement(next).getComputedStyle(next), r = next.getBoundingClientRect();
       // The body's overflow propagates to the viewport when the root leaves it visible.
@@ -296,7 +339,8 @@
       const dialog=element.matches('dialog,[role="dialog"],[role="alertdialog"]');
       if (!modal && !controlled.has(element) && !element.matches(':popover-open') && !(dialog && isolatedDialog(element))) continue;
       const r=element.getBoundingClientRect(), x=r.x+r.width/2,y=r.y+r.height/2;
-      const hit=hitAt(element,x+context.offsetX,y+context.offsetY);
+      const frame=frameContext(element.getRootNode()), point=frame?.matrix.transformPoint({x,y});
+      const hit=point && hitAt(element,point.x,point.y);
       if (hit && containsAcrossRoots(element,hit)) overlayCandidates.push({element,name:dialogTitle(element)});
     }
   }
@@ -311,7 +355,9 @@
     const r = element.getBoundingClientRect(), b = clippingRect(element,context);
     const x = Math.max(r.x+element.clientLeft,b.left), y = Math.max(r.y+element.clientTop,b.top);
     const right = Math.min(r.x+element.clientLeft+element.clientWidth,b.right), bottom = Math.min(r.y+element.clientTop+element.clientHeight,b.bottom);
-    return {x:x+context.offsetX,y:y+context.offsetY,width:Math.max(0,right-x),height:Math.max(0,bottom-y)};
+    const rect=mappedRect({x,y,width:Math.max(0,right-x),height:Math.max(0,bottom-y)},context.matrix);
+    // CDP wheels move CSS pixels in the receiving document, even when its frame is scaled.
+    return {...rect,wheel_height:Math.max(0,bottom-y)};
   };
   for (const context of contexts) scrollContexts.set(context.root,context);
   cache.scrollConnected = element => Boolean(element?.isConnected && frameContext(element.getRootNode()));
@@ -319,7 +365,7 @@
   cache.scrollHit = hitAt;
   const scrollNodes = [];
   for (const context of contexts) for (const element of context.root.querySelectorAll('*')) {
-    if (scrollEligible(element) && element.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}) && inViewport(element,context) && !ancestors(element).some(n=>n.matches?.('[aria-hidden="true"],[inert]'))) scrollNodes.push(element);
+    if (scrollEligible(element) && scrollVisibleRect(element) && element.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}) && inViewport(element,context) && !ancestors(element).some(n=>n.matches?.('[aria-hidden="true"],[inert]'))) scrollNodes.push(element);
   }
   const labelledName = element => {
     const ids = (element.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean);
@@ -350,7 +396,7 @@
     while ((current = walker.nextNode())) {
       const value = current.textContent.replace(/\s+/g,' ').trim(), parent = current.parentElement;
       if (!value || !parent || parent.closest('script,style,noscript,template')) continue;
-      range.selectNodeContents(current); const bounds = clippingRect(parent, context);
+      range.selectNodeContents(current); const bounds = clippingRect(parent, context, true, true);
       const intersects = [...range.getClientRects()].some(r => r.width > 0 && r.height > 0 && r.bottom > bounds.top && r.right > bounds.left && r.top < bounds.bottom && r.left < bounds.right);
       if (!intersects || !parent.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) continue;
       if (!ancestors(parent).some(node => node.matches?.('[aria-hidden="true"],[inert]'))) visibleLength = appendText(visibleText, value, 'visible_text', visibleLength);
