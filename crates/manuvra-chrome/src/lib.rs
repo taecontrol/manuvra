@@ -12,7 +12,7 @@ pub use input::{
 };
 pub use observation::{
     ActiveDescendant, Coverage, Element, FocusAnchor, FocusSurface, HoverRegion, Observation, Rect,
-    SelectOption, ViewportState,
+    ScrollRegion, ScrollTarget, SelectOption, ViewportState,
 };
 pub use owned::{
     BrowserConfig, BrowserError, BrowserProvenance, CapturedPage, OwnedBrowser, ProvenanceViewport,

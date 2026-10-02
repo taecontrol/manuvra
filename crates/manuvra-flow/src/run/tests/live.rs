@@ -206,6 +206,7 @@ impl HostedBrowser for LiveBrowser {
 /// it is a visible candidate, otherwise hovers the region that reveals it, and judges a
 /// natural done condition from the wanted control's expanded state.
 pub(crate) struct RowActionProvider {
+    scroll_when_missing: bool,
     wanted: Vec<(&'static str, &'static str)>,
     pub(crate) choices: Mutex<Vec<(String, String, Value)>>,
 }
@@ -213,9 +214,16 @@ pub(crate) struct RowActionProvider {
 impl RowActionProvider {
     pub(crate) fn new(wanted: Vec<(&'static str, &'static str)>) -> Self {
         Self {
+            scroll_when_missing: false,
             wanted,
             choices: Mutex::new(Vec::new()),
         }
+    }
+
+    pub(crate) fn scrolling(wanted: Vec<(&'static str, &'static str)>) -> Self {
+        let mut provider = Self::new(wanted);
+        provider.scroll_when_missing = true;
+        provider
     }
 
     fn wanted_control(&self, request: &Value) -> &'static str {
@@ -250,7 +258,10 @@ impl manuvra_jev::Evaluator for RowActionProvider {
         _deadline: Instant,
     ) -> Result<manuvra_jev::Evaluation, manuvra_jev::JevError> {
         let wanted = self.wanted_control(request);
-        let (operation, click) = Self::choose(request, wanted);
+        let (mut operation, click) = Self::choose(request, wanted);
+        if self.scroll_when_missing && operation == "BLOCKED" {
+            operation = "SCROLL_DOWN";
+        }
         let expanded = request["state"]["page"]["elements"]
             .as_array()
             .unwrap()

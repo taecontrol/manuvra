@@ -138,8 +138,25 @@ fn redacted_observation(raw: &Observation, redactor: &Redactor) -> Result<Value,
     }
     if let Value::Object(fields) = &mut exported {
         fields.extend(exported_hover_regions(raw, redactor));
+        fields.extend(exported_scroll_regions(raw, redactor));
     }
     Ok(exported)
+}
+
+fn exported_scroll_regions(raw: &Observation, redactor: &Redactor) -> Vec<(String, Value)> {
+    let mut fields = Vec::new();
+    if !raw.scroll_regions.is_empty() {
+        let regions:Vec<_> = raw.scroll_regions.iter().map(|r| json!({
+            "name":redactor.redact_external_text(&r.name), "overlay":r.overlay.as_ref().map(|s|redactor.redact_external_text(s)),
+            "can_scroll_up":r.can_scroll_up,"can_scroll_down":r.can_scroll_down,
+            "scroll_top":r.scroll_top,"scroll_height":r.scroll_height,"client_height":r.client_height,"rect":r.rect
+        })).collect();
+        fields.push(("scroll_regions".into(), json!(regions)));
+    }
+    if raw.scroll_regions_truncated {
+        fields.push(("scroll_regions_truncated".into(), json!(true)));
+    }
+    fields
 }
 
 /// Hover regions appear in evidence only when present, with page text redacted and without the
@@ -396,6 +413,26 @@ mod tests {
         assert!(!text.contains("node_id"));
         assert!(!text.contains("98172"));
         assert!(!redactor.contains_export_leak(text.as_bytes()));
+    }
+
+    #[test]
+    fn scroll_observation_masks_names_and_omits_browser_identity() {
+        let mut job = mutation_job();
+        job.values.get_mut("name").unwrap().secret = true;
+        let redactor = Redactor::for_job(&job).unwrap();
+        let mut page = richly_observed();
+        page.scroll_regions=serde_json::from_value(json!([{"node_id":987321,"name":"Wanted","overlay":"Wanted","parent_node_id":null,"can_scroll_up":false,"can_scroll_down":true,"scroll_top":0,"scroll_height":1000,"client_height":300,"rect":{"x":0,"y":0,"width":200,"height":300}}])).unwrap();
+        page.scroll_regions_truncated = true;
+        let exported = redacted_observation(&page, &redactor).unwrap();
+        assert_eq!(exported["scroll_regions_truncated"], true);
+        assert_eq!(
+            exported["scroll_regions"][0]["name"],
+            "\u{e000}<masked:1>\u{e000}"
+        );
+        let text = exported.to_string();
+        assert!(!text.contains("Wanted"));
+        assert!(!text.contains("node_id"));
+        assert!(!text.contains("987321"));
     }
 
     #[test]

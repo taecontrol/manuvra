@@ -268,6 +268,7 @@ fn prepared(
         .find(|element| element.name == name)
         .unwrap_or_else(|| panic!("missing observed target {name}"));
     PreparedInput {
+        scroll_region: None,
         document_id: observation.document_id.clone(),
         node_id: element.node_id,
         operation,
@@ -286,6 +287,7 @@ fn prepared_key(
     sequence: u64,
 ) -> PreparedInput {
     PreparedInput {
+        scroll_region: None,
         document_id: observation.document_id.clone(),
         node_id: 0,
         operation: PreparedOperation::PressKey(key),
@@ -1181,6 +1183,7 @@ fn production_input_strategies_cover_native_and_bounded_fallback_paths() {
             break;
         }
         let scroll = PreparedInput {
+            scroll_region: None,
             document_id: observed.document_id.clone(),
             node_id: 0,
             operation: PreparedOperation::ScrollDown,
@@ -1386,6 +1389,7 @@ fn production_hover_reveals_only_its_region_controls_for_a_following_click() {
     let fact = browser
         .perform(
             PreparedInput {
+                scroll_region: None,
                 document_id: observed.document_id.clone(),
                 node_id: region.node_id,
                 operation: PreparedOperation::Hover,
@@ -1500,6 +1504,7 @@ fn headless_hover_reveals_media_gated_row_actions_for_a_following_click() {
     browser
         .perform(
             PreparedInput {
+                scroll_region: None,
                 document_id: observed.document_id.clone(),
                 node_id: region.node_id,
                 operation: PreparedOperation::Hover,
@@ -1944,6 +1949,7 @@ fn production_snapshot_lists_insertion_gaps_and_hover_reveals_the_selected_gap()
     browser
         .perform(
             PreparedInput {
+                scroll_region: None,
                 document_id: observation.document_id.clone(),
                 node_id: region.node_id,
                 operation: PreparedOperation::Hover,
@@ -2090,6 +2096,7 @@ fn containers_match_semantic_and_repeated_items_before_and_after_hover() {
         browser
             .perform(
                 PreparedInput {
+                    scroll_region: None,
                     document_id: page.document_id.clone(),
                     node_id: region.node_id,
                     operation: PreparedOperation::Hover,
@@ -2161,6 +2168,7 @@ fn recycled_virtualized_control_changes_container_while_its_node_stays_the_same(
     browser
         .perform(
             PreparedInput {
+                scroll_region: None,
                 document_id: before.document_id.clone(),
                 node_id: 0,
                 operation: PreparedOperation::ScrollDown,
@@ -2206,6 +2214,7 @@ fn a_region_with_separate_hover_points_reveals_its_second_control_only() {
     browser
         .perform(
             PreparedInput {
+                scroll_region: None,
                 document_id: observed.document_id,
                 node_id: region.reveal_node_ids[1],
                 operation: PreparedOperation::Hover,
@@ -2274,6 +2283,7 @@ fn hover_reveals_respect_layer_hierarchy_conditions_and_stylesheet_roots() {
         browser
             .perform(
                 PreparedInput {
+                    scroll_region: None,
                     document_id: observation.document_id.clone(),
                     node_id: region.reveal_node_ids[offset],
                     operation: PreparedOperation::Hover,
@@ -2363,6 +2373,7 @@ fn opacity_increase_under_negative_hover_is_not_a_reveal() {
     browser
         .perform(
             PreparedInput {
+                scroll_region: None,
                 document_id: before.document_id.clone(),
                 node_id: button.node_id,
                 operation: PreparedOperation::Hover,
@@ -2451,5 +2462,147 @@ fn clipping_respects_containing_blocks_and_text_intersection() {
     assert!(!has_line(&observed, "Clipped"));
     assert!(!observed.visible_text.contains("Invisible text"));
     assert!(!observed.covered_text.contains("Invisible text"));
+    browser.close().unwrap();
+}
+
+fn prepared_scroll(observed: &Observation, up: bool, sequence: u64) -> PreparedInput {
+    PreparedInput {
+        document_id: observed.document_id.clone(),
+        node_id: 0,
+        operation: if up {
+            PreparedOperation::ScrollUp
+        } else {
+            PreparedOperation::ScrollDown
+        },
+        text: None,
+        previous_text: None,
+        option_node_id: None,
+        combobox: false,
+        action_sequence: sequence,
+        focus_anchor: None,
+        scroll_region: Some(observed.scroll_regions[0].clone()),
+    }
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn region_wheel_moves_the_app_shell_table_and_keeps_the_document_still() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(include_str!(
+        "../../../tests/browser/scroll-app-shell-table.html"
+    ));
+    let mut browser = launch_headless();
+    browser.navigate(&server.url()).unwrap();
+    let observed = browser.observe().unwrap();
+    assert_eq!(observed.viewport.scroll_y, 0.0);
+    assert_eq!(observed.scroll_regions.len(), 1);
+    let region = &observed.scroll_regions[0];
+    assert_eq!(region.name, "Localities");
+    assert!(region.can_scroll_down);
+    assert!(!region.can_scroll_up);
+    browser
+        .perform(
+            prepared_scroll(&observed, false, 1),
+            &InputCancellation::default(),
+        )
+        .unwrap();
+    let after = browser.observe().unwrap();
+    assert!(after.scroll_regions[0].scroll_top > 0.0);
+    assert_eq!(after.viewport.scroll_y, 0.0);
+    browser.close().unwrap();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn region_wheel_rejects_covered_and_disconnected_regions() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let body = r#"<!doctype html><style>body{margin:0;overflow:hidden}.region{height:150px;width:200px;overflow:auto}.cover{position:fixed;inset:0;background:white;z-index:10}</style><div class="region" aria-label="Rows"><div style="height:1000px">Rows</div></div><div class="cover"><button onclick="document.querySelector('.region').remove()">Remove region</button></div>"#;
+    let server = FixtureServer::with_body(body);
+    let mut browser = launch_headless();
+    browser.navigate(&server.url()).unwrap();
+    let observed = browser.observe().unwrap();
+    let result = browser.perform(
+        prepared_scroll(&observed, false, 1),
+        &InputCancellation::default(),
+    );
+    assert!(matches!(result,Err(PerformError::Rejected(reason)) if reason=="covered"));
+    assert_eq!(browser.observe().unwrap().scroll_regions[0].scroll_top, 0.0);
+    browser
+        .perform(
+            prepared(
+                &observed,
+                "Remove region",
+                PreparedOperation::Click,
+                None,
+                None,
+                2,
+            ),
+            &InputCancellation::default(),
+        )
+        .unwrap();
+    assert!(
+        matches!(browser.perform(prepared_scroll(&observed,false,3),&InputCancellation::default()),Err(PerformError::Rejected(reason)) if reason=="target_missing")
+    );
+    browser.close().unwrap();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn wheel_uses_the_in_window_height_and_exposes_every_row_center() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(
+        r#"<!doctype html><style>body{margin:0;overflow:hidden}#region{position:absolute;top:600px;left:20px;height:300px;width:200px;overflow:auto}button{display:block;height:30px;width:100px;margin:0}</style><div id="region" aria-label="Rows"></div><textarea style="height:20px">long
+text
+on
+many
+lines</textarea><script>for(let i=1;i<=30;i++){const b=document.createElement('button');b.textContent='Row '+i;region.append(b)}const tail=document.createElement('div');tail.style.height='120px';region.append(tail);</script>"#,
+    );
+    let mut browser = launch_headless();
+    browser.navigate(&server.url()).unwrap();
+    let mut seen = std::collections::BTreeSet::new();
+    for sequence in 1..=12 {
+        let observed = browser.observe().unwrap();
+        assert_eq!(observed.scroll_regions.len(), 1);
+        let region = &observed.scroll_regions[0];
+        assert_eq!(region.rect.height, 180.0);
+        for element in &observed.elements {
+            if element.name.starts_with("Row ") {
+                seen.insert(element.name.clone());
+            }
+        }
+        if !region.can_scroll_down {
+            break;
+        }
+        let before = region.scroll_top;
+        browser
+            .perform(
+                prepared_scroll(&observed, false, sequence),
+                &InputCancellation::default(),
+            )
+            .unwrap();
+        let after = browser.observe().unwrap();
+        assert!(after.scroll_regions[0].scroll_top - before <= 173.0);
+        assert_eq!(after.viewport.scroll_y, 0.0);
+    }
+    assert_eq!(seen, (1..=30).map(|i| format!("Row {i}")).collect());
+    browser.close().unwrap();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn region_end_tolerance_excludes_the_last_fractional_pixel() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(
+        r#"<!doctype html><div id="region" aria-label="Rows" style="height:100px;width:200px;overflow:auto"><div style="height:200.5px">Content</div></div><script>region.scrollTop=region.scrollHeight-region.clientHeight-1;</script>"#,
+    );
+    let mut browser = launch_headless();
+    browser.navigate(&server.url()).unwrap();
+    let observed = browser.observe().unwrap();
+    let region = &observed.scroll_regions[0];
+    assert!(region.can_scroll_up);
+    assert!(!region.can_scroll_down);
+    assert!(
+        matches!(browser.perform(prepared_scroll(&observed,false,1),&InputCancellation::default()),Err(PerformError::Rejected(reason)) if reason=="scroll_region_at_end")
+    );
     browser.close().unwrap();
 }

@@ -92,12 +92,17 @@ fn hover_replay_key(observation: &Observation, region: &HoverRegion, reveal: &st
 }
 
 fn scroll_replay_key(observation: &Observation, operation: Operation) -> String {
-    let stable = serde_json::json!({
+    let mut stable = serde_json::json!({
         "operation":operation,
         "route":observation.route,
         "scroll_y":observation.viewport.scroll_y,
         "document_height":observation.viewport.document_height,
     });
+    if let super::scroll::ScrollRoute::Region(region) = super::scroll::route(observation, operation)
+    {
+        stable["scroll_target"] = serde_json::json!(region.target());
+        stable["positions"] = super::scroll::positions(observation, region);
+    }
     hex::encode(Sha256::digest(stable.to_string().as_bytes()))
 }
 
@@ -192,6 +197,34 @@ mod tests {
         assert_eq!(staging["container"], "staging");
         anchor.container = Some("Production".into());
         assert_ne!(focus_identity(anchor), staging);
+    }
+
+    #[test]
+    fn region_scroll_replay_key_tracks_target_ancestors_and_window_positions() {
+        let mut page = observation("CLICK", "button");
+        let legacy = scroll_replay_key(&page, Operation::ScrollDown);
+        page.scroll_regions=serde_json::from_value(serde_json::json!([
+            {"node_id":1,"name":"Body","overlay":null,"parent_node_id":null,"can_scroll_up":false,"can_scroll_down":false,"scroll_top":700,"scroll_height":1000,"client_height":300,"rect":{"x":0,"y":0,"width":200,"height":300}},
+            {"node_id":2,"name":"List","overlay":null,"parent_node_id":1,"can_scroll_up":false,"can_scroll_down":true,"scroll_top":0,"scroll_height":1000,"client_height":300,"rect":{"x":0,"y":0,"width":200,"height":300}}
+        ])).unwrap();
+        let key = scroll_replay_key(&page, Operation::ScrollDown);
+        assert_ne!(key, legacy);
+        assert_eq!(key, scroll_replay_key(&page, Operation::ScrollDown));
+        for index in 0..2 {
+            let mut changed = page.clone();
+            changed.scroll_regions[index].scroll_top += 1.0;
+            assert_ne!(key, scroll_replay_key(&changed, Operation::ScrollDown));
+        }
+        let mut changed = page.clone();
+        changed.viewport.scroll_y = 1.0;
+        assert_ne!(key, scroll_replay_key(&changed, Operation::ScrollDown));
+        page.viewport.document_height = 1000.0;
+        let with_regions = scroll_replay_key(&page, Operation::ScrollDown);
+        page.scroll_regions.clear();
+        assert_eq!(
+            with_regions,
+            scroll_replay_key(&page, Operation::ScrollDown)
+        );
     }
 
     /// How a minted key permit settles before the next beat.

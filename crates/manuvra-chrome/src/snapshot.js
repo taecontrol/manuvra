@@ -41,8 +41,8 @@
   const nearestDialog = (element) => ancestors(element).find(node => node.matches?.('dialog,[role="dialog"],[role="alertdialog"]')) || null;
   const viewOfElement = element => element.ownerDocument.defaultView;
   // Only ancestors below the containing block can be escaped by positioned descendants.
-  const clippingRect = (element, context) => {
-    const bounds = {left:-context.offsetX, top:-context.offsetY, right:innerWidth-context.offsetX, bottom:innerHeight-context.offsetY};
+  const clippingRect = (element, context, viewport = true) => {
+    const bounds = viewport ? {left:-context.offsetX, top:-context.offsetY, right:innerWidth-context.offsetX, bottom:innerHeight-context.offsetY} : {left:-Infinity,top:-Infinity,right:Infinity,bottom:Infinity};
     let current = element;
     while (current) {
       const style = viewOfElement(current).getComputedStyle(current);
@@ -52,6 +52,10 @@
       if (positioned) next = current.offsetParent;
       if (!next || next.ownerDocument !== element.ownerDocument) break;
       const css = viewOfElement(next).getComputedStyle(next), r = next.getBoundingClientRect();
+      // The body's overflow propagates to the viewport when the root leaves it visible.
+      const rootStyle = viewOfElement(next).getComputedStyle(next.ownerDocument.documentElement);
+      const viewportOverflow = next === next.ownerDocument.documentElement || (next === next.ownerDocument.body && rootStyle.overflowX === 'visible' && rootStyle.overflowY === 'visible');
+      if (viewportOverflow) {current = next; continue;}
       if (css.overflowX !== 'visible') { bounds.left = Math.max(bounds.left,r.left+next.clientLeft); bounds.right = Math.min(bounds.right,r.left+next.clientLeft+next.clientWidth); }
       if (css.overflowY !== 'visible') { bounds.top = Math.max(bounds.top,r.top+next.clientTop); bounds.bottom = Math.min(bounds.bottom,r.top+next.clientTop+next.clientHeight); }
       current = next;
@@ -63,11 +67,9 @@
     return r.width > 0 && r.height > 0 && r.bottom > b.top && r.right > b.left && r.top < b.bottom && r.left < b.right;
   };
   const centerUnclipped = (element, context) => {
-    const r = element.getBoundingClientRect(), b = clippingRect(element, context), x = r.x+r.width/2, y = r.y+r.height/2;
+    const r = element.getBoundingClientRect(), b = clippingRect(element, context, false), x = r.x+r.width/2, y = r.y+r.height/2;
     // Keep the existing viewport-intersection rule; apply centers only to ancestor clipping.
-    const withinX = x >= b.left || b.left === -context.offsetX;
-    const withinY = y >= b.top || b.top === -context.offsetY;
-    return withinX && withinY && (x < b.right || b.right === innerWidth-context.offsetX) && (y < b.bottom || b.bottom === innerHeight-context.offsetY);
+    return x >= b.left && x < b.right && y >= b.top && y < b.bottom;
   };
   const rendered = (element, context) => Boolean(element) && element.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}) && inViewport(element, context) && centerUnclipped(element, context);
   const visible = (element, context) => rendered(element, context) && !ancestors(element).some(node => node.matches?.('[aria-hidden="true"],[inert]'));
@@ -239,6 +241,37 @@
   }
   const hoverRegions = [...regionRecords.values()].slice(0, REGION_LIMIT).map((record, offset) => ({index:offset + 1, ...record}));
 
+  const scrollEligible = e => e?.nodeType === 1 && e !== e.ownerDocument.scrollingElement && !e.matches('body,html,input,textarea,select,[contenteditable="true"]') && !e.isContentEditable && ['auto','scroll'].includes(viewOf(e).getComputedStyle(e).overflowY) && e.scrollHeight > e.clientHeight;
+  const scrollContexts = new Map();
+  const scrollVisibleRect = element => {
+    const context = scrollContexts.get(element.getRootNode()); if (!context) return null;
+    const r = element.getBoundingClientRect(), b = clippingRect(element,context);
+    const x = Math.max(r.x+element.clientLeft,b.left), y = Math.max(r.y+element.clientTop,b.top);
+    const right = Math.min(r.x+element.clientLeft+element.clientWidth,b.right), bottom = Math.min(r.y+element.clientTop+element.clientHeight,b.bottom);
+    return {x:x+context.offsetX,y:y+context.offsetY,width:Math.max(0,right-x),height:Math.max(0,bottom-y)};
+  };
+  for (const context of contexts) scrollContexts.set(context.root,context);
+  cache.scrollEligible = scrollEligible; cache.scrollVisibleRect = scrollVisibleRect;
+  cache.scrollHit = (region,x,y) => {
+    const context = scrollContexts.get(region.getRootNode()), root = region.getRootNode();
+    return root.elementFromPoint?.(x-context.offsetX,y-context.offsetY) || region.ownerDocument.elementFromPoint(x-context.offsetX,y-context.offsetY);
+  };
+  const scrollNodes = [];
+  for (const context of contexts) for (const element of context.root.querySelectorAll('*')) {
+    if (scrollEligible(element) && element.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}) && inViewport(element,context) && !ancestors(element).some(n=>n.matches?.('[aria-hidden="true"],[inert]'))) scrollNodes.push(element);
+  }
+  const labelledName = element => {
+    const ids = (element.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean);
+    return ids.map(id=>name(referencedById(element,id))).filter(Boolean).join(' ') || element.getAttribute('aria-label') || element.getAttribute('title') || '';
+  };
+  const scrollName = element => labelledName(element) || [...element.querySelectorAll('[role="listbox"],[role="list"],table,[role="table"],[role="grid"],[role="menu"]')].map(labelledName).find(Boolean) || 'Scrollable area';
+  const scrollRegions = scrollNodes.slice(0,REGION_LIMIT).map(element => ({
+    node_id:nodeId(element),name:scrollName(element).slice(0,REGION_NAME_LIMIT),overlay:null,
+    parent_node_id:(()=>{const p=ancestors(element).slice(1).find(n=>scrollNodes.includes(n));return p?nodeId(p):null})(),
+    can_scroll_up:element.scrollTop>1,can_scroll_down:element.scrollTop+element.clientHeight<element.scrollHeight-1,
+    scroll_top:element.scrollTop,scroll_height:element.scrollHeight,client_height:element.clientHeight,rect:scrollVisibleRect(element)
+  }));
+
   const TEXT_LIMIT = 8000;
   const visibleText = [], coveredText = []; let visibleLength = 0, coveredLength = 0;
   const appendText = (parts, value, kind, length) => {
@@ -312,5 +345,5 @@
     dialogTexts[record.title] = text.slice(0,TEXT_LIMIT);
   }
   const finalGaps = [...new Set(gaps)], truncated = finalGaps.some(gap => gap.endsWith('_truncated'));
-  return {document_id:String(performance.timeOrigin),url:location.href,route:location.pathname+location.search,title:document.title,dialogs,focused,focus_anchor:focusAnchor,visible_text:visibleText.join('\n'),covered_text:coveredText.join('\n'),dialog_texts:dialogTexts,elements,viewport:{width:innerWidth,height:innerHeight,scroll_x:scrollX,scroll_y:scrollY,document_height:document.documentElement.scrollHeight},coverage:{viewport_complete:!truncated,open_shadow_roots:true,slots:true,same_origin_frames:!finalGaps.includes('cross_origin_frame'),gaps:finalGaps},hover_rules_unreadable:hoverRulesUnreadable,hover_regions:hoverRegions,hover_regions_truncated:regionRecords.size > REGION_LIMIT};
+  return {document_id:String(performance.timeOrigin),url:location.href,route:location.pathname+location.search,title:document.title,dialogs,focused,focus_anchor:focusAnchor,visible_text:visibleText.join('\n'),covered_text:coveredText.join('\n'),dialog_texts:dialogTexts,elements,viewport:{width:innerWidth,height:innerHeight,scroll_x:scrollX,scroll_y:scrollY,document_height:document.documentElement.scrollHeight},coverage:{viewport_complete:!truncated,open_shadow_roots:true,slots:true,same_origin_frames:!finalGaps.includes('cross_origin_frame'),gaps:finalGaps},scroll_regions:scrollRegions,scroll_regions_truncated:scrollNodes.length>REGION_LIMIT,hover_rules_unreadable:hoverRulesUnreadable,hover_regions:hoverRegions,hover_regions_truncated:regionRecords.size > REGION_LIMIT};
 })()

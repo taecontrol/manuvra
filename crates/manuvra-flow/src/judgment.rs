@@ -431,6 +431,8 @@ mod tests {
             },
             coverage: Coverage::default(),
             hover_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            scroll_regions_truncated: false,
             hover_regions_truncated: false,
             hover_rules_unreadable: false,
         };
@@ -541,6 +543,8 @@ mod tests {
             },
             coverage: Coverage::default(),
             hover_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            scroll_regions_truncated: false,
             hover_regions_truncated: false,
             hover_rules_unreadable: false,
         }

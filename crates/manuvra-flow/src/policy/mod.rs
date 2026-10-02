@@ -8,6 +8,7 @@ mod ledger;
 mod replay_key;
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 mod revalidation;
+pub(crate) mod scroll;
 mod surface;
 mod targeting;
 pub(crate) use targeting::{ClickChoice, click_choice, reveal_key};

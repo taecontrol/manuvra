@@ -70,6 +70,7 @@ pub struct PreparedInput {
     pub combobox: bool,
     pub action_sequence: u64,
     pub focus_anchor: Option<FocusAnchor>,
+    pub scroll_region: Option<crate::ScrollRegion>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -168,7 +169,7 @@ fn dispatch_prepared(
         PreparedOperation::Select => select(client, input, cancellation),
         PreparedOperation::SetValue => set_value(client, input, cancellation),
         PreparedOperation::ScrollUp | PreparedOperation::ScrollDown => {
-            scroll(client, input.operation, cancellation)
+            scroll_input(client, input, cancellation)
         }
         PreparedOperation::Hover => hover(client, target, cancellation),
         PreparedOperation::PressKey(key) => press_key(client, key, cancellation),
@@ -664,6 +665,80 @@ fn set_value(
     )
 }
 
+fn scroll_input(
+    client: &CdpClient,
+    input: &PreparedInput,
+    cancellation: &InputCancellation,
+) -> Result<PerformFact, PerformError> {
+    match &input.scroll_region {
+        Some(region) => scroll_region(client, input, region, cancellation),
+        None => scroll(client, input.operation, cancellation),
+    }
+}
+
+fn scroll_region(
+    client: &CdpClient,
+    input: &PreparedInput,
+    region: &crate::ScrollRegion,
+    cancellation: &InputCancellation,
+) -> Result<PerformFact, PerformError> {
+    let direction = if input.operation == PreparedOperation::ScrollUp {
+        -1
+    } else {
+        1
+    };
+    let expression = format!(
+        "({})({},{},{})",
+        include_str!("scroll-locate.js"),
+        serde_json::to_string(&input.document_id)
+            .map_err(|e| PerformError::NotPerformed(e.to_string()))?,
+        region.node_id,
+        direction
+    );
+    let located = command(
+        client,
+        "Runtime.evaluate",
+        json!({"expression":expression,"returnByValue":true}),
+        cancellation,
+    )?;
+    let target = scroll_point(&located)?;
+    cancellation.enter_suboperation();
+    command(
+        client,
+        "Input.dispatchMouseEvent",
+        json!({"type":"mouseWheel","x":target.0,"y":target.1,"deltaX":0,"deltaY":target.2}),
+        cancellation,
+    )?;
+    Ok(PerformFact {
+        readback: None,
+        readback_matches: None,
+        suboperations: vec![if direction < 0 {
+            "scroll_up".into()
+        } else {
+            "scroll_down".into()
+        }],
+    })
+}
+
+fn scroll_point(located: &Value) -> Result<(f64, f64, f64), PerformError> {
+    let target = &located["result"]["value"];
+    if target["ok"] != true {
+        return Err(PerformError::Rejected(
+            target["reason"]
+                .as_str()
+                .unwrap_or("scroll_region_unavailable")
+                .into(),
+        ));
+    }
+    let number = |key| {
+        target[key]
+            .as_f64()
+            .filter(|n| n.is_finite())
+            .ok_or_else(|| PerformError::Uncertain("malformed scroll point".into()))
+    };
+    Ok((number("x")?, number("y")?, number("delta")?))
+}
+
 fn scroll(
     client: &CdpClient,
     operation: PreparedOperation,
@@ -743,6 +818,7 @@ mod tests {
 
     fn input(operation: PreparedOperation) -> PreparedInput {
         PreparedInput {
+            scroll_region: None,
             document_id: "d".into(),
             node_id: 7,
             operation,
@@ -755,8 +831,120 @@ mod tests {
         }
     }
 
+    fn region_input() -> PreparedInput {
+        let mut prepared = input(PreparedOperation::ScrollDown);
+        prepared.scroll_region = Some(crate::ScrollRegion {
+            node_id: 11,
+            name: "Rows".into(),
+            overlay: None,
+            parent_node_id: None,
+            can_scroll_up: false,
+            can_scroll_down: true,
+            scroll_top: 0.0,
+            scroll_height: 1000.0,
+            client_height: 300.0,
+            rect: crate::Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 200.0,
+                height: 300.0,
+            },
+        });
+        prepared
+    }
+    fn reply_scroll_point(chrome: &ScriptedChrome) {
+        chrome.reply(
+            "Runtime.evaluate",
+            json!({"result":{"value":{"ok":true,"x":100.0,"y":150.0,"delta":292.0}}}),
+        );
+    }
+    #[test]
+    fn region_scroll_revalidates_before_wheel_and_preserves_transport_outcomes() {
+        let chrome = ScriptedChrome::start();
+        reply_scroll_point(&chrome);
+        let fact = perform(
+            &chrome.connect_raw(),
+            region_input(),
+            &InputCancellation::default(),
+        )
+        .unwrap();
+        assert_eq!(fact.suboperations, ["scroll_down"]);
+        let commands = chrome.commands();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(
+            commands[1],
+            (
+                "Input.dispatchMouseEvent".into(),
+                json!({"type":"mouseWheel","x":100.0,"y":150.0,"deltaX":0,"deltaY":292.0})
+            )
+        );
+        for reason in [
+            "document_changed",
+            "target_missing",
+            "scroll_region_at_end",
+            "covered",
+        ] {
+            let chrome = ScriptedChrome::start();
+            chrome.reply(
+                "Runtime.evaluate",
+                json!({"result":{"value":{"ok":false,"reason":reason}}}),
+            );
+            assert_eq!(
+                perform(
+                    &chrome.connect_raw(),
+                    region_input(),
+                    &InputCancellation::default()
+                ),
+                Err(PerformError::Rejected(reason.into()))
+            );
+            assert!(chrome.received("Input.dispatchMouseEvent").is_empty());
+        }
+        for boundary in ["Runtime.evaluate", "Input.dispatchMouseEvent"] {
+            let chrome = ScriptedChrome::start();
+            reply_scroll_point(&chrome);
+            chrome.reject(boundary);
+            assert!(matches!(
+                perform(
+                    &chrome.connect_raw(),
+                    region_input(),
+                    &InputCancellation::default()
+                ),
+                Err(PerformError::Rejected(_))
+            ));
+            let chrome = ScriptedChrome::start();
+            reply_scroll_point(&chrome);
+            chrome.disconnect_on(boundary);
+            assert!(matches!(
+                perform(
+                    &chrome.connect_raw(),
+                    region_input(),
+                    &InputCancellation::default()
+                ),
+                Err(PerformError::Uncertain(_))
+            ));
+        }
+        let chrome = ScriptedChrome::start();
+        reply_scroll_point(&chrome);
+        let cancellation = InputCancellation::default();
+        cancellation.cancel_before_boundary(1);
+        assert!(matches!(
+            perform(&chrome.connect_raw(), region_input(), &cancellation),
+            Err(PerformError::NotPerformed(_))
+        ));
+        assert_eq!(chrome.commands().len(), 1);
+        let chrome = ScriptedChrome::start();
+        let cancellation = InputCancellation::default();
+        cancellation.cancel();
+        assert!(matches!(
+            perform(&chrome.connect_raw(), region_input(), &cancellation),
+            Err(PerformError::NotPerformed(_))
+        ));
+        assert!(chrome.commands().is_empty());
+    }
+
     fn focus_input(key: Key) -> PreparedInput {
         PreparedInput {
+            scroll_region: None,
             document_id: "d".into(),
             node_id: 0,
             operation: PreparedOperation::PressKey(key),

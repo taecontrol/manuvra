@@ -803,15 +803,13 @@ fn settle_after_input(
         // controls starts from zero, so an immediate observation still finds them hidden. A fixed
         // window, unlike a quiet-journal wait, cannot turn a performed hover into an error on a
         // page that never stops changing.
-        PreparedOperation::Hover => {
+        PreparedOperation::Hover | PreparedOperation::ScrollUp | PreparedOperation::ScrollDown => {
             thread::sleep(QUIET_WINDOW);
             Ok(())
         }
-        PreparedOperation::TypeText
-        | PreparedOperation::Select
-        | PreparedOperation::SetValue
-        | PreparedOperation::ScrollUp
-        | PreparedOperation::ScrollDown => Ok(()),
+        PreparedOperation::TypeText | PreparedOperation::Select | PreparedOperation::SetValue => {
+            Ok(())
+        }
     }
 }
 
@@ -1420,6 +1418,7 @@ mod tests {
         let fact = browser
             .perform(
                 PreparedInput {
+                    scroll_region: None,
                     document_id: "d".into(),
                     node_id: 7,
                     operation,
@@ -1508,6 +1507,7 @@ mod tests {
             let fact = browser
                 .perform(
                     PreparedInput {
+                        scroll_region: None,
                         document_id: "d".into(),
                         node_id: 7,
                         operation,
