@@ -51,7 +51,7 @@ for port in 4351 4354; do
   stop_fixture "$test_root/cleanup.json" "$test_root/cleanup.stderr"
   [[ -z "$active_fixture" && -z "$active_fixture_state" ]]
   [[ $(wc -l <"$test_root/checked-ports") -eq 2 ]]
-  if rg -q -v "^$port$" "$test_root/checked-ports"; then
+  if grep -q -v "^$port$" "$test_root/checked-ports"; then
     fail "cleanup checked another fixture's port"
   fi
 done
@@ -74,7 +74,7 @@ port_is_open() { [[ "$port_busy" == true ]]; }
 if (preflight_fixture 4354) 2>"$test_root/preflight.stderr"; then
   fail "occupied fixture port was accepted"
 fi
-rg -q 'port 4354 is already in use' "$test_root/preflight.stderr"
+grep -q -F 'port 4354 is already in use' "$test_root/preflight.stderr"
 # Advance the test clock past the release deadline without waiting ten seconds.
 printf '%s\n' 1000 >"$test_root/clock"
 date() {
