@@ -26,6 +26,7 @@ live-self-test:
 	/bin/bash scripts/live/money-journey-matrix.sh --runtime-self-test
 	bash scripts/live/money-scroll.sh --self-test
 	python3 scripts/live/scroll-matrix.py --self-test-detectors
+	python3 scripts/live/scroll-harness-self-test.py
 	python3 scripts/live/keyboard-matrix.py --self-test-detectors
 	python3 scripts/live/hover-journey-check.py --self-test
 	bash scripts/live/natural-done.sh --self-test
