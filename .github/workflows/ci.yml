@@ -139,7 +139,11 @@ jobs:
           test "$fixture_count" -gt 0
           cargo test --locked -p manuvra-chrome --test local_fixture -- --ignored --nocapture --test-threads=1
       - name: Verify viewport provenance through the CLI
-        run: cargo test --locked -p manuvra-cli --test cli viewport:: -- --ignored --nocapture --test-threads=1
+        run: |
+          cargo test --locked -p manuvra-cli --test cli viewport:: -- --ignored --nocapture --test-threads=1
+          test -s "$MANUVRA_FIXTURE_EVIDENCE/cli-viewport-390x844.png"
+          test -s "$MANUVRA_FIXTURE_EVIDENCE/cli-viewport-390x844-observation.json"
+          test -s "$MANUVRA_FIXTURE_EVIDENCE/cli-viewport-provenance.json"
       - name: Retain browser fixture captures
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -186,7 +190,11 @@ jobs:
           test "$fixture_count" -gt 0
           cargo test --locked -p manuvra-chrome --test local_fixture -- --ignored --nocapture --test-threads=1
       - name: Verify viewport provenance through the CLI
-        run: cargo test --locked -p manuvra-cli --test cli viewport:: -- --ignored --nocapture --test-threads=1
+        run: |
+          cargo test --locked -p manuvra-cli --test cli viewport:: -- --ignored --nocapture --test-threads=1
+          test -s "$MANUVRA_FIXTURE_EVIDENCE/cli-viewport-390x844.png"
+          test -s "$MANUVRA_FIXTURE_EVIDENCE/cli-viewport-390x844-observation.json"
+          test -s "$MANUVRA_FIXTURE_EVIDENCE/cli-viewport-provenance.json"
       - name: Retain browser fixture captures
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
