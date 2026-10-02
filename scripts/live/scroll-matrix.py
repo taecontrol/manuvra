@@ -46,7 +46,7 @@ INSTRUMENT = r"""
       return {id:el.id, before:previous, after:el.scrollTop,
         up:el.scrollTop>1, down:el.scrollTop+el.clientHeight<el.scrollHeight-1};
     });
-    record({kind:'state',window_y:scrollY,regions,selected:document.getElementById('status')?.textContent});
+    record({kind:'state',window_y:scrollY,width:innerWidth,height:innerHeight,regions,selected:document.getElementById('status')?.textContent});
   }
   document.addEventListener('click', e => {
     record({kind:'click',target:e.target.closest('button,[role=option]')?.id || e.target.id}); state();
@@ -136,6 +136,8 @@ def assess(journey, result, trace, intact, browser, first, calls, aligned=True):
     if clicks != spec['clicks'][:len(clicks)] or len(clicks)>len(spec['clicks']):
         violations.append('wrong_control')
     states = [e for e in browser if e.get('kind') == 'state']
+    if any(e.get('width')!=1280 or e.get('height')!=800 for e in states):
+        violations.append('fixture_viewport_mismatch')
     if any(e.get('window_y') != 0 for e in states):
         violations.append('window_moved')
     if any(r['before']!=r['after'] and r['id']!=spec['region'] for e in states for r in e.get('regions',[])):
@@ -197,7 +199,7 @@ def self_test_detectors():
     positions = [{'document':False,'before':0,'after':292},{'document':True,'before':0,'after':0}]
     trace = [{'event':'action_fact','fact':{'operation':'SCROLL_DOWN','outcome':'observed','scroll_readback':positions}}]
     browser = [{'kind':'click','target':'trigger'},{'kind':'wheel'}, {'kind':'click','target':'option-45'},
-               {'kind':'state','window_y':0,'regions':[{'id':'categories','before':0,'after':292,'down':True}],
+               {'kind':'state','window_y':0,'width':1280,'height':800,'regions':[{'id':'categories','before':0,'after':292,'down':True}],
                 'selected':'Category: Option 45'}]
     baseline = assess(journey,result,trace,True,browser,[],{'choose':1})
     assert baseline['classification']=='autonomous',baseline
@@ -244,7 +246,7 @@ def run_case(binary,server,matrix,journey,iteration):
     server.reset(journey)
     env = dict(os.environ,XDG_STATE_HOME=str(case/'state'))
     job = ROOT / 'tests/live/scroll' / (journey+'.json')
-    _,result = invoke(binary,['run','--request-id',case.name+'-'+matrix.name,'--job',str(job),
+    _,result = invoke(binary,['run','--headless','--request-id',case.name+'-'+matrix.name,'--job',str(job),
                              '--evidence',str(case/'evidence')],env,case/'initial.json')
     result = settled(binary,result,env,case)
     browser = server.facts()
@@ -253,6 +255,14 @@ def run_case(binary,server,matrix,journey,iteration):
     trace,intact = evidence(result)
     first,calls,models,aligned = decision_facts(result,trace)
     row = assess(journey,result,trace,intact,browser,first,calls,aligned)
+    try:
+        provenance = json.loads((Path(result['evidence']['manifest']).parent/'provenance.json').read_text())
+    except (OSError,ValueError,KeyError):
+        provenance = {}
+    row['browser_provenance'] = provenance
+    if provenance.get('display_mode')!='headless' or provenance.get('viewport')!={'width':1280,'height':800}:
+        row['classification']='failed'
+        row['violations'].append('browser_configuration_mismatch')
     row.update(journey=journey,iteration=iteration,case=str(case),models=models)
     if result.get('state') in ('uncertain','running') and result.get('run_id'):
         _,aborted = invoke(binary,['abort',result['run_id'],'--request-id','abort-'+case.name],env,case/'abort.json')
