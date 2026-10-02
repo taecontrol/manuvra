@@ -1110,6 +1110,11 @@ mod tests {
             json!({"enabled":true})
         );
         assert_eq!(browser.provenance().viewport.width, 800);
+        assert_eq!(
+            serde_json::to_value(browser.provenance()).unwrap()["viewport"]
+                .get("initial_client_width"),
+            Some(&Value::Null)
+        );
         assert_eq!(browser.provenance().browser_version, "Chromium Test");
         browser.close().unwrap();
         assert!(!profile.exists());
@@ -1160,6 +1165,88 @@ mod tests {
         };
         let command = browser_command(Path::new("/browser"), temporary.path(), &config);
         assert!(command.get_args().any(|arg| arg == "--blink-settings=primaryHoverType=2,availableHoverTypes=2,primaryPointerType=4,availablePointerTypes=4"));
+        assert!(command.get_args().any(|arg| arg == "--hide-scrollbars"));
+    }
+
+    #[test]
+    fn viewport_provenance_records_literal_width_once_after_navigation_settles() {
+        for width in [0, 375, u32::MAX] {
+            let chrome = ScriptedChrome::start();
+            chrome.reply("Page.navigate", json!({"frameId":"main"}));
+            chrome.reply_evaluation(
+                "document.readyState",
+                json!({"result":{"value":"complete"}}),
+            );
+            chrome.reply_evaluation(
+                "document.documentElement.clientWidth",
+                json!({"result":{"value":width}}),
+            );
+            let mut browser = browser_with_client(chrome.connect_raw());
+            browser.navigate("http://example.test/initial").unwrap();
+            assert_eq!(
+                serde_json::to_value(browser.provenance()).unwrap()["viewport"],
+                json!({"width":800,"height":600,"initial_client_width":width})
+            );
+            chrome.reply_evaluation(
+                "document.documentElement.clientWidth",
+                json!({"result":{"value":640}}),
+            );
+            browser.navigate("http://example.test/later").unwrap();
+            assert_eq!(
+                serde_json::to_value(browser.provenance()).unwrap()["viewport"]["initial_client_width"],
+                width
+            );
+            let evaluations = chrome.received("Runtime.evaluate");
+            assert!(
+                evaluations[..evaluations
+                    .iter()
+                    .position(|command| command["params"]["expression"]
+                        == "document.documentElement.clientWidth")
+                    .unwrap()]
+                    .iter()
+                    .all(|command| command["params"]["expression"] == "document.readyState")
+            );
+            assert_eq!(
+                evaluations
+                    .iter()
+                    .filter(|command| command["params"]["expression"]
+                        == "document.documentElement.clientWidth")
+                    .count(),
+                1
+            );
+            browser.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn viewport_navigation_rejects_invalid_or_failed_initial_width_reads() {
+        for reply in [
+            json!({"result":{"value":null}}),
+            json!({"result":{"value":"375"}}),
+            json!({"result":{"value":true}}),
+            json!({"result":{"value":-1}}),
+            json!({"result":{"value":1.5}}),
+            json!({"result":{"value":4_294_967_296_u64}}),
+            json!({"exceptionDetails":{"text":"unavailable"}}),
+        ] {
+            let chrome = ScriptedChrome::start();
+            chrome.reply("Page.navigate", json!({"frameId":"main"}));
+            chrome.reply_evaluation(
+                "document.readyState",
+                json!({"result":{"value":"complete"}}),
+            );
+            chrome.reply_evaluation("document.documentElement.clientWidth", reply.clone());
+            let mut browser = browser_with_client(chrome.connect_raw());
+            assert!(browser.navigate("http://example.test/").is_err(), "{reply}");
+            assert_eq!(
+                serde_json::to_value(browser.provenance()).unwrap()["viewport"]
+                    .get("initial_client_width"),
+                Some(&Value::Null)
+            );
+            let profile = browser.profile.clone();
+            browser.close().unwrap();
+            assert!(!profile.exists());
+        }
     }
 
     #[test]

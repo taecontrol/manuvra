@@ -27,6 +27,9 @@ const REVALIDATION_FIXTURE: &str =
 const EDITING_FIXTURE: &str = include_str!("../../../tests/browser/keyboard-editing.html");
 static REAL_BROWSER: Mutex<()> = Mutex::new(());
 
+#[path = "local_fixture/viewport.rs"]
+mod viewport;
+
 /// The owned browser's process group and profile, observed from outside the crate.
 struct BrowserLifecycle {
     process_group: i32,

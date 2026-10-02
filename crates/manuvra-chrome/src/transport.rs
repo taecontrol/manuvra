@@ -880,6 +880,7 @@ pub(crate) mod test_support {
     struct Script {
         received: Vec<Value>,
         replies: HashMap<String, Vec<Value>>,
+        evaluation_replies: HashMap<String, Value>,
         reject: HashSet<String>,
         silent: HashSet<String>,
         disconnect_on: HashSet<String>,
@@ -950,6 +951,14 @@ pub(crate) mod test_support {
                 .filter(|value| value["method"] == method)
                 .cloned()
                 .collect()
+        }
+
+        pub fn reply_evaluation(&self, expression: &str, result: Value) {
+            self.script
+                .lock()
+                .expect("scripted Chrome")
+                .evaluation_replies
+                .insert(expression.to_owned(), result);
         }
 
         pub fn reject(&self, method: &str) {
@@ -1287,17 +1296,23 @@ pub(crate) mod test_support {
             {
                 json!({"id": id, "error": {"message": "rejected"}})
             } else {
-                let result = script
-                    .replies
-                    .get_mut(&method)
-                    .map(|replies| {
-                        if replies.len() > 1 {
-                            replies.remove(0)
-                        } else {
-                            replies[0].clone()
-                        }
-                    })
-                    .unwrap_or(json!({}));
+                let evaluation = (method == "Runtime.evaluate")
+                    .then(|| value.pointer("/params/expression").and_then(Value::as_str))
+                    .flatten()
+                    .and_then(|expression| script.evaluation_replies.get(expression).cloned());
+                let result = evaluation.unwrap_or_else(|| {
+                    script
+                        .replies
+                        .get_mut(&method)
+                        .map(|replies| {
+                            if replies.len() > 1 {
+                                replies.remove(0)
+                            } else {
+                                replies[0].clone()
+                            }
+                        })
+                        .unwrap_or(json!({}))
+                });
                 json!({"id": id, "result": result})
             };
             (reply, invalid, events)
