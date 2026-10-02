@@ -2681,10 +2681,30 @@ fn status_publishes_host_loss_when_host_and_watchdog_die_leaving_their_socket() 
     });
     let watchdog_pid = paused["watchdog"]["pid"].as_u64().unwrap() as u32;
     let host_pid = paused["host"]["pid"].as_u64().unwrap() as u32;
-    assert_eq!(unsafe { libc::kill(watchdog_pid as i32, libc::SIGKILL) }, 0);
-    assert_process_gone(watchdog_pid);
+    // Freeze the watchdog so it cannot reconcile host death before both deaths are injected.
+    assert_eq!(unsafe { libc::kill(watchdog_pid as i32, libc::SIGSTOP) }, 0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let state = Command::new("ps")
+            .args(["-o", "stat=", "-p", &watchdog_pid.to_string()])
+            .output()
+            .unwrap();
+        if String::from_utf8_lossy(&state.stdout)
+            .trim()
+            .starts_with('T')
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "watchdog did not stop"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     assert_eq!(unsafe { libc::kill(host_pid as i32, libc::SIGKILL) }, 0);
+    assert_eq!(unsafe { libc::kill(watchdog_pid as i32, libc::SIGKILL) }, 0);
     assert_process_gone(host_pid);
+    assert_process_gone(watchdog_pid);
     assert!(runtime_run.join("control.sock").exists());
 
     let status = hosted_invoke(&temp, &["status", run_id, "--wait-ms", "5000"]);
