@@ -436,6 +436,52 @@ mod tests {
 
     #[test]
     #[ignore = "requires the local Chromium executable"]
+    fn hosted_scroll_selects_the_popup_option_and_reaches_the_dialog_button() {
+        for (body, goal, wanted, status) in [
+            (
+                include_str!("../../../../tests/browser/scroll-popup-list.html"),
+                "Choose Option 45",
+                "Option 45",
+                "Category: Option 45",
+            ),
+            (
+                include_str!("../../../../tests/browser/scroll-dialog-body.html"),
+                "Save terms",
+                "Save terms",
+                "Terms saved",
+            ),
+        ] {
+            let fixture = HoverRevealFixture::with_body(body);
+            let url = fixture.url();
+            let steps = if goal == "Choose Option 45" {
+                json!([
+                    {"id":"open","goal":"Open Category","done_when":[{"dialog_open":"Choose category"}]},
+                    {"id":"choose","goal":goal,"done_when":[{"text_visible":status}]}
+                ])
+            } else {
+                json!([{ "id":"save","goal":goal,"done_when":[{"text_visible":status}]}])
+            };
+            let job = parse_job(
+                json!({"schema_version":1,"target":{"kind":"browser","url":url},"context":{"journey":"scroll in overlay","revision":"fixture","environment":"local Chromium","actor":"synthetic","authority":"operate synthetic controls"},"steps":steps}),
+            );
+            let mut browser = LiveBrowser::open(&url);
+            let provider =
+                RowActionProvider::scrolling(vec![("Open Category", "Category"), (goal, wanted)]);
+            let mut journal = MemoryJournal::default();
+            let run = run_loop(
+                &job,
+                &mut browser,
+                &provider,
+                &ScriptedControl::default(),
+                &mut journal,
+            );
+            assert_eq!(run.state(), "passed", "{}", run.outcome.result);
+            assert_eq!(browser.final_page.unwrap().viewport.scroll_y, 0.0);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the local Chromium executable"]
     fn hosted_scroll_reaches_the_locality_below_the_table_fold() {
         let fixture = HoverRevealFixture::with_body(include_str!(
             "../../../../tests/browser/scroll-app-shell-table.html"

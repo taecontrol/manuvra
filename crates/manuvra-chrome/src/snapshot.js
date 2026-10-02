@@ -241,6 +241,33 @@
   }
   const hoverRegions = [...regionRecords.values()].slice(0, REGION_LIMIT).map((record, offset) => ({index:offset + 1, ...record}));
 
+  const overlayCandidates = [];
+  const containsAcrossRoots = (outer,inner) => ancestors(inner).includes(outer);
+  const isolatedDialog = dialog => {
+    const owner=dialog.ownerDocument;
+    return [...owner.body.querySelectorAll('*')].filter(e=>!containsAcrossRoots(dialog,e) && !containsAcrossRoots(e,dialog) && !e.matches('script,style,template') && e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})).every(e=>ancestors(e).some(n=>n.matches?.('[aria-hidden="true"],[inert]')));
+  };
+  for (const context of contexts) {
+    const controlled=new Set();
+    for (const trigger of context.root.querySelectorAll('[aria-expanded="true"]')) {
+      if (!visible(trigger,context) || !(trigger.getAttribute('aria-haspopup') && trigger.getAttribute('aria-haspopup') !== 'false' || trigger.getAttribute('role')==='combobox')) continue;
+      for (const id of `${trigger.getAttribute('aria-controls') || ''} ${trigger.getAttribute('aria-owns') || ''}`.split(/\s+/).filter(Boolean)) {
+        const element=referencedById(trigger,id);if(element) controlled.add(element);
+      }
+    }
+    for (const element of context.root.querySelectorAll('*')) {
+      if (!visible(element,context)) continue;
+      const modal=element.matches('dialog:modal,[aria-modal="true"]:is(dialog,[role="dialog"],[role="alertdialog"])');
+      const dialog=element.matches('dialog,[role="dialog"],[role="alertdialog"]');
+      if (!modal && !controlled.has(element) && !element.matches(':popover-open') && !(dialog && isolatedDialog(element))) continue;
+      const r=element.getBoundingClientRect(), x=r.x+r.width/2,y=r.y+r.height/2;
+      const hit=context.root.elementFromPoint?.(x,y) || element.ownerDocument.elementFromPoint(x,y);
+      if (hit && containsAcrossRoots(element,hit)) overlayCandidates.push({element,name:dialogTitle(element)});
+    }
+  }
+  const topOverlay=overlayCandidates.at(-1) || null;
+  const overlayOf=element=>overlayCandidates.filter(o=>containsAcrossRoots(o.element,element)).at(-1) || null;
+
   const scrollEligible = e => e?.nodeType === 1 && e !== e.ownerDocument.scrollingElement && !e.matches('body,html,input,textarea,select,[contenteditable="true"]') && !e.isContentEditable && ['auto','scroll'].includes(viewOf(e).getComputedStyle(e).overflowY) && e.scrollHeight > e.clientHeight;
   const scrollContexts = new Map();
   const scrollVisibleRect = element => {
@@ -264,9 +291,9 @@
     const ids = (element.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean);
     return ids.map(id=>name(referencedById(element,id))).filter(Boolean).join(' ') || element.getAttribute('aria-label') || element.getAttribute('title') || '';
   };
-  const scrollName = element => labelledName(element) || [...element.querySelectorAll('[role="listbox"],[role="list"],table,[role="table"],[role="grid"],[role="menu"]')].map(labelledName).find(Boolean) || 'Scrollable area';
+  const scrollName = element => labelledName(element) || [...element.querySelectorAll('[role="listbox"],[role="list"],table,[role="table"],[role="grid"],[role="menu"]')].map(labelledName).find(Boolean) || overlayOf(element)?.name || 'Scrollable area';
   const scrollRegions = scrollNodes.slice(0,REGION_LIMIT).map(element => ({
-    node_id:nodeId(element),name:scrollName(element).slice(0,REGION_NAME_LIMIT),overlay:null,
+    node_id:nodeId(element),name:scrollName(element).slice(0,REGION_NAME_LIMIT),overlay:overlayOf(element)?.name || null,overlay_node_id:overlayOf(element)?nodeId(overlayOf(element).element):null,
     parent_node_id:(()=>{const p=ancestors(element).slice(1).find(n=>scrollNodes.includes(n));return p?nodeId(p):null})(),
     can_scroll_up:element.scrollTop>1,can_scroll_down:element.scrollTop+element.clientHeight<element.scrollHeight-1,
     scroll_top:element.scrollTop,scroll_height:element.scrollHeight,client_height:element.clientHeight,rect:scrollVisibleRect(element)
@@ -345,5 +372,5 @@
     dialogTexts[record.title] = text.slice(0,TEXT_LIMIT);
   }
   const finalGaps = [...new Set(gaps)], truncated = finalGaps.some(gap => gap.endsWith('_truncated'));
-  return {document_id:String(performance.timeOrigin),url:location.href,route:location.pathname+location.search,title:document.title,dialogs,focused,focus_anchor:focusAnchor,visible_text:visibleText.join('\n'),covered_text:coveredText.join('\n'),dialog_texts:dialogTexts,elements,viewport:{width:innerWidth,height:innerHeight,scroll_x:scrollX,scroll_y:scrollY,document_height:document.documentElement.scrollHeight},coverage:{viewport_complete:!truncated,open_shadow_roots:true,slots:true,same_origin_frames:!finalGaps.includes('cross_origin_frame'),gaps:finalGaps},scroll_regions:scrollRegions,scroll_regions_truncated:scrollNodes.length>REGION_LIMIT,hover_rules_unreadable:hoverRulesUnreadable,hover_regions:hoverRegions,hover_regions_truncated:regionRecords.size > REGION_LIMIT};
+  return {document_id:String(performance.timeOrigin),url:location.href,route:location.pathname+location.search,title:document.title,dialogs,focused,focus_anchor:focusAnchor,visible_text:visibleText.join('\n'),covered_text:coveredText.join('\n'),dialog_texts:dialogTexts,elements,viewport:{width:innerWidth,height:innerHeight,scroll_x:scrollX,scroll_y:scrollY,document_height:document.documentElement.scrollHeight},coverage:{viewport_complete:!truncated,open_shadow_roots:true,slots:true,same_origin_frames:!finalGaps.includes('cross_origin_frame'),gaps:finalGaps},overlay:topOverlay?{node_id:nodeId(topOverlay.element),name:topOverlay.name}:null,scroll_regions:scrollRegions,scroll_regions_truncated:scrollNodes.length>REGION_LIMIT,hover_rules_unreadable:hoverRulesUnreadable,hover_regions:hoverRegions,hover_regions_truncated:regionRecords.size > REGION_LIMIT};
 })()

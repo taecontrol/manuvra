@@ -1,0 +1,9 @@
+<!doctype html><title>Overlay shapes</title><style>body{margin:0;min-height:2000px;font:14px sans-serif}#region{height:240px;overflow:auto}#overlay{position:fixed;left:100px;top:80px;width:400px;background:white;border:1px solid;padding:16px}</style><div id="page"><h1>Page</h1><button id="trigger">Open choices</button></div><div id="overlay" aria-label="Choices"><div id="region" role="listbox" aria-label="Items"></div></div><script>
+const mode=new URLSearchParams(location.search).get('mode');
+for(let i=1;i<=40;i++){const b=document.createElement('div');b.textContent='Item '+i;b.style.height='30px';region.append(b)}
+if(mode==='select'){trigger.role='combobox';trigger.setAttribute('aria-expanded','true');trigger.setAttribute('aria-controls','overlay');}
+if(mode==='radix'){overlay.role='dialog';page.setAttribute('aria-hidden','true');}
+if(mode==='banner'){overlay.role='dialog';}
+if(mode==='menu'){overlay.role='menu';}
+if(mode==='accordion'){trigger.setAttribute('aria-expanded','true');trigger.setAttribute('aria-controls','overlay');}
+</script>

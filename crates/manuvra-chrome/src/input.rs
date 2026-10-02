@@ -837,6 +837,7 @@ mod tests {
             node_id: 11,
             name: "Rows".into(),
             overlay: None,
+            overlay_node_id: None,
             parent_node_id: None,
             can_scroll_up: false,
             can_scroll_down: true,

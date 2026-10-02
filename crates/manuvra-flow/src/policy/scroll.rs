@@ -11,7 +11,7 @@ pub(crate) enum ScrollRoute<'a> {
 }
 
 pub(crate) fn route(observation: &Observation, operation: Operation) -> ScrollRoute<'_> {
-    if window_moves(observation, operation) {
+    if observation.overlay.is_none() && window_moves(observation, operation) {
         return ScrollRoute::Window;
     }
     if observation.scroll_regions_truncated {
@@ -20,7 +20,7 @@ pub(crate) fn route(observation: &Observation, operation: Operation) -> ScrollRo
     let movable: Vec<_> = observation
         .scroll_regions
         .iter()
-        .filter(|r| region_moves(r, operation))
+        .filter(|r| in_scope(observation, r) && region_moves(r, operation))
         .collect();
     let mut outermost = movable
         .iter()
@@ -31,6 +31,13 @@ pub(crate) fn route(observation: &Observation, operation: Operation) -> ScrollRo
         (None, _) => ScrollRoute::None,
         _ => ScrollRoute::Tied,
     }
+}
+
+fn in_scope(observation: &Observation, region: &ScrollRegion) -> bool {
+    observation
+        .overlay
+        .as_ref()
+        .is_none_or(|overlay| region.overlay_node_id == Some(overlay.node_id))
 }
 
 fn window_moves(observation: &Observation, operation: Operation) -> bool {
@@ -99,6 +106,7 @@ mod tests {
             parent_node_id: parent,
             name: format!("Region {id}"),
             overlay: None,
+            overlay_node_id: None,
             can_scroll_up: false,
             can_scroll_down: true,
             scroll_top: 0.0,
@@ -137,5 +145,41 @@ mod tests {
         page.scroll_regions.clear();
         assert_eq!(route(&page, Operation::ScrollDown), ScrollRoute::None);
         assert_eq!(route(&page, Operation::ScrollUp), ScrollRoute::Window);
+    }
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    use super::*;
+    use crate::policy::tests::support::observation;
+    #[test]
+    fn overlay_routes_its_body_then_inner_list_even_with_a_movable_window() {
+        let mut page = observation("CLICK", "button");
+        page.viewport.document_height = 2000.0;
+        page.overlay = Some(manuvra_chrome::Overlay {
+            node_id: 90,
+            name: "Choices".into(),
+        });
+        page.scroll_regions=serde_json::from_value(serde_json::json!([
+            {"node_id":1,"name":"Body","overlay":"Choices","overlay_node_id":90,"parent_node_id":null,"can_scroll_up":false,"can_scroll_down":true,"scroll_top":0,"scroll_height":1000,"client_height":300,"rect":{"x":0,"y":0,"width":200,"height":300}},
+            {"node_id":2,"name":"List","overlay":"Choices","overlay_node_id":90,"parent_node_id":1,"can_scroll_up":false,"can_scroll_down":true,"scroll_top":0,"scroll_height":1000,"client_height":300,"rect":{"x":0,"y":0,"width":200,"height":300}},
+            {"node_id":3,"name":"Other","overlay":"Choices","overlay_node_id":91,"parent_node_id":null,"can_scroll_up":false,"can_scroll_down":true,"scroll_top":0,"scroll_height":1000,"client_height":300,"rect":{"x":0,"y":0,"width":200,"height":300}}
+        ])).unwrap();
+        assert_eq!(
+            route(&page, Operation::ScrollDown),
+            ScrollRoute::Region(&page.scroll_regions[0])
+        );
+        page.scroll_regions[0].can_scroll_down = false;
+        assert_eq!(
+            route(&page, Operation::ScrollDown),
+            ScrollRoute::Region(&page.scroll_regions[1])
+        );
+        page.scroll_regions[1].can_scroll_down = false;
+        assert_eq!(route(&page, Operation::ScrollDown), ScrollRoute::None);
+        page.scroll_regions_truncated = true;
+        assert_eq!(route(&page, Operation::ScrollDown), ScrollRoute::Tied);
+        page.scroll_regions_truncated = false;
+        page.overlay = None;
+        assert_eq!(route(&page, Operation::ScrollDown), ScrollRoute::Window);
     }
 }

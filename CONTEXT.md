@@ -29,6 +29,9 @@ The nearest semantic or repeated item below a dialog that holds a control, exclu
 **Scroll region**:
 A visible element whose content overflows vertically and can be scrolled by a user; the window is the document's root region.
 
+**Overlay**:
+The scroll routing scope: the topmost visible modal dialog or popup opened from a trigger that declares a popup.
+
 **Hover region**:
 A visible container on the target, such as a list row, holding controls hidden by opacity until the pointer is over it. Its name is the container’s label. An observation lists the controls it reveals. A hidden control can be chosen as a click target: policy hovers first, and the click is judged again on a new observation.
 _Avoid_: hover area, reveal zone, hidden row

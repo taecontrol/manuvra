@@ -2606,3 +2606,106 @@ fn region_end_tolerance_excludes_the_last_fractional_pixel() {
     );
     browser.close().unwrap();
 }
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn overlays_include_radix_shapes_and_exclude_document_disclosures_and_banners() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(include_str!(
+        "../../../tests/browser/scroll-overlay-variants.html"
+    ));
+    let mut browser = launch_headless();
+    for (mode, overlay) in [
+        ("select", true),
+        ("radix", true),
+        ("banner", false),
+        ("menu", false),
+        ("accordion", false),
+    ] {
+        browser
+            .navigate(&format!("{}?mode={mode}", server.url()))
+            .unwrap();
+        let observed = browser.observe().unwrap();
+        assert_eq!(observed.overlay.is_some(), overlay, "{mode}");
+        assert_eq!(
+            observed.scroll_regions[0].overlay.is_some(),
+            overlay,
+            "{mode}"
+        );
+        if overlay {
+            assert_eq!(observed.overlay.unwrap().name, "Choices");
+        }
+    }
+    browser.close().unwrap();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn popup_wheel_moves_its_list_and_keeps_the_popup_open_over_a_scrollable_page() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(include_str!(
+        "../../../tests/browser/scroll-popup-list.html"
+    ));
+    let mut browser = launch_headless();
+    browser.navigate(&server.url()).unwrap();
+    let observed = browser.observe().unwrap();
+    browser
+        .perform(
+            prepared(
+                &observed,
+                "Category",
+                PreparedOperation::Click,
+                None,
+                None,
+                1,
+            ),
+            &InputCancellation::default(),
+        )
+        .unwrap();
+    let observed = browser.observe().unwrap();
+    assert_eq!(observed.overlay.as_ref().unwrap().name, "Choose category");
+    assert_eq!(
+        observed.scroll_regions[0].overlay.as_deref(),
+        Some("Choose category")
+    );
+    browser
+        .perform(
+            prepared_scroll(&observed, false, 2),
+            &InputCancellation::default(),
+        )
+        .unwrap();
+    let after = browser.observe().unwrap();
+    assert_eq!(after.viewport.scroll_y, 0.0);
+    assert!(after.overlay.is_some());
+    assert!(after.scroll_regions[0].scroll_top > 0.0);
+    browser.close().unwrap();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn dialog_wheel_avoids_a_movable_inner_list_at_the_body_center() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(include_str!(
+        "../../../tests/browser/scroll-dialog-body.html"
+    ));
+    let mut browser = launch_headless();
+    browser
+        .navigate(&format!("{}?inner", server.url()))
+        .unwrap();
+    let observed = browser.observe().unwrap();
+    assert_eq!(observed.scroll_regions.len(), 2);
+    assert_eq!(observed.scroll_regions[0].name, "Review terms");
+    browser
+        .perform(
+            prepared_scroll(&observed, false, 1),
+            &InputCancellation::default(),
+        )
+        .unwrap();
+    let after = browser.observe().unwrap();
+    assert!(after.scroll_regions[0].scroll_top > 0.0);
+    if let Some(inner) = after.scroll_regions.iter().find(|r| r.name == "Inner list") {
+        assert_eq!(inner.scroll_top, 0.0);
+    }
+    assert_eq!(after.viewport.scroll_y, 0.0);
+    browser.close().unwrap();
+}

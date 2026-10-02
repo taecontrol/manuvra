@@ -57,6 +57,7 @@ pub(crate) fn observation(operation: &str, role: &str) -> Observation {
         coverage: Coverage::default(),
         hover_regions: Vec::new(),
         scroll_regions: Vec::new(),
+        overlay: None,
         scroll_regions_truncated: false,
         hover_regions_truncated: false,
         hover_rules_unreadable: false,

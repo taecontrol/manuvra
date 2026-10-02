@@ -28,6 +28,8 @@ pub struct Observation {
     pub coverage: Coverage,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scroll_regions: Vec<ScrollRegion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay: Option<Overlay>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub scroll_regions_truncated: bool,
     /// Visible containers whose controls are hidden by opacity until hovered, in document order.
@@ -47,6 +49,8 @@ pub struct ScrollRegion {
     pub node_id: u64,
     pub name: String,
     pub overlay: Option<String>,
+    #[serde(default)]
+    pub overlay_node_id: Option<u64>,
     pub parent_node_id: Option<u64>,
     pub can_scroll_up: bool,
     pub can_scroll_down: bool,
@@ -54,6 +58,13 @@ pub struct ScrollRegion {
     pub scroll_height: f64,
     pub client_height: f64,
     pub rect: Rect,
+}
+
+/// The topmost routing scope; the browser identity stays internal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Overlay {
+    pub node_id: u64,
+    pub name: String,
 }
 
 /// Dispatch-free identity used by action evidence.

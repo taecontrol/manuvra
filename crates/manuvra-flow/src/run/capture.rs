@@ -153,6 +153,12 @@ fn exported_scroll_regions(raw: &Observation, redactor: &Redactor) -> Vec<(Strin
         })).collect();
         fields.push(("scroll_regions".into(), json!(regions)));
     }
+    if let Some(overlay) = &raw.overlay {
+        fields.push((
+            "overlay".into(),
+            json!({"name":redactor.redact_external_text(&overlay.name)}),
+        ));
+    }
     if raw.scroll_regions_truncated {
         fields.push(("scroll_regions_truncated".into(), json!(true)));
     }
