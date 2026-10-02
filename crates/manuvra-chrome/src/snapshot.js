@@ -13,9 +13,43 @@
     const rect = frame.getBoundingClientRect(), style = frame.ownerDocument.defaultView.getComputedStyle(frame);
     return {x: rect.x + frame.clientLeft + parseFloat(style.paddingLeft), y: rect.y + frame.clientTop + parseFloat(style.paddingTop)};
   };
+  // Rebuild frame geometry at dispatch; a snapshot's offsets cannot authorize a later wheel.
+  const frameContext = root => {
+    let owner = root.ownerDocument || root;
+    const frames = [];
+    while (owner !== document) {
+      const frame = owner.defaultView?.frameElement;
+      if (!frame?.isConnected || frame.contentDocument !== owner) return null;
+      frames.unshift({frame,owner}); owner = frame.ownerDocument;
+    }
+    let offsetX = 0, offsetY = 0;
+    const bounds = {left:0,top:0,right:innerWidth,bottom:innerHeight};
+    for (const {frame,owner} of frames) {
+      const origin = frameOrigin(frame); offsetX += origin.x; offsetY += origin.y;
+      bounds.left = Math.max(bounds.left,offsetX); bounds.top = Math.max(bounds.top,offsetY);
+      bounds.right = Math.min(bounds.right,offsetX+owner.defaultView.innerWidth);
+      bounds.bottom = Math.min(bounds.bottom,offsetY+owner.defaultView.innerHeight);
+    }
+    return {offsetX,offsetY,bounds,frames};
+  };
+  const hitAt = (region,x,y) => {
+    const root = region.getRootNode(), context = frameContext(root);
+    if (!context) return null;
+    const deepHit = (owner,x,y) => {
+      let hit = owner.elementFromPoint(x,y), next;
+      while (hit?.shadowRoot && (next = hit.shadowRoot.elementFromPoint(x,y)) && next !== hit) hit = next;
+      return hit;
+    };
+    let offsetX = 0, offsetY = 0;
+    for (const {frame} of context.frames) {
+      if (deepHit(frame.ownerDocument,x-offsetX,y-offsetY) !== frame) return null;
+      const origin = frameOrigin(frame); offsetX += origin.x; offsetY += origin.y;
+    }
+    return deepHit(region.ownerDocument,x-context.offsetX,y-context.offsetY);
+  };
   const visit = (root, context, offsetX, offsetY) => {
     if (!root || seenRoots.has(root)) return;
-    seenRoots.add(root); contexts.push({root, context, offsetX, offsetY});
+    seenRoots.add(root); contexts.push({root, context, offsetX, offsetY, bounds:frameContext(root)?.bounds});
     if (root.defaultView?.__manuvraClosedShadowRoots > 0) gaps.push('closed_shadow_root');
     for (const element of root.querySelectorAll('*')) {
       if (element.shadowRoot) visit(element.shadowRoot, `${context}/shadow:${nodeId(element)}`, offsetX, offsetY);
@@ -42,7 +76,8 @@
   const viewOfElement = element => element.ownerDocument.defaultView;
   // Only ancestors below the containing block can be escaped by positioned descendants.
   const clippingRect = (element, context, viewport = true) => {
-    const bounds = viewport ? {left:-context.offsetX, top:-context.offsetY, right:innerWidth-context.offsetX, bottom:innerHeight-context.offsetY} : {left:-Infinity,top:-Infinity,right:Infinity,bottom:Infinity};
+    const windowBounds = context.bounds || {left:0,top:0,right:innerWidth,bottom:innerHeight};
+    const bounds = viewport ? {left:windowBounds.left-context.offsetX, top:windowBounds.top-context.offsetY, right:windowBounds.right-context.offsetX, bottom:windowBounds.bottom-context.offsetY} : {left:-Infinity,top:-Infinity,right:Infinity,bottom:Infinity};
     let current = element;
     while (current) {
       const style = viewOfElement(current).getComputedStyle(current);
@@ -261,7 +296,7 @@
       const dialog=element.matches('dialog,[role="dialog"],[role="alertdialog"]');
       if (!modal && !controlled.has(element) && !element.matches(':popover-open') && !(dialog && isolatedDialog(element))) continue;
       const r=element.getBoundingClientRect(), x=r.x+r.width/2,y=r.y+r.height/2;
-      const hit=context.root.elementFromPoint?.(x,y) || element.ownerDocument.elementFromPoint(x,y);
+      const hit=hitAt(element,x+context.offsetX,y+context.offsetY);
       if (hit && containsAcrossRoots(element,hit)) overlayCandidates.push({element,name:dialogTitle(element)});
     }
   }
@@ -271,18 +306,17 @@
   const scrollEligible = e => e?.nodeType === 1 && e !== e.ownerDocument.scrollingElement && !e.matches('body,html,input,textarea,select,[contenteditable="true"]') && !e.isContentEditable && ['auto','scroll'].includes(viewOf(e).getComputedStyle(e).overflowY) && e.scrollHeight > e.clientHeight;
   const scrollContexts = new Map();
   const scrollVisibleRect = element => {
-    const context = scrollContexts.get(element.getRootNode()); if (!context) return null;
+    if (!scrollContexts.has(element.getRootNode())) return null;
+    const context = frameContext(element.getRootNode()); if (!context) return null;
     const r = element.getBoundingClientRect(), b = clippingRect(element,context);
     const x = Math.max(r.x+element.clientLeft,b.left), y = Math.max(r.y+element.clientTop,b.top);
     const right = Math.min(r.x+element.clientLeft+element.clientWidth,b.right), bottom = Math.min(r.y+element.clientTop+element.clientHeight,b.bottom);
     return {x:x+context.offsetX,y:y+context.offsetY,width:Math.max(0,right-x),height:Math.max(0,bottom-y)};
   };
   for (const context of contexts) scrollContexts.set(context.root,context);
+  cache.scrollConnected = element => Boolean(element?.isConnected && frameContext(element.getRootNode()));
   cache.scrollEligible = scrollEligible; cache.scrollVisibleRect = scrollVisibleRect;
-  cache.scrollHit = (region,x,y) => {
-    const context = scrollContexts.get(region.getRootNode()), root = region.getRootNode();
-    return root.elementFromPoint?.(x-context.offsetX,y-context.offsetY) || region.ownerDocument.elementFromPoint(x-context.offsetX,y-context.offsetY);
-  };
+  cache.scrollHit = hitAt;
   const scrollNodes = [];
   for (const context of contexts) for (const element of context.root.querySelectorAll('*')) {
     if (scrollEligible(element) && element.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}) && inViewport(element,context) && !ancestors(element).some(n=>n.matches?.('[aria-hidden="true"],[inert]'))) scrollNodes.push(element);

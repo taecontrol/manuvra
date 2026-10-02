@@ -1,7 +1,7 @@
 (documentId, nodeId, direction) => {
   if (String(performance.timeOrigin) !== documentId) return {ok:false,reason:'document_changed'};
   const cache = window.__manuvra, region = cache?.nodes?.get(nodeId);
-  if (!region?.isConnected) return {ok:false,reason:'target_missing'};
+  if (!cache?.scrollConnected(region)) return {ok:false,reason:'target_missing'};
   const movable = e => cache.scrollEligible(e) && (direction < 0 ? e.scrollTop > 1 : e.scrollTop + e.clientHeight < e.scrollHeight - 1);
   if (!movable(region)) return {ok:false,reason:'scroll_region_at_end'};
   const r = cache.scrollVisibleRect(region);

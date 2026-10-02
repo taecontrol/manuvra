@@ -890,6 +890,50 @@ mod tests {
         chrome.reply("Runtime.evaluate",json!({"result":{"value":[{"name":"Rows","overlay":null,"document":false,"before":0.0,"after":292.0},{"overlay":null,"document":true,"before":0.0,"after":0.0}]}}));
     }
     #[test]
+    fn malformed_scroll_responses_preserve_dispatch_knowledge() {
+        for target in [
+            json!({"ok":true,"y":150,"delta":292}),
+            json!({"ok":true,"x":"100","y":150,"delta":292}),
+            json!({"ok":true,"x":100,"y":null,"delta":292}),
+            json!({"ok":true,"x":100,"y":150,"delta":[]}),
+        ] {
+            let chrome = ScriptedChrome::start();
+            chrome.reply("Runtime.evaluate", json!({"result":{"value":target}}));
+            assert!(matches!(
+                perform(
+                    &chrome.connect_raw(),
+                    region_input(),
+                    &InputCancellation::default()
+                ),
+                Err(PerformError::Uncertain(_))
+            ));
+            assert!(chrome.received("Input.dispatchMouseEvent").is_empty());
+        }
+        for positions in [
+            Value::Null,
+            json!({}),
+            json!([{"document":true,"before":0}]),
+            json!([{"document":true,"before":"0","after":10}]),
+        ] {
+            let chrome = ScriptedChrome::start();
+            chrome.reply(
+                "Runtime.evaluate",
+                json!({"result":{"value":{"ok":true,"x":100,"y":150,"delta":292}}}),
+            );
+            chrome.reply("Runtime.evaluate", json!({"result":{"value":positions}}));
+            assert!(matches!(
+                perform(
+                    &chrome.connect_raw(),
+                    region_input(),
+                    &InputCancellation::default()
+                ),
+                Err(PerformError::Uncertain(_))
+            ));
+            assert_eq!(chrome.received("Input.dispatchMouseEvent").len(), 1);
+        }
+    }
+
+    #[test]
     fn region_scroll_revalidates_before_wheel_and_preserves_transport_outcomes() {
         let chrome = ScriptedChrome::start();
         reply_scroll_point(&chrome);
