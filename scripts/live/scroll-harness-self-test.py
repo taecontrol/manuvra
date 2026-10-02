@@ -176,12 +176,13 @@ def budgets_and_reports(root):
 def shared_evidence(root):
     owner = root/'evidence';owner.mkdir()
     trace = owner/'trace.jsonl';trace.write_text('{"event":"observation"}\n')
+    other=owner/'other.jsonl';other.write_bytes(trace.read_bytes())
     manifest = {'complete':True,'artifacts':[{'role':'trace','path':str(trace),'complete':True,
                  'digest':hashlib.sha256(trace.read_bytes()).hexdigest()}]}
     path = owner/'manifest.json';shared.write_json(path,manifest)
     result = {'evidence':{'manifest':str(path)}}
     assert shared.evidence(result)[1]
-    for change in [lambda m: m.update(artifacts=[]),lambda m: m['artifacts'][0].update(role='screenshot'),lambda m: m.update(complete=False),lambda m: m['artifacts'][0].update(complete=False),
+    for change in [lambda m: m['artifacts'][0].update(path=str(other)),lambda m: m['artifacts'].append({'role':'screenshot','path':str(owner/'missing'),'digest':'bad','complete':True}),lambda m: m.update(artifacts=[]),lambda m: m['artifacts'][0].update(role='screenshot'),lambda m: m.update(complete=False),lambda m: m['artifacts'][0].update(complete=False),
                    lambda m: m['artifacts'][0].update(digest='bad'),lambda m: m['artifacts'][0].update(path=str(owner/'missing'))]:
         bad = copy.deepcopy(manifest);change(bad);shared.write_json(path,bad)
         events,intact=shared.evidence(result)
