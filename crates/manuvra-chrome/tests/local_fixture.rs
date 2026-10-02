@@ -3877,9 +3877,38 @@ fn rotated_scroll_preserves_the_hover_reveal_interval() {
     let mut browser = launch_headless();
     // The transport also proves overlap over a longer distance. Flow owns the
     // Run's fallback ceiling; this does not enlarge it.
-    for (top, wheel_limit) in [(20, 8), (200, 48)] {
+    for (top, wheel_limit, labelled, inherited_opacity) in [
+        (20, 8, true, false),
+        (200, 48, true, false),
+        (20, 8, false, false),
+        (20, 8, true, true),
+        (20, 8, false, true),
+    ] {
+        let region_attributes = if labelled {
+            r#"aria-label="Diagonal""#
+        } else {
+            ""
+        };
+        let row_attributes = if labelled {
+            r#"role="listitem" aria-label="Goal row""#
+        } else {
+            ""
+        };
+        let button =
+            r#"<button id="target" onclick="result.textContent='Goal selected'">Goal</button>"#;
+        let (reveal_css, control) = if inherited_opacity {
+            (
+                "#carrier{opacity:0}#row:hover #carrier{opacity:1}",
+                format!(r#"<div id="carrier">{button}</div>"#),
+            )
+        } else {
+            (
+                "#target{opacity:0}#row:hover #target{opacity:1}",
+                button.to_owned(),
+            )
+        };
         let body = format!(
-            r#"<!doctype html><style>body{{margin:0;overflow:hidden}}#region{{position:absolute;left:-100px;top:100px;width:300px;height:300px;overflow:auto;transform:rotate(45deg);transform-origin:top left;scrollbar-width:none}}#row{{position:absolute;left:140px;top:{top}px;width:80px;height:20px}}#target{{position:absolute;left:5px;top:0;width:10px;height:10px;opacity:0}}#row:hover #target{{opacity:1}}</style><div id="region" aria-label="Diagonal"><div style="height:1000px"></div><div id="row" role="listitem" aria-label="Goal row"><button id="target" onclick="result.textContent='Goal selected'">Goal</button></div></div><p id="result">Not selected</p>"#
+            r#"<!doctype html><style>body{{margin:0;overflow:hidden}}#region{{position:absolute;left:-100px;top:100px;width:300px;height:300px;overflow:auto;transform:rotate(45deg);transform-origin:top left;scrollbar-width:none}}#row{{position:absolute;left:140px;top:{top}px;width:80px;height:20px}}#target{{position:absolute;left:5px;top:0;width:10px;height:10px}}{reveal_css}</style><div id="region" {region_attributes}><div style="height:1000px"></div><div id="row" {row_attributes}>{control}</div></div><p id="result">Not selected</p>"#
         );
         let server = FixtureServer::with_body(Box::leak(body.into_boxed_str()));
         browser.navigate(&server.url()).unwrap();
@@ -3940,7 +3969,10 @@ fn rotated_scroll_preserves_the_hover_reveal_interval() {
                 .unwrap();
             assert_eq!(fact.scroll_readback.last().unwrap().after, 0.0);
         }
-        assert!(clicked, "hover reveal interval was skipped at top {top}");
+        assert!(
+            clicked,
+            "hover reveal interval was skipped: top {top}, labelled {labelled}, inherited opacity {inherited_opacity}"
+        );
         assert!(
             browser
                 .observe()
