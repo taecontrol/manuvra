@@ -271,6 +271,7 @@ impl manuvra_flow::actions::Performer for FaultActionPerformer<'_> {
         .map_err(manuvra_flow::PerformError::Uncertain)?;
         self.boundary.after_dispatch();
         Ok(manuvra_flow::PerformFact {
+            scroll_readback: Vec::new(),
             readback: None,
             readback_matches: None,
             suboperations: vec![],

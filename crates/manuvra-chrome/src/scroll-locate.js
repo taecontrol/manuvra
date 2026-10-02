@@ -10,7 +10,16 @@
     const x = r.x + r.width*fx, y = r.y + r.height*fy;
     let hit = cache.scrollHit(region,x,y);
     while (hit && !movable(hit)) hit = hit.parentElement || hit.getRootNode()?.host;
-    if (hit === region) return {ok:true,x,y,delta:direction*Math.max(40,r.height-8)};
+    if (hit === region) {
+      const positions=[];let current=region;
+      while (current) {
+        if (cache.scrollEligible(current)) positions.push({node:current,identity:{name:cache.scrollName(current),overlay:cache.scrollOverlay(current),document:false},before:current.scrollTop});
+        current=current.parentElement || current.getRootNode()?.host;
+      }
+      positions.push({node:null,identity:{overlay:null,document:true},before:scrollY});
+      cache.scrollReadback={documentId,positions};
+      return {ok:true,x,y,delta:direction*Math.max(40,r.height-8)};
+    }
   }
   return {ok:false,reason:'covered'};
 }

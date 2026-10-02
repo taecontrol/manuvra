@@ -60,6 +60,17 @@ pub struct ScrollRegion {
     pub rect: Rect,
 }
 
+/// A measured scroll position, with dispatch identity omitted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScrollPosition {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub overlay: Option<String>,
+    pub document: bool,
+    pub before: f64,
+    pub after: f64,
+}
+
 /// The topmost routing scope; the browser identity stays internal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Overlay {

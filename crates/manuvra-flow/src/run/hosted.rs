@@ -436,6 +436,41 @@ mod tests {
 
     #[test]
     #[ignore = "requires the local Chromium executable"]
+    fn hosted_no_effect_scroll_reports_equal_positions_and_refuses_identical_replay() {
+        let body = include_str!("../../../../tests/browser/scroll-app-shell-table.html");
+        let fixture = HoverRevealFixture::with_body(body);
+        let url = format!("{}?cancel-wheel", fixture.url());
+        let job = parse_job(
+            json!({"schema_version":1,"target":{"kind":"browser","url":url},"context":{"journey":"no effect scroll","revision":"fixture","environment":"local Chromium","actor":"synthetic","authority":"open locality 52"},"steps":[{"id":"open","goal":"Open locality 52","done_when":[{"text_visible":"Opened locality 52"}]}]}),
+        );
+        let mut browser = LiveBrowser::open(&url);
+        let provider = RowActionProvider::scrolling(vec![("Open locality 52", "Open locality 52")]);
+        let mut journal = MemoryJournal::default();
+        let run = run_loop(
+            &job,
+            &mut browser,
+            &provider,
+            &ScriptedControl::default(),
+            &mut journal,
+        );
+        let escalation: Value =
+            serde_json::from_slice(&std::fs::read(run.artifact("escalations/e_1.json")).unwrap())
+                .unwrap();
+        assert_eq!(escalation["gate_reason"], "replay_forbidden");
+        let facts: Vec<_> = journal
+            .entries
+            .iter()
+            .filter(|e| e["event"] == "action_fact")
+            .collect();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0]["fact"]["outcome"], "observed");
+        let positions = facts[0]["fact"]["scroll_readback"].as_array().unwrap();
+        assert!(!positions.is_empty());
+        assert!(positions.iter().all(|p| p["before"] == p["after"]));
+    }
+
+    #[test]
+    #[ignore = "requires the local Chromium executable"]
     fn hosted_scroll_selects_the_popup_option_and_reaches_the_dialog_button() {
         for (body, goal, wanted, status) in [
             (

@@ -7,6 +7,12 @@ use manuvra_chrome::Observation;
 use manuvra_contract::Step;
 
 impl Policy {
+    pub(crate) fn record_uncertain_scroll(&mut self, replay_key: &str) {
+        let base = replay_key.split(':').next().unwrap_or(replay_key);
+        let ordinal = self.scroll_attempts.entry(base.to_owned()).or_default();
+        *ordinal = ordinal.saturating_add(1);
+    }
+
     pub(super) fn check_fallback_budget(&self, operation: Operation) -> Result<(), PolicyStop> {
         (operation.mutates() || self.fallbacks < 8)
             .then_some(())

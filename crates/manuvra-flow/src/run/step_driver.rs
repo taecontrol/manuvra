@@ -450,6 +450,10 @@ impl StepDriver<'_> {
                 );
                 StepProgress::Continue
             }
+            Err(actions::ActionStop::UncertainScroll(replay_key)) => {
+                self.policy.record_uncertain_scroll(&replay_key);
+                StepProgress::Continue
+            }
             Err(actions::ActionStop::Reobserve(replay_key)) => {
                 self.policy.release_not_performed(&replay_key);
                 self.done_unknown_reobserved = false;
@@ -478,7 +482,7 @@ impl StepDriver<'_> {
                 "candidate_revalidation_failed",
                 false,
             ),
-            actions::ActionStop::Reobserve(_) => {
+            actions::ActionStop::Reobserve(_) | actions::ActionStop::UncertainScroll(_) => {
                 unreachable!("not-performed actions reobserve before stop mapping")
             }
             other => terminal_action_stop(other, self.artifacts, self.redactor, self.step),
@@ -587,6 +591,127 @@ mod tests {
     use manuvra_chrome::{BrowserError, Observation, PerformError, PerformFact, PreparedOperation};
     use manuvra_contract::RunState;
     use serde_json::Value;
+
+    #[test]
+    fn an_uncertain_scroll_followed_by_cancellation_ends_run_cancelled() {
+        struct CancelAfterScroll(FakeBrowser);
+        impl super::super::capture::BrowserPage for CancelAfterScroll {
+            fn capture_redacted_page(
+                &self,
+                values: &[String],
+            ) -> Result<manuvra_chrome::CapturedPage, manuvra_chrome::BrowserError> {
+                self.0.capture_redacted_page(values)
+            }
+            fn observe_page(&self) -> Result<Observation, manuvra_chrome::BrowserError> {
+                self.0.observe_page()
+            }
+        }
+        impl actions::Performer for CancelAfterScroll {
+            fn dispatch(
+                &self,
+                input: manuvra_chrome::PreparedInput,
+                cancellation: &manuvra_chrome::InputCancellation,
+            ) -> Result<manuvra_chrome::PerformFact, PerformError> {
+                let result = actions::Performer::dispatch(&self.0, input, cancellation);
+                cancellation.cancel();
+                result
+            }
+        }
+        let job = job("Finished");
+        let mut page = observed("Ready");
+        page.viewport.document_height = 2000.0;
+        let browser = CancelAfterScroll(
+            FakeBrowser::new([page])
+                .always_dispatching(Err(PerformError::Uncertain("lost wheel".into()))),
+        );
+        let redactor = Redactor::for_job(&job).unwrap();
+        let mut machine = crate::run::machine::HostedMachine::new(&job, &redactor);
+        let cancellation = manuvra_chrome::InputCancellation::default();
+        machine.drive(
+            &browser,
+            &ScriptedProvider::new([Turn::scroll_down()]),
+            &mut MemoryJournal::default(),
+            &cancellation,
+            None,
+            &ScriptedControl::default(),
+        );
+        assert_eq!(
+            machine.artifacts.stop.as_ref().unwrap().code,
+            "run_cancelled"
+        );
+        assert!(machine.artifacts.escalation.is_none());
+        assert_eq!(browser.0.dispatched(), 1);
+    }
+
+    #[test]
+    fn uncertain_scrolls_reobserve_with_new_keys_until_the_fallback_budget() {
+        let mut job = mutation_job();
+        job.steps[0].done_when =
+            serde_json::from_value(json!([{ "text_visible":"Finished"}])).unwrap();
+        let mut page = observed("Ready");
+        page.viewport.document_height = 2000.0;
+        let browser = FakeBrowser::new([page])
+            .always_dispatching(Err(PerformError::Uncertain("lost wheel".into())));
+        let provider = ScriptedProvider::new((0..9).map(|_| Turn::scroll_down()));
+        let artifacts = driven(&job, &browser, &provider, &mut MemoryJournal::default());
+        assert_eq!(artifacts.stop.as_ref().unwrap().code, "budget_exhausted");
+        assert!(artifacts.escalation.is_none());
+        assert_eq!(browser.dispatched(), 8);
+        let keys: std::collections::BTreeSet<_> = artifacts
+            .trace
+            .iter()
+            .filter(|e| e["event"] == "action_prepared")
+            .map(|e| e["replay_key"].as_str().unwrap())
+            .collect();
+        assert_eq!(keys.len(), 8);
+    }
+
+    #[test]
+    fn rejected_scrolls_reobserve_and_release_their_key_without_refunding_fallbacks() {
+        let mut job = mutation_job();
+        job.steps[0].done_when =
+            serde_json::from_value(json!([{ "text_visible":"Finished"}])).unwrap();
+        let mut page = observed("Ready");
+        page.viewport.document_height = 2000.0;
+        let browser = FakeBrowser::new([page])
+            .always_dispatching(Err(PerformError::Rejected("stale region".into())));
+        let provider = ScriptedProvider::new((0..9).map(|_| Turn::scroll_down()));
+        let artifacts = driven(&job, &browser, &provider, &mut MemoryJournal::default());
+        assert_eq!(artifacts.stop.as_ref().unwrap().code, "budget_exhausted");
+        assert!(artifacts.escalation.is_none());
+        assert_eq!(browser.dispatched(), 8);
+    }
+
+    #[test]
+    fn classified_region_names_are_masked_in_escalation_recent_actions() {
+        let mut job = mutation_job();
+        job.steps[0].done_when =
+            serde_json::from_value(json!([{ "text_visible":"Finished"}])).unwrap();
+        job.values.get_mut("name").unwrap().secret = true;
+        let mut page = observed("Ready");
+        page.scroll_regions=serde_json::from_value(json!([{"node_id":9997,"name":"Wanted","overlay":null,"parent_node_id":null,"can_scroll_up":false,"can_scroll_down":true,"scroll_top":0,"scroll_height":1000,"client_height":300,"rect":{"x":0,"y":0,"width":200,"height":300}}])).unwrap();
+        let browser =
+            FakeBrowser::new([page]).always_dispatching(Ok(manuvra_chrome::PerformFact {
+                scroll_readback: vec![manuvra_chrome::ScrollPosition {
+                    name: Some("Wanted".into()),
+                    overlay: None,
+                    document: false,
+                    before: 0.0,
+                    after: 0.0,
+                }],
+                readback: None,
+                readback_matches: None,
+                suboperations: vec!["scroll_down".into()],
+            }));
+        let provider = ScriptedProvider::new([Turn::scroll_down(), Turn::scroll_down()]);
+        let artifacts = driven(&job, &browser, &provider, &mut MemoryJournal::default());
+        let escalation = &artifacts.escalations.last().unwrap().1;
+        let recent = escalation["recent_actions"].to_string();
+        assert!(recent.contains("scroll_target"));
+        assert!(recent.contains("scroll_readback"));
+        assert!(!recent.contains("Wanted"));
+        assert!(!recent.contains("9997"));
+    }
 
     #[test]
     fn autonomous_arrow_sequence_selects_observed_beta() {

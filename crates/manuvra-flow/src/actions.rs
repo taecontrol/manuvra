@@ -31,6 +31,8 @@ pub struct ActionFact {
     pub hover_target: Option<HoverTarget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scroll_target: Option<manuvra_chrome::ScrollTarget>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scroll_readback: Vec<manuvra_chrome::ScrollPosition>,
     pub value_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key: Option<manuvra_chrome::Key>,
@@ -45,6 +47,7 @@ pub struct ActionFact {
 pub enum ActionStop {
     EvidenceUnavailable,
     Uncertain,
+    UncertainScroll(String),
     ReadbackMismatch,
     IncompleteEvidence,
     InvalidPermit,
@@ -418,6 +421,10 @@ fn action_fact(
     prepared: PreparedAction,
     dispatched: Result<PerformFact, PerformError>,
 ) -> (ActionFact, Option<ActionStop>) {
+    let scroll_readback = dispatched
+        .as_ref()
+        .map(|fact| fact.scroll_readback.clone())
+        .unwrap_or_default();
     let (outcome, readback_matches, stop, suboperations) = match dispatched {
         Ok(fact)
             if matches!(
@@ -445,11 +452,15 @@ fn action_fact(
         Err(PerformError::Uncertain(_)) => (
             Outcome::Uncertain,
             None,
-            Some(ActionStop::Uncertain),
+            Some(uncertain_stop(
+                prepared.candidate.operation,
+                &prepared.replay_key,
+            )),
             Vec::new(),
         ),
     };
     let fact = ActionFact {
+        scroll_readback,
         candidate_id: prepared.candidate.id,
         operation: prepared.candidate.operation,
         target_name: prepared.candidate.target_name,
@@ -465,6 +476,14 @@ fn action_fact(
         basis: prepared.basis,
     };
     (fact, stop)
+}
+
+fn uncertain_stop(operation: Operation, replay_key: &str) -> ActionStop {
+    if matches!(operation, Operation::ScrollUp | Operation::ScrollDown) {
+        ActionStop::UncertainScroll(replay_key.to_owned())
+    } else {
+        ActionStop::Uncertain
+    }
 }
 
 #[cfg(test)]
@@ -490,6 +509,7 @@ mod tests {
         let (fact, stop) = action_fact(
             prepared,
             Ok(PerformFact {
+                scroll_readback: Vec::new(),
                 readback: None,
                 readback_matches: None,
                 suboperations: vec!["scroll_down".into()],
@@ -520,6 +540,7 @@ mod tests {
         ) -> Result<PerformFact, PerformError> {
             *self.0.lock().unwrap() = Some(input);
             Ok(PerformFact {
+                scroll_readback: Vec::new(),
                 readback: Some("Wanted".into()),
                 readback_matches: Some(true),
                 suboperations: vec![],
@@ -535,6 +556,7 @@ mod tests {
         ) -> Result<PerformFact, PerformError> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(PerformFact {
+                scroll_readback: Vec::new(),
                 readback: Some("Wanted".into()),
                 readback_matches: None,
                 suboperations: vec![],
@@ -555,6 +577,7 @@ mod tests {
             } else {
                 self.0.fetch_add(1, Ordering::SeqCst);
                 Ok(PerformFact {
+                    scroll_readback: Vec::new(),
                     readback: None,
                     readback_matches: None,
                     suboperations: vec![],
@@ -849,6 +872,7 @@ mod tests {
         let result = perform(
             permit(&job, &obs),
             &FakePerformer(Ok(PerformFact {
+                scroll_readback: Vec::new(),
                 readback: Some("Wrong".into()),
                 readback_matches: None,
                 suboperations: vec![],
@@ -951,6 +975,7 @@ mod tests {
             perform(
                 permit(&job, &obs),
                 &FakePerformer(Ok(PerformFact {
+                    scroll_readback: Vec::new(),
                     readback: Some("Wanted".into()),
                     readback_matches: Some(true),
                     suboperations: vec!["insert_text".into()],
@@ -998,6 +1023,13 @@ mod tests {
         let fact = perform(
             permit_for(&job, &page, "SCROLL_DOWN"),
             &FakePerformer(Ok(PerformFact {
+                scroll_readback: vec![manuvra_chrome::ScrollPosition {
+                    name: Some("Wanted".into()),
+                    overlay: None,
+                    document: false,
+                    before: 0.0,
+                    after: 292.0,
+                }],
                 readback: None,
                 readback_matches: None,
                 suboperations: vec![],

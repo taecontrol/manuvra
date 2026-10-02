@@ -2713,3 +2713,59 @@ fn dialog_wheel_avoids_a_movable_inner_list_at_the_body_center() {
     assert_eq!(after.viewport.scroll_y, 0.0);
     browser.close().unwrap();
 }
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn scroll_readback_distinguishes_movement_no_effect_and_dialog_chaining() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(include_str!(
+        "../../../tests/browser/scroll-app-shell-table.html"
+    ));
+    let mut browser = launch_headless();
+    for cancel in [false, true] {
+        browser
+            .navigate(&format!(
+                "{}{}",
+                server.url(),
+                if cancel { "?cancel-wheel" } else { "" }
+            ))
+            .unwrap();
+        let observed = browser.observe().unwrap();
+        let fact = browser
+            .perform(
+                prepared_scroll(&observed, false, 1),
+                &InputCancellation::default(),
+            )
+            .unwrap();
+        assert_eq!(fact.scroll_readback.len(), 2);
+        let region = &fact.scroll_readback[0];
+        assert_eq!(region.name.as_deref(), Some("Localities"));
+        assert!(!region.document);
+        assert_eq!(region.before == region.after, cancel);
+        let document = &fact.scroll_readback[1];
+        assert!(document.document);
+        assert!(document.name.is_none());
+        assert_eq!(document.before, document.after);
+    }
+    let dialog = FixtureServer::with_body(include_str!(
+        "../../../tests/browser/scroll-dialog-body.html"
+    ));
+    browser
+        .navigate(&format!("{}?inner&inner-end", dialog.url()))
+        .unwrap();
+    let observed = browser.observe().unwrap();
+    assert!(!observed.scroll_regions[1].can_scroll_down);
+    let fact = browser
+        .perform(
+            prepared_scroll(&observed, false, 2),
+            &InputCancellation::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        fact.scroll_readback[0].name.as_deref(),
+        Some("Review terms")
+    );
+    assert!(fact.scroll_readback[0].after > fact.scroll_readback[0].before);
+    assert!(fact.scroll_readback.last().unwrap().document);
+    browser.close().unwrap();
+}

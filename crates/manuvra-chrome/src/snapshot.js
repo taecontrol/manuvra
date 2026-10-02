@@ -292,6 +292,7 @@
     return ids.map(id=>name(referencedById(element,id))).filter(Boolean).join(' ') || element.getAttribute('aria-label') || element.getAttribute('title') || '';
   };
   const scrollName = element => labelledName(element) || [...element.querySelectorAll('[role="listbox"],[role="list"],table,[role="table"],[role="grid"],[role="menu"]')].map(labelledName).find(Boolean) || overlayOf(element)?.name || 'Scrollable area';
+  cache.scrollName = scrollName; cache.scrollOverlay = element => overlayOf(element)?.name || null;
   const scrollRegions = scrollNodes.slice(0,REGION_LIMIT).map(element => ({
     node_id:nodeId(element),name:scrollName(element).slice(0,REGION_NAME_LIMIT),overlay:overlayOf(element)?.name || null,overlay_node_id:overlayOf(element)?nodeId(overlayOf(element).element):null,
     parent_node_id:(()=>{const p=ancestors(element).slice(1).find(n=>scrollNodes.includes(n));return p?nodeId(p):null})(),

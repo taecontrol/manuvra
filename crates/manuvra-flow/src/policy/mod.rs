@@ -77,6 +77,7 @@ pub struct Policy {
     model_calls: u16,
     step_mutations: u8,
     fallbacks: u8,
+    scroll_attempts: HashMap<String, u16>,
     step: u32,
     /// Every minted replay key with the operation it charged, so refunds return exactly that.
     replay: HashMap<String, Operation>,
@@ -112,6 +113,7 @@ impl Policy {
             model_calls: 0,
             step_mutations: 0,
             fallbacks: 0,
+            scroll_attempts: HashMap::new(),
             step: 0,
             replay: HashMap::new(),
             unsettled_keys: HashMap::new(),

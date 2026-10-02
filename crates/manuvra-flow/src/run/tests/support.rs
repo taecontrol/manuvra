@@ -154,6 +154,7 @@ pub(crate) fn captured(observation: Observation) -> Result<CapturedPage, Browser
 
 pub(crate) fn performed(suboperations: &[&str]) -> Result<PerformFact, PerformError> {
     Ok(PerformFact {
+        scroll_readback: Vec::new(),
         readback: None,
         readback_matches: None,
         suboperations: suboperations.iter().map(|&name| name.to_owned()).collect(),
@@ -162,6 +163,7 @@ pub(crate) fn performed(suboperations: &[&str]) -> Result<PerformFact, PerformEr
 
 pub(crate) fn typed(readback: &str) -> Result<PerformFact, PerformError> {
     Ok(PerformFact {
+        scroll_readback: Vec::new(),
         readback: Some(readback.into()),
         readback_matches: None,
         suboperations: vec![],

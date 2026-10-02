@@ -14,7 +14,7 @@ impl Policy {
     ) -> Option<String> {
         match candidate.operation {
             Operation::ScrollUp | Operation::ScrollDown => {
-                Some(scroll_replay_key(observation, candidate.operation))
+                Some(self.scroll_key(observation, candidate.operation))
             }
             Operation::Hover => candidate
                 .hover_region(observation)
@@ -28,6 +28,14 @@ impl Policy {
                 .target_index
                 .and_then(|index| observation.elements.iter().find(|item| item.index == index))
                 .map(|target| replay_key(observation, target, candidate)),
+        }
+    }
+
+    fn scroll_key(&self, observation: &Observation, operation: Operation) -> String {
+        let key = scroll_replay_key(observation, operation);
+        match self.scroll_attempts.get(&key) {
+            Some(ordinal) => format!("{key}:{ordinal}"),
+            None => key,
         }
     }
 
@@ -225,6 +233,53 @@ mod tests {
             with_regions,
             scroll_replay_key(&page, Operation::ScrollDown)
         );
+    }
+
+    #[test]
+    fn an_uncertain_scroll_does_not_reopen_an_observed_other_direction() {
+        let mut page = observation("CLICK", "button");
+        page.viewport.document_height = 2000.0;
+        page.viewport.scroll_y = 100.0;
+        let mut policy = Policy::new(&JobOptions::default(), &page.url);
+        let down = minted(decide_not_done(
+            &mut policy,
+            &step(),
+            &page,
+            &judgments("SCROLL_DOWN"),
+            false,
+        ));
+        policy.record_observed(&down.replay_key);
+        let up = minted(decide_not_done(
+            &mut policy,
+            &step(),
+            &page,
+            &judgments("SCROLL_UP"),
+            false,
+        ));
+        policy.record_uncertain_scroll(&up.replay_key);
+        assert!(matches!(
+            decide_not_done(
+                &mut policy,
+                &step(),
+                &page,
+                &judgments("SCROLL_DOWN"),
+                false
+            ),
+            Next::Stop(PolicyStop::Uncertain("replay_forbidden"))
+        ));
+        let retried = minted(decide_not_done(
+            &mut policy,
+            &step(),
+            &page,
+            &judgments("SCROLL_UP"),
+            false,
+        ));
+        assert_ne!(retried.replay_key, up.replay_key);
+        policy.record_observed(&retried.replay_key);
+        assert!(matches!(
+            decide_not_done(&mut policy, &step(), &page, &judgments("SCROLL_UP"), false),
+            Next::Stop(PolicyStop::Uncertain("replay_forbidden"))
+        ));
     }
 
     /// How a minted key permit settles before the next beat.
