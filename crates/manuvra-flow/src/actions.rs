@@ -1012,6 +1012,20 @@ mod tests {
     }
 
     #[test]
+    fn prepared_scroll_rejects_a_replaced_region_even_with_the_same_name() {
+        let job = job();
+        let mut page = observation();
+        page.scroll_regions=serde_json::from_value(json!([{"node_id":1,"name":"Rows","overlay":null,"parent_node_id":null,"can_scroll_up":false,"can_scroll_down":true,"scroll_top":0,"scroll_height":1000,"client_height":300,"rect":{"x":0,"y":0,"width":200,"height":300}}])).unwrap();
+        let (candidate, _, _, _) = permit_for(&job, &page, "SCROLL_DOWN").consume();
+        assert!(prepared_scroll_region(&candidate, &page).unwrap().is_some());
+        page.scroll_regions[0].node_id = 2;
+        assert_eq!(
+            prepared_scroll_region(&candidate, &page),
+            Err(ActionStop::InvalidPermit)
+        );
+    }
+
+    #[test]
     fn region_action_names_are_redacted_by_the_durable_journal() {
         let mut job = job();
         job.values.get_mut("name").unwrap().secret = true;

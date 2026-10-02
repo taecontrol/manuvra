@@ -280,9 +280,27 @@ impl Policy {
 mod tests {
     use super::*;
     use crate::judgment::Operation;
+    use crate::policy::Next;
     use crate::policy::tests::support::*;
     use crate::test_support::hover_region as region;
     use manuvra_contract::JobOptions;
+
+    #[test]
+    fn tied_scroll_regions_publish_the_ambiguity_reason() {
+        let mut page = observation("CLICK", "button");
+        page.scroll_regions_truncated = true;
+        let mut policy = Policy::new(&JobOptions::default(), &page.url);
+        assert!(matches!(
+            decide_not_done(
+                &mut policy,
+                &step(),
+                &page,
+                &judgments("SCROLL_DOWN"),
+                false
+            ),
+            Next::Stop(PolicyStop::Blocked("scroll_region_ambiguous"))
+        ));
+    }
 
     #[test]
     fn hover_on_a_listed_region_mints_a_fallback_permit_naming_the_region() {
