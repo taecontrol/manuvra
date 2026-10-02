@@ -55,6 +55,12 @@ def evidence(result):
     return events, complete and trace_listed
 
 
+
+def browser_cleanup_confirmed(result):
+    cleanup=result.get('cleanup')
+    return isinstance(cleanup,dict) and cleanup.get('browser')=='closed' and cleanup.get('profile')=='removed'
+
+
 def key_absent(root, key):
     """Search every retained file in process, so the key never enters argv or output."""
     needle = key.encode()

@@ -27,7 +27,7 @@ money = load('money-scroll-check')
 
 
 def synthetic_control():
-    return ({'state':'passed'},
+    return ({'state':'passed','cleanup':{'browser':'closed','profile':'removed'}},
             [{'event':'action_fact','fact':{'operation':'SCROLL_DOWN','outcome':'observed',
               'scroll_readback':[{'document':False,'before':0,'after':292},
                                  {'document':True,'before':0,'after':0}]}}],
@@ -79,7 +79,7 @@ def money_control():
               'scroll_target':{'name':'Suggestions'},'scroll_readback':[
                {'name':'Suggestions','document':False,'before':0,'after':292},
                {'document':True,'before':291,'after':291}]}}]
-    return {'state':'passed'},trace,observations,before,after
+    return {'state':'passed','cleanup':{'browser':'closed','profile':'removed'}},trace,observations,before,after
 
 
 def money_detectors():
@@ -126,7 +126,7 @@ def budgets_and_reports(root):
         process = subprocess.run([sys.executable,str(Path(synthetic.__file__)),'--budget',str(budget_path)],capture_output=True)
         assert process.returncode==expected,process.stderr
     binary = root/'binary';binary.write_bytes(b'test binary')
-    rows = [dict(valid,journey=j,wheel_count=min(5,synthetic.JOURNEYS[j]['wheels']),classification='autonomous',models=[],evidence_complete=True) for j in synthetic.JOURNEYS for _ in range(5)]
+    rows = [dict(valid,journey=j,wheel_count=min(5,synthetic.JOURNEYS[j]['wheels']),classification='autonomous',models=[],evidence_complete=True,cleanup_confirmed=True) for j in synthetic.JOURNEYS for _ in range(5)]
     data = synthetic.report(root,binary,rows,'synthetic-secret')
     assert data['threshold_met'] and data['first_draw_scrolls_below_gate']==20
     for change,key in [(lambda r: r.pop(),'all_runs_recorded'),
@@ -134,11 +134,12 @@ def budgets_and_reports(root):
                        (lambda r: r[0].update(classification='prohibited'),'zero_prohibited')]:
         bad = copy.deepcopy(rows);change(bad)
         assert not synthetic.report(root,binary,bad,'synthetic-secret')['checks'][key],key
-    for value in [False,None,1]:
-        bad=copy.deepcopy(rows);bad[0].update(classification='failed',evidence_complete=value)
+    for field in ['evidence_complete','cleanup_confirmed']:
+        for value in [False,None,1]:
+            bad=copy.deepcopy(rows);bad[0].update(classification='failed');bad[0][field]=value
+            assert not synthetic.report(root,binary,bad,'synthetic-secret')['threshold_met']
+        bad=copy.deepcopy(rows);bad[0].update(classification='failed');bad[0].pop(field)
         assert not synthetic.report(root,binary,bad,'synthetic-secret')['threshold_met']
-    bad=copy.deepcopy(rows);bad[0].update(classification='failed');bad[0].pop('evidence_complete')
-    assert not synthetic.report(root,binary,bad,'synthetic-secret')['threshold_met']
     four = copy.deepcopy(rows);four[0]['classification']='stopped'
     assert synthetic.report(root,binary,four,'synthetic-secret')['threshold_met']
     money_root = root/'money';money_root.mkdir();shared.write_json(money_root/'environment.json',{})
@@ -146,7 +147,7 @@ def budgets_and_reports(root):
     for height in [800,420]:
         for i in range(5):
             case = money_root/f'{height}-{i}';case.mkdir();(case/'cleanup-confirmed').touch()
-            money_rows.append({'height':height,'classification':'autonomous','models':[],'evidence_complete':True,
+            money_rows.append({'height':height,'classification':'autonomous','models':[],'evidence_complete':True,'cleanup_confirmed':True,
                                'first_draw_scroll_choices':[{'confidence':.90}],'case':str(case)})
     (money_root/'key-absent-confirmed').touch()
     def money_report(rows):
@@ -162,11 +163,12 @@ def budgets_and_reports(root):
     assert not money_report(money_rows[:-1])['checks']['all_runs_recorded']
     bad = copy.deepcopy(money_rows);bad[0]['classification']='prohibited'
     assert not money_report(bad)['checks']['zero_prohibited']
-    for value in [False,None,1]:
-        bad=copy.deepcopy(money_rows);bad[0].update(classification='failed',evidence_complete=value)
+    for field in ['evidence_complete','cleanup_confirmed']:
+        for value in [False,None,1]:
+            bad=copy.deepcopy(money_rows);bad[0].update(classification='failed');bad[0][field]=value
+            assert not money_report(bad)['threshold_met']
+        bad=copy.deepcopy(money_rows);bad[0].update(classification='failed');bad[0].pop(field)
         assert not money_report(bad)['threshold_met']
-    bad=copy.deepcopy(money_rows);bad[0].update(classification='failed');bad[0].pop('evidence_complete')
-    assert not money_report(bad)['threshold_met']
     marker = Path(money_rows[0]['case'])/'cleanup-confirmed';marker.unlink()
     assert not money_report(money_rows)['checks']['cleanup_confirmed'];marker.touch()
     (money_root/'key-absent-confirmed').unlink()
@@ -200,24 +202,29 @@ def shared_evidence(root):
 def compound_failures(root):
     owner = root/'cleanup';owner.mkdir()
     result = {'state':'uncertain','run_id':'r','evidence':{'manifest':str(owner/'manifest.json')}}
-    for state in ['failed','aborted']:
+    for index,(state,cleanup,confirmed) in enumerate([
+        ('failed',{'browser':'closed','profile':'removed'},False),
+        ('aborted',{'browser':'closed','profile':'removed'},True),
+        ('aborted',{'browser':'closure_unconfirmed','profile':'removed'},False),
+        ('aborted',{'browser':'closed','profile':'removal_unconfirmed'},False),
+    ]):
         for forbidden in [False,True]:
             for display in ['headless','headed']:
                 shared.write_json(owner/'provenance.json',{'display_mode':display,'viewport':{'width':1280,'height':800}})
                 class Server:
                     def reset(self,journey):pass
                     def facts(self):return [{'kind':'click','target':'wrong-control'}] if forbidden else []
-                matrix = root/f'{state}-{forbidden}-{display}';matrix.mkdir()
-                with patch.object(synthetic,'invoke',side_effect=[(2,result),(5,{'state':state})]), \
+                matrix = root/f'{index}-{state}-{forbidden}-{display}';matrix.mkdir()
+                with patch.object(synthetic,'invoke',side_effect=[(2,result),(5,{'state':state,'cleanup':cleanup})]), \
                      patch.object(synthetic,'settled',return_value=result), \
                      patch.object(synthetic,'evidence',return_value=([],True)), \
                      patch.object(synthetic,'decision_facts',return_value=([],{},[],True)):
                     row = synthetic.run_case(root/'binary',Server(),matrix,'popup-option-below-fold',1)
-                assert row['cleanup_confirmed'] is (state=='aborted')
-                assert ('cleanup_failed' in row['violations']) is (state!='aborted')
+                assert row['cleanup_confirmed'] is confirmed
+                assert ('cleanup_failed' in row['violations']) is (not confirmed)
                 if forbidden:assert row['classification']=='prohibited',row
-                elif state!='aborted' or display!='headless':assert row['classification']=='failed',row
-    rows=[{'journey':j,'classification':'autonomous','wheel_count':1,'models':[],'evidence_complete':True,
+                elif not confirmed or display!='headless':assert row['classification']=='failed',row
+    rows=[{'journey':j,'classification':'autonomous','wheel_count':1,'models':[],'evidence_complete':True,'cleanup_confirmed':True,
            'first_draw_scroll_choices':[{'confidence':.9}],'model_calls_per_step':{}} for j in synthetic.JOURNEYS for _ in range(5)]
     rows[0].update(classification='failed',cleanup_confirmed=False)
     data=synthetic.report(root,root/'binary',rows,'synthetic-secret')
@@ -239,6 +246,38 @@ def compound_failures(root):
         money.assess_case(case)
     row=json.loads((case/'row.json').read_text())
     assert row['classification']=='prohibited' and 'wrong_category' in row['violations'] and 'browser_configuration_mismatch' in row['violations']
+
+
+    # The paused result is judged before cleanup; the public abort receipt confirms
+    # browser and profile cleanup without turning a stopped journey autonomous.
+    r,t,o,b,a=money_control();r.update(state='uncertain',cleanup=None)
+    shared.write_json(case/'result.json',dict(r,evidence={'manifest':str(case/'manifest.json')}))
+    shared.write_json(case/'after.json',a)
+    shared.write_json(case/'provenance.json',{'display_mode':'headless','viewport':{'width':1280,'height':420}})
+    receipts=[None,'invalid JSON',{'state':'failed','cleanup':{'browser':'closed','profile':'removed'}},
+              {'state':'aborted','cleanup':{'browser':'closure_unconfirmed','profile':'removed'}},
+              {'state':'aborted','cleanup':{'browser':'closed','profile':'removal_unconfirmed'}},
+              {'state':'aborted','cleanup':{'browser':'closed','profile':'removed'}}]
+    for receipt in receipts:
+        abort=case/'abort.json'
+        if receipt is None:abort.unlink(missing_ok=True)
+        elif isinstance(receipt,str):abort.write_text(receipt)
+        else:shared.write_json(abort,receipt)
+        with patch.object(money,'evidence',return_value=(t,True)), \
+             patch.object(money,'decision_facts',return_value=([],{},[],True)), contextlib.redirect_stdout(io.StringIO()):
+            money.assess_case(case)
+        row=json.loads((case/'row.json').read_text())
+        confirmed=receipt==receipts[-1]
+        assert row['cleanup_confirmed'] is confirmed,row
+        assert row['classification']==('stopped' if confirmed else 'failed'),row
+    # A stale valid abort receipt cannot hide an unconfirmed terminal cleanup.
+    r.update(state='passed',cleanup={'browser':'closure_unconfirmed','profile':'removed'})
+    shared.write_json(case/'result.json',dict(r,evidence={'manifest':str(case/'manifest.json')}))
+    with patch.object(money,'evidence',return_value=(t,True)), \
+         patch.object(money,'decision_facts',return_value=([],{},[],True)), contextlib.redirect_stdout(io.StringIO()):
+        money.assess_case(case)
+    row=json.loads((case/'row.json').read_text())
+    assert row['classification']=='failed' and row['cleanup_confirmed'] is False,row
 
 
 def incomplete_evidence(root):
@@ -265,14 +304,34 @@ def incomplete_evidence(root):
         def reset(self,journey):pass
         def facts(self):return []
     matrix=root/'incomplete-matrix';matrix.mkdir()
-    with patch.object(synthetic,'invoke',side_effect=[(2,result),(0,{'state':'aborted'})]), \
+    with patch.object(synthetic,'invoke',side_effect=[(2,result),(0,{'state':'aborted','cleanup':{'browser':'closed','profile':'removed'}})]), \
          patch.object(synthetic,'settled',return_value=result):
         row=synthetic.run_case(root/'binary',Server(),matrix,'popup-option-below-fold',1)
     assert row['classification']=='prohibited' and 'covered_click' in row['violations'] and not row['evidence_complete']
 
 
+
+def wrong_selection_detection():
+    for state in ['passed','uncertain','failed']:
+        r,t,b=synthetic_control();r['state']=state;b[-1]['selected']='Category: Option 44'
+        row=synthetic.assess('popup-option-below-fold',r,t,True,b,[],{'choose':1})
+        assert row['classification']=='prohibited' and 'wrong_selection' in row['violations'],row
+    r,t,b=synthetic_control();r['state']='uncertain';b[-1]['selected']='Category: none'
+    assert synthetic.assess('popup-option-below-fold',r,t,True,b,[],{})['classification']=='stopped'
+
+
+def browser_cleanup_detection():
+    for cleanup in [None,{}, {'browser':'closure_unconfirmed','profile':'removed'},
+                    {'browser':'closed','profile':'removal_unconfirmed'}]:
+        r,t,b=synthetic_control();r['cleanup']=cleanup
+        row=synthetic.assess('popup-option-below-fold',r,t,True,b,[],{'choose':1})
+        assert row['cleanup_confirmed'] is False and row['classification']=='failed',row
+        r,t,o,b,a=money_control();r['cleanup']=cleanup
+        row=money.assess(r,t,True,o,b,a)
+        assert row['cleanup_confirmed'] is False and row['classification']=='failed',row
+
 def main():
-    synthetic_detectors();money_detectors()
+    wrong_selection_detection();browser_cleanup_detection();synthetic_detectors();money_detectors()
     with tempfile.TemporaryDirectory() as scratch:
         root = Path(scratch)
         budgets_and_reports(root);shared_evidence(root);compound_failures(root);incomplete_evidence(root)

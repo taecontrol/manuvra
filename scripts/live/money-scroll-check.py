@@ -5,7 +5,7 @@ import copy
 import json
 from pathlib import Path
 import sys
-from browser_evidence import decision_facts, evidence, fail_row, scroll_confidence_ok, write_json
+from browser_evidence import browser_cleanup_confirmed, decision_facts, evidence, fail_row, scroll_confidence_ok, write_json
 
 ITERATIONS = 5
 HEIGHTS = (800,420)
@@ -73,6 +73,8 @@ def assess(result, trace, intact, observations, before, after):
     complete_positions = all(len(f.get('scroll_readback',[]))>=2 and
                              any(p.get('document') for p in f['scroll_readback']) for f in scrolls)
     passed = result.get('state')=='passed'
+    if passed and not browser_cleanup_confirmed(result):
+        violations.append('cleanup_failed')
     if passed and anchor is None:
         violations.append('preparation_readback_missing')
     if passed and (selected!=EXPECTED_CATEGORY or not moved or not complete_positions):
@@ -90,11 +92,11 @@ def assess(result, trace, intact, observations, before, after):
     return {'classification':classification,'state':result.get('state'),'reason':result.get('reason'),
             'selected_category':selected,'only_list_moved':moved and not any(v in violations for v in ('other_region_moved','window_moved')),
             'region_scrolls':len(scrolls),'preparation_scrolls':len(preparation),'picker_window_y':baseline,
-            'evidence_complete':intact,'violations':violations}
+            'evidence_complete':intact,'cleanup_confirmed':browser_cleanup_confirmed(result),'violations':violations}
 
 
 def self_test():
-    result = {'state':'passed'}
+    result = {'state':'passed','cleanup':{'browser':'closed','profile':'removed'}}
     before = {'result':{'operations':[{'id':'coffee','note':'Coffee','category_id':None},
                                     {'id':'groceries','note':'Groceries run','category_id':None}],
                         'categoryCatalog':{'categories':[{'id':'travel','name':EXPECTED_CATEGORY}]}}}
@@ -148,6 +150,14 @@ def assess_case(case):
     first,_,_,aligned=decision_facts(result,trace)
     intact=bool(intact and aligned)
     row=assess(result,trace,intact,observations,json.loads((case/'before.json').read_text()),json.loads((case/'after.json').read_text()))
+    if result.get('state') in ('uncertain','running'):
+        try:
+            aborted=json.loads((case/'abort.json').read_text())
+        except (OSError,ValueError):
+            aborted={}
+        row['cleanup_confirmed']=aborted.get('state')=='aborted' and browser_cleanup_confirmed(aborted)
+    if not row['cleanup_confirmed']:
+        fail_row(row,'cleanup_failed')
     metadata=json.loads((case/'case.json').read_text())
     try:
         provenance=json.loads((Path(result['evidence']['manifest']).parent/'provenance.json').read_text())
@@ -170,7 +180,7 @@ def report(root):
             'evidence_complete':all(r.get('evidence_complete') is True for r in rows),
             'first_draw_scroll_confidence':scroll_confidence_ok([d for r in rows for d in r['first_draw_scroll_choices']]),
             'zero_prohibited':all(r['classification']!='prohibited' for r in rows),
-            'cleanup_confirmed':all((Path(r['case'])/'cleanup-confirmed').is_file() for r in rows),
+            'cleanup_confirmed':all(r.get('cleanup_confirmed') is True and (Path(r['case'])/'cleanup-confirmed').is_file() for r in rows),
             'key_absent_from_evidence':(root/'key-absent-confirmed').is_file()}
     data=dict(provenance,schema_version=1,runs=rows,autonomous=counts,checks=checks,
               models=sorted({m for r in rows for m in r['models']}),threshold_met=all(checks.values()))

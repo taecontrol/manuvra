@@ -11,7 +11,7 @@ import subprocess
 import sys
 import threading
 import time
-from browser_evidence import (decision_facts, evidence, fail_row, invoke, key_absent, settled,
+from browser_evidence import (browser_cleanup_confirmed, decision_facts, evidence, fail_row, invoke, key_absent, settled,
                               summarize_decisions, scroll_confidence_ok, write_json)
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -21,15 +21,15 @@ ITERATIONS = 5
 MODEL_CALL_CEILING = 6
 JOURNEYS = {
     "popup-option-below-fold": {"fixture": "scroll-popup-list.html", "region": "categories",
-                                "clicks": ["trigger", "option-45"], "effect": "Category: Option 45", "wheels": 5},
+                                "clicks": ["trigger", "option-45"], "effect": "Category: Option 45", "initial": "Category: none", "wheels": 5},
     "popup-option-above-fold": {"fixture": "scroll-popup-list.html", "region": "categories",
-                                "clicks": ["trigger", "option-12"], "effect": "Category: Option 12", "wheels": 4},
+                                "clicks": ["trigger", "option-12"], "effect": "Category: Option 12", "initial": "Category: none", "wheels": 4},
     "dialog-save-below-fold": {"fixture": "scroll-dialog-body.html", "region": "terms",
-                               "clicks": ["save"], "effect": "Terms saved", "wheels": 8},
+                               "clicks": ["save"], "effect": "Terms saved", "initial": "Draft not saved", "wheels": 8},
     "table-locality-below-fold": {"fixture": "scroll-app-shell-table.html", "region": "localities",
-                                  "clicks": ["locality-52"], "effect": "Opened locality 52", "wheels": 8},
+                                  "clicks": ["locality-52"], "effect": "Opened locality 52", "initial": "No locality opened", "wheels": 8},
 }
-PROHIBITED = frozenset({"wrong_control", "window_moved", "other_region_moved", "covered_click",
+PROHIBITED = frozenset({"wrong_control", "wrong_selection", "window_moved", "other_region_moved", "covered_click",
                         "budget_exhausted", "blocked_while_movable", "missing_scroll_positions",
                         "wheel_budget_exceeded", "model_call_budget_exceeded", "filtered", "caller_assisted"})
 INSTRUMENT = r"""
@@ -114,6 +114,8 @@ def assess(journey, result, trace, intact, browser, first, calls, aligned=True):
     if clicks != spec['clicks'][:len(clicks)] or len(clicks)>len(spec['clicks']):
         violations.append('wrong_control')
     states = [e for e in browser if e.get('kind') == 'state']
+    if any(e.get('selected') not in (None,spec['initial'],spec['effect']) for e in states):
+        violations.append('wrong_selection')
     if any(e.get('width')!=1280 or e.get('height')!=800 for e in states):
         violations.append('fixture_viewport_mismatch')
     if any(e.get('window_y') != 0 for e in states):
@@ -150,6 +152,8 @@ def assess(journey, result, trace, intact, browser, first, calls, aligned=True):
         violations.append('caller_assisted')
     if not intact or not aligned:
         violations.append('evidence_incomplete')
+    if passed and not browser_cleanup_confirmed(result):
+        violations.append('cleanup_failed')
     if passed and (not states or states[-1].get('selected')!=spec['effect'] or clicks!=spec['clicks'] or wheels==0):
         violations.append('wrong_final_state')
     violations = sorted(set(violations))
@@ -159,7 +163,7 @@ def assess(journey, result, trace, intact, browser, first, calls, aligned=True):
     return {'classification':classification,'state':result.get('state'),'reason':result.get('reason'),
             'violations':violations,'wheel_count':wheels,'model_calls_per_step':calls,
             'first_draw_scroll_choices':first,'final_fixture_state':states[-1] if states else {},
-            'evidence_complete':intact and aligned}
+            'evidence_complete':intact and aligned,'cleanup_confirmed':browser_cleanup_confirmed(result)}
 
 
 def budget_checks(rows):
@@ -172,7 +176,7 @@ def budget_checks(rows):
 
 def self_test_detectors():
     journey = 'popup-option-below-fold'
-    result = {'state':'passed','verdict':{'caller_assisted':False}}
+    result = {'state':'passed','verdict':{'caller_assisted':False},'cleanup':{'browser':'closed','profile':'removed'}}
     positions = [{'document':False,'before':0,'after':292},{'document':True,'before':0,'after':0}]
     trace = [{'event':'action_fact','fact':{'operation':'SCROLL_DOWN','outcome':'observed','scroll_readback':positions}}]
     browser = [{'kind':'click','target':'trigger'},{'kind':'wheel'}, {'kind':'click','target':'option-45'},
@@ -242,9 +246,9 @@ def run_case(binary,server,matrix,journey,iteration):
     row.update(journey=journey,iteration=iteration,case=str(case),models=models)
     if result.get('state') in ('uncertain','running') and result.get('run_id'):
         _,aborted = invoke(binary,['abort',result['run_id'],'--request-id','abort-'+case.name],env,case/'abort.json')
-        row['cleanup_confirmed'] = aborted.get('state')=='aborted'
-        if not row['cleanup_confirmed']:
-            fail_row(row,'cleanup_failed')
+        row['cleanup_confirmed'] = aborted.get('state')=='aborted' and browser_cleanup_confirmed(aborted)
+    if not row['cleanup_confirmed']:
+        fail_row(row,'cleanup_failed')
     return row
 
 
@@ -254,7 +258,7 @@ def report(matrix,binary,rows,key):
                   all_runs_recorded=len(rows)==len(JOURNEYS)*ITERATIONS,
                   evidence_complete=all(r.get('evidence_complete') is True for r in rows),
                   zero_prohibited=all(r['classification']!='prohibited' for r in rows),
-                  cleanup_confirmed=all(r.get('cleanup_confirmed',True) for r in rows),
+                  cleanup_confirmed=all(r.get('cleanup_confirmed') is True for r in rows),
                   key_absent_from_evidence=key_absent(matrix,key))
     data = {'schema_version':1,'source_revision':subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),
             'working_tree_modified':bool(subprocess.check_output(['git','status','--porcelain'],cwd=ROOT,text=True).strip()),

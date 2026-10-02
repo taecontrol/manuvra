@@ -65,10 +65,10 @@ for height in 800 420; do
     wait_checkpoint "$active_state" "$active_run" "$case_dir/result.json"
     observe_fixture accounts >"$case_dir/after.json"
     jq -e '.status == "completed"' "$case_dir/after.json" >/dev/null
-    python3 "$checker" --case "$case_dir"
     if [[ $(jq -r '.state' "$case_dir/result.json") == uncertain ]]; then
       abort_paused_run "$active_state" "$active_run" "$case_dir/abort.json"
     fi
+    python3 "$checker" --case "$case_dir"
     active_run=
     stop_fixture "$case_dir/cleanup.json" "$case_dir/cleanup.stderr"
     touch "$case_dir/cleanup-confirmed"
