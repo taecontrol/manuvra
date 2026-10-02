@@ -241,7 +241,7 @@ def run_case(binary,server,matrix,journey,iteration):
     except (OSError,ValueError,KeyError):
         provenance = {}
     row['browser_provenance'] = provenance
-    if provenance.get('display_mode')!='headless' or provenance.get('viewport')!={'width':1280,'height':800}:
+    if provenance.get('display_mode')!='headless' or provenance.get('viewport')!={'width':1280,'height':800,'initial_client_width':1280}:
         fail_row(row,'browser_configuration_mismatch')
     row.update(journey=journey,iteration=iteration,case=str(case),models=models)
     if result.get('state') in ('uncertain','running') and result.get('run_id'):

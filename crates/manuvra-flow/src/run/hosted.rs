@@ -39,15 +39,18 @@ fn run_with_browser(
     let started = StartedBrowser::launch(browser_config(job, &config), target_url(job))
         .and_then(StartedBrowser::navigate);
     match started {
-        Ok(started) => finish_browser_run(
-            job,
-            config,
-            redactor,
-            started.browser,
-            started.provenance,
-            provider_key,
-            control,
-        ),
+        Ok(started) => {
+            let provenance = started.provenance();
+            finish_browser_run(
+                job,
+                config,
+                redactor,
+                started.browser,
+                provenance,
+                provider_key,
+                control,
+            )
+        }
         Err(StartupFailure::Launch(error)) => publish_browser_error(job, config, redactor, error),
         Err(StartupFailure::AfterLaunch(failure)) => publish_browser_error_with_provenance(
             job,

@@ -209,12 +209,12 @@ def compound_failures(root):
         ('aborted',{'browser':'closed','profile':'removal_unconfirmed'},False),
     ]):
         for forbidden in [False,True]:
-            for display in ['headless','headed']:
-                shared.write_json(owner/'provenance.json',{'display_mode':display,'viewport':{'width':1280,'height':800}})
+            for display,width in [('headless',1280),('headed',1280),('headless',1279),('headless',None)]:
+                shared.write_json(owner/'provenance.json',{'display_mode':display,'viewport':{'width':1280,'height':800,'initial_client_width':width}})
                 class Server:
                     def reset(self,journey):pass
                     def facts(self):return [{'kind':'click','target':'wrong-control'}] if forbidden else []
-                matrix = root/f'{index}-{state}-{forbidden}-{display}';matrix.mkdir()
+                matrix = root/f'{index}-{state}-{forbidden}-{display}-{width}';matrix.mkdir()
                 with patch.object(synthetic,'invoke',side_effect=[(2,result),(5,{'state':state,'cleanup':cleanup})]), \
                      patch.object(synthetic,'settled',return_value=result), \
                      patch.object(synthetic,'evidence',return_value=([],True)), \
@@ -222,8 +222,11 @@ def compound_failures(root):
                     row = synthetic.run_case(root/'binary',Server(),matrix,'popup-option-below-fold',1)
                 assert row['cleanup_confirmed'] is confirmed
                 assert ('cleanup_failed' in row['violations']) is (not confirmed)
+                mismatch = display!='headless' or width!=1280
+                assert ('browser_configuration_mismatch' in row['violations']) is mismatch
                 if forbidden:assert row['classification']=='prohibited',row
-                elif not confirmed or display!='headless':assert row['classification']=='failed',row
+                elif not confirmed or mismatch:assert row['classification']=='failed',row
+                else:assert row['classification']=='stopped',row
     rows=[{'journey':j,'classification':'autonomous','wheel_count':1,'models':[],'evidence_complete':True,'cleanup_confirmed':True,
            'first_draw_scroll_choices':[{'confidence':.9}],'model_calls_per_step':{}} for j in synthetic.JOURNEYS for _ in range(5)]
     rows[0].update(classification='failed',cleanup_confirmed=False)
@@ -235,7 +238,7 @@ def compound_failures(root):
     shared.write_json(case/'result.json',dict(r,evidence={'manifest':str(case/'manifest.json')}))
     shared.write_json(case/'before.json',b);shared.write_json(case/'after.json',a)
     shared.write_json(case/'case.json',{'height':420,'iteration':1})
-    shared.write_json(case/'provenance.json',{'display_mode':'headed','viewport':{'width':1280,'height':420}})
+    shared.write_json(case/'provenance.json',{'display_mode':'headed','viewport':{'width':1280,'height':420,'initial_client_width':1280}})
     artifacts=[]
     for i,observation in enumerate(o):
         path=case/f'observation-{i}.json';shared.write_json(path,observation)
@@ -253,7 +256,7 @@ def compound_failures(root):
     r,t,o,b,a=money_control();r.update(state='uncertain',cleanup=None)
     shared.write_json(case/'result.json',dict(r,evidence={'manifest':str(case/'manifest.json')}))
     shared.write_json(case/'after.json',a)
-    shared.write_json(case/'provenance.json',{'display_mode':'headless','viewport':{'width':1280,'height':420}})
+    shared.write_json(case/'provenance.json',{'display_mode':'headless','viewport':{'width':1280,'height':420,'initial_client_width':1280}})
     receipts=[None,'invalid JSON',{'state':'failed','cleanup':{'browser':'closed','profile':'removed'}},
               {'state':'aborted','cleanup':{'browser':'closure_unconfirmed','profile':'removed'}},
               {'state':'aborted','cleanup':{'browser':'closed','profile':'removal_unconfirmed'}},
@@ -270,6 +273,14 @@ def compound_failures(root):
         confirmed=receipt==receipts[-1]
         assert row['cleanup_confirmed'] is confirmed,row
         assert row['classification']==('stopped' if confirmed else 'failed'),row
+    for width in [1279,None,'1280']:
+        shared.write_json(case/'provenance.json',{'display_mode':'headless','viewport':{'width':1280,'height':420,'initial_client_width':width}})
+        with patch.object(money,'evidence',return_value=(t,True)), \
+             patch.object(money,'decision_facts',return_value=([],{},[],True)), contextlib.redirect_stdout(io.StringIO()):
+            money.assess_case(case)
+        row=json.loads((case/'row.json').read_text())
+        assert row['classification']=='failed' and 'browser_configuration_mismatch' in row['violations'],row
+    shared.write_json(case/'provenance.json',{'display_mode':'headless','viewport':{'width':1280,'height':420,'initial_client_width':1280}})
     # A stale valid abort receipt cannot hide an unconfirmed terminal cleanup.
     r.update(state='passed',cleanup={'browser':'closure_unconfirmed','profile':'removed'})
     shared.write_json(case/'result.json',dict(r,evidence={'manifest':str(case/'manifest.json')}))
@@ -293,13 +304,13 @@ def incomplete_evidence(root):
         artifacts.append({'role':'observation','path':str(path),'complete':True,'digest':hashlib.sha256(path.read_bytes()).hexdigest()})
     artifacts.append({'role':'screenshot','path':str(case/'missing.png'),'complete':True,'digest':'bad'})
     shared.write_json(case/'manifest.json',{'complete':True,'artifacts':artifacts})
-    shared.write_json(case/'provenance.json',{'display_mode':'headless','viewport':{'width':1280,'height':420}})
+    shared.write_json(case/'provenance.json',{'display_mode':'headless','viewport':{'width':1280,'height':420,'initial_client_width':1280}})
     shared.write_json(case/'result.json',result);shared.write_json(case/'before.json',before);shared.write_json(case/'after.json',after)
     shared.write_json(case/'case.json',{'height':420,'iteration':1})
     with contextlib.redirect_stdout(io.StringIO()):money.assess_case(case)
     row=json.loads((case/'row.json').read_text())
     assert row['classification']=='prohibited' and 'covered_click' in row['violations'] and not row['evidence_complete']
-    shared.write_json(case/'provenance.json',{'display_mode':'headless','viewport':{'width':1280,'height':800}})
+    shared.write_json(case/'provenance.json',{'display_mode':'headless','viewport':{'width':1280,'height':800,'initial_client_width':1280}})
     class Server:
         def reset(self,journey):pass
         def facts(self):return []

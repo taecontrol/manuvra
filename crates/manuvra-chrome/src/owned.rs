@@ -165,6 +165,9 @@ pub struct BrowserProvenance {
 pub struct ProvenanceViewport {
     pub width: u16,
     pub height: u16,
+    /// Root client width after the first completed navigation, in CSS pixels.
+    #[serde(default)]
+    pub initial_client_width: Option<u32>,
 }
 
 pub struct CapturedPage {
@@ -226,11 +229,23 @@ impl OwnedBrowser {
         &self.provenance
     }
 
-    pub fn navigate(&self, url: &str) -> Result<(), BrowserError> {
+    pub fn navigate(&mut self, url: &str) -> Result<(), BrowserError> {
         let fence = self.client.cursor();
         let navigated = command(&self.client, "Page.navigate", json!({"url": url}))?;
         require_committed_navigation(&navigated)?;
-        wait_for_document(&self.client, fence)
+        wait_for_document(&self.client, fence)?;
+        self.record_initial_client_width()
+    }
+
+    fn record_initial_client_width(&mut self) -> Result<(), BrowserError> {
+        if self.provenance.viewport.initial_client_width.is_none() {
+            let value = evaluate(&self.client, "document.documentElement.clientWidth")?;
+            let width = serde_json::from_value::<u32>(value).map_err(|_| {
+                BrowserError::InvalidObservation("initial client width is invalid".into())
+            })?;
+            self.provenance.viewport.initial_client_width = Some(width);
+        }
+        Ok(())
     }
 
     pub fn observe(&self) -> Result<Observation, BrowserError> {
@@ -537,6 +552,7 @@ impl StartingBrowser {
                 viewport: ProvenanceViewport {
                     width: prepared.config.width,
                     height: prepared.config.height,
+                    initial_client_width: None,
                 },
                 display_mode: display_mode(prepared.config.headless).into(),
             },
@@ -621,6 +637,7 @@ fn browser_command(binary: &Path, profile: &Path, config: &BrowserConfig) -> Com
         // Manuvra dispatches, including controls revealed only under @media (hover: hover).
         command
             .arg("--headless=new")
+            .arg("--hide-scrollbars")
             .arg("--disable-gpu")
             .arg("--blink-settings=primaryHoverType=2,availableHoverTypes=2,primaryPointerType=4,availablePointerTypes=4");
     }
@@ -1291,7 +1308,7 @@ mod tests {
             "Page.navigate",
             json!({"frameId":"main","errorText":"net::ERR_CONNECTION_REFUSED"}),
         );
-        let browser = browser_with_client(chrome.connect_raw());
+        let mut browser = browser_with_client(chrome.connect_raw());
         assert!(matches!(
             browser.navigate("http://127.0.0.1:9/"),
             Err(BrowserError::Control(message)) if message == "navigation failed: net::ERR_CONNECTION_REFUSED"
@@ -1386,11 +1403,15 @@ mod tests {
             json!({"data":base64::Engine::encode(&base64::engine::general_purpose::STANDARD,&png)}),
         );
         let client = chrome.connect_raw();
-        let browser = browser_with_client(client);
+        let mut browser = browser_with_client(client);
         assert_eq!(browser.observe().unwrap().title, "Fixture");
         assert_eq!(browser.capture().unwrap().screenshot.width, 1);
         assert_eq!(browser.capture_redacted(&[]).unwrap().screenshot.height, 1);
         chrome.reply("Runtime.evaluate", json!({"result":{"value":"complete"}}));
+        chrome.reply_evaluation(
+            "document.documentElement.clientWidth",
+            json!({"result":{"value":800}}),
+        );
         chrome.push_event("DOM.childNodeInserted", json!({}));
         browser.navigate("http://example.test/").unwrap();
         assert!(matches!(
@@ -1773,6 +1794,7 @@ mod tests {
                 viewport: ProvenanceViewport {
                     width: 800,
                     height: 600,
+                    initial_client_width: None,
                 },
                 display_mode: "headless".into(),
             },
