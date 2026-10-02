@@ -1791,8 +1791,12 @@ const FRAME_CHURN_PAGE: &str = r#"<!doctype html><title>Frame churn</title>
 <script>
   let count = 0;
   document.querySelector('#count').addEventListener('click', () => { document.querySelector('#counted').textContent = `Count: ${++count}`; });
-  document.querySelector('#churn').addEventListener('click', () => setTimeout(() => {
-    for (let index = 0; index < 1500; index += 1) { const frame = document.createElement('iframe'); document.body.append(frame); frame.remove(); }
+  document.querySelector('#churn').addEventListener('click', () => setTimeout(async () => {
+    for (let index = 0; index < 1500; index += 1) {
+      const frame = document.createElement('iframe'); document.body.append(frame); frame.remove();
+      // Yield without reducing the event count: this fixture tests journal eviction, not a blocked renderer.
+      if (index % 10 === 9) await new Promise(resolve => setTimeout(resolve, 0));
+    }
     document.querySelector('#state').textContent = 'Churn finished';
   }, 500));
 </script>"#;
