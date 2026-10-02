@@ -209,8 +209,10 @@ def compound_failures(root):
         ('aborted',{'browser':'closed','profile':'removal_unconfirmed'},False),
     ]):
         for forbidden in [False,True]:
-            for display,width in [('headless',1280),('headed',1280),('headless',1279),('headless',None)]:
-                shared.write_json(owner/'provenance.json',{'display_mode':display,'viewport':{'width':1280,'height':800,'initial_client_width':width}})
+            for display,width in [('headless',1280),('headed',1280),('headless',1279),('headless',None),('headless','missing')]:
+                provenance={'display_mode':display,'viewport':{'width':1280,'height':800,'initial_client_width':width}}
+                if width=='missing':provenance['viewport'].pop('initial_client_width')
+                shared.write_json(owner/'provenance.json',provenance)
                 class Server:
                     def reset(self,journey):pass
                     def facts(self):return [{'kind':'click','target':'wrong-control'}] if forbidden else []
@@ -273,8 +275,10 @@ def compound_failures(root):
         confirmed=receipt==receipts[-1]
         assert row['cleanup_confirmed'] is confirmed,row
         assert row['classification']==('stopped' if confirmed else 'failed'),row
-    for width in [1279,None,'1280']:
-        shared.write_json(case/'provenance.json',{'display_mode':'headless','viewport':{'width':1280,'height':420,'initial_client_width':width}})
+    for width in [1279,None,'1280','missing']:
+        provenance={'display_mode':'headless','viewport':{'width':1280,'height':420,'initial_client_width':width}}
+        if width=='missing':provenance['viewport'].pop('initial_client_width')
+        shared.write_json(case/'provenance.json',provenance)
         with patch.object(money,'evidence',return_value=(t,True)), \
              patch.object(money,'decision_facts',return_value=([],{},[],True)), contextlib.redirect_stdout(io.StringIO()):
             money.assess_case(case)

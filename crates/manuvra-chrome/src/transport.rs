@@ -879,6 +879,7 @@ pub(crate) mod test_support {
     #[derive(Default)]
     struct Script {
         received: Vec<Value>,
+        received_times: Vec<Instant>,
         replies: HashMap<String, Vec<Value>>,
         evaluation_replies: HashMap<String, Value>,
         reject: HashSet<String>,
@@ -950,6 +951,17 @@ pub(crate) mod test_support {
                 .iter()
                 .filter(|value| value["method"] == method)
                 .cloned()
+                .collect()
+        }
+
+        pub fn received_times(&self, method: &str) -> Vec<Instant> {
+            let script = self.script.lock().expect("scripted Chrome");
+            script
+                .received
+                .iter()
+                .zip(&script.received_times)
+                .filter(|(value, _)| value["method"] == method)
+                .map(|(_, time)| *time)
                 .collect()
         }
 
@@ -1274,6 +1286,7 @@ pub(crate) mod test_support {
         let (reply, invalid, events) = {
             let mut script = script.lock().expect("scripted Chrome");
             script.received.push(value.clone());
+            script.received_times.push(Instant::now());
             if script.disconnect_on.contains(&method) {
                 return false;
             }

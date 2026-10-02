@@ -403,6 +403,7 @@ impl RunJournal for MemoryJournal {
 #[derive(Default)]
 pub(crate) struct ScriptedControl {
     checkpoints: Mutex<Vec<Value>>,
+    checkpoint_provenance: Mutex<Vec<Value>>,
     dispositions: Mutex<VecDeque<Disposition>>,
     pub(crate) cancellation: manuvra_chrome::InputCancellation,
 }
@@ -418,6 +419,10 @@ impl ScriptedControl {
     pub(crate) fn checkpoints(&self) -> Vec<Value> {
         self.checkpoints.lock().unwrap().clone()
     }
+
+    pub(crate) fn checkpoint_provenance(&self) -> Vec<Value> {
+        self.checkpoint_provenance.lock().unwrap().clone()
+    }
 }
 
 impl HostedControl for ScriptedControl {
@@ -430,6 +435,12 @@ impl HostedControl for ScriptedControl {
     }
 
     fn publish_checkpoint(&self, result: &Value) -> Result<(), String> {
+        if result["state"] != "running" {
+            let manifest = std::path::Path::new(result["evidence"]["manifest"].as_str().unwrap());
+            let provenance = manifest.parent().unwrap().join("provenance.json");
+            let provenance = serde_json::from_slice(&std::fs::read(provenance).unwrap()).unwrap();
+            self.checkpoint_provenance.lock().unwrap().push(provenance);
+        }
         self.checkpoints.lock().unwrap().push(result.clone());
         Ok(())
     }
@@ -605,7 +616,7 @@ pub(crate) fn run_loop(
         config,
         &redactor,
         browser,
-        json!({"fixture":"hosted-loop"}),
+        json!({"fixture":"hosted-loop","viewport":{"width":1120,"height":780,"initial_client_width":375}}),
         provider,
         journal,
         &control.cancellation,

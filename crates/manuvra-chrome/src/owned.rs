@@ -1190,10 +1190,8 @@ mod tests {
         for width in [0, 375, u32::MAX] {
             let chrome = ScriptedChrome::start();
             chrome.reply("Page.navigate", json!({"frameId":"main"}));
-            chrome.reply_evaluation(
-                "document.readyState",
-                json!({"result":{"value":"complete"}}),
-            );
+            chrome.reply("Runtime.evaluate", json!({"result":{"value":"loading"}}));
+            chrome.reply("Runtime.evaluate", json!({"result":{"value":"complete"}}));
             chrome.reply_evaluation(
                 "document.documentElement.clientWidth",
                 json!({"result":{"value":width}}),
@@ -1214,14 +1212,25 @@ mod tests {
                 width
             );
             let evaluations = chrome.received("Runtime.evaluate");
+            let width_index = evaluations
+                .iter()
+                .position(|command| {
+                    command["params"]["expression"] == "document.documentElement.clientWidth"
+                })
+                .unwrap();
             assert!(
-                evaluations[..evaluations
-                    .iter()
-                    .position(|command| command["params"]["expression"]
-                        == "document.documentElement.clientWidth")
-                    .unwrap()]
+                width_index >= 2,
+                "measure only after loading becomes complete"
+            );
+            assert!(
+                evaluations[..width_index]
                     .iter()
                     .all(|command| command["params"]["expression"] == "document.readyState")
+            );
+            let times = chrome.received_times("Runtime.evaluate");
+            assert!(
+                times[width_index].duration_since(times[1]) >= QUIET_WINDOW,
+                "measure only after the completed document becomes quiet"
             );
             assert_eq!(
                 evaluations

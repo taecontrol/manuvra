@@ -81,6 +81,33 @@ fn assert_no_step_input(result: &Value) {
     }
 }
 
+fn retain_viewport_capture(result: &Value) {
+    let Some(directory) = std::env::var_os("MANUVRA_FIXTURE_EVIDENCE") else {
+        return;
+    };
+    let directory = PathBuf::from(directory);
+    fs::create_dir_all(&directory).unwrap();
+    let manifest = PathBuf::from(result["evidence"]["manifest"].as_str().unwrap());
+    let manifest: Value = serde_json::from_slice(&fs::read(manifest).unwrap()).unwrap();
+    for (role, name) in [
+        ("screenshot", "cli-viewport-390x844.png"),
+        ("observation", "cli-viewport-390x844-observation.json"),
+    ] {
+        let artifact = manifest["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|artifact| artifact["role"] == role)
+            .unwrap();
+        fs::copy(artifact["path"].as_str().unwrap(), directory.join(name)).unwrap();
+    }
+    fs::write(
+        directory.join("cli-viewport-provenance.json"),
+        serde_json::to_vec_pretty(&provenance(result)).unwrap(),
+    )
+    .unwrap();
+}
+
 #[test]
 #[ignore = "requires the local Chromium executable"]
 fn viewport_cli_provenance_records_initial_target_width_and_verifiable_artifacts() {
@@ -98,6 +125,9 @@ fn viewport_cli_provenance_records_initial_target_width_and_verifiable_artifacts
         assert_eq!(result["cleanup"]["profile"], "removed");
         assert_complete_artifacts(&result);
         assert_no_step_input(&result);
+        if requested == Some((390, 844)) {
+            retain_viewport_capture(&result);
+        }
         let recovered = invoke(
             &temporary,
             &["status", "--request-id", "viewport-observation"],
