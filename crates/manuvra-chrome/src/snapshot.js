@@ -19,10 +19,10 @@
     const x=Math.min(...points.map(p=>p.x)), y=Math.min(...points.map(p=>p.y));
     return {x,y,width:Math.max(...points.map(p=>p.x))-x,height:Math.max(...points.map(p=>p.y))-y};
   };
-  // A frame's affine map includes transforms on its ancestors, not just its own CSS.
-  const frameMatrix = frame => {
-    let matrix = new DOMMatrix();
-    for (let node=frame;node;node=node.parentElement || node.getRootNode()?.host) {
+  // Keep client dimensions and DOMRects in explicit coordinate spaces.
+  const elementGeometry = element => {
+    let matrix = new DOMMatrix(), zoom = 1;
+    for (let node=element;node;node=node.parentElement || node.getRootNode()?.host) {
       const css=node.ownerDocument.defaultView.getComputedStyle(node);
       const transform=new DOMMatrix(css.transform==='none'?undefined:css.transform);
       if (!transform.is2D || css.perspective!=='none') return null;
@@ -37,16 +37,21 @@
         if (parts.length>2 && parts[2]!==1) return null;
         scaling=scaling.scale(parts[0],parts[1]??parts[0]);
       }
-      matrix=new DOMMatrix().scale(parseFloat(css.zoom)||1).multiply(rotation).multiply(scaling).multiply(transform).multiply(matrix);
+      const nodeZoom=parseFloat(css.zoom)||1;zoom*=nodeZoom;
+      matrix=new DOMMatrix().scale(nodeZoom).multiply(rotation).multiply(scaling).multiply(transform).multiply(matrix);
     }
-    const css=frame.ownerDocument.defaultView.getComputedStyle(frame), rect=frame.getBoundingClientRect();
+    const css=element.ownerDocument.defaultView.getComputedStyle(element), rect=element.getBoundingClientRect();
     const width=parseFloat(css.width)+(css.boxSizing==='border-box'?0:parseFloat(css.paddingLeft)+parseFloat(css.paddingRight)+parseFloat(css.borderLeftWidth)+parseFloat(css.borderRightWidth));
     const height=parseFloat(css.height)+(css.boxSizing==='border-box'?0:parseFloat(css.paddingTop)+parseFloat(css.paddingBottom)+parseFloat(css.borderTopWidth)+parseFloat(css.borderBottomWidth));
     const linear=new DOMMatrix([matrix.a,matrix.b,matrix.c,matrix.d,0,0]);
     const box=mappedRect({x:0,y:0,width,height},linear);
     linear.e=rect.x-box.x;linear.f=rect.y-box.y;
-    const result=linear.translate(frame.clientLeft+parseFloat(css.paddingLeft),frame.clientTop+parseFloat(css.paddingTop));
-    return Number.isFinite(result.inverse().a)?result:null;
+    return Number.isFinite(linear.inverse().a)?{matrix:linear,zoom}:null;
+  };
+  const clientBox = element => {
+    const geometry=elementGeometry(element);
+    if(!geometry)throw new Error('Unverifiable client geometry');
+    return {...geometry,matrix:geometry.matrix.translate(element.clientLeft,element.clientTop),width:element.clientWidth,height:element.clientHeight};
   };
   // Rebuild frame geometry at dispatch; a snapshot cannot authorize a later wheel.
   const frameContext = root => {
@@ -57,12 +62,14 @@
       if (!frame?.isConnected || frame.contentDocument !== owner) return null;
       frames.unshift({frame,owner}); owner = frame.ownerDocument;
     }
-    let matrix=new DOMMatrix();
+    let matrix=new DOMMatrix(),zoom=1;
     const bounds={left:0,top:0,right:innerWidth,bottom:innerHeight};
     for (const entry of frames) {
       entry.parentMatrix=matrix;
-      const local=frameMatrix(entry.frame);if(!local)return null;
-      matrix=matrix.multiply(local);
+      const geometry=elementGeometry(entry.frame);if(!geometry)return null;
+      const css=entry.frame.ownerDocument.defaultView.getComputedStyle(entry.frame);
+      const local=geometry.matrix.translate(entry.frame.clientLeft+parseFloat(css.paddingLeft),entry.frame.clientTop+parseFloat(css.paddingTop));
+      matrix=matrix.multiply(local);zoom*=geometry.zoom;
       const viewport=mappedRect({x:0,y:0,width:entry.owner.defaultView.innerWidth,height:entry.owner.defaultView.innerHeight},matrix);
       bounds.left=Math.max(bounds.left,viewport.x);bounds.top=Math.max(bounds.top,viewport.y);
       bounds.right=Math.min(bounds.right,viewport.x+viewport.width);bounds.bottom=Math.min(bounds.bottom,viewport.y+viewport.height);
@@ -70,7 +77,7 @@
     const visible=bounds.right>bounds.left && bounds.bottom>bounds.top ? mappedRect({x:bounds.left,y:bounds.top,width:bounds.right-bounds.left,height:bounds.bottom-bounds.top},matrix.inverse()) : {x:0,y:0,width:0,height:0};
     const view=(root.ownerDocument || root).defaultView;
     const viewportBounds={left:Math.max(0,visible.x),top:Math.max(0,visible.y),right:Math.min(view.innerWidth,visible.x+visible.width),bottom:Math.min(view.innerHeight,visible.y+visible.height)};
-    return {matrix,bounds,viewportBounds,frames};
+    return {matrix,zoom,bounds,viewportBounds,frames};
   };
   const hitAt = (region,x,y) => {
     const context=frameContext(region.getRootNode());if(!context)return null;
@@ -129,13 +136,16 @@
       if (positioned) next = current.offsetParent;
       if (clipSelf) {next = current; clipSelf = false;}
       if (!next || next.ownerDocument !== element.ownerDocument) break;
-      const css = viewOfElement(next).getComputedStyle(next), r = next.getBoundingClientRect();
+      const css = viewOfElement(next).getComputedStyle(next);
       // The body's overflow propagates to the viewport when the root leaves it visible.
       const rootStyle = viewOfElement(next).getComputedStyle(next.ownerDocument.documentElement);
       const viewportOverflow = next === next.ownerDocument.documentElement || (next === next.ownerDocument.body && rootStyle.overflowX === 'visible' && rootStyle.overflowY === 'visible');
       if (viewportOverflow) {current = next; continue;}
-      if (css.overflowX !== 'visible') { bounds.left = Math.max(bounds.left,r.left+next.clientLeft); bounds.right = Math.min(bounds.right,r.left+next.clientLeft+next.clientWidth); }
-      if (css.overflowY !== 'visible') { bounds.top = Math.max(bounds.top,r.top+next.clientTop); bounds.bottom = Math.min(bounds.bottom,r.top+next.clientTop+next.clientHeight); }
+      if(css.overflowX !== 'visible' || css.overflowY !== 'visible') {
+        const box=clientBox(next),r=mappedRect({x:0,y:0,width:box.width,height:box.height},box.matrix);
+        if (css.overflowX !== 'visible') { bounds.left = Math.max(bounds.left,r.x); bounds.right = Math.min(bounds.right,r.x+r.width); }
+        if (css.overflowY !== 'visible') { bounds.top = Math.max(bounds.top,r.y); bounds.bottom = Math.min(bounds.bottom,r.y+r.height); }
+      }
       current = next;
     }
     return bounds;
@@ -352,12 +362,13 @@
   const scrollVisibleRect = element => {
     if (!scrollContexts.has(element.getRootNode())) return null;
     const context = frameContext(element.getRootNode()); if (!context) return null;
-    const r = element.getBoundingClientRect(), b = clippingRect(element,context);
-    const x = Math.max(r.x+element.clientLeft,b.left), y = Math.max(r.y+element.clientTop,b.top);
-    const right = Math.min(r.x+element.clientLeft+element.clientWidth,b.right), bottom = Math.min(r.y+element.clientTop+element.clientHeight,b.bottom);
-    const rect=mappedRect({x,y,width:Math.max(0,right-x),height:Math.max(0,bottom-y)},context.matrix);
-    // CDP wheels move CSS pixels in the receiving document, even when its frame is scaled.
-    return {...rect,wheel_height:Math.max(0,bottom-y)};
+    const box=clientBox(element),r=mappedRect({x:0,y:0,width:box.width,height:box.height},box.matrix),b=clippingRect(element,context);
+    const x=Math.max(r.x,b.left),y=Math.max(r.y,b.top);
+    const right=Math.min(r.x+r.width,b.right),bottom=Math.min(r.y+r.height,b.bottom);
+    const clipped={x,y,width:Math.max(0,right-x),height:Math.max(0,bottom-y)};
+    const rect=mappedRect(clipped,context.matrix),local=mappedRect(clipped,box.matrix.inverse());
+    // Transforms change geometry; CSS zoom also changes the units of a delivered wheel.
+    return {...rect,wheel_height:Math.max(0,Math.min(box.height,local.y+local.height)-Math.max(0,local.y)),wheel_scale:context.zoom*box.zoom};
   };
   for (const context of contexts) scrollContexts.set(context.root,context);
   cache.scrollConnected = element => Boolean(element?.isConnected && frameContext(element.getRootNode()));
