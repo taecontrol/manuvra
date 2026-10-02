@@ -36,7 +36,7 @@ provider_key_present() {
 }
 
 port_is_open() {
-  nc -z -w 2 127.0.0.1 4351 >/dev/null 2>&1
+  nc -z -w 2 127.0.0.1 "${1:-${MONEY_FIXTURE_PORT:-4351}}" >/dev/null 2>&1
 }
 
 validate_money_dir() {
@@ -49,19 +49,21 @@ validate_money_dir() {
 }
 
 preflight_fixture() {
+  local fixture_port=${1:-${MONEY_FIXTURE_PORT:-4351}}
   validate_money_dir
   require_command jq
   require_command nc
   require_command node
   require_command pnpm
-  if port_is_open; then
-    fail "port 4351 is already in use"
+  if port_is_open "$fixture_port"; then
+    fail "port $fixture_port is already in use"
   fi
 }
 
 # One Money fixture is active at a time. Its state lives in the caller-chosen directory.
 active_fixture=
 active_fixture_state=
+active_fixture_port=${MONEY_FIXTURE_PORT:-4351}
 
 cleanup_active_fixture() {
   if [[ -n "$active_fixture" ]]; then
@@ -71,11 +73,12 @@ cleanup_active_fixture() {
 }
 
 start_fixture() {
-  local run_id=$1 fixture_state=$2 launch=$3 doctor=$4 candidate
+  local run_id=$1 fixture_state=$2 launch=$3 doctor=$4 candidate fixture_port=${5:-${MONEY_FIXTURE_PORT:-4351}}
   active_fixture=$run_id
   active_fixture_state=$fixture_state
+  active_fixture_port=$fixture_port
   (cd "$money_dir" && VERIFY_STATE="$fixture_state" \
-    pnpm verify:app launch --run-id "$run_id" --port 4351) >"$launch"
+    pnpm verify:app launch --run-id "$run_id" --port "$fixture_port") >"$launch"
   candidate=$(jq -r '.result.candidate // empty' "$launch")
   [[ -n "$candidate" ]] || fail "fixture launch did not publish a candidate"
   (cd "$money_dir" && VERIFY_STATE="$fixture_state" node scripts/app-driver.mjs doctor \
@@ -100,15 +103,30 @@ stop_fixture() {
   jq -e '.status == "completed" and .result.cleanup == "cleaned"' "$output" >/dev/null || return 1
   active_fixture=
   active_fixture_state=
-  port_released
+  port_released "$active_fixture_port"
 }
 
-# Waits for the fixture runtime to release port 4351; cleanup can report before its last worker exits.
+# Waits for the fixture runtime to release its port; cleanup can report before its last worker exits.
 port_released() {
-  local deadline
+  local deadline fixture_port=${1:-${MONEY_FIXTURE_PORT:-4351}}
   deadline=$(( $(date +%s) + 10 ))
-  while port_is_open && [[ $(date +%s) -lt $deadline ]]; do sleep 0.1; done
-  ! port_is_open
+  while port_is_open "$fixture_port" && [[ $(date +%s) -lt $deadline ]]; do sleep 0.1; done
+  ! port_is_open "$fixture_port"
+}
+
+# Keep source jobs intact; a live suite can choose a different local fixture port.
+fixture_job() {
+  local template=$1 output=$2 origin="http://127.0.0.1:$active_fixture_port"
+  if [[ "$active_fixture_port" == 4351 ]]; then
+    cp "$template" "$output"
+  else
+    jq --arg origin "$origin" '
+      .target.url |= sub("http://127\\.0\\.0\\.1:4351"; $origin) |
+      if .options.allowed_origins != null then
+        .options.allowed_origins |= map(if . == "http://127.0.0.1:4351" then $origin else . end)
+      else . end
+    ' "$template" >"$output"
+  fi
 }
 
 # Follows a running Run with `status` until it reaches a checkpoint. Uses the caller's `$manuvra`.

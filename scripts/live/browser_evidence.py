@@ -1,4 +1,5 @@
 """CLI polling and evidence integrity checks shared by the browser live matrices."""
+from collections import Counter
 import hashlib
 import json
 from pathlib import Path
@@ -62,3 +63,29 @@ def key_absent(root, key):
     except OSError:
         return False
     return True
+
+
+def decision_facts(result, trace):
+    """First draws exclude the confidence-gate re-observation, not subsequent action beats."""
+    manifest = result.get('evidence',{}).get('manifest')
+    if not manifest:
+        return [], {}, [], False
+    try:
+        root = Path(manifest).parent
+        decisions = [json.loads(p.read_text()) for p in sorted((root/'decisions').glob('d_*.json'))]
+        observations = [e for e in trace if e.get('event') in ('observation','reobservation')
+                        and e.get('done') != 'satisfied']
+        return summarize_decisions(decisions, observations)
+    except (OSError, ValueError, KeyError):
+        return [], {}, [], False
+
+
+def summarize_decisions(decisions, observations):
+    counts = Counter(d['request']['state']['current_step']['goal'] for d in decisions)
+    first = [d['operation'] for d,e in zip(decisions,observations)
+             if e.get('event') == 'observation' and d['operation']['choice'] in ('SCROLL_UP','SCROLL_DOWN')]
+    return first,dict(counts),sorted({d['model'] for d in decisions}),len(observations)==len(decisions)
+
+
+def scroll_confidence_ok(choices):
+    return bool(choices) and sum(d['confidence']<.70 for d in choices)/len(choices)<=.05

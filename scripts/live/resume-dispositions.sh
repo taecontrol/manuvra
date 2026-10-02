@@ -33,6 +33,10 @@ start_fixture "manuvra-resume-dispositions-$label-$stamp" "$case_root/money-fixt
 jq '.options.pause_timeout_ms=120000 | .options.lifetime_ms=300000' \
   "$repo_root/tests/live/money/create-account-forced-pause.json" >"$job"
 
+run_job="$case_root/run-job.json"
+fixture_job "$job" "$run_job"
+job=$run_job
+
 result="$case_root/result.json"
 set +e
 XDG_STATE_HOME="$state_root" \

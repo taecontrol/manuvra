@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "target": {
+    "kind": "browser",
+    "url": "http://127.0.0.1:4351/accounts/00000000-0000-4000-8000-000000000201"
+  },
+  "context": {
+    "journey": "Set Coffee category below the real picker fold",
+    "revision": "Money e013e07",
+    "environment": "fresh disposable Money fixture",
+    "actor": "coding agent",
+    "authority": "set the synthetic expense category"
+  },
+  "values": {},
+  "steps": [
+    {
+      "id": "prepare",
+      "goal": "Scroll down until Coffee is visible",
+      "done_when": [
+        {
+          "text_visible": "Coffee",
+          "scope": "viewport"
+        }
+      ],
+      "mutation_limit": 1
+    },
+    {
+      "id": "open",
+      "goal": "Open the category picker for Coffee",
+      "done_when": [
+        {
+          "dialog_open": "Untitled dialog"
+        }
+      ],
+      "mutation_limit": 1
+    },
+    {
+      "id": "find",
+      "goal": "Scroll down through the remaining categories to Travel item 10, in the Travel group after Fun. Keep scrolling the list until the exact Travel item 10 option is visible.",
+      "done_when": [
+        {
+          "dialog_open": "Untitled dialog"
+        },
+        {
+          "text_visible": "Travel item 10"
+        }
+      ],
+      "mutation_limit": 1
+    },
+    {
+      "id": "category",
+      "goal": "Choose Travel item 10 as the category for Coffee",
+      "done_when": [
+        {
+          "text_visible": "Travel item 10"
+        },
+        {
+          "dialog_closed": "Untitled dialog"
+        }
+      ],
+      "mutation_limit": 1
+    }
+  ],
+  "expectations": [],
+  "options": {
+    "allowed_origins": [
+      "http://127.0.0.1:4351"
+    ],
+    "active_timeout_ms": 180000,
+    "pause_timeout_ms": 120000,
+    "lifetime_ms": 300000,
+    "viewport": {
+      "width": 1280,
+      "height": 800
+    }
+  }
+}

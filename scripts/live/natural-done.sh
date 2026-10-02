@@ -93,10 +93,12 @@ run_case() {
   start_fixture "manuvra-natural-done-$iteration-$stamp" "$evidence_root/$label-fixture" \
     "$evidence_root/$label-launch.json" "$evidence_root/$label-doctor.json"
   started=$(date +%s%3N)
+  local job="$evidence_root/$label-job.json"
+  fixture_job "$repo_root/tests/live/money/create-account-natural-done.json" "$job"
   set +e
   XDG_STATE_HOME="$state_root/$label" "$manuvra" run \
     --request-id "natural-done-$label-$stamp" \
-    --job "$repo_root/tests/live/money/create-account-natural-done.json" \
+    --job "$job" \
     --evidence "$evidence_root/$label" \
     >"$evidence_root/$label-stdout.json" 2>"$evidence_root/$label-stderr.txt"
   status=$?

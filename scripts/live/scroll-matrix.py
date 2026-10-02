@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Prove nested scroll journeys with live Jev and independent browser facts."""
 import argparse
-from collections import Counter
 import copy
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -12,7 +11,8 @@ import subprocess
 import sys
 import threading
 import time
-from browser_evidence import evidence, invoke, key_absent, settled, write_json
+from browser_evidence import (decision_facts, evidence, invoke, key_absent, settled,
+                              summarize_decisions, scroll_confidence_ok, write_json)
 
 ROOT = Path(__file__).resolve().parents[2]
 PORT = 4353
@@ -106,28 +106,6 @@ class FixtureHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
 
-def decision_facts(result, trace):
-    """First draws exclude the confidence-gate re-observation, not subsequent action beats."""
-    manifest = result.get('evidence',{}).get('manifest')
-    if not manifest:
-        return [], {}, [], False
-    try:
-        root = Path(manifest).parent
-        decisions = [json.loads(p.read_text()) for p in sorted((root/'decisions').glob('d_*.json'))]
-        observations = [e for e in trace if e.get('event') in ('observation','reobservation')
-                        and e.get('done') != 'satisfied']
-        return summarize_decisions(decisions, observations)
-    except (OSError, ValueError, KeyError):
-        return [], {}, [], False
-
-
-def summarize_decisions(decisions, observations):
-    counts = Counter(d['request']['state']['current_step']['goal'] for d in decisions)
-    first = [d['operation'] for d,e in zip(decisions,observations)
-             if e.get('event') == 'observation' and d['operation']['choice'] in ('SCROLL_UP','SCROLL_DOWN')]
-    return first,dict(counts),sorted({d['model'] for d in decisions}),len(observations)==len(decisions)
-
-
 def assess(journey, result, trace, intact, browser, first, calls, aligned=True):
     spec = JOURNEYS[journey]
     violations = []
@@ -186,8 +164,7 @@ def assess(journey, result, trace, intact, browser, first, calls, aligned=True):
 
 def budget_checks(rows):
     first = [d for r in rows for d in r.get('first_draw_scroll_choices',[])]
-    low = sum(d['confidence']<.70 for d in first)
-    return {'first_draw_scroll_confidence': bool(first) and low/len(first)<=.05,
+    return {'first_draw_scroll_confidence': scroll_confidence_ok(first),
             'wheel_counts':all(r.get('wheel_count',0)<=JOURNEYS[r['journey']]['wheels'] for r in rows),
             'model_calls': MODEL_CALL_CEILING is None or all(n<=MODEL_CALL_CEILING for r in rows
                           for n in r.get('model_calls_per_step',{}).values())}

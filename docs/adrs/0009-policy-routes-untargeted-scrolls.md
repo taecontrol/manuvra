@@ -15,6 +15,8 @@ Jev chooses an untargeted scroll direction. Policy owns the destination because 
 
 Judgment requests name the non-document region each direction would reach, using masked page text. They omit this fact when no direction routes to a region. Clipping determines the visible choices; it does not authorize an input. Revalidation must establish the same document, connected region, remaining movement, and a wheel point that reaches that region before dispatch.
 
+Requests that name a routed scroll region also offer `NO_CLICK_TARGET` and require the exact intended control or option. A real category picker exposed substitution of a visible option sharing only part of the requested name while the required option was still below the fold. Abstention keeps an absent target from being replaced with another item, while the operation question can choose another scroll. Existing container and hover reveal instructions remain in force. Requests with only a document route retain their shape.
+
 A region scroll records positions of its target, scroll ancestors, and document after bounded rendering-frame stabilization. No movement is an observed outcome that consumes the replay key. An uncertain scroll re-observes with a fresh attempt key, still bounded by the existing fallback budget. Other uncertain inputs retain escalation. Document scrolling keeps its existing dispatch and evidence contract.
 
 ## Consequences

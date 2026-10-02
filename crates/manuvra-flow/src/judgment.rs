@@ -100,8 +100,8 @@ pub fn request(
                 "TYPE_TEXT":"Replace a visible editable field only when this step's goal explicitly asks to fill, enter, or type a caller-provided value and code facts show the field is not already equal to that value. Never choose this for an open, choose, confirm, use, or submit goal.",
                 "SELECT":"Choose a caller-provided value from a visible native select whose observed options contain it.",
                 "PRESS_KEY":"Press one supported key at the currently focused element when the goal explicitly asks for a key press. If the goal starts with Press, keep choosing PRESS_KEY for each key needed to complete it, even when a click could produce the same effect.",
-                "SCROLL_UP":"Scroll up to reveal the required target when it is earlier than the visible items in a scroll region. When the required option precedes the visible options and code facts allow scrolling up, choose SCROLL_UP before clicking an unrelated visible option or reopening the picker.",
-                "SCROLL_DOWN":"Scroll down when the needed target is not visible yet and may lie further down, in the page or in an open dialog, popup, or list that scrolls.",
+                "SCROLL_UP":"Scroll upward only when the needed target is outside the visible viewport above.",
+                "SCROLL_DOWN":"Scroll downward only when the needed target is outside the visible viewport below.",
                 "WAIT":"Wait briefly only because the page is visibly still updating.",
                 "BLOCKED":"No offered operation can safely progress this step."
             }},
@@ -113,6 +113,7 @@ pub fn request(
         }
     });
     let regions = routed_scroll_regions(observation, values);
+    let has_scroll_regions = !regions.is_empty();
     if !regions.is_empty() {
         request["state"]["code_facts"]["scroll_regions"] = json!(regions);
     }
@@ -136,7 +137,37 @@ pub fn request(
             "Click a control or option listed as a click target that directly advances this step, including targets marked revealed_by_hover, which code reveals before clicking. Use this for goals that say open, choose, confirm, use, or submit."
         );
     }
+    describe_region_operations(&mut request, has_scroll_regions);
     request
+}
+
+fn describe_region_operations(request: &mut Value, has_scroll_regions: bool) {
+    if !has_scroll_regions {
+        return;
+    }
+    request["questions"]["operation"]["criteria"]["SCROLL_UP"] = json!(
+        "Scroll up to reveal the required target when it is earlier than the visible items in a scroll region. When the required option precedes the visible options and code facts allow scrolling up, choose SCROLL_UP before clicking an unrelated visible option or reopening the picker."
+    );
+    request["questions"]["operation"]["criteria"]["SCROLL_DOWN"] = json!(
+        "Scroll down when the needed target is not visible yet and may lie further down, in the page or in an open dialog, popup, or list that scrolls."
+    );
+    request["questions"]["click_target"]["criteria"]["NO_CLICK_TARGET"] = json!(
+        "The exact control or option required by this step is not listed. Never substitute another item with a similar name."
+    );
+    let rules = request["questions"]["click_target"]["instructions"]["rules"]
+        .as_str()
+        .unwrap_or_default();
+    request["questions"]["click_target"]["instructions"]["rules"] = json!(format!(
+        "{rules} If the exact required control or option is not listed, choose NO_CLICK_TARGET. Never substitute a different item that shares only part of its name."
+    ));
+    let mut click_rule = "Click a listed control only when the exact required target is visible. If the required target is absent, CLICK cannot advance the step: choose SCROLL_UP or SCROLL_DOWN to reveal it. A successful previous scroll is progress, and more scrolls can be needed before the exact target appears. Never substitute a different option whose name resembles the requested one.".to_owned();
+    if request["questions"]["operation"]["criteria"]["CLICK"]
+        .as_str()
+        .is_some_and(|rule| rule.contains("revealed_by_hover"))
+    {
+        click_rule.push_str(" Treat targets marked revealed_by_hover as visible offered targets: code reveals them before clicking.");
+    }
+    request["questions"]["operation"]["criteria"]["CLICK"] = json!(click_rule);
 }
 
 fn routed_scroll_regions(observation: &Observation, values: &Values<'_>) -> Vec<Value> {
@@ -625,6 +656,11 @@ mod tests {
                 .get("scroll_regions")
                 .is_none()
         );
+        assert!(
+            request(&job.steps[0], &page, &[], &values)["questions"]["click_target"]["criteria"]
+                .get("NO_CLICK_TARGET")
+                .is_none()
+        );
         page.overlay = None;
         page.scroll_regions[0].can_scroll_up = true;
         page.scroll_regions[0].can_scroll_down = true;
@@ -636,6 +672,31 @@ mod tests {
         );
         page.scroll_regions_truncated = true;
         assert!(routed_scroll_regions(&page, &values).is_empty());
+    }
+
+    #[test]
+    fn scroll_abstention_keeps_hover_reveals_and_target_context() {
+        let job = golden_job();
+        let page = with_scroll_region(with_hover_regions(golden_observation()));
+        let actual = request(&job.steps[0], &page, &[], &Values::new(&job));
+        let rules = actual["questions"]["click_target"]["instructions"]["rules"]
+            .as_str()
+            .unwrap();
+        assert!(rules.contains("revealed_by_hover"));
+        assert!(rules.contains("container"));
+        assert!(rules.contains("choose NO_CLICK_TARGET"));
+        assert!(
+            actual["questions"]["operation"]["criteria"]["CLICK"]
+                .as_str()
+                .unwrap()
+                .contains("revealed_by_hover")
+        );
+        let targets = &actual["questions"]["click_target"]["criteria"];
+        assert!(targets.get("NO_CLICK_TARGET").is_some());
+        assert!(targets.as_object().unwrap().values().any(|target| {
+            target["revealed_by_hover"] == true && target["container"] == "<value:account>"
+        }));
+        assert!(!actual.to_string().contains("Savings 4417"));
     }
 
     #[test]
