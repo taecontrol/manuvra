@@ -143,6 +143,7 @@ const COVERAGE_PROBE: &str = r#"(() => {
 const START_TIMEOUT: Duration = Duration::from_secs(15);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const QUIET_WINDOW: Duration = Duration::from_millis(150);
+const PROFILE_REMOVAL_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub struct BrowserConfig {
@@ -337,8 +338,11 @@ impl OwnedBrowser {
             self.lifecycle = Lifecycle::Terminated;
         }
         if self.lifecycle == Lifecycle::Terminated {
-            fs::remove_dir_all(&self.profile)
-                .map_err(|error| BrowserError::Control(safe_error(&error.to_string())))?;
+            retry_profile_removal(
+                || fs::remove_dir_all(&self.profile),
+                Instant::now() + PROFILE_REMOVAL_TIMEOUT,
+            )
+            .map_err(|error| BrowserError::Control(safe_error(&error.to_string())))?;
             self.lifecycle = Lifecycle::Closed;
         }
         Ok(())
@@ -350,6 +354,13 @@ enum Lifecycle {
     Running,
     Terminated,
     Closed,
+}
+
+fn retry_profile_removal(
+    mut remove: impl FnMut() -> std::io::Result<()>,
+    _deadline: Instant,
+) -> std::io::Result<()> {
+    remove()
 }
 
 fn require_committed_navigation(navigated: &Value) -> Result<(), BrowserError> {
@@ -1290,6 +1301,53 @@ mod tests {
             serde_json::from_str::<Vec<String>>(argument).unwrap(),
             values,
             "the argument is a JSON array literal holding exactly the values"
+        );
+    }
+
+    #[test]
+    fn profile_removal_retries_only_concurrent_directory_writes_within_its_deadline() {
+        for (errors, expected_calls, expected_error) in [
+            (
+                vec![Some(libc::ENOTEMPTY), Some(libc::ENOTEMPTY), None],
+                3,
+                None,
+            ),
+            (vec![None], 1, None),
+            (vec![Some(libc::EACCES)], 1, Some(libc::EACCES)),
+            (vec![Some(libc::ENOENT)], 1, Some(libc::ENOENT)),
+            (
+                vec![Some(libc::ENOTEMPTY), Some(libc::EACCES)],
+                2,
+                Some(libc::EACCES),
+            ),
+        ] {
+            let mut calls = 0;
+            let result = retry_profile_removal(
+                || {
+                    let error = errors[calls];
+                    calls += 1;
+                    error.map_or(Ok(()), |code| Err(std::io::Error::from_raw_os_error(code)))
+                },
+                Instant::now() + PROFILE_REMOVAL_TIMEOUT,
+            );
+            assert_eq!(
+                result.err().and_then(|error| error.raw_os_error()),
+                expected_error
+            );
+            assert_eq!(calls, expected_calls);
+        }
+        let mut calls = 0;
+        let result = retry_profile_removal(
+            || {
+                calls += 1;
+                Err(std::io::Error::from_raw_os_error(libc::ENOTEMPTY))
+            },
+            Instant::now(),
+        );
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOTEMPTY));
+        assert_eq!(
+            calls, 1,
+            "a continuing writer cannot make cleanup unbounded"
         );
     }
 
