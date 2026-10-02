@@ -1418,7 +1418,9 @@ fn caller_loss_does_not_kill_host_and_active_request_ids_attach_without_restart(
 fn identical_active_paused_request_attaches_before_terminal_evidence_recovery() {
     let temp = hosted_temp();
     let mut job = fault_window_job();
-    job["options"]["pause_timeout_ms"] = json!(5_000);
+    // Allow the attach and stale-peer probes to finish before the synthetic host expires.
+    job["options"]["pause_timeout_ms"] = json!(30_000);
+    job["options"]["lifetime_ms"] = json!(30_000);
     let job_path = fixture(&temp, &job);
     let first = Command::new(binary())
         .args([
