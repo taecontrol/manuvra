@@ -167,6 +167,7 @@ def report(root):
     counts={str(height):sum(r['classification']=='autonomous' and r['height']==height for r in rows) for height in HEIGHTS}
     checks={'each_viewport_at_least_4':all(n>=4 for n in counts.values()),
             'all_runs_recorded':len(rows)==len(HEIGHTS)*ITERATIONS,
+            'evidence_complete':all(r.get('evidence_complete') is True for r in rows),
             'first_draw_scroll_confidence':scroll_confidence_ok([d for r in rows for d in r['first_draw_scroll_choices']]),
             'zero_prohibited':all(r['classification']!='prohibited' for r in rows),
             'cleanup_confirmed':all((Path(r['case'])/'cleanup-confirmed').is_file() for r in rows),

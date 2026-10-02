@@ -252,6 +252,7 @@ def report(matrix,binary,rows,key):
     counts = {j:sum(r['classification']=='autonomous' for r in rows if r['journey']==j) for j in JOURNEYS}
     checks = dict(budget_checks(rows),each_journey_at_least_4=all(n>=4 for n in counts.values()),
                   all_runs_recorded=len(rows)==len(JOURNEYS)*ITERATIONS,
+                  evidence_complete=all(r.get('evidence_complete') is True for r in rows),
                   zero_prohibited=all(r['classification']!='prohibited' for r in rows),
                   cleanup_confirmed=all(r.get('cleanup_confirmed',True) for r in rows),
                   key_absent_from_evidence=key_absent(matrix,key))

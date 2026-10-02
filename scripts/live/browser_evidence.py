@@ -39,16 +39,20 @@ def evidence(result):
         return [], False
     try:
         manifest = json.loads(Path(manifest_path).read_text())
-        complete = manifest.get("complete") is True
-        for artifact in manifest.get("artifacts", []):
-            path = Path(artifact["path"])
-            complete &= artifact.get("complete") is True
-            complete &= hashlib.sha256(path.read_bytes()).hexdigest() == artifact["digest"]
         trace = Path(manifest_path).parent / "trace.jsonl"
         events = [json.loads(line) for line in trace.read_text().splitlines()]
-        return events, complete
     except (OSError, ValueError, KeyError):
         return [], False
+    complete = manifest.get("complete") is True
+    trace_listed = False
+    for artifact in manifest.get("artifacts", []):
+        try:
+            trace_listed |= artifact.get("role") == "trace" and Path(artifact["path"]) == trace
+            complete &= artifact.get("complete") is True
+            complete &= hashlib.sha256(Path(artifact["path"]).read_bytes()).hexdigest() == artifact["digest"]
+        except (OSError, ValueError, KeyError):
+            complete = False
+    return events, complete and trace_listed
 
 
 def key_absent(root, key):

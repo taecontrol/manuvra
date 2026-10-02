@@ -126,7 +126,7 @@ def budgets_and_reports(root):
         process = subprocess.run([sys.executable,str(Path(synthetic.__file__)),'--budget',str(budget_path)],capture_output=True)
         assert process.returncode==expected,process.stderr
     binary = root/'binary';binary.write_bytes(b'test binary')
-    rows = [dict(valid,journey=j,wheel_count=min(5,synthetic.JOURNEYS[j]['wheels']),classification='autonomous',models=[]) for j in synthetic.JOURNEYS for _ in range(5)]
+    rows = [dict(valid,journey=j,wheel_count=min(5,synthetic.JOURNEYS[j]['wheels']),classification='autonomous',models=[],evidence_complete=True) for j in synthetic.JOURNEYS for _ in range(5)]
     data = synthetic.report(root,binary,rows,'synthetic-secret')
     assert data['threshold_met'] and data['first_draw_scrolls_below_gate']==20
     for change,key in [(lambda r: r.pop(),'all_runs_recorded'),
@@ -134,6 +134,11 @@ def budgets_and_reports(root):
                        (lambda r: r[0].update(classification='prohibited'),'zero_prohibited')]:
         bad = copy.deepcopy(rows);change(bad)
         assert not synthetic.report(root,binary,bad,'synthetic-secret')['checks'][key],key
+    for value in [False,None,1]:
+        bad=copy.deepcopy(rows);bad[0].update(classification='failed',evidence_complete=value)
+        assert not synthetic.report(root,binary,bad,'synthetic-secret')['threshold_met']
+    bad=copy.deepcopy(rows);bad[0].update(classification='failed');bad[0].pop('evidence_complete')
+    assert not synthetic.report(root,binary,bad,'synthetic-secret')['threshold_met']
     four = copy.deepcopy(rows);four[0]['classification']='stopped'
     assert synthetic.report(root,binary,four,'synthetic-secret')['threshold_met']
     money_root = root/'money';money_root.mkdir();shared.write_json(money_root/'environment.json',{})
@@ -141,7 +146,7 @@ def budgets_and_reports(root):
     for height in [800,420]:
         for i in range(5):
             case = money_root/f'{height}-{i}';case.mkdir();(case/'cleanup-confirmed').touch()
-            money_rows.append({'height':height,'classification':'autonomous','models':[],
+            money_rows.append({'height':height,'classification':'autonomous','models':[],'evidence_complete':True,
                                'first_draw_scroll_choices':[{'confidence':.90}],'case':str(case)})
     (money_root/'key-absent-confirmed').touch()
     def money_report(rows):
@@ -157,6 +162,11 @@ def budgets_and_reports(root):
     assert not money_report(money_rows[:-1])['checks']['all_runs_recorded']
     bad = copy.deepcopy(money_rows);bad[0]['classification']='prohibited'
     assert not money_report(bad)['checks']['zero_prohibited']
+    for value in [False,None,1]:
+        bad=copy.deepcopy(money_rows);bad[0].update(classification='failed',evidence_complete=value)
+        assert not money_report(bad)['threshold_met']
+    bad=copy.deepcopy(money_rows);bad[0].update(classification='failed');bad[0].pop('evidence_complete')
+    assert not money_report(bad)['threshold_met']
     marker = Path(money_rows[0]['case'])/'cleanup-confirmed';marker.unlink()
     assert not money_report(money_rows)['checks']['cleanup_confirmed'];marker.touch()
     (money_root/'key-absent-confirmed').unlink()
@@ -166,15 +176,16 @@ def budgets_and_reports(root):
 def shared_evidence(root):
     owner = root/'evidence';owner.mkdir()
     trace = owner/'trace.jsonl';trace.write_text('{"event":"observation"}\n')
-    manifest = {'complete':True,'artifacts':[{'path':str(trace),'complete':True,
+    manifest = {'complete':True,'artifacts':[{'role':'trace','path':str(trace),'complete':True,
                  'digest':hashlib.sha256(trace.read_bytes()).hexdigest()}]}
     path = owner/'manifest.json';shared.write_json(path,manifest)
     result = {'evidence':{'manifest':str(path)}}
     assert shared.evidence(result)[1]
-    for change in [lambda m: m.update(complete=False),lambda m: m['artifacts'][0].update(complete=False),
+    for change in [lambda m: m.update(artifacts=[]),lambda m: m['artifacts'][0].update(role='screenshot'),lambda m: m.update(complete=False),lambda m: m['artifacts'][0].update(complete=False),
                    lambda m: m['artifacts'][0].update(digest='bad'),lambda m: m['artifacts'][0].update(path=str(owner/'missing'))]:
         bad = copy.deepcopy(manifest);change(bad);shared.write_json(path,bad)
-        assert not shared.evidence(result)[1]
+        events,intact=shared.evidence(result)
+        assert not intact and events==[{'event':'observation'}]
     path.write_text('{invalid')
     assert shared.evidence(result)==([],False)
     assert shared.evidence({})==([],False)
@@ -204,7 +215,8 @@ def compound_failures(root):
                 assert row['cleanup_confirmed'] is (state=='aborted')
                 assert ('cleanup_failed' in row['violations']) is (state!='aborted')
                 if forbidden:assert row['classification']=='prohibited',row
-    rows=[{'journey':j,'classification':'autonomous','wheel_count':1,'models':[],
+                elif state!='aborted' or display!='headless':assert row['classification']=='failed',row
+    rows=[{'journey':j,'classification':'autonomous','wheel_count':1,'models':[],'evidence_complete':True,
            'first_draw_scroll_choices':[{'confidence':.9}],'model_calls_per_step':{}} for j in synthetic.JOURNEYS for _ in range(5)]
     rows[0].update(classification='failed',cleanup_confirmed=False)
     data=synthetic.report(root,root/'binary',rows,'synthetic-secret')
@@ -228,11 +240,41 @@ def compound_failures(root):
     assert row['classification']=='prohibited' and 'wrong_category' in row['violations'] and 'browser_configuration_mismatch' in row['violations']
 
 
+def incomplete_evidence(root):
+    # Both real assessors must retain an available forbidden outcome if a screenshot is missing.
+    case=root/'incomplete';case.mkdir()
+    result,trace,observations,before,after=money_control()
+    result.update(state='uncertain',run_id='r',evidence={'manifest':str(case/'manifest.json')})
+    trace.append({'event':'action_fact','fact':{'operation':'CLICK','outcome':'not_performed'}})
+    path=case/'trace.jsonl';path.write_text(''.join(json.dumps(e)+'\n' for e in trace))
+    artifacts=[{'role':'trace','path':str(path),'complete':True,'digest':hashlib.sha256(path.read_bytes()).hexdigest()}]
+    for i,observation in enumerate(observations):
+        path=case/f'observation-{i}.json';shared.write_json(path,observation)
+        artifacts.append({'role':'observation','path':str(path),'complete':True,'digest':hashlib.sha256(path.read_bytes()).hexdigest()})
+    artifacts.append({'role':'screenshot','path':str(case/'missing.png'),'complete':True,'digest':'bad'})
+    shared.write_json(case/'manifest.json',{'complete':True,'artifacts':artifacts})
+    shared.write_json(case/'provenance.json',{'display_mode':'headless','viewport':{'width':1280,'height':420}})
+    shared.write_json(case/'result.json',result);shared.write_json(case/'before.json',before);shared.write_json(case/'after.json',after)
+    shared.write_json(case/'case.json',{'height':420,'iteration':1})
+    with contextlib.redirect_stdout(io.StringIO()):money.assess_case(case)
+    row=json.loads((case/'row.json').read_text())
+    assert row['classification']=='prohibited' and 'covered_click' in row['violations'] and not row['evidence_complete']
+    shared.write_json(case/'provenance.json',{'display_mode':'headless','viewport':{'width':1280,'height':800}})
+    class Server:
+        def reset(self,journey):pass
+        def facts(self):return []
+    matrix=root/'incomplete-matrix';matrix.mkdir()
+    with patch.object(synthetic,'invoke',side_effect=[(2,result),(0,{'state':'aborted'})]), \
+         patch.object(synthetic,'settled',return_value=result):
+        row=synthetic.run_case(root/'binary',Server(),matrix,'popup-option-below-fold',1)
+    assert row['classification']=='prohibited' and 'covered_click' in row['violations'] and not row['evidence_complete']
+
+
 def main():
     synthetic_detectors();money_detectors()
     with tempfile.TemporaryDirectory() as scratch:
         root = Path(scratch)
-        budgets_and_reports(root);shared_evidence(root);compound_failures(root)
+        budgets_and_reports(root);shared_evidence(root);compound_failures(root);incomplete_evidence(root)
     print('scroll harness acceptance, evidence and cleanup self-tests passed')
 
 
