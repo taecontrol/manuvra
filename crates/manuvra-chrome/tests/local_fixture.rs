@@ -3872,6 +3872,88 @@ fn rotated_viewport_clipping_keeps_each_control_column_overlapping() {
 
 #[test]
 #[ignore = "requires the local Chromium executable"]
+fn rotated_scroll_preserves_the_hover_reveal_interval() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let mut browser = launch_headless();
+    // The transport also proves overlap over a longer distance. Flow owns the
+    // Run's fallback ceiling; this does not enlarge it.
+    for (top, wheel_limit) in [(20, 8), (200, 48)] {
+        let body = format!(
+            r#"<!doctype html><style>body{{margin:0;overflow:hidden}}#region{{position:absolute;left:-100px;top:100px;width:300px;height:300px;overflow:auto;transform:rotate(45deg);transform-origin:top left;scrollbar-width:none}}#row{{position:absolute;left:140px;top:{top}px;width:80px;height:20px}}#target{{position:absolute;left:5px;top:0;width:10px;height:10px;opacity:0}}#row:hover #target{{opacity:1}}</style><div id="region" aria-label="Diagonal"><div style="height:1000px"></div><div id="row" role="listitem" aria-label="Goal row"><button id="target" onclick="result.textContent='Goal selected'">Goal</button></div></div><p id="result">Not selected</p>"#
+        );
+        let server = FixtureServer::with_body(Box::leak(body.into_boxed_str()));
+        browser.navigate(&server.url()).unwrap();
+        let mut clicked = false;
+        for ordinal in 1..=wheel_limit + 1 {
+            let observed = browser.observe().unwrap();
+            if let Some(region) = observed
+                .hover_regions
+                .iter()
+                .find(|r| r.reveals_on_hover.iter().any(|name| name == "Goal"))
+            {
+                let hover = browser.perform(
+                    PreparedInput {
+                        scroll_region: None,
+                        document_id: observed.document_id.clone(),
+                        node_id: region.node_id,
+                        operation: PreparedOperation::Hover,
+                        text: None,
+                        previous_text: None,
+                        option_node_id: None,
+                        combobox: false,
+                        action_sequence: 2 * ordinal,
+                        focus_anchor: None,
+                    },
+                    &InputCancellation::default(),
+                );
+                match hover {
+                    Ok(_) => {
+                        let revealed = browser.observe().unwrap();
+                        browser
+                            .perform(
+                                prepared(
+                                    &revealed,
+                                    "Goal",
+                                    PreparedOperation::Click,
+                                    None,
+                                    None,
+                                    2 * ordinal + 1,
+                                ),
+                                &InputCancellation::default(),
+                            )
+                            .unwrap();
+                        clicked = true;
+                        break;
+                    }
+                    Err(PerformError::Rejected(reason)) if reason == "covered" => {}
+                    other => panic!("unexpected hover outcome: {other:?}"),
+                }
+            }
+            if ordinal > wheel_limit || !observed.scroll_regions[0].can_scroll_down {
+                break;
+            }
+            let fact = browser
+                .perform(
+                    prepared_scroll(&observed, false, 2 * ordinal + 1),
+                    &InputCancellation::default(),
+                )
+                .unwrap();
+            assert_eq!(fact.scroll_readback.last().unwrap().after, 0.0);
+        }
+        assert!(clicked, "hover reveal interval was skipped at top {top}");
+        assert!(
+            browser
+                .observe()
+                .unwrap()
+                .visible_text
+                .contains("Goal selected")
+        );
+    }
+    browser.close().unwrap();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
 fn boxless_overflow_wrappers_keep_painted_controls_and_text() {
     let _serial = REAL_BROWSER.lock().unwrap();
     let mut browser = launch_headless();

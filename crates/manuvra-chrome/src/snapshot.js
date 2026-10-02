@@ -434,7 +434,9 @@
     for(let i=0;i<roots.length;i++) for(const node of roots[i].querySelectorAll('*')) {
       if(node.shadowRoot)roots.push(node.shadowRoot);
       const lineage=ancestors(node);
-      if(!node.matches(CONTROL) || !lineage.includes(region) || !node.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}) || lineage.some(n=>n.matches?.('[aria-hidden="true"],[inert]')))continue;
+      if(!node.matches(CONTROL) || !lineage.includes(region) || !node.checkVisibility({checkVisibilityCSS:true}) || lineage.some(n=>n.matches?.('[aria-hidden="true"],[inert]')))continue;
+      // A supported CSS hover reveal can make a below-fold control actionable.
+      if(!node.checkVisibility({checkOpacity:true}) && !(hoverRevealed(node) && (revealingRegion(node) || unlabeledRegion(node))))continue;
       const rect=node.getBoundingClientRect(),x=inverse.transformPoint({x:rect.x+rect.width/2,y:rect.y+rect.height/2}).x;
       const span=polygonColumnHeight(polygon,x);
       if(span>0)height=Math.min(height,span);
