@@ -7,6 +7,8 @@
   };
   for (const [id, element] of cache.nodes) if (!element.isConnected) cache.nodes.delete(id);
 
+  // Assigned nodes are painted through their slot, not through their light-DOM parent.
+  const up = n => n.assignedSlot || n.parentElement || n.getRootNode?.()?.host || null;
   const gaps = [], contexts = [], seenRoots = new Set();
   let unverifiableFrameGeometry = false;
   // A frame's document starts at its content box, inside the border and padding.
@@ -56,7 +58,7 @@
   // Keep client dimensions and DOMRects in explicit coordinate spaces.
   const elementGeometry = element => {
     let matrix = new DOMMatrix(), zoom = 1;
-    for (let node=element;node;node=node.parentElement || node.getRootNode()?.host) {
+    for (let node=element;node;node=up(node)) {
       const css=node.ownerDocument.defaultView.getComputedStyle(node);
       const transform=new DOMMatrix(css.transform==='none'?undefined:css.transform);
       // A matrix3d used for a flat scale animation is still an affine X/Y map.
@@ -150,8 +152,7 @@
     const values = []; let current = element;
     while (current) {
       values.push(current);
-      const root = current.getRootNode?.();
-      current = current.parentElement || root?.host || null;
+      current = up(current);
     }
     return values;
   };
@@ -165,7 +166,7 @@
     while (current) {
       const style = viewOfElement(current).getComputedStyle(current);
       const positioned = style.position === 'absolute' || style.position === 'fixed';
-      const parent = current.parentElement || current.getRootNode()?.host;
+      const parent = up(current);
       let next = parent;
       if (positioned) next = current.offsetParent;
       if (clipSelf) {next = current; clipSelf = false;}
@@ -175,7 +176,9 @@
       const rootStyle = viewOfElement(next).getComputedStyle(next.ownerDocument.documentElement);
       const viewportOverflow = next === next.ownerDocument.documentElement || (next === next.ownerDocument.body && rootStyle.overflowX === 'visible' && rootStyle.overflowY === 'visible');
       if (viewportOverflow) {current = next; continue;}
-      if(css.overflowX !== 'visible' || css.overflowY !== 'visible')
+      // Overflow does not create a clipping box on contents or non-replaced inline elements.
+      const boxless = css.display === 'contents' || css.display === 'inline' && next instanceof viewOfElement(next).HTMLElement && !next.matches('img,iframe,frame,object,embed,video,audio,canvas,input,textarea,select,button') && next.clientWidth === 0 && next.clientHeight === 0;
+      if(!boxless && (css.overflowX !== 'visible' || css.overflowY !== 'visible'))
         bounds.clips.push({box:clientBox(next),clipX:css.overflowX!=='visible',clipY:css.overflowY!=='visible'});
       current = next;
     }
@@ -228,7 +231,6 @@
   const dialogs = dialogRecords.map(record => record.title);
   const selector = 'a[href],button,input:not([type="hidden"]),textarea,select,summary,[contenteditable="true"],[role="button"],[role="link"],[role="checkbox"],[role="radio"],[role="switch"],[role="tab"],[role="menuitem"],[role="menuitemradio"],[role="option"],[role="combobox"],[role="textbox"],[role="searchbox"],[role="spinbutton"]';
   const CONTROL = selector;
-  const up = (n) => n.parentElement || n.getRootNode?.()?.host || null;
   const isDialog = (n) => n.matches?.('dialog,[role="dialog"],[role="alertdialog"]');
   const nonLinkControl = (n) => n.matches?.(CONTROL) && !n.matches('a[href],[role="link"]');
   // Painted text segments of `root`, excluding text inside non-link controls and editable fields.
@@ -390,23 +392,50 @@
 
   const scrollEligible = e => e?.nodeType === 1 && e !== e.ownerDocument.scrollingElement && !e.matches('body,html,input,textarea,select,[contenteditable="true"]') && !e.isContentEditable && ['auto','scroll'].includes(viewOf(e).getComputedStyle(e).overflowY) && e.scrollHeight > e.clientHeight;
   const scrollContexts = new Map();
+  // A diagonal viewport cut has different vertical spans at different columns.
+  // Overlap where a DOM-present control can be revealed, rather than just where
+  // the polygon is tallest. Rectangular regions keep their full visible height.
+  const controlColumnHeight = (region, polygon, inverse, height) => {
+    const roots=[region.ownerDocument];
+    for(let i=0;i<roots.length;i++) for(const node of roots[i].querySelectorAll('*')) {
+      if(node.shadowRoot)roots.push(node.shadowRoot);
+      if(!node.matches(CONTROL) || !ancestors(node).includes(region) || !node.checkVisibility({checkVisibilityCSS:true}))continue;
+      const rect=node.getBoundingClientRect(),x=inverse.transformPoint({x:rect.x+rect.width/2,y:rect.y+rect.height/2}).x;
+      const ys=[];
+      for(let j=0;j<polygon.length;j++) {
+        const a=polygon[j],b=polygon[(j+1)%polygon.length];
+        if(x<Math.min(a.x,b.x) || x>Math.max(a.x,b.x))continue;
+        if(a.x===b.x)ys.push(a.y,b.y);
+        else ys.push(a.y+(b.y-a.y)*(x-a.x)/(b.x-a.x));
+      }
+      const span=Math.max(...ys)-Math.min(...ys);
+      if(span>0)height=Math.min(height,span);
+    }
+    return height;
+  };
   const scrollVisibleRect = element => {
     if (!scrollContexts.has(element.getRootNode())) return null;
     const context = frameContext(element.getRootNode()); if (!context) return null;
     const box=clientBox(element),b=clippingRect(element,context);
     const points=clippedPolygon(rectPoints({x:0,y:0,width:box.width,height:box.height}).map(p=>box.matrix.transformPoint(p)),b);
-    const rect=pointBounds(points.map(p=>context.matrix.transformPoint(p))),local=pointBounds(points.map(p=>box.matrix.inverse().transformPoint(p)));
+    const inverse=box.matrix.inverse(),polygon=points.map(p=>inverse.transformPoint(p));
+    const rect=pointBounds(points.map(p=>context.matrix.transformPoint(p))),local=pointBounds(polygon);
+    const height=controlColumnHeight(element,polygon,inverse,local.height);
     // Transforms change geometry; CSS zoom also changes the units of a delivered wheel.
-    return {...rect,wheel_height:local.height,wheel_scale:context.zoom*box.zoom};
+    return {...rect,wheel_height:height,wheel_scale:context.zoom*box.zoom};
   };
   for (const context of contexts) scrollContexts.set(context.root,context);
   cache.scrollConnected = element => Boolean(element?.isConnected && frameContext(element.getRootNode()));
   cache.scrollEligible = scrollEligible; cache.scrollVisibleRect = scrollVisibleRect;
-  cache.scrollHit = hitAt;
+  cache.scrollHit = hitAt; cache.scrollParent = up;
   const scrollNodes = [];
   for (const context of contexts) for (const element of context.root.querySelectorAll('*')) {
     if (scrollEligible(element) && scrollVisibleRect(element) && element.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}) && inViewport(element,context) && !ancestors(element).some(n=>n.matches?.('[aria-hidden="true"],[inert]'))) scrollNodes.push(element);
   }
+  // DOM discovery order differs from painted order for assigned slot content.
+  const scrollSet=new Set(scrollNodes);
+  const scrollDepth=new Map(scrollNodes.map(node=>[node,ancestors(node).filter(parent=>scrollSet.has(parent)).length]));
+  scrollNodes.sort((a,b)=>scrollDepth.get(a)-scrollDepth.get(b));
   const labelledName = element => {
     const ids = (element.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean);
     return ids.map(id=>name(referencedById(element,id))).filter(Boolean).join(' ') || element.getAttribute('aria-label') || element.getAttribute('title') || '';
@@ -473,7 +502,7 @@
     const activeDescendant = activeId ? {id:activeId,role:descendant?role(descendant):'',name:descendant?name(descendant):'',selected:descendant && 'selected' in descendant ? Boolean(descendant.selected) : descendantBool(descendant,'aria-selected'),checked:descendant && 'checked' in descendant ? Boolean(descendant.checked) : descendantBool(descendant,'aria-checked')} : null;
     const anchorRole = indexed?.role || role(active);
     const posinset = Number.parseInt(active.getAttribute('aria-posinset'), 10);
-    const container = active.parentElement?.closest('[role="tree"],[role="treegrid"],[role="grid"],[role="listbox"],[role="menu"],[role="menubar"],[role="tablist"],[role="radiogroup"],[role="toolbar"]') || active.parentElement;
+    const container = ancestors(active).slice(1).find(node=>node.matches('[role="tree"],[role="treegrid"],[role="grid"],[role="listbox"],[role="menu"],[role="menubar"],[role="tablist"],[role="radiogroup"],[role="toolbar"]')) || up(active);
     const siblingIndex = container ? [...container.querySelectorAll('*')].filter(element => role(element) === anchorRole).indexOf(active) + 1 : 0;
     const position = indexed ? null : posinset > 0 ? posinset : siblingIndex || null;
     focusAnchor = {active_descendant:activeDescendant,expanded:boolAttr('aria-expanded'),selected:'selected' in active ? Boolean(active.selected) : boolAttr('aria-selected'),checked:'checked' in active ? Boolean(active.checked) : boolAttr('aria-checked'),position,node_id:nodeId(active),context:context?.context || 'main',role:anchorRole,name:indexed?.name || (active === containingDialog ? dialog : ariaName),in_dialog:indexed?.in_dialog || dialog,container:containerOf(active),covered:!closed && !crossOrigin,surface:crossOrigin?'cross_origin_frame':closed?'closed_shadow_root':active.tagName==='CANVAS'?'canvas':null};

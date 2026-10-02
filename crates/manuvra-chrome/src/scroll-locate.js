@@ -9,12 +9,12 @@
   for (const fy of [0.5,0.1,0.9,0.25,0.75]) for (const fx of [0.5,0.1,0.9]) {
     const x = r.x + r.width*fx, y = r.y + r.height*fy;
     let hit = cache.scrollHit(region,x,y);
-    while (hit && !movable(hit)) hit = hit.parentElement || hit.getRootNode()?.host;
+    while (hit && !movable(hit)) hit = cache.scrollParent(hit);
     if (hit === region) {
       const positions=[];let current=region;
       while (current) {
         if (cache.scrollEligible(current)) positions.push({node:current,identity:{name:cache.scrollName(current),overlay:cache.scrollOverlay(current),document:false},before:current.scrollTop});
-        current=current.parentElement || current.getRootNode()?.host;
+        current=cache.scrollParent(current);
       }
       positions.push({node:null,identity:{overlay:null,document:true},before:scrollY});
       cache.scrollReadback={documentId,positions};

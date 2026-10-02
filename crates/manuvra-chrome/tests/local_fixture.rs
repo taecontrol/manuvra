@@ -2466,6 +2466,44 @@ fn clipping_respects_containing_blocks_and_text_intersection() {
     assert!(!has_line(&observed, "Clipped"));
     assert!(!observed.visible_text.contains("Invisible text"));
     assert!(!observed.covered_text.contains("Invisible text"));
+
+    for (page, absent, retained) in [
+        (
+            r#"<!doctype html><style>body{margin:0;overflow:hidden}button,span{position:fixed;width:100px;height:20px}</style><button style="left:-200px;top:40px">LEFT ROOT GOAL</button><button style="left:40px;top:-100px">ABOVE ROOT GOAL</button><span style="left:-200px;top:40px">LEFT ROOT TEXT</span><span style="left:40px;top:-100px">ABOVE ROOT TEXT</span>"#,
+            "ROOT TEXT",
+            None,
+        ),
+        (
+            r#"<!doctype html><style>body{margin:0}#clip{width:80px;height:20px;overflow:hidden;font:12px monospace;line-height:20px}</style><div id="clip">FIRST SECOND THIRD FOURTH FIFTH</div>"#,
+            "",
+            Some("FIRST SECOND THIRD FOURTH FIFTH"),
+        ),
+        (
+            r#"<!doctype html><style>body{margin:0}#clip{position:relative;width:300px;height:100px;overflow:hidden}span{position:absolute;left:20px;top:100px;white-space:nowrap;font:12px monospace;line-height:12px}</style><div id="clip"><span id="text">TANGENT TEXT</span></div><script>let range=document.createRange();range.selectNodeContents(text);let measuredTop=range.getBoundingClientRect().top;let edge=clip.getBoundingClientRect().bottom;text.style.top=(100+edge-measuredTop)+'px';const out=document.createElement('output');out.textContent='Range edges: '+range.getBoundingClientRect().top+' / '+edge;document.body.append(out);</script>"#,
+            "TANGENT TEXT",
+            Some("Range edges: 100 / 100"),
+        ),
+    ] {
+        let server = FixtureServer::with_body(page);
+        browser.navigate(&server.url()).unwrap();
+        let observed = browser.observe().unwrap();
+        assert!(observed.elements.is_empty());
+        if !absent.is_empty() {
+            assert!(
+                !observed.visible_text.contains(absent),
+                "{}",
+                observed.visible_text
+            );
+            assert!(!observed.covered_text.contains(absent));
+        }
+        if let Some(retained) = retained {
+            assert!(
+                observed.visible_text.contains(retained),
+                "{}",
+                observed.visible_text
+            );
+        }
+    }
     browser.close().unwrap();
 }
 
@@ -3436,6 +3474,23 @@ fn nested_frame_viewports_bound_both_region_dimensions() {
     assert_eq!(observed.scroll_regions.len(), 1);
     assert_eq!(observed.scroll_regions[0].rect.width, 70.0);
     assert_eq!(observed.scroll_regions[0].rect.height, 50.0);
+
+    let child=r#"<!doctype html><body style="margin:0"><div aria-label="Nested rows" style="height:100px;width:180px;overflow:auto"><button>OFF MAIN GOAL</button><div style="height:1000px">OFF MAIN TEXT</div></div>"#.replace('"',"&quot;");
+    let parent=format!(r#"<!doctype html><body style="margin:0"><iframe style="position:absolute;left:30px;top:30px;width:200px;height:120px;border:0" srcdoc="{child}"></iframe>"#).replace('&',"&amp;").replace('"',"&quot;");
+    let page = format!(
+        r#"<!doctype html><iframe style="position:absolute;left:1100px;top:50px;width:100px;height:80px;border:0" srcdoc="{parent}"></iframe>"#
+    );
+    let server = FixtureServer::with_body(Box::leak(page.into_boxed_str()));
+    browser.navigate(&server.url()).unwrap();
+    let observed = browser.observe().unwrap();
+    assert!(observed.scroll_regions.is_empty());
+    assert!(!observed.visible_text.contains("OFF MAIN"));
+    assert!(
+        !observed
+            .elements
+            .iter()
+            .any(|e| e.name.contains("OFF MAIN"))
+    );
     browser.close().unwrap();
 }
 
@@ -3465,6 +3520,7 @@ fn unverifiable_client_geometry_cannot_publish_scroll_authority() {
         "rotate:x 20deg",
         "transform:perspective(500px)",
         "transform:scale(0)",
+        "transform:matrix3d(1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,2)",
     ] {
         let body = format!(
             r#"<!doctype html><div style="height:150px;width:300px;overflow:auto;{css}"><div style="height:1000px">Rows</div></div>"#
@@ -3483,7 +3539,7 @@ fn rotated_clipping_excludes_controls_and_text_outside_the_client_box() {
     let mut browser = launch_headless();
     for angle in [30, 45, -30] {
         let body = format!(
-            r#"<!doctype html><style>body{{margin:0;overflow:hidden}}#region{{position:absolute;left:400px;top:200px;width:300px;height:150px;overflow:auto;transform:rotate({angle}deg);transform-origin:top left}}button,span{{position:absolute;left:180px;width:90px;height:20px}}button{{font-size:8px}}span{{left:100px}}</style><div id="region" aria-label="Rotated"><div style="height:1000px"></div><button style="top:40px">VISIBLE GOAL</button><button style="top:170px">CLIPPED GOAL</button><span style="top:200px">CLIPPED TEXT</span><span aria-hidden="true" style="top:230px">CLIPPED COVERED</span><span style="top:140px">PARTLY VISIBLE TEXT</span></div>"#
+            r#"<!doctype html><style>body{{margin:0;overflow:hidden}}#region{{position:absolute;left:400px;top:200px;width:300px;height:150px;overflow:auto;scrollbar-width:none;transform:rotate({angle}deg);transform-origin:top left}}button,span{{position:absolute;left:180px;width:90px;height:20px}}button{{font-size:8px}}span{{left:100px}}</style><div id="region" aria-label="Rotated"><div style="height:1000px"></div><button style="top:40px">VISIBLE GOAL</button><button style="top:170px">CLIPPED GOAL</button><span style="top:200px">CLIPPED TEXT</span><span aria-hidden="true" style="top:230px">CLIPPED COVERED</span><span style="top:140px">PARTLY VISIBLE TEXT</span><button style="left:260px;top:40px">RIGHT EDGE GOAL</button><button style="left:-80px;top:40px">LEFT EDGE GOAL</button><span style="left:-250px;top:40px">LEFT OUTSIDE TEXT</span><span style="left:400px;top:40px">RIGHT OUTSIDE TEXT</span><span style="top:-100px">ABOVE OUTSIDE TEXT</span></div>"#
         );
         let server = FixtureServer::with_body(Box::leak(body.into_boxed_str()));
         browser.navigate(&server.url()).unwrap();
@@ -3501,6 +3557,13 @@ fn rotated_clipping_excludes_controls_and_text_outside_the_client_box() {
             assert!(!observed.visible_text.contains("CLIPPED GOAL"), "{angle}");
         }
         assert!(!observed.visible_text.contains("CLIPPED TEXT"), "{angle}");
+        for text in [
+            "LEFT OUTSIDE TEXT",
+            "RIGHT OUTSIDE TEXT",
+            "ABOVE OUTSIDE TEXT",
+        ] {
+            assert!(!observed.visible_text.contains(text), "{angle}: {text}");
+        }
         assert!(!observed.covered_text.contains("CLIPPED"), "{angle}");
         assert!(
             observed.visible_text.contains("PARTLY VISIBLE TEXT"),
@@ -3581,5 +3644,205 @@ fn nested_zoomed_frames_accumulate_native_wheel_units() {
         .unwrap();
     assert!((fact.scroll_readback[0].after - 92.0).abs() <= 1.0);
     assert_eq!(fact.scroll_readback.last().unwrap().after, 0.0);
+    browser.close().unwrap();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn slotted_controls_follow_their_painted_scroll_ancestors() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let mut browser = launch_headless();
+    for transform in ["none", "scale(.5)"] {
+        let body = format!(
+            r#"<!doctype html><style>body{{margin:0;overflow:hidden}}button{{display:block;height:30px;width:220px;padding:0;border:0}}</style><div id="host"></div><p id="result">Selected: none</p><script>for(let i=1;i<=30;i++){{let b=document.createElement('button');b.textContent='Slotted Row '+i;b.onclick=()=>result.textContent='Selected: '+i;host.append(b)}}host.attachShadow({{mode:'open'}}).innerHTML='<div aria-label="Slotted rows" style="height:60px;width:220px;overflow-y:auto;overflow-x:hidden;transform:{transform};transform-origin:top left"><slot></slot></div>'</script>"#
+        );
+        let server = FixtureServer::with_body(Box::leak(body.into_boxed_str()));
+        browser.navigate(&server.url()).unwrap();
+        let observed = browser.observe().unwrap();
+        assert_eq!(observed.scroll_regions.len(), 1);
+        assert_eq!(
+            observed
+                .elements
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Slotted Row 1", "Slotted Row 2"],
+            "{transform}"
+        );
+        assert!(
+            !observed.visible_text.contains("Slotted Row 3"),
+            "{transform}"
+        );
+        let fact = browser
+            .perform(
+                prepared_scroll(&observed, false, 1),
+                &InputCancellation::default(),
+            )
+            .unwrap();
+        assert!(
+            (fact.scroll_readback[0].after - 52.0).abs() <= 1.0,
+            "{transform}: {fact:?}"
+        );
+        assert_eq!(fact.scroll_readback.last().unwrap().after, 0.0);
+        let after = browser.observe().unwrap();
+        assert!(
+            after.elements.iter().any(|e| e.name == "Slotted Row 3"),
+            "{transform}"
+        );
+        browser
+            .perform(
+                prepared(
+                    &after,
+                    "Slotted Row 3",
+                    PreparedOperation::Click,
+                    None,
+                    None,
+                    2,
+                ),
+                &InputCancellation::default(),
+            )
+            .unwrap();
+        assert!(
+            browser
+                .observe()
+                .unwrap()
+                .visible_text
+                .contains("Selected: 3")
+        );
+    }
+    let server = FixtureServer::with_body(
+        r#"<!doctype html><style>body{margin:0;overflow:hidden}button{display:block;height:30px;width:180px;padding:0;border:0}</style><div id="host"><div id="inner" aria-label="Inner slotted rows" style="height:200px;width:220px;overflow:auto"></div></div><script>for(let i=1;i<=30;i++){let b=document.createElement('button');b.textContent='Nested row '+i;inner.append(b)}host.attachShadow({mode:'open'}).innerHTML='<div id="outer" aria-label="Outer slotted rows" style="height:60px;width:240px;overflow:auto"><slot></slot></div>';host.shadowRoot.getElementById('outer').scrollTop=140</script>"#,
+    );
+    browser.navigate(&server.url()).unwrap();
+    let observed = browser.observe().unwrap();
+    assert_eq!(
+        observed
+            .scroll_regions
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Outer slotted rows", "Inner slotted rows"]
+    );
+    assert_eq!(
+        observed.scroll_regions[1].parent_node_id,
+        Some(observed.scroll_regions[0].node_id)
+    );
+    let mut input = prepared_scroll(&observed, false, 1);
+    input.scroll_region = Some(observed.scroll_regions[1].clone());
+    let fact = browser
+        .perform(input, &InputCancellation::default())
+        .unwrap();
+    assert_eq!(fact.scroll_readback.len(), 3);
+    assert!((fact.scroll_readback[0].after - 52.0).abs() <= 1.0);
+    assert_eq!(
+        fact.scroll_readback[1].name.as_deref(),
+        Some("Outer slotted rows")
+    );
+    assert_eq!(fact.scroll_readback[1].before, 140.0);
+    assert_eq!(fact.scroll_readback[1].after, 140.0);
+    assert_eq!(fact.scroll_readback[2].after, 0.0);
+    browser.close().unwrap();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn rotated_viewport_clipping_keeps_each_control_column_overlapping() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let mut browser = launch_headless();
+    let server = FixtureServer::with_body(
+        r#"<!doctype html><style>body{margin:0;overflow:hidden}#region{position:absolute;left:-100px;top:100px;width:300px;height:300px;overflow-y:auto;overflow-x:hidden;transform:rotate(45deg);transform-origin:top left;scrollbar-width:none}button{position:absolute;left:140px;width:80px;height:20px;padding:0;border:0}</style><div id="region" aria-label="Diagonal rows"><div style="height:1000px"></div></div><script>for(let i=1;i<=30;i++){let b=document.createElement('button');b.textContent='T'+i;b.style.top=(30*(i-1))+'px';region.append(b)}</script>"#,
+    );
+    browser.navigate(&server.url()).unwrap();
+    let mut observed = browser.observe().unwrap();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut previous = std::collections::BTreeSet::new();
+    for ordinal in 1..=8 {
+        let current = observed
+            .elements
+            .iter()
+            .map(|e| e.name.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        if ordinal > 1 {
+            assert!(
+                !previous.is_disjoint(&current),
+                "consecutive views must share controls: {previous:?} / {current:?}"
+            );
+        }
+        seen.extend(current.iter().cloned());
+        previous = current;
+        let fact = browser
+            .perform(
+                prepared_scroll(&observed, false, ordinal),
+                &InputCancellation::default(),
+            )
+            .unwrap();
+        assert_eq!(fact.scroll_readback.last().unwrap().after, 0.0);
+        observed = browser.observe().unwrap();
+    }
+    seen.extend(observed.elements.iter().map(|e| e.name.clone()));
+    for i in 1..=10 {
+        assert!(
+            seen.contains(&format!("T{i}")),
+            "a reachable control was skipped: T{i}; views={seen:?}"
+        );
+    }
+    browser.close().unwrap();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn boxless_overflow_wrappers_keep_painted_controls_and_text() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let mut browser = launch_headless();
+    for css in [
+        "overflow:hidden",
+        "overflow:clip",
+        "display:contents;overflow:hidden",
+        "display:inline-block;overflow:hidden",
+    ] {
+        let body = format!(
+            r#"<!doctype html><style>body{{margin:0}}</style><span style="{css}"><button onclick="this.textContent='Selected goal'">Visible goal</button></span>"#
+        );
+        let server = FixtureServer::with_body(Box::leak(body.into_boxed_str()));
+        browser.navigate(&server.url()).unwrap();
+        let observed = browser.observe().unwrap();
+        assert_eq!(observed.elements.len(), 1, "{css}");
+        assert!(observed.visible_text.contains("Visible goal"), "{css}");
+        browser
+            .perform(
+                prepared(
+                    &observed,
+                    "Visible goal",
+                    PreparedOperation::Click,
+                    None,
+                    None,
+                    1,
+                ),
+                &InputCancellation::default(),
+            )
+            .unwrap();
+        assert!(
+            browser
+                .observe()
+                .unwrap()
+                .visible_text
+                .contains("Selected goal"),
+            "{css}"
+        );
+    }
+    let server = FixtureServer::with_body(
+        r#"<!doctype html><span style="display:inline-block;width:1px;height:1px;overflow:hidden"><button>Actually clipped</button></span>"#,
+    );
+    browser.navigate(&server.url()).unwrap();
+    let observed = browser.observe().unwrap();
+    assert!(observed.elements.is_empty());
+    assert!(!observed.visible_text.contains("Actually clipped"));
+    let server = FixtureServer::with_body(
+        r#"<!doctype html><body style="margin:0"><svg width="0" height="0" style="overflow:hidden"><foreignObject width="200" height="200"><button>Zero viewport clipped</button></foreignObject></svg>"#,
+    );
+    browser.navigate(&server.url()).unwrap();
+    let observed = browser.observe().unwrap();
+    assert!(observed.elements.is_empty());
+    assert!(!observed.visible_text.contains("Zero viewport clipped"));
     browser.close().unwrap();
 }
