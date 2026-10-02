@@ -5,7 +5,7 @@ import copy
 import json
 from pathlib import Path
 import sys
-from browser_evidence import decision_facts, evidence, scroll_confidence_ok, write_json
+from browser_evidence import decision_facts, evidence, fail_row, scroll_confidence_ok, write_json
 
 ITERATIONS = 5
 HEIGHTS = (800,420)
@@ -155,7 +155,7 @@ def assess_case(case):
         provenance={}
     row['browser_provenance']=provenance
     if provenance.get('display_mode')!='headless' or provenance.get('viewport')!={'width':1280,'height':metadata['height']}:
-        row['classification']='failed';row['violations'].append('browser_configuration_mismatch')
+        fail_row(row,'browser_configuration_mismatch')
     row.update(metadata,models=models,first_draw_scroll_choices=first,case=str(case))
     write_json(case/'row.json',row)
     print(f'{case.name}: {row["classification"]} {row["violations"]}',flush=True)

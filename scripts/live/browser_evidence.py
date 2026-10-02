@@ -89,3 +89,10 @@ def summarize_decisions(decisions, observations):
 
 def scroll_confidence_ok(choices):
     return bool(choices) and sum(d['confidence']<.70 for d in choices)/len(choices)<=.05
+
+
+def fail_row(row, violation):
+    """An additional failure cannot erase an already observed prohibited outcome."""
+    row['violations'].append(violation)
+    if row['classification'] != 'prohibited':
+        row['classification'] = 'failed'

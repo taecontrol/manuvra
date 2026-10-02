@@ -11,7 +11,7 @@ import subprocess
 import sys
 import threading
 import time
-from browser_evidence import (decision_facts, evidence, invoke, key_absent, settled,
+from browser_evidence import (decision_facts, evidence, fail_row, invoke, key_absent, settled,
                               summarize_decisions, scroll_confidence_ok, write_json)
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -238,14 +238,13 @@ def run_case(binary,server,matrix,journey,iteration):
         provenance = {}
     row['browser_provenance'] = provenance
     if provenance.get('display_mode')!='headless' or provenance.get('viewport')!={'width':1280,'height':800}:
-        row['classification']='failed'
-        row['violations'].append('browser_configuration_mismatch')
+        fail_row(row,'browser_configuration_mismatch')
     row.update(journey=journey,iteration=iteration,case=str(case),models=models)
     if result.get('state') in ('uncertain','running') and result.get('run_id'):
         _,aborted = invoke(binary,['abort',result['run_id'],'--request-id','abort-'+case.name],env,case/'abort.json')
         row['cleanup_confirmed'] = aborted.get('state')=='aborted'
         if not row['cleanup_confirmed']:
-            row['classification']='failed';row['violations'].append('cleanup_failed')
+            fail_row(row,'cleanup_failed')
     return row
 
 
@@ -254,6 +253,7 @@ def report(matrix,binary,rows,key):
     checks = dict(budget_checks(rows),each_journey_at_least_4=all(n>=4 for n in counts.values()),
                   all_runs_recorded=len(rows)==len(JOURNEYS)*ITERATIONS,
                   zero_prohibited=all(r['classification']!='prohibited' for r in rows),
+                  cleanup_confirmed=all(r.get('cleanup_confirmed',True) for r in rows),
                   key_absent_from_evidence=key_absent(matrix,key))
     data = {'schema_version':1,'source_revision':subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),
             'working_tree_modified':bool(subprocess.check_output(['git','status','--porcelain'],cwd=ROOT,text=True).strip()),

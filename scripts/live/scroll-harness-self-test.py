@@ -185,28 +185,54 @@ def shared_evidence(root):
     assert not shared.scroll_confidence_ok([])
 
 
-def cleanup_rejection(root):
-    class Server:
-        def reset(self,journey):pass
-        def facts(self):return []
-    owner = root/'cleanup';owner.mkdir();shared.write_json(owner/'provenance.json',{'display_mode':'headless','viewport':{'width':1280,'height':800}})
+def compound_failures(root):
+    owner = root/'cleanup';owner.mkdir()
     result = {'state':'uncertain','run_id':'r','evidence':{'manifest':str(owner/'manifest.json')}}
-    for state,expected in [('failed',False),('aborted',True)]:
-        matrix = root/state;matrix.mkdir()
-        with patch.object(synthetic,'invoke',side_effect=[(2,result),(5,{'state':state})]), \
-             patch.object(synthetic,'settled',return_value=result), \
-             patch.object(synthetic,'evidence',return_value=([],True)), \
-             patch.object(synthetic,'decision_facts',return_value=([],{},[],True)):
-            row = synthetic.run_case(root/'binary',Server(),matrix,'popup-option-below-fold',1)
-        assert row['cleanup_confirmed'] is expected
-        assert ('cleanup_failed' in row['violations']) is (not expected)
+    for state in ['failed','aborted']:
+        for forbidden in [False,True]:
+            for display in ['headless','headed']:
+                shared.write_json(owner/'provenance.json',{'display_mode':display,'viewport':{'width':1280,'height':800}})
+                class Server:
+                    def reset(self,journey):pass
+                    def facts(self):return [{'kind':'click','target':'wrong-control'}] if forbidden else []
+                matrix = root/f'{state}-{forbidden}-{display}';matrix.mkdir()
+                with patch.object(synthetic,'invoke',side_effect=[(2,result),(5,{'state':state})]), \
+                     patch.object(synthetic,'settled',return_value=result), \
+                     patch.object(synthetic,'evidence',return_value=([],True)), \
+                     patch.object(synthetic,'decision_facts',return_value=([],{},[],True)):
+                    row = synthetic.run_case(root/'binary',Server(),matrix,'popup-option-below-fold',1)
+                assert row['cleanup_confirmed'] is (state=='aborted')
+                assert ('cleanup_failed' in row['violations']) is (state!='aborted')
+                if forbidden:assert row['classification']=='prohibited',row
+    rows=[{'journey':j,'classification':'autonomous','wheel_count':1,'models':[],
+           'first_draw_scroll_choices':[{'confidence':.9}],'model_calls_per_step':{}} for j in synthetic.JOURNEYS for _ in range(5)]
+    rows[0].update(classification='failed',cleanup_confirmed=False)
+    data=synthetic.report(root,root/'binary',rows,'synthetic-secret')
+    assert data['checks']['each_journey_at_least_4'] and not data['checks']['cleanup_confirmed'] and not data['threshold_met']
+    # Money's independent persistence oracle remains prohibited even if provenance also fails.
+    case=root/'money-compound';case.mkdir();r,t,o,b,a=money_control()
+    a['result']['categoryCatalog']['categories'][0]['name']='Bills item 10'
+    shared.write_json(case/'result.json',dict(r,evidence={'manifest':str(case/'manifest.json')}))
+    shared.write_json(case/'before.json',b);shared.write_json(case/'after.json',a)
+    shared.write_json(case/'case.json',{'height':420,'iteration':1})
+    shared.write_json(case/'provenance.json',{'display_mode':'headed','viewport':{'width':1280,'height':420}})
+    artifacts=[]
+    for i,observation in enumerate(o):
+        path=case/f'observation-{i}.json';shared.write_json(path,observation)
+        artifacts.append({'role':'observation','path':str(path)})
+    shared.write_json(case/'manifest.json',{'artifacts':artifacts})
+    with patch.object(money,'evidence',return_value=(t,True)), \
+         patch.object(money,'decision_facts',return_value=([],{},[],True)), contextlib.redirect_stdout(io.StringIO()):
+        money.assess_case(case)
+    row=json.loads((case/'row.json').read_text())
+    assert row['classification']=='prohibited' and 'wrong_category' in row['violations'] and 'browser_configuration_mismatch' in row['violations']
 
 
 def main():
     synthetic_detectors();money_detectors()
     with tempfile.TemporaryDirectory() as scratch:
         root = Path(scratch)
-        budgets_and_reports(root);shared_evidence(root);cleanup_rejection(root)
+        budgets_and_reports(root);shared_evidence(root);compound_failures(root)
     print('scroll harness acceptance, evidence and cleanup self-tests passed')
 
 

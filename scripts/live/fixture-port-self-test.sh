@@ -6,7 +6,10 @@ test_root=$(mktemp -d)
 trap 'rm -rf -- "$test_root"' EXIT
 money_dir=$test_root
 pnpm() {
-  if [[ ${cleanup_mode:-} == exit_failure && $2 == cleanup ]]; then return 7; fi
+  if [[ ${cleanup_mode:-} == exit_failure && $2 == cleanup ]]; then
+    printf '%s\n' '{"status":"completed","result":{"cleanup":"cleaned"}}'
+    return 7
+  fi
   if [[ ${cleanup_mode:-} == result_failure && $2 == cleanup ]]; then
     printf '%s\n' '{"status":"completed","result":{"cleanup":"failed"}}'
     return 0
