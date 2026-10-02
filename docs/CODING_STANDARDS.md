@@ -13,6 +13,7 @@ These standards apply to production code, tests, scripts, and maintained documen
 
 - Never infer that a browser mutation was not performed when dispatch may have occurred. Preserve `observed`, `not_performed`, and `uncertain` outcomes through every boundary.
 - Never retry or replay a mutation unless code has proved non-effect and the existing policy explicitly permits the bounded fallback. Follow [ADR-0003](adrs/0003-never-replay-a-crashed-run.md).
+- Keep DOM client dimensions, transformed DOMRects, frame coordinates, and wheel deltas in explicit coordinate spaces. Convert at their owning browser boundary before clipping or dispatch, including ancestor transforms and CSS zoom; reject unverifiable geometry.
 - Revalidate browser identity, state, origin, budgets, and replay guards immediately before dispatch. A caller disposition does not waive verification; follow [ADR-0004](adrs/0004-resume-authority-preserves-verification.md).
 - Redact secrets and classified values before persistence or provider calls. Write private evidence atomically, publish digests and completeness truthfully, and fail closed when required evidence cannot be verified.
 
