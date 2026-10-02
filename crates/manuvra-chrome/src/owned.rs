@@ -1334,7 +1334,7 @@ mod tests {
             let mut calls = 0;
             let result = retry_profile_removal(
                 || {
-                    let error = errors[calls];
+                    let error = errors[calls.min(errors.len() - 1)];
                     calls += 1;
                     error.map_or(Ok(()), |code| Err(std::io::Error::from_raw_os_error(code)))
                 },
@@ -1358,6 +1358,21 @@ mod tests {
         assert_eq!(
             calls, 1,
             "a continuing writer cannot make cleanup unbounded"
+        );
+        let started = Instant::now();
+        let mut calls = 0;
+        let result = retry_profile_removal(
+            || {
+                calls += 1;
+                Err(std::io::Error::from_raw_os_error(libc::ENOTEMPTY))
+            },
+            started + PROFILE_REMOVAL_TIMEOUT,
+        );
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOTEMPTY));
+        assert!(calls > 1, "transient writes receive bounded retries");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the production cleanup budget must bound a persistent writer"
         );
     }
 
