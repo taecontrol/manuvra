@@ -3741,6 +3741,36 @@ fn slotted_controls_follow_their_painted_scroll_ancestors() {
     assert_eq!(fact.scroll_readback[1].before, 140.0);
     assert_eq!(fact.scroll_readback[1].after, 140.0);
     assert_eq!(fact.scroll_readback[2].after, 0.0);
+
+    let server = FixtureServer::with_body(
+        r#"<!doctype html><body style="margin:0;overflow:hidden"><div id="host"><div id="inner" aria-label="Scaled inner" style="height:200px;width:220px;overflow:auto;scrollbar-width:none"><div style="height:1000px">Rows</div></div></div><script>host.attachShadow({mode:'open'}).innerHTML='<div id="outer" aria-label="Scaled outer" style="height:60px;width:240px;overflow:auto;scrollbar-width:none;transform:scale(.5);transform-origin:top left"><slot></slot></div>';host.shadowRoot.getElementById('outer').scrollTop=140</script>"#,
+    );
+    browser.navigate(&server.url()).unwrap();
+    let observed = browser.observe().unwrap();
+    let inner = observed
+        .scroll_regions
+        .iter()
+        .find(|r| r.name == "Scaled inner")
+        .unwrap();
+    assert!((inner.rect.width - 110.0).abs() < 0.01);
+    assert!((inner.rect.height - 30.0).abs() < 0.01);
+    let mut input = prepared_scroll(&observed, false, 1);
+    input.scroll_region = Some(inner.clone());
+    let fact = browser
+        .perform(input, &InputCancellation::default())
+        .unwrap();
+    assert!((fact.scroll_readback[0].after - 52.0).abs() <= 1.0);
+    assert_eq!(fact.scroll_readback[1].after, 140.0);
+    assert_eq!(fact.scroll_readback[2].after, 0.0);
+    let server = FixtureServer::with_body(
+        r#"<!doctype html><div id="host"><div role="treeitem" tabindex="0" aria-label="One">One</div><div id="two" role="treeitem" tabindex="0" aria-label="Two">Two</div></div><script>host.attachShadow({mode:'open'}).innerHTML='<div role="tree"><slot></slot></div>';two.focus()</script>"#,
+    );
+    browser.navigate(&server.url()).unwrap();
+    let observed = browser.observe().unwrap();
+    let focus = observed.focus_anchor.as_ref().unwrap();
+    assert_eq!(focus.role, "treeitem");
+    assert_eq!(focus.name, "Two");
+    assert_eq!(focus.position, Some(2));
     browser.close().unwrap();
 }
 
@@ -3786,6 +3816,47 @@ fn rotated_viewport_clipping_keeps_each_control_column_overlapping() {
             "a reachable control was skipped: T{i}; views={seen:?}"
         );
     }
+
+    let baseline = r#"<!doctype html><style>body{margin:0;overflow:hidden}#region{position:absolute;left:-100px;top:100px;width:300px;height:300px;overflow:auto;transform:rotate(45deg);transform-origin:top left;scrollbar-width:none}#target{position:absolute;left:140px;top:30px;width:80px;height:20px}#host{position:absolute;left:140px;top:10px;width:10px;height:10px}</style><div id="region" aria-label="Diagonal"><div style="height:1000px"></div><button id="target">Target</button>SHADOW</div><p id="result">Not selected</p>"#;
+    let mut distances = Vec::new();
+    let plain = baseline.replace("SHADOW", "");
+    for (index,html) in [
+        plain.clone(),
+        format!(r#"{plain}<button style="position:fixed;left:95px;top:95px;width:10px;height:10px">Unrelated</button>"#),
+        plain.replace("<button id=\"target\">",r#"<button style="visibility:hidden;position:absolute;left:138px;top:0;width:8px;height:10px">Hidden</button><button id="target">"#),
+        baseline.replace("SHADOW",r#"<div id="host"></div><script>host.attachShadow({mode:'open'}).innerHTML='<button style="width:10px;height:10px;padding:0;border:0" onclick="result.textContent=\'Shadow selected\'">Shadow target</button>'</script>"#),
+    ].into_iter().enumerate() {
+        let server=FixtureServer::with_body(Box::leak(html.into_boxed_str()));
+        browser.navigate(&server.url()).unwrap();
+        let observed=browser.observe().unwrap();
+        let fact=browser.perform(prepared_scroll(&observed,false,1), &InputCancellation::default()).unwrap();
+        distances.push(fact.scroll_readback[0].after);
+        if index==3 {
+            let mut observed=browser.observe().unwrap();
+            let mut clicked=false;
+            for ordinal in 2..=8 {
+                // Require a centre actually inside the window, then prove the
+                // native hit and effect rather than trusting a partial candidate.
+                if observed.elements.iter().any(|e|e.name=="Shadow target" && e.rect.x+e.rect.width/2.0>1.0) {
+                    browser.perform(prepared(&observed,"Shadow target",PreparedOperation::Click,None,None,ordinal), &InputCancellation::default()).unwrap();
+                    clicked=true;break;
+                }
+                browser.perform(prepared_scroll(&observed,false,ordinal), &InputCancellation::default()).unwrap();
+                observed=browser.observe().unwrap();
+            }
+            assert!(clicked,"reachable shadow control was skipped");
+            assert!(browser.observe().unwrap().visible_text.contains("Shadow selected"));
+        }
+    }
+    assert_eq!(
+        distances[0], distances[1],
+        "unrelated control: {distances:?}"
+    );
+    assert_eq!(distances[0], distances[2], "hidden control: {distances:?}");
+    assert!(
+        distances[3] + 5.0 < distances[0],
+        "shadow column must constrain overlap: {distances:?}"
+    );
     browser.close().unwrap();
 }
 
@@ -3844,5 +3915,159 @@ fn boxless_overflow_wrappers_keep_painted_controls_and_text() {
     let observed = browser.observe().unwrap();
     assert!(observed.elements.is_empty());
     assert!(!observed.visible_text.contains("Zero viewport clipped"));
+    browser.close().unwrap();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn native_svg_coordinates_clip_html_regions_and_preserve_visible_clicks() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let mut browser = launch_headless();
+    for (viewbox, svg_css, foreign_transform, height, top, initially_visible) in [
+        (600, "none", "", 50.0, 160, false),
+        (150, "none", "", 200.0, 70, true),
+        (150, "scale(.5)", "", 100.0, 70, true),
+        (150, "none", "scale(.5,.75)", 150.0, 70, true),
+    ] {
+        let body = format!(
+            r#"<!doctype html><style>body{{margin:0;overflow:hidden}}</style><svg width="300" height="300" viewBox="0 0 {viewbox} {viewbox}" style="transform:{svg_css};transform-origin:top left"><foreignObject width="{viewbox}" height="{viewbox}" transform="{foreign_transform}"><div xmlns="http://www.w3.org/1999/xhtml" aria-label="SVG rows" style="width:100px;height:100px;overflow:auto;position:relative;scrollbar-width:none"><div style="height:1000px"></div><button style="position:absolute;top:{top}px;left:5px;width:70px;height:20px;font-size:8px" onclick="result.textContent='Selected goal'">SVG goal</button></div></foreignObject></svg><p id="result">Selected: none</p>"#
+        );
+        let server = FixtureServer::with_body(Box::leak(body.into_boxed_str()));
+        browser.navigate(&server.url()).unwrap();
+        let observed = browser.observe().unwrap();
+        assert_eq!(observed.scroll_regions.len(), 1);
+        assert!(
+            (observed.scroll_regions[0].rect.height - height).abs() < 0.01,
+            "{viewbox}/{svg_css}/{foreign_transform}: {:?}",
+            observed.scroll_regions
+        );
+        assert_eq!(
+            observed.elements.iter().any(|e| e.name == "SVG goal"),
+            initially_visible
+        );
+        assert_eq!(
+            observed.visible_text.contains("SVG goal"),
+            initially_visible
+        );
+        let clickable = if initially_visible {
+            observed
+        } else {
+            let fact = browser
+                .perform(
+                    prepared_scroll(&observed, false, 1),
+                    &InputCancellation::default(),
+                )
+                .unwrap();
+            assert!((fact.scroll_readback[0].after - 92.0).abs() <= 1.0);
+            assert_eq!(fact.scroll_readback.last().unwrap().after, 0.0);
+            browser.observe().unwrap()
+        };
+        browser
+            .perform(
+                prepared(
+                    &clickable,
+                    "SVG goal",
+                    PreparedOperation::Click,
+                    None,
+                    None,
+                    2,
+                ),
+                &InputCancellation::default(),
+            )
+            .unwrap();
+        assert!(
+            browser
+                .observe()
+                .unwrap()
+                .visible_text
+                .contains("Selected goal")
+        );
+    }
+    let server = FixtureServer::with_body(
+        r#"<!doctype html><body style="margin:0"><svg width="300" height="300"><g style="overflow:hidden"><foreignObject width="300" height="300"><button xmlns="http://www.w3.org/1999/xhtml" onclick="this.textContent='Selected goal'">Visible SVG group goal</button></foreignObject></g></svg>"#,
+    );
+    browser.navigate(&server.url()).unwrap();
+    let observed = browser.observe().unwrap();
+    assert!(observed.visible_text.contains("Visible SVG group goal"));
+    browser
+        .perform(
+            prepared(
+                &observed,
+                "Visible SVG group goal",
+                PreparedOperation::Click,
+                None,
+                None,
+                1,
+            ),
+            &InputCancellation::default(),
+        )
+        .unwrap();
+    assert!(
+        browser
+            .observe()
+            .unwrap()
+            .visible_text
+            .contains("Selected goal")
+    );
+    browser.close().unwrap();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn overflow_clip_margin_preserves_the_browser_clip_edge() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let mut browser = launch_headless();
+    for (overflow, margin, padding, visible, text_visible) in [
+        ("clip", "100px", 0, true, true),
+        ("hidden", "100px", 0, false, false),
+        ("clip", "100px", 20, true, true),
+        ("clip", "border-box", 20, true, true),
+        ("clip", "content-box", 20, false, false),
+        ("clip", "0px", 20, false, true),
+    ] {
+        let body = format!(
+            r#"<!doctype html><body style="margin:0;overflow:hidden"><div style="width:200px;height:40px;padding:{padding}px;border:{border}px solid;overflow:{overflow};overflow-clip-margin:{margin};position:relative"><button style="position:absolute;top:70px;left:10px;width:150px;height:30px" onclick="this.textContent='Selected goal'">Visible margin goal</button></div>"#,
+            border = if padding > 0 { 10 } else { 0 }
+        );
+        let server = FixtureServer::with_body(Box::leak(body.into_boxed_str()));
+        browser.navigate(&server.url()).unwrap();
+        let observed = browser.observe().unwrap();
+        assert_eq!(
+            observed
+                .elements
+                .iter()
+                .any(|e| e.name == "Visible margin goal"),
+            visible,
+            "{overflow}/{margin}/{padding}"
+        );
+        assert_eq!(
+            observed.visible_text.contains("Visible margin goal"),
+            text_visible,
+            "{overflow}/{margin}/{padding}: {}",
+            observed.visible_text
+        );
+        if visible {
+            browser
+                .perform(
+                    prepared(
+                        &observed,
+                        "Visible margin goal",
+                        PreparedOperation::Click,
+                        None,
+                        None,
+                        1,
+                    ),
+                    &InputCancellation::default(),
+                )
+                .unwrap();
+            assert!(
+                browser
+                    .observe()
+                    .unwrap()
+                    .visible_text
+                    .contains("Selected goal")
+            );
+        }
+    }
     browser.close().unwrap();
 }

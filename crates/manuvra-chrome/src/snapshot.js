@@ -54,10 +54,20 @@
     }
     return points;
   };
+  const polygonColumnHeight = (polygon,x) => {
+    const ys=[];
+    for(let j=0;j<polygon.length;j++) {
+      const a=polygon[j],b=polygon[(j+1)%polygon.length];
+      if(x<Math.min(a.x,b.x) || x>Math.max(a.x,b.x))continue;
+      if(a.x===b.x)ys.push(a.y,b.y);
+      else ys.push(a.y+(b.y-a.y)*(x-a.x)/(b.x-a.x));
+    }
+    return Math.max(...ys)-Math.min(...ys);
+  };
   const polygonArea = points => Math.abs(points.reduce((sum,p,i)=>{const q=points[(i+1)%points.length];return sum+p.x*q.y-q.x*p.y;},0))/2;
   // Keep client dimensions and DOMRects in explicit coordinate spaces.
   const elementGeometry = element => {
-    let matrix = new DOMMatrix(), zoom = 1;
+    let matrix = new DOMMatrix(), zoom = 1, svgBasis = false;
     for (let node=element;node;node=up(node)) {
       const css=node.ownerDocument.defaultView.getComputedStyle(node);
       const transform=new DOMMatrix(css.transform==='none'?undefined:css.transform);
@@ -75,7 +85,15 @@
         scaling=scaling.scale(parts[0],parts[1]??parts[0]);
       }
       const nodeZoom=parseFloat(css.zoom)||1;zoom*=nodeZoom;
-      matrix=new DOMMatrix().scale(nodeZoom).multiply(rotation).multiply(scaling).multiply(transform).multiply(matrix);
+      // SVG's native basis includes viewBox and attribute transforms, which CSS
+      // transform alone cannot describe. Descendant HTML still uses CSS units.
+      const view=node.ownerDocument.defaultView;
+      if(!svgBasis && node instanceof view.SVGGraphicsElement && !(node instanceof view.SVGSVGElement)) {
+        const native=node.getScreenCTM();if(!native)return null;
+        const values=[native.a,native.b,native.c,native.d,native.e,native.f];
+        if(!values.every(Number.isFinite))return null;
+        matrix=new DOMMatrix(values).multiply(matrix);svgBasis=true;
+      } else if(!svgBasis) matrix=new DOMMatrix().scale(nodeZoom).multiply(rotation).multiply(scaling).multiply(transform).multiply(matrix);
     }
     const css=element.ownerDocument.defaultView.getComputedStyle(element), rect=element.getBoundingClientRect();
     const width=parseFloat(css.width)+(css.boxSizing==='border-box'?0:parseFloat(css.paddingLeft)+parseFloat(css.paddingRight)+parseFloat(css.borderLeftWidth)+parseFloat(css.borderRightWidth));
@@ -89,6 +107,22 @@
     const geometry=elementGeometry(element);
     if(!geometry)throw new Error('Unverifiable client geometry');
     return {...geometry,matrix:geometry.matrix.translate(element.clientLeft,element.clientTop),width:element.clientWidth,height:element.clientHeight};
+  };
+  const overflowBox = (element,css) => {
+    const box=clientBox(element);
+    if(css.overflowX!=='clip' && css.overflowY!=='clip')return box;
+    const value=css.overflowClipMargin,margin=parseFloat(value.split(/\s+/).at(-1))||0;
+    let left=-margin,top=-margin,width=box.width+2*margin,height=box.height+2*margin;
+    if(value.startsWith('content-box')) {
+      left+=parseFloat(css.paddingLeft);top+=parseFloat(css.paddingTop);
+      width-=parseFloat(css.paddingLeft)+parseFloat(css.paddingRight);
+      height-=parseFloat(css.paddingTop)+parseFloat(css.paddingBottom);
+    } else if(value.startsWith('border-box')) {
+      left-=element.clientLeft;top-=element.clientTop;
+      width+=parseFloat(css.borderLeftWidth)+parseFloat(css.borderRightWidth);
+      height+=parseFloat(css.borderTopWidth)+parseFloat(css.borderBottomWidth);
+    }
+    return {...box,matrix:box.matrix.translate(left,top),width,height};
   };
   // Rebuild frame geometry at dispatch; a snapshot cannot authorize a later wheel.
   const frameContext = root => {
@@ -177,9 +211,9 @@
       const viewportOverflow = next === next.ownerDocument.documentElement || (next === next.ownerDocument.body && rootStyle.overflowX === 'visible' && rootStyle.overflowY === 'visible');
       if (viewportOverflow) {current = next; continue;}
       // Overflow does not create a clipping box on contents or non-replaced inline elements.
-      const boxless = css.display === 'contents' || css.display === 'inline' && next instanceof viewOfElement(next).HTMLElement && !next.matches('img,iframe,frame,object,embed,video,audio,canvas,input,textarea,select,button') && next.clientWidth === 0 && next.clientHeight === 0;
+      const boxless = css.display === 'contents' || next instanceof viewOfElement(next).SVGElement && !next.matches('svg,foreignObject') || css.display === 'inline' && next instanceof viewOfElement(next).HTMLElement && !next.matches('img,iframe,frame,object,embed,video,audio,canvas,input,textarea,select,button') && next.clientWidth === 0 && next.clientHeight === 0;
       if(!boxless && (css.overflowX !== 'visible' || css.overflowY !== 'visible'))
-        bounds.clips.push({box:clientBox(next),clipX:css.overflowX!=='visible',clipY:css.overflowY!=='visible'});
+        bounds.clips.push({box:overflowBox(next,css),clipX:css.overflowX!=='visible',clipY:css.overflowY!=='visible'});
       current = next;
     }
     return bounds;
@@ -401,14 +435,7 @@
       if(node.shadowRoot)roots.push(node.shadowRoot);
       if(!node.matches(CONTROL) || !ancestors(node).includes(region) || !node.checkVisibility({checkVisibilityCSS:true}))continue;
       const rect=node.getBoundingClientRect(),x=inverse.transformPoint({x:rect.x+rect.width/2,y:rect.y+rect.height/2}).x;
-      const ys=[];
-      for(let j=0;j<polygon.length;j++) {
-        const a=polygon[j],b=polygon[(j+1)%polygon.length];
-        if(x<Math.min(a.x,b.x) || x>Math.max(a.x,b.x))continue;
-        if(a.x===b.x)ys.push(a.y,b.y);
-        else ys.push(a.y+(b.y-a.y)*(x-a.x)/(b.x-a.x));
-      }
-      const span=Math.max(...ys)-Math.min(...ys);
+      const span=polygonColumnHeight(polygon,x);
       if(span>0)height=Math.min(height,span);
     }
     return height;
@@ -502,7 +529,7 @@
     const activeDescendant = activeId ? {id:activeId,role:descendant?role(descendant):'',name:descendant?name(descendant):'',selected:descendant && 'selected' in descendant ? Boolean(descendant.selected) : descendantBool(descendant,'aria-selected'),checked:descendant && 'checked' in descendant ? Boolean(descendant.checked) : descendantBool(descendant,'aria-checked')} : null;
     const anchorRole = indexed?.role || role(active);
     const posinset = Number.parseInt(active.getAttribute('aria-posinset'), 10);
-    const container = ancestors(active).slice(1).find(node=>node.matches('[role="tree"],[role="treegrid"],[role="grid"],[role="listbox"],[role="menu"],[role="menubar"],[role="tablist"],[role="radiogroup"],[role="toolbar"]')) || up(active);
+    const container = active.parentElement?.closest('[role="tree"],[role="treegrid"],[role="grid"],[role="listbox"],[role="menu"],[role="menubar"],[role="tablist"],[role="radiogroup"],[role="toolbar"]') || active.parentElement;
     const siblingIndex = container ? [...container.querySelectorAll('*')].filter(element => role(element) === anchorRole).indexOf(active) + 1 : 0;
     const position = indexed ? null : posinset > 0 ? posinset : siblingIndex || null;
     focusAnchor = {active_descendant:activeDescendant,expanded:boolAttr('aria-expanded'),selected:'selected' in active ? Boolean(active.selected) : boolAttr('aria-selected'),checked:'checked' in active ? Boolean(active.checked) : boolAttr('aria-checked'),position,node_id:nodeId(active),context:context?.context || 'main',role:anchorRole,name:indexed?.name || (active === containingDialog ? dialog : ariaName),in_dialog:indexed?.in_dialog || dialog,container:containerOf(active),covered:!closed && !crossOrigin,surface:crossOrigin?'cross_origin_frame':closed?'closed_shadow_root':active.tagName==='CANVAS'?'canvas':null};
