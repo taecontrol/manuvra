@@ -1,4 +1,4 @@
-.PHONY: fmt lint test crap live live-all live-hover live-keyboard live-natural-done live-observation live-resume-dispositions live-run-lifecycle live-self-test
+.PHONY: fmt lint test crap live live-all live-hover live-keyboard live-natural-done live-observation live-resume-dispositions live-run-lifecycle live-self-test live-scroll
 
 CRAP_REPORT ?= target/crap-report.json
 CRAP_GATE_MANIFEST := tools/crap-gate/Cargo.toml
@@ -23,6 +23,7 @@ crap:
 live-self-test:
 	/bin/bash scripts/live/money-journey-matrix.sh --self-test
 	/bin/bash scripts/live/money-journey-matrix.sh --runtime-self-test
+	python3 scripts/live/scroll-matrix.py --self-test-detectors
 	python3 scripts/live/keyboard-matrix.py --self-test-detectors
 	python3 scripts/live/hover-journey-check.py --self-test
 	bash scripts/live/natural-done.sh --self-test
@@ -32,6 +33,9 @@ live:
 
 live-hover:
 	bash scripts/live/hover-reveal.sh
+
+live-scroll:
+	python3 scripts/live/scroll-matrix.py
 
 live-keyboard:
 	python3 scripts/live/keyboard-matrix.py
@@ -57,3 +61,4 @@ live-all:
 	$(MAKE) live-run-lifecycle
 	$(MAKE) live-hover
 	$(MAKE) live-keyboard
+	$(MAKE) live-scroll

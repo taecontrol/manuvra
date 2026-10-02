@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "target": {
+    "kind": "browser",
+    "url": "http://127.0.0.1:4353/"
+  },
+  "context": {
+    "journey": "Confirm Save terms",
+    "revision": "synthetic scroll fixture",
+    "environment": "fresh disposable fixture",
+    "actor": "coding agent",
+    "authority": "interact with this fixture"
+  },
+  "values": {},
+  "steps": [
+    {
+      "id": "choose",
+      "goal": "Save the terms in the Review terms dialog",
+      "done_when": [
+        {
+          "text_visible": "Terms saved"
+        }
+      ],
+      "mutation_limit": 1
+    }
+  ],
+  "expectations": [],
+  "options": {
+    "allowed_origins": [
+      "http://127.0.0.1:4353"
+    ],
+    "active_timeout_ms": 180000,
+    "pause_timeout_ms": 120000,
+    "lifetime_ms": 300000,
+    "viewport": {
+      "width": 1280,
+      "height": 800
+    }
+  }
+}

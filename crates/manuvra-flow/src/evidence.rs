@@ -204,6 +204,20 @@ fn json_escaped(value: &str) -> String {
 
 fn is_protocol_collision(value: &str) -> bool {
     const OWNED_VOCABULARY: &[&str] = &[
+        "scroll_regions",
+        "scroll_regions_truncated",
+        "can_scroll",
+        "scroll_target",
+        "scroll_readback",
+        "overlay",
+        "document",
+        "before",
+        "after",
+        "scroll_top",
+        "scroll_height",
+        "client_height",
+        "can_scroll_up",
+        "can_scroll_down",
         "schema_version",
         "target",
         "kind",

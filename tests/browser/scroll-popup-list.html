@@ -10,7 +10,7 @@ const trigger=document.getElementById('trigger');let pop=null;
 const block=e=>{if(!e.target.closest('.pop'))e.preventDefault()};
 function close(){pop?.remove();pop=null;document.body.classList.remove('locked');trigger.setAttribute('aria-expanded','false');document.removeEventListener('wheel',block)}
 trigger.onclick=()=>{if(pop)return close();pop=document.createElement('div');pop.className='pop';pop.id='category-popup';pop.setAttribute('role','dialog');pop.setAttribute('aria-label','Choose category');
-const l=document.createElement('div');l.className='list';l.setAttribute('role','listbox');l.setAttribute('aria-label','Categories');
-for(let i=1;i<=50;i++){const o=document.createElement('div');o.className='opt';o.setAttribute('role','option');o.setAttribute('aria-selected','false');o.textContent='Option '+i;o.onclick=()=>{document.getElementById('status').textContent='Category: Option '+i;close()};l.append(o)}
+const l=document.createElement('div');l.className='list';l.id='categories';l.setAttribute('role','listbox');l.setAttribute('aria-label','Categories');
+for(let i=1;i<=50;i++){const o=document.createElement('div');o.className='opt';o.id='option-'+i;o.setAttribute('role','option');o.setAttribute('aria-selected','false');o.textContent='Option '+i;o.onclick=()=>{document.getElementById('status').textContent='Category: Option '+i;close()};l.append(o)}
 pop.append(l);document.body.append(pop);document.body.classList.add('locked');trigger.setAttribute('aria-expanded','true');document.addEventListener('wheel',block,{passive:false});if(new URLSearchParams(location.search).has('reverse'))l.scrollTop=39*l.firstElementChild.offsetHeight};
 </script></body></html>

@@ -100,8 +100,8 @@ pub fn request(
                 "TYPE_TEXT":"Replace a visible editable field only when this step's goal explicitly asks to fill, enter, or type a caller-provided value and code facts show the field is not already equal to that value. Never choose this for an open, choose, confirm, use, or submit goal.",
                 "SELECT":"Choose a caller-provided value from a visible native select whose observed options contain it.",
                 "PRESS_KEY":"Press one supported key at the currently focused element when the goal explicitly asks for a key press. If the goal starts with Press, keep choosing PRESS_KEY for each key needed to complete it, even when a click could produce the same effect.",
-                "SCROLL_UP":"Scroll upward only when the needed target is outside the visible viewport above.",
-                "SCROLL_DOWN":"Scroll downward only when the needed target is outside the visible viewport below.",
+                "SCROLL_UP":"Scroll up to reveal the required target when it is earlier than the visible items in a scroll region. When the required option precedes the visible options and code facts allow scrolling up, choose SCROLL_UP before clicking an unrelated visible option or reopening the picker.",
+                "SCROLL_DOWN":"Scroll down when the needed target is not visible yet and may lie further down, in the page or in an open dialog, popup, or list that scrolls.",
                 "WAIT":"Wait briefly only because the page is visibly still updating.",
                 "BLOCKED":"No offered operation can safely progress this step."
             }},
@@ -112,6 +112,10 @@ pub fn request(
             "key":{"type":"choice","instructions":{"premise":"The operation is PRESS_KEY","rules":"Choose one key for the current observation, not the whole step. For a goal that asks for arrows and Enter to choose an option, inspect the focused element's active_descendant: use an arrow to reach the named option, then use Enter when that option is active.","goal":values.mask(&step.goal)},"criteria":{"Escape":"Close the focused overlay with Escape.","Tab":"Move focus forward with Tab.","Shift+Tab":"Move focus backward with Shift+Tab.","Enter":"Activate the focused control or its active descendant with Enter.","Space":"Activate the focused control with Space.","ArrowUp":"Move to the previous option with ArrowUp.","ArrowDown":"Move to the next option with ArrowDown.","ArrowLeft":"Move left in a composite widget with ArrowLeft.","ArrowRight":"Move right in a composite widget with ArrowRight.","Home":"Move to the first option with Home.","End":"Move to the last option with End."}}
         }
     });
+    let regions = routed_scroll_regions(observation, values);
+    if !regions.is_empty() {
+        request["state"]["code_facts"]["scroll_regions"] = json!(regions);
+    }
     if crate::contest::contested(observation) && observation.hover_regions.is_empty() {
         request["questions"]["click_target"]["instructions"]["rules"] =
             json!(contested_target_rules());
@@ -133,6 +137,31 @@ pub fn request(
         );
     }
     request
+}
+
+fn routed_scroll_regions(observation: &Observation, values: &Values<'_>) -> Vec<Value> {
+    use crate::policy::scroll::{ScrollRoute, route};
+    let mut regions: Vec<(u64, Value)> = Vec::new();
+    for (operation, direction) in [(Operation::ScrollUp, "up"), (Operation::ScrollDown, "down")] {
+        if let ScrollRoute::Region(region) = route(observation, operation) {
+            if let Some((_, fact)) = regions.iter_mut().find(|(id, _)| *id == region.node_id) {
+                fact["can_scroll"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!(direction));
+            } else {
+                regions.push((
+                    region.node_id,
+                    json!({
+                        "name":values.mask(&region.name),
+                        "in_dialog":region.overlay.as_ref().map(|title|values.mask(title)),
+                        "can_scroll":[direction]
+                    }),
+                ));
+            }
+        }
+    }
+    regions.into_iter().map(|(_, fact)| fact).collect()
 }
 
 fn reveal_target_rules() -> &'static str {
@@ -550,6 +579,63 @@ mod tests {
             hover_regions_truncated: false,
             hover_rules_unreadable: false,
         }
+    }
+
+    fn with_scroll_region(mut page: Observation) -> Observation {
+        page.overlay = Some(manuvra_chrome::Overlay {
+            node_id: 80,
+            name: "Edit Savings 4417".into(),
+        });
+        page.scroll_regions = serde_json::from_value(json!([{
+            "node_id":9997,"name":"Savings 4417","overlay":"Edit Savings 4417",
+            "overlay_node_id":80,"parent_node_id":null,"can_scroll_up":true,"can_scroll_down":true,
+            "scroll_top":100,"scroll_height":1000,"client_height":300,
+            "rect":{"x":0,"y":0,"width":200,"height":300}
+        }]))
+        .unwrap();
+        page
+    }
+
+    #[test]
+    fn request_scroll_fact_uses_only_routed_directions_and_masks_names() {
+        let job = golden_job();
+        let values = Values::new(&job);
+        let recent = [json!({"event":"action_fact","fact":{"target_name":"Savings 4417"}})];
+        let mut page = with_scroll_region(golden_observation());
+        let actual = request(&job.steps[0], &page, &recent, &values);
+        assert_eq!(
+            actual.to_string(),
+            include_str!("../tests/fixtures/judgment-request-with-scroll-regions.json").trim_end()
+        );
+        assert_eq!(
+            actual["state"]["code_facts"]["scroll_regions"],
+            json!([{
+                "name":"<value:account>","in_dialog":"Edit <value:account>","can_scroll":["up","down"]
+            }])
+        );
+        assert!(!actual.to_string().contains("9997"));
+        page.scroll_regions[0].can_scroll_up = false;
+        assert_eq!(
+            routed_scroll_regions(&page, &values)[0]["can_scroll"],
+            json!(["down"])
+        );
+        page.scroll_regions[0].can_scroll_down = false;
+        assert!(
+            request(&job.steps[0], &page, &[], &values)["state"]["code_facts"]
+                .get("scroll_regions")
+                .is_none()
+        );
+        page.overlay = None;
+        page.scroll_regions[0].can_scroll_up = true;
+        page.scroll_regions[0].can_scroll_down = true;
+        assert!(routed_scroll_regions(&page, &values).is_empty());
+        page.viewport.scroll_y = 1220.;
+        assert_eq!(
+            routed_scroll_regions(&page, &values)[0]["can_scroll"],
+            json!(["down"])
+        );
+        page.scroll_regions_truncated = true;
+        assert!(routed_scroll_regions(&page, &values).is_empty());
     }
 
     #[test]

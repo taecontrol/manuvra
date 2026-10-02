@@ -247,6 +247,16 @@ To check the duplicate-effect detector, run `bash -ic 'python3 scripts/live/keyb
 
 Contributors and coding agents should follow [docs/CODING_STANDARDS.md](docs/CODING_STANDARDS.md). The [architecture decision records](docs/adrs/) explain the project's design choices.
 
+Nested scroll journeys run against instrumented synthetic fixtures with live Jev and a release binary:
+
+```bash
+make live-scroll
+python3 scripts/live/scroll-matrix.py --self-test-detectors
+python3 scripts/live/scroll-matrix.py --budget .work/live/scroll/<run>/report.json
+```
+
+The matrix runs five headless attempts per journey at 1280×800: selecting an option below and above a popup list's fold, saving below a dialog's fold, and opening a locality below a table's fold. Each journey needs at least four autonomous passes, zero prohibited outcomes, and at most 5% of pooled first-draw scroll choices below confidence 0.70. Independent browser events detect wrong clicks, document or unrelated region movement, and wheel counts; evidence verifies readback positions and a ceiling of six logical model calls per step. Reports retain binary and fixture digests, revision, model, and per-run facts under `.work/live/scroll/`. `make live-self-test` exercises the detectors without a browser or provider. `make live-all` runs the suite after the existing live journeys.
+
 ## Release
 
 Releases start from the `release` workflow on `main`; a dispatch from any other ref fails before building anything. Enter the workspace version from `Cargo.toml` without the leading `v`. The workflow requires a successful CI run for that exact commit, then:
