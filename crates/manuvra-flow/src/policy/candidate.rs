@@ -71,6 +71,9 @@ struct OfferedHoverTarget<'a> {
 }
 
 impl Candidate {
+    pub(crate) fn scroll_node_id(&self) -> Option<u64> {
+        self.target_identity.node_id
+    }
     #[cfg(any(target_os = "linux", target_os = "macos", test))]
     pub(crate) fn offered(&self) -> serde_json::Value {
         serde_json::to_value(OfferedCandidate {
@@ -220,17 +223,17 @@ impl Policy {
         observation: &Observation,
         operation: Operation,
     ) -> Result<Candidate, PolicyStop> {
-        let can_scroll = match operation {
-            Operation::ScrollUp => observation.viewport.scroll_y > 0.0,
-            Operation::ScrollDown => {
-                observation.viewport.scroll_y + f64::from(observation.viewport.height)
-                    < observation.viewport.document_height
+        use super::scroll::{ScrollRoute, route};
+        let mut candidate = self.untargeted_candidate(observation, operation);
+        match route(observation, operation) {
+            ScrollRoute::Window => Ok(candidate),
+            ScrollRoute::Region(region) => {
+                candidate.target_identity.node_id = Some(region.node_id);
+                Ok(candidate)
             }
-            _ => false,
-        };
-        can_scroll
-            .then(|| self.untargeted_candidate(observation, operation))
-            .ok_or(PolicyStop::Blocked("operation_blocked"))
+            ScrollRoute::None => Err(PolicyStop::Blocked("operation_blocked")),
+            ScrollRoute::Tied => Err(PolicyStop::Blocked("scroll_region_ambiguous")),
+        }
     }
 
     fn hover_candidate(
@@ -277,9 +280,27 @@ impl Policy {
 mod tests {
     use super::*;
     use crate::judgment::Operation;
+    use crate::policy::Next;
     use crate::policy::tests::support::*;
     use crate::test_support::hover_region as region;
     use manuvra_contract::JobOptions;
+
+    #[test]
+    fn tied_scroll_regions_publish_the_ambiguity_reason() {
+        let mut page = observation("CLICK", "button");
+        page.scroll_regions_truncated = true;
+        let mut policy = Policy::new(&JobOptions::default(), &page.url);
+        assert!(matches!(
+            decide_not_done(
+                &mut policy,
+                &step(),
+                &page,
+                &judgments("SCROLL_DOWN"),
+                false
+            ),
+            Next::Stop(PolicyStop::Blocked("scroll_region_ambiguous"))
+        ));
+    }
 
     #[test]
     fn hover_on_a_listed_region_mints_a_fallback_permit_naming_the_region() {
@@ -351,5 +372,45 @@ mod tests {
             .unwrap()
             .offered();
         assert!(element.get("hover_target").is_none());
+    }
+}
+
+#[cfg(test)]
+mod window_characterization {
+    use crate::policy::tests::support::*;
+    use crate::policy::{Next, Policy, PolicyStop};
+    use manuvra_contract::JobOptions;
+    #[test]
+    fn window_scroll_ends_and_identical_repeats_stop_before_dispatch() {
+        let mut page = observation("CLICK", "button");
+        for direction in ["SCROLL_UP", "SCROLL_DOWN"] {
+            let mut policy = Policy::new(&JobOptions::default(), &page.url);
+            assert!(matches!(
+                decide_not_done(&mut policy, &step(), &page, &judgments(direction), false),
+                Next::Stop(PolicyStop::Blocked("operation_blocked"))
+            ));
+        }
+        page.viewport.document_height = 1000.0;
+        let mut policy = Policy::new(&JobOptions::default(), &page.url);
+        assert!(matches!(
+            decide_not_done(
+                &mut policy,
+                &step(),
+                &page,
+                &judgments("SCROLL_DOWN"),
+                false
+            ),
+            Next::Mutate(_)
+        ));
+        assert!(matches!(
+            decide_not_done(
+                &mut policy,
+                &step(),
+                &page,
+                &judgments("SCROLL_DOWN"),
+                false
+            ),
+            Next::Stop(PolicyStop::Uncertain("replay_forbidden"))
+        ));
     }
 }

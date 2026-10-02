@@ -436,6 +436,123 @@ mod tests {
 
     #[test]
     #[ignore = "requires the local Chromium executable"]
+    fn hosted_no_effect_scroll_reports_equal_positions_and_refuses_identical_replay() {
+        let body = include_str!("../../../../tests/browser/scroll-app-shell-table.html");
+        let fixture = HoverRevealFixture::with_body(body);
+        let url = format!("{}?cancel-wheel", fixture.url());
+        let job = parse_job(
+            json!({"schema_version":1,"target":{"kind":"browser","url":url},"context":{"journey":"no effect scroll","revision":"fixture","environment":"local Chromium","actor":"synthetic","authority":"open locality 52"},"steps":[{"id":"open","goal":"Open locality 52","done_when":[{"text_visible":"Opened locality 52"}]}]}),
+        );
+        let mut browser = LiveBrowser::open(&url);
+        let provider = RowActionProvider::scrolling(vec![("Open locality 52", "Open locality 52")]);
+        let mut journal = MemoryJournal::default();
+        let run = run_loop(
+            &job,
+            &mut browser,
+            &provider,
+            &ScriptedControl::default(),
+            &mut journal,
+        );
+        let escalation: Value =
+            serde_json::from_slice(&std::fs::read(run.artifact("escalations/e_1.json")).unwrap())
+                .unwrap();
+        assert_eq!(escalation["gate_reason"], "replay_forbidden");
+        let facts: Vec<_> = journal
+            .entries
+            .iter()
+            .filter(|e| e["event"] == "action_fact")
+            .collect();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0]["fact"]["outcome"], "observed");
+        let positions = facts[0]["fact"]["scroll_readback"].as_array().unwrap();
+        assert!(!positions.is_empty());
+        assert!(positions.iter().all(|p| p["before"] == p["after"]));
+    }
+
+    #[test]
+    #[ignore = "requires the local Chromium executable"]
+    fn hosted_scroll_selects_the_popup_option_and_reaches_the_dialog_button() {
+        for (body, goal, wanted, status) in [
+            (
+                include_str!("../../../../tests/browser/scroll-popup-list.html"),
+                "Choose Option 45",
+                "Option 45",
+                "Category: Option 45",
+            ),
+            (
+                include_str!("../../../../tests/browser/scroll-dialog-body.html"),
+                "Save terms",
+                "Save terms",
+                "Terms saved",
+            ),
+        ] {
+            let fixture = HoverRevealFixture::with_body(body);
+            let url = fixture.url();
+            let steps = if goal == "Choose Option 45" {
+                json!([
+                    {"id":"open","goal":"Open Category","done_when":[{"dialog_open":"Choose category"}]},
+                    {"id":"choose","goal":goal,"done_when":[{"text_visible":status}]}
+                ])
+            } else {
+                json!([{ "id":"save","goal":goal,"done_when":[{"text_visible":status}]}])
+            };
+            let job = parse_job(
+                json!({"schema_version":1,"target":{"kind":"browser","url":url},"context":{"journey":"scroll in overlay","revision":"fixture","environment":"local Chromium","actor":"synthetic","authority":"operate synthetic controls"},"steps":steps}),
+            );
+            let mut browser = LiveBrowser::open(&url);
+            let provider =
+                RowActionProvider::scrolling(vec![("Open Category", "Category"), (goal, wanted)]);
+            let mut journal = MemoryJournal::default();
+            let run = run_loop(
+                &job,
+                &mut browser,
+                &provider,
+                &ScriptedControl::default(),
+                &mut journal,
+            );
+            assert_eq!(run.state(), "passed", "{}", run.outcome.result);
+            assert_eq!(browser.final_page.unwrap().viewport.scroll_y, 0.0);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the local Chromium executable"]
+    fn hosted_scroll_reaches_the_locality_below_the_table_fold() {
+        let fixture = HoverRevealFixture::with_body(include_str!(
+            "../../../../tests/browser/scroll-app-shell-table.html"
+        ));
+        let url = fixture.url();
+        let job = parse_job(
+            json!({"schema_version":1,"target":{"kind":"browser","url":url},"context":{"journey":"scroll to locality","revision":"fixture","environment":"local Chromium","actor":"synthetic","authority":"open locality 52"},"steps":[{"id":"open","goal":"Open locality 52","done_when":[{"text_visible":"Opened locality 52"}]}]}),
+        );
+        let mut browser = LiveBrowser::open(&url);
+        let provider = RowActionProvider::scrolling(vec![("Open locality 52", "Open locality 52")]);
+        let mut journal = MemoryJournal::default();
+        let run = run_loop(
+            &job,
+            &mut browser,
+            &provider,
+            &ScriptedControl::default(),
+            &mut journal,
+        );
+        assert_eq!(run.state(), "passed", "{}", run.outcome.result);
+        assert!(
+            journal
+                .prepared()
+                .iter()
+                .any(|e| e["scroll_target"]["name"] == "Localities")
+        );
+        assert!(
+            browser
+                .final_page
+                .unwrap()
+                .visible_text
+                .contains("Opened locality 52")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the local Chromium executable"]
     fn hosted_run_stops_after_committed_navigation_to_a_foreign_origin() {
         let fixture = OriginFixture::start();
         let start_url = fixture.start_url();

@@ -23,11 +23,14 @@ cargo build --locked --manifest-path "$repo_root/Cargo.toml" --bin manuvra
 start_fixture "manuvra-run-lifecycle-$stamp" "$evidence_root/money-fixture" \
   "$evidence_root/launch.json" "$evidence_root/doctor.json"
 
+job="$evidence_root/job.json"
+fixture_job "$repo_root/tests/live/money/create-account-forced-pause.json" "$job"
+
 set +e
 XDG_STATE_HOME="$state_root" XDG_RUNTIME_DIR="$runtime_root" \
   "$repo_root/target/debug/manuvra" run \
   --request-id "run-lifecycle-$stamp" \
-  --job "$repo_root/tests/live/money/create-account-forced-pause.json" \
+  --job "$job" \
   --evidence "$evidence_root/run" >"$evidence_root/run.json"
 run_status=$?
 set -e
@@ -62,7 +65,7 @@ set +e
 XDG_STATE_HOME="$state_root" XDG_RUNTIME_DIR="$runtime_root" \
   "$repo_root/target/debug/manuvra" run \
   --request-id "run-lifecycle-$stamp" \
-  --job "$repo_root/tests/live/money/create-account-forced-pause.json" \
+  --job "$job" \
   --evidence "$evidence_root/run" \
   --wait-ms 0 >"$evidence_root/attach-identical.json"
 attach_status=$?
@@ -122,7 +125,7 @@ set +e
 XDG_STATE_HOME="$state_root" XDG_RUNTIME_DIR="$runtime_root" \
   "$repo_root/target/debug/manuvra" run \
   --request-id "run-lifecycle-$stamp" \
-  --job "$repo_root/tests/live/money/create-account-forced-pause.json" \
+  --job "$job" \
   --evidence "$evidence_root/run" >"$evidence_root/retry-after-expiry.json"
 retry_status=$?
 set -e

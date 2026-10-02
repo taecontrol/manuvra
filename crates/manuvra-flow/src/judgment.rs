@@ -112,6 +112,11 @@ pub fn request(
             "key":{"type":"choice","instructions":{"premise":"The operation is PRESS_KEY","rules":"Choose one key for the current observation, not the whole step. For a goal that asks for arrows and Enter to choose an option, inspect the focused element's active_descendant: use an arrow to reach the named option, then use Enter when that option is active.","goal":values.mask(&step.goal)},"criteria":{"Escape":"Close the focused overlay with Escape.","Tab":"Move focus forward with Tab.","Shift+Tab":"Move focus backward with Shift+Tab.","Enter":"Activate the focused control or its active descendant with Enter.","Space":"Activate the focused control with Space.","ArrowUp":"Move to the previous option with ArrowUp.","ArrowDown":"Move to the next option with ArrowDown.","ArrowLeft":"Move left in a composite widget with ArrowLeft.","ArrowRight":"Move right in a composite widget with ArrowRight.","Home":"Move to the first option with Home.","End":"Move to the last option with End."}}
         }
     });
+    let regions = routed_scroll_regions(observation, values);
+    let has_scroll_regions = !regions.is_empty();
+    if !regions.is_empty() {
+        request["state"]["code_facts"]["scroll_regions"] = json!(regions);
+    }
     if crate::contest::contested(observation) && observation.hover_regions.is_empty() {
         request["questions"]["click_target"]["instructions"]["rules"] =
             json!(contested_target_rules());
@@ -132,7 +137,62 @@ pub fn request(
             "Click a control or option listed as a click target that directly advances this step, including targets marked revealed_by_hover, which code reveals before clicking. Use this for goals that say open, choose, confirm, use, or submit."
         );
     }
+    describe_region_operations(&mut request, has_scroll_regions);
     request
+}
+
+fn describe_region_operations(request: &mut Value, has_scroll_regions: bool) {
+    if !has_scroll_regions {
+        return;
+    }
+    request["questions"]["operation"]["criteria"]["SCROLL_UP"] = json!(
+        "Scroll up to reveal the required target when it is earlier than the visible items in a scroll region. When the required option precedes the visible options and code facts allow scrolling up, choose SCROLL_UP before clicking an unrelated visible option or reopening the picker."
+    );
+    request["questions"]["operation"]["criteria"]["SCROLL_DOWN"] = json!(
+        "Scroll down when the needed target is not visible yet and may lie further down, in the page or in an open dialog, popup, or list that scrolls."
+    );
+    request["questions"]["click_target"]["criteria"]["NO_CLICK_TARGET"] = json!(
+        "The exact control or option required by this step is not listed. Never substitute another item with a similar name."
+    );
+    let rules = request["questions"]["click_target"]["instructions"]["rules"]
+        .as_str()
+        .unwrap_or_default();
+    request["questions"]["click_target"]["instructions"]["rules"] = json!(format!(
+        "{rules} If the exact required control or option is not listed, choose NO_CLICK_TARGET. Never substitute a different item that shares only part of its name."
+    ));
+    let mut click_rule = "Click a listed control only when the exact required target is visible. If the required target is absent, CLICK cannot advance the step: choose SCROLL_UP or SCROLL_DOWN to reveal it. A successful previous scroll is progress, and more scrolls can be needed before the exact target appears. Never substitute a different option whose name resembles the requested one.".to_owned();
+    if request["questions"]["operation"]["criteria"]["CLICK"]
+        .as_str()
+        .is_some_and(|rule| rule.contains("revealed_by_hover"))
+    {
+        click_rule.push_str(" Treat targets marked revealed_by_hover as visible offered targets: code reveals them before clicking.");
+    }
+    request["questions"]["operation"]["criteria"]["CLICK"] = json!(click_rule);
+}
+
+fn routed_scroll_regions(observation: &Observation, values: &Values<'_>) -> Vec<Value> {
+    use crate::policy::scroll::{ScrollRoute, route};
+    let mut regions: Vec<(u64, Value)> = Vec::new();
+    for (operation, direction) in [(Operation::ScrollUp, "up"), (Operation::ScrollDown, "down")] {
+        if let ScrollRoute::Region(region) = route(observation, operation) {
+            if let Some((_, fact)) = regions.iter_mut().find(|(id, _)| *id == region.node_id) {
+                fact["can_scroll"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!(direction));
+            } else {
+                regions.push((
+                    region.node_id,
+                    json!({
+                        "name":values.mask(&region.name),
+                        "in_dialog":region.overlay.as_ref().map(|title|values.mask(title)),
+                        "can_scroll":[direction]
+                    }),
+                ));
+            }
+        }
+    }
+    regions.into_iter().map(|(_, fact)| fact).collect()
 }
 
 fn reveal_target_rules() -> &'static str {
@@ -431,6 +491,9 @@ mod tests {
             },
             coverage: Coverage::default(),
             hover_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            overlay: None,
+            scroll_regions_truncated: false,
             hover_regions_truncated: false,
             hover_rules_unreadable: false,
         };
@@ -541,9 +604,99 @@ mod tests {
             },
             coverage: Coverage::default(),
             hover_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            overlay: None,
+            scroll_regions_truncated: false,
             hover_regions_truncated: false,
             hover_rules_unreadable: false,
         }
+    }
+
+    fn with_scroll_region(mut page: Observation) -> Observation {
+        page.overlay = Some(manuvra_chrome::Overlay {
+            node_id: 80,
+            name: "Edit Savings 4417".into(),
+        });
+        page.scroll_regions = serde_json::from_value(json!([{
+            "node_id":9997,"name":"Savings 4417","overlay":"Edit Savings 4417",
+            "overlay_node_id":80,"parent_node_id":null,"can_scroll_up":true,"can_scroll_down":true,
+            "scroll_top":100,"scroll_height":1000,"client_height":300,
+            "rect":{"x":0,"y":0,"width":200,"height":300}
+        }]))
+        .unwrap();
+        page
+    }
+
+    #[test]
+    fn request_scroll_fact_uses_only_routed_directions_and_masks_names() {
+        let job = golden_job();
+        let values = Values::new(&job);
+        let recent = [json!({"event":"action_fact","fact":{"target_name":"Savings 4417"}})];
+        let mut page = with_scroll_region(golden_observation());
+        let actual = request(&job.steps[0], &page, &recent, &values);
+        assert_eq!(
+            actual.to_string(),
+            include_str!("../tests/fixtures/judgment-request-with-scroll-regions.json").trim_end()
+        );
+        assert_eq!(
+            actual["state"]["code_facts"]["scroll_regions"],
+            json!([{
+                "name":"<value:account>","in_dialog":"Edit <value:account>","can_scroll":["up","down"]
+            }])
+        );
+        assert!(!actual.to_string().contains("9997"));
+        page.scroll_regions[0].can_scroll_up = false;
+        assert_eq!(
+            routed_scroll_regions(&page, &values)[0]["can_scroll"],
+            json!(["down"])
+        );
+        page.scroll_regions[0].can_scroll_down = false;
+        assert!(
+            request(&job.steps[0], &page, &[], &values)["state"]["code_facts"]
+                .get("scroll_regions")
+                .is_none()
+        );
+        assert!(
+            request(&job.steps[0], &page, &[], &values)["questions"]["click_target"]["criteria"]
+                .get("NO_CLICK_TARGET")
+                .is_none()
+        );
+        page.overlay = None;
+        page.scroll_regions[0].can_scroll_up = true;
+        page.scroll_regions[0].can_scroll_down = true;
+        assert!(routed_scroll_regions(&page, &values).is_empty());
+        page.viewport.scroll_y = 1220.;
+        assert_eq!(
+            routed_scroll_regions(&page, &values)[0]["can_scroll"],
+            json!(["down"])
+        );
+        page.scroll_regions_truncated = true;
+        assert!(routed_scroll_regions(&page, &values).is_empty());
+    }
+
+    #[test]
+    fn scroll_abstention_keeps_hover_reveals_and_target_context() {
+        let job = golden_job();
+        let page = with_scroll_region(with_hover_regions(golden_observation()));
+        let actual = request(&job.steps[0], &page, &[], &Values::new(&job));
+        let rules = actual["questions"]["click_target"]["instructions"]["rules"]
+            .as_str()
+            .unwrap();
+        assert!(rules.contains("revealed_by_hover"));
+        assert!(rules.contains("container"));
+        assert!(rules.contains("choose NO_CLICK_TARGET"));
+        assert!(
+            actual["questions"]["operation"]["criteria"]["CLICK"]
+                .as_str()
+                .unwrap()
+                .contains("revealed_by_hover")
+        );
+        let targets = &actual["questions"]["click_target"]["criteria"];
+        assert!(targets.get("NO_CLICK_TARGET").is_some());
+        assert!(targets.as_object().unwrap().values().any(|target| {
+            target["revealed_by_hover"] == true && target["container"] == "<value:account>"
+        }));
+        assert!(!actual.to_string().contains("Savings 4417"));
     }
 
     #[test]

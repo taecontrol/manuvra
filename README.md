@@ -247,6 +247,24 @@ To check the duplicate-effect detector, run `bash -ic 'python3 scripts/live/keyb
 
 Contributors and coding agents should follow [docs/CODING_STANDARDS.md](docs/CODING_STANDARDS.md). The [architecture decision records](docs/adrs/) explain the project's design choices.
 
+Nested scroll journeys run against instrumented synthetic fixtures with live Jev and a release binary:
+
+```bash
+make live-scroll
+python3 scripts/live/scroll-matrix.py --self-test-detectors
+python3 scripts/live/scroll-matrix.py --budget .work/live/scroll/<run>/report.json
+```
+
+The matrix runs five headless attempts per journey at 1280×800: selecting an option below and above a popup list's fold, saving below a dialog's fold, and opening a locality below a table's fold. Each journey needs at least four autonomous passes, zero prohibited outcomes, and at most 5% of pooled first-draw scroll choices below confidence 0.70. Independent browser events detect wrong clicks, document or unrelated region movement, and wheel counts; evidence verifies readback positions and a ceiling of six logical model calls per step. Reports retain binary and fixture digests, revision, model, and per-run facts under `.work/live/scroll/`. `make live-self-test` exercises the detectors without a browser or provider. `make live-all` runs the suite after the existing live journeys.
+
+The real Money picker has a separate gate:
+
+```bash
+MONEY_DIR=/path/to/disposable/money-at-e013e07 make live-money-scroll
+```
+
+The checkout must have its dependencies installed and a current build. `MONEY_FIXTURE_PORT` optionally selects a free local port for all Money live suites; `MONEY_SCROLL_PORT` can override it for this suite. The suite owns disposable driver state and port 4351 through the shared live helpers, seeds one account, 40 categories and three expenses, and sets Coffee to Travel item 10 without filtering. The job first scrolls the document if Coffee is outside the viewport, then opens Coffee’s picker, scrolls through the category groups until the complete label is visible, and chooses it. It runs five headless attempts at each of 1280×800 and 1280×420, requiring four autonomous passes per viewport and zero prohibited outcomes. The Money driver's persistence readback verifies the category; scroll evidence and observations verify that only the cmdk list moved after Coffee became visible, with the document position frozen before opening the picker. Every unperformed click fails the covered-click guard because detailed browser rejection reasons stay internal. The suite checks cleanup and provider-key absence, writes reports under `.work/live/money-scroll/`, and runs last in `make live-all`.
+
 ## Release
 
 Releases start from the `release` workflow on `main`; a dispatch from any other ref fails before building anything. Enter the workspace version from `Cargo.toml` without the leading `v`. The workflow requires a successful CI run for that exact commit, then:

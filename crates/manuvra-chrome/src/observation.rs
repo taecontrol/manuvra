@@ -26,6 +26,12 @@ pub struct Observation {
     pub viewport: ViewportState,
     #[serde(default)]
     pub coverage: Coverage,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scroll_regions: Vec<ScrollRegion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay: Option<Overlay>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub scroll_regions_truncated: bool,
     /// Visible containers whose controls are hidden by opacity until hovered, in document order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hover_regions: Vec<HoverRegion>,
@@ -35,6 +41,59 @@ pub struct Observation {
     /// CSSOM hover rules could not be read. Detection-only; not a coverage gap.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hover_rules_unreadable: bool,
+}
+
+/// A visible, vertically overflowing region. Node identities are browser-internal.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScrollRegion {
+    pub node_id: u64,
+    pub name: String,
+    pub overlay: Option<String>,
+    #[serde(default)]
+    pub overlay_node_id: Option<u64>,
+    pub parent_node_id: Option<u64>,
+    pub can_scroll_up: bool,
+    pub can_scroll_down: bool,
+    pub scroll_top: f64,
+    pub scroll_height: f64,
+    pub client_height: f64,
+    pub rect: Rect,
+}
+
+/// A measured scroll position, with dispatch identity omitted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScrollPosition {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub overlay: Option<String>,
+    pub document: bool,
+    pub before: f64,
+    pub after: f64,
+}
+
+/// The topmost routing scope; the browser identity stays internal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Overlay {
+    pub node_id: u64,
+    pub name: String,
+}
+
+/// Dispatch-free identity used by action evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScrollTarget {
+    pub name: String,
+    pub overlay: Option<String>,
+    pub document: bool,
+}
+
+impl ScrollRegion {
+    pub fn target(&self) -> ScrollTarget {
+        ScrollTarget {
+            name: self.name.clone(),
+            overlay: self.overlay.clone(),
+            document: false,
+        }
+    }
 }
 
 /// A visible container holding controls that are hidden by opacity until the pointer is over it.

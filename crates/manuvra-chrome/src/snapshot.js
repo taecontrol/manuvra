@@ -7,15 +7,167 @@
   };
   for (const [id, element] of cache.nodes) if (!element.isConnected) cache.nodes.delete(id);
 
+  // Assigned nodes are painted through their slot, not through their light-DOM parent.
+  const up = n => n.assignedSlot || n.parentElement || n.getRootNode?.()?.host || null;
   const gaps = [], contexts = [], seenRoots = new Set();
+  let unverifiableFrameGeometry = false;
   // A frame's document starts at its content box, inside the border and padding.
   const frameOrigin = (frame) => {
     const rect = frame.getBoundingClientRect(), style = frame.ownerDocument.defaultView.getComputedStyle(frame);
     return {x: rect.x + frame.clientLeft + parseFloat(style.paddingLeft), y: rect.y + frame.clientTop + parseFloat(style.paddingTop)};
   };
+  const mappedRect = (rect,matrix) => {
+    const points = [[rect.x,rect.y],[rect.x+rect.width,rect.y],[rect.x,rect.y+rect.height],[rect.x+rect.width,rect.y+rect.height]].map(([x,y])=>matrix.transformPoint({x,y}));
+    const x=Math.min(...points.map(p=>p.x)), y=Math.min(...points.map(p=>p.y));
+    return {x,y,width:Math.max(...points.map(p=>p.x))-x,height:Math.max(...points.map(p=>p.y))-y};
+  };
+  const rectPoints = r => [{x:r.x,y:r.y},{x:r.x+r.width,y:r.y},{x:r.x+r.width,y:r.y+r.height},{x:r.x,y:r.y+r.height}];
+  const pointBounds = points => {
+    if(!points.length)return {x:0,y:0,width:0,height:0};
+    const x=Math.min(...points.map(p=>p.x)),y=Math.min(...points.map(p=>p.y));
+    return {x,y,width:Math.max(...points.map(p=>p.x))-x,height:Math.max(...points.map(p=>p.y))-y};
+  };
+  // Clip a polygon against each affine client edge in its own coordinate space.
+  const clipEdge = (points,inverse,axis,limit,greater) => {
+    const out=[],distance=p=>(inverse.transformPoint(p)[axis]-limit)*(greater?1:-1);
+    if(!points.length)return out;
+    let previous=points.at(-1),before=distance(previous);
+    for(const point of points) {
+      const after=distance(point);
+      if((before>=0)!==(after>=0)) {
+        const fraction=before/(before-after);
+        out.push({x:previous.x+(point.x-previous.x)*fraction,y:previous.y+(point.y-previous.y)*fraction});
+      }
+      if(after>=0)out.push(point);
+      previous=point;before=after;
+    }
+    return out;
+  };
+  const clippedPolygon = (points,bounds) => {
+    const identity=new DOMMatrix();
+    for(const [axis,limit,greater] of [['x',bounds.left,true],['x',bounds.right,false],['y',bounds.top,true],['y',bounds.bottom,false]])
+      points=clipEdge(points,identity,axis,limit,greater);
+    for(const {box,clipX,clipY} of bounds.clips) {
+      const inverse=box.matrix.inverse();
+      if(clipX) {points=clipEdge(points,inverse,'x',0,true);points=clipEdge(points,inverse,'x',box.width,false);}
+      if(clipY) {points=clipEdge(points,inverse,'y',0,true);points=clipEdge(points,inverse,'y',box.height,false);}
+    }
+    return points;
+  };
+  const polygonColumnHeight = (polygon,x) => {
+    const ys=[];
+    for(let j=0;j<polygon.length;j++) {
+      const a=polygon[j],b=polygon[(j+1)%polygon.length];
+      if(x<Math.min(a.x,b.x) || x>Math.max(a.x,b.x))continue;
+      if(a.x===b.x)ys.push(a.y,b.y);
+      else ys.push(a.y+(b.y-a.y)*(x-a.x)/(b.x-a.x));
+    }
+    return Math.max(...ys)-Math.min(...ys);
+  };
+  const polygonArea = points => Math.abs(points.reduce((sum,p,i)=>{const q=points[(i+1)%points.length];return sum+p.x*q.y-q.x*p.y;},0))/2;
+  // Keep client dimensions and DOMRects in explicit coordinate spaces.
+  const elementGeometry = element => {
+    let matrix = new DOMMatrix(), zoom = 1, svgBasis = false;
+    for (let node=element;node;node=up(node)) {
+      const css=node.ownerDocument.defaultView.getComputedStyle(node);
+      const transform=new DOMMatrix(css.transform==='none'?undefined:css.transform);
+      // A matrix3d used for a flat scale animation is still an affine X/Y map.
+      const planar=[transform.m13,transform.m14,transform.m23,transform.m24,transform.m31,transform.m32,transform.m34].every(value=>value===0) && transform.m44===1;
+      if (!planar || css.perspective!=='none') return null;
+      let rotation=new DOMMatrix(), scaling=new DOMMatrix();
+      if (css.rotate!=='none') {
+        const parts=css.rotate.split(/\s+/), angle=parts.at(-1);
+        if (parts.length>2 || parts.length===2 && parts[0]!=='z') return null;
+        rotation=rotation.rotate(parseFloat(angle)*(angle.endsWith('turn')?360:angle.endsWith('rad')?180/Math.PI:1));
+      }
+      if (css.scale!=='none') {
+        const parts=css.scale.split(/\s+/).map(Number);
+        scaling=scaling.scale(parts[0],parts[1]??parts[0]);
+      }
+      const nodeZoom=parseFloat(css.zoom)||1;zoom*=nodeZoom;
+      // SVG's native basis includes viewBox and attribute transforms, which CSS
+      // transform alone cannot describe. Descendant HTML still uses CSS units.
+      const view=node.ownerDocument.defaultView;
+      if(!svgBasis && node instanceof view.SVGGraphicsElement && !(node instanceof view.SVGSVGElement)) {
+        const native=node.getScreenCTM();if(!native)return null;
+        const values=[native.a,native.b,native.c,native.d,native.e,native.f];
+        if(!values.every(Number.isFinite))return null;
+        matrix=new DOMMatrix(values).multiply(matrix);svgBasis=true;
+      } else if(!svgBasis) matrix=new DOMMatrix().scale(nodeZoom).multiply(rotation).multiply(scaling).multiply(transform).multiply(matrix);
+    }
+    const css=element.ownerDocument.defaultView.getComputedStyle(element), rect=element.getBoundingClientRect();
+    const width=parseFloat(css.width)+(css.boxSizing==='border-box'?0:parseFloat(css.paddingLeft)+parseFloat(css.paddingRight)+parseFloat(css.borderLeftWidth)+parseFloat(css.borderRightWidth));
+    const height=parseFloat(css.height)+(css.boxSizing==='border-box'?0:parseFloat(css.paddingTop)+parseFloat(css.paddingBottom)+parseFloat(css.borderTopWidth)+parseFloat(css.borderBottomWidth));
+    const linear=new DOMMatrix([matrix.a,matrix.b,matrix.c,matrix.d,0,0]);
+    const box=mappedRect({x:0,y:0,width,height},linear);
+    linear.e=rect.x-box.x;linear.f=rect.y-box.y;
+    return Number.isFinite(linear.inverse().a)?{matrix:linear,zoom}:null;
+  };
+  const clientBox = element => {
+    const geometry=elementGeometry(element);
+    if(!geometry)throw new Error('Unverifiable client geometry');
+    return {...geometry,matrix:geometry.matrix.translate(element.clientLeft,element.clientTop),width:element.clientWidth,height:element.clientHeight};
+  };
+  const overflowBox = (element,css) => {
+    const box=clientBox(element);
+    if(css.overflowX!=='clip' && css.overflowY!=='clip')return box;
+    const value=css.overflowClipMargin,margin=parseFloat(value.split(/\s+/).at(-1))||0;
+    let left=-margin,top=-margin,width=box.width+2*margin,height=box.height+2*margin;
+    if(value.startsWith('content-box')) {
+      left+=parseFloat(css.paddingLeft);top+=parseFloat(css.paddingTop);
+      width-=parseFloat(css.paddingLeft)+parseFloat(css.paddingRight);
+      height-=parseFloat(css.paddingTop)+parseFloat(css.paddingBottom);
+    } else if(value.startsWith('border-box')) {
+      left-=element.clientLeft;top-=element.clientTop;
+      width+=parseFloat(css.borderLeftWidth)+parseFloat(css.borderRightWidth);
+      height+=parseFloat(css.borderTopWidth)+parseFloat(css.borderBottomWidth);
+    }
+    return {...box,matrix:box.matrix.translate(left,top),width,height};
+  };
+  // Rebuild frame geometry at dispatch; a snapshot cannot authorize a later wheel.
+  const frameContext = root => {
+    let owner = root.ownerDocument || root;
+    const frames = [];
+    while (owner !== document) {
+      const frame = owner.defaultView?.frameElement;
+      if (!frame?.isConnected || frame.contentDocument !== owner) return null;
+      frames.unshift({frame,owner}); owner = frame.ownerDocument;
+    }
+    let matrix=new DOMMatrix(),zoom=1;
+    const viewports=[];
+    for (const entry of frames) {
+      entry.parentMatrix=matrix;
+      const parent=entry.frame.ownerDocument.defaultView;
+      viewports.push({matrix,width:parent.innerWidth,height:parent.innerHeight});
+      const geometry=elementGeometry(entry.frame);if(!geometry)return null;
+      const css=entry.frame.ownerDocument.defaultView.getComputedStyle(entry.frame);
+      const local=geometry.matrix.translate(entry.frame.clientLeft+parseFloat(css.paddingLeft),entry.frame.clientTop+parseFloat(css.paddingTop));
+      matrix=matrix.multiply(local);zoom*=geometry.zoom;
+    }
+    const view=(root.ownerDocument || root).defaultView;
+    const viewportBounds={left:0,top:0,right:view.innerWidth,bottom:view.innerHeight};
+    const viewportClips=viewports.map(box=>({box:{...box,matrix:matrix.inverse().multiply(box.matrix)},clipX:true,clipY:true}));
+    return {matrix,zoom,viewportBounds,viewportClips,frames};
+  };
+  const hitAt = (region,x,y) => {
+    const context=frameContext(region.getRootNode());if(!context)return null;
+    const deepHit=(owner,x,y)=> {
+      let hit=owner.elementFromPoint(x,y),next;
+      while(hit?.shadowRoot && (next=hit.shadowRoot.elementFromPoint(x,y)) && next!==hit) hit=next;
+      return hit;
+    };
+    for(const {frame,parentMatrix} of context.frames) {
+      const point=parentMatrix.inverse().transformPoint({x,y});
+      if(deepHit(frame.ownerDocument,point.x,point.y)!==frame)return null;
+    }
+    const point=context.matrix.inverse().transformPoint({x,y});
+    return deepHit(region.ownerDocument,point.x,point.y);
+  };
   const visit = (root, context, offsetX, offsetY) => {
     if (!root || seenRoots.has(root)) return;
-    seenRoots.add(root); contexts.push({root, context, offsetX, offsetY});
+    const geometry=frameContext(root);
+    if(!geometry) {unverifiableFrameGeometry=true;return;}
+    seenRoots.add(root); contexts.push({root, context, offsetX, offsetY, viewportBounds:geometry.viewportBounds,viewportClips:geometry.viewportClips});
     if (root.defaultView?.__manuvraClosedShadowRoots > 0) gaps.push('closed_shadow_root');
     for (const element of root.querySelectorAll('*')) {
       if (element.shadowRoot) visit(element.shadowRoot, `${context}/shadow:${nodeId(element)}`, offsetX, offsetY);
@@ -28,22 +180,54 @@
     }
   };
   visit(document, 'main', 0, 0);
+  if(unverifiableFrameGeometry)return null;
 
   const ancestors = (element) => {
     const values = []; let current = element;
     while (current) {
       values.push(current);
-      const root = current.getRootNode?.();
-      current = current.parentElement || root?.host || null;
+      current = up(current);
     }
     return values;
   };
   const nearestDialog = (element) => ancestors(element).find(node => node.matches?.('dialog,[role="dialog"],[role="alertdialog"]')) || null;
-  const inViewport = (element, context) => {
-    const r = element.getBoundingClientRect(), x = r.x + context.offsetX, y = r.y + context.offsetY;
-    return r.width > 0 && r.height > 0 && y + r.height > 0 && x + r.width > 0 && y < innerHeight && x < innerWidth;
+  const viewOfElement = element => element.ownerDocument.defaultView;
+  // Only ancestors below the containing block can be escaped by positioned descendants.
+  const clippingRect = (element, context, viewport = true, clipSelf = false) => {
+    const windowBounds = context.viewportBounds || {left:-context.offsetX,top:-context.offsetY,right:innerWidth-context.offsetX,bottom:innerHeight-context.offsetY};
+    const bounds = {...(viewport ? windowBounds : {left:-Infinity,top:-Infinity,right:Infinity,bottom:Infinity}),clips:viewport?[...(context.viewportClips || [])]:[]};
+    let current = element;
+    while (current) {
+      const style = viewOfElement(current).getComputedStyle(current);
+      const positioned = style.position === 'absolute' || style.position === 'fixed';
+      const parent = up(current);
+      let next = parent;
+      if (positioned) next = current.offsetParent;
+      if (clipSelf) {next = current; clipSelf = false;}
+      if (!next || next.ownerDocument !== element.ownerDocument) break;
+      const css = viewOfElement(next).getComputedStyle(next);
+      // The body's overflow propagates to the viewport when the root leaves it visible.
+      const rootStyle = viewOfElement(next).getComputedStyle(next.ownerDocument.documentElement);
+      const viewportOverflow = next === next.ownerDocument.documentElement || (next === next.ownerDocument.body && rootStyle.overflowX === 'visible' && rootStyle.overflowY === 'visible');
+      if (viewportOverflow) {current = next; continue;}
+      // Overflow does not create a clipping box on contents or non-replaced inline elements.
+      const boxless = css.display === 'contents' || next instanceof viewOfElement(next).SVGElement && !next.matches('svg,foreignObject') || css.display === 'inline' && next instanceof viewOfElement(next).HTMLElement && !next.matches('img,iframe,frame,object,embed,video,audio,canvas,input,textarea,select,button') && next.clientWidth === 0 && next.clientHeight === 0;
+      if(!boxless && (css.overflowX !== 'visible' || css.overflowY !== 'visible'))
+        bounds.clips.push({box:overflowBox(next,css),clipX:css.overflowX!=='visible',clipY:css.overflowY!=='visible'});
+      current = next;
+    }
+    return bounds;
   };
-  const rendered = (element, context) => Boolean(element) && element.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}) && inViewport(element, context);
+  const inViewport = (element, context) => {
+    const r = element.getBoundingClientRect(), b = clippingRect(element, context);
+    return r.width > 0 && r.height > 0 && polygonArea(clippedPolygon(rectPoints(r),b)) > 0;
+  };
+  const centerUnclipped = (element, context) => {
+    const r = element.getBoundingClientRect(), b = clippingRect(element, context, false), x = r.x+r.width/2, y = r.y+r.height/2;
+    // Keep the existing viewport-intersection rule; apply centers only to ancestor clipping.
+    return b.clips.every(({box,clipX,clipY})=>{const point=box.matrix.inverse().transformPoint({x,y});return (!clipX || point.x>=0 && point.x<box.width) && (!clipY || point.y>=0 && point.y<box.height);});
+  };
+  const rendered = (element, context) => Boolean(element) && element.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}) && inViewport(element, context) && centerUnclipped(element, context);
   const visible = (element, context) => rendered(element, context) && !ancestors(element).some(node => node.matches?.('[aria-hidden="true"],[inert]'));
   const referencedById = (element, id) => element.getRootNode().getElementById?.(id);
   const name = (element, seen = new Set()) => {
@@ -81,7 +265,6 @@
   const dialogs = dialogRecords.map(record => record.title);
   const selector = 'a[href],button,input:not([type="hidden"]),textarea,select,summary,[contenteditable="true"],[role="button"],[role="link"],[role="checkbox"],[role="radio"],[role="switch"],[role="tab"],[role="menuitem"],[role="menuitemradio"],[role="option"],[role="combobox"],[role="textbox"],[role="searchbox"],[role="spinbutton"]';
   const CONTROL = selector;
-  const up = (n) => n.parentElement || n.getRootNode?.()?.host || null;
   const isDialog = (n) => n.matches?.('dialog,[role="dialog"],[role="alertdialog"]');
   const nonLinkControl = (n) => n.matches?.(CONTROL) && !n.matches('a[href],[role="link"]');
   // Painted text segments of `root`, excluding text inside non-link controls and editable fields.
@@ -131,7 +314,7 @@
   for (const [element, index] of elementIndices) elements[index - 1].shares_name = twinCounts.get(twinKey(element)) > 1;
 
   const REGION_LIMIT = 20, REGION_NAME_LIMIT = 120;
-  const hiddenByOpacity = (element, context) => inViewport(element, context) && element.checkVisibility({checkVisibilityCSS:true}) &&
+  const hiddenByOpacity = (element, context) => inViewport(element, context) && centerUnclipped(element, context) && element.checkVisibility({checkVisibilityCSS:true}) &&
     !element.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}) && !ancestors(element).some(node => node.matches?.('[aria-hidden="true"],[inert]'));
   const revealingRegion = (element) => ancestors(element).slice(1).find(node => node.checkVisibility({checkOpacity:true}) &&
     (node.matches('li,tr,[role=row],[role=listitem]') || node.hasAttribute('aria-label')));
@@ -213,6 +396,89 @@
   }
   const hoverRegions = [...regionRecords.values()].slice(0, REGION_LIMIT).map((record, offset) => ({index:offset + 1, ...record}));
 
+  const overlayCandidates = [];
+  const containsAcrossRoots = (outer,inner) => ancestors(inner).includes(outer);
+  const isolatedDialog = dialog => {
+    const owner=dialog.ownerDocument;
+    return [...owner.body.querySelectorAll('*')].filter(e=>!containsAcrossRoots(dialog,e) && !containsAcrossRoots(e,dialog) && !e.matches('script,style,template') && e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})).every(e=>ancestors(e).some(n=>n.matches?.('[aria-hidden="true"],[inert]')));
+  };
+  for (const context of contexts) {
+    const controlled=new Set();
+    for (const trigger of context.root.querySelectorAll('[aria-expanded="true"]')) {
+      if (!visible(trigger,context) || !(trigger.getAttribute('aria-haspopup') && trigger.getAttribute('aria-haspopup') !== 'false' || trigger.getAttribute('role')==='combobox')) continue;
+      for (const id of `${trigger.getAttribute('aria-controls') || ''} ${trigger.getAttribute('aria-owns') || ''}`.split(/\s+/).filter(Boolean)) {
+        const element=referencedById(trigger,id);if(element) controlled.add(element);
+      }
+    }
+    for (const element of context.root.querySelectorAll('*')) {
+      if (!visible(element,context)) continue;
+      const modal=element.matches('dialog:modal,[aria-modal="true"]:is(dialog,[role="dialog"],[role="alertdialog"])');
+      const dialog=element.matches('dialog,[role="dialog"],[role="alertdialog"]');
+      if (!modal && !controlled.has(element) && !element.matches(':popover-open') && !(dialog && isolatedDialog(element))) continue;
+      const r=element.getBoundingClientRect(), x=r.x+r.width/2,y=r.y+r.height/2;
+      const frame=frameContext(element.getRootNode()), point=frame?.matrix.transformPoint({x,y});
+      const hit=point && hitAt(element,point.x,point.y);
+      if (hit && containsAcrossRoots(element,hit)) overlayCandidates.push({element,name:dialogTitle(element)});
+    }
+  }
+  const topOverlay=overlayCandidates.at(-1) || null;
+  const overlayOf=element=>overlayCandidates.filter(o=>containsAcrossRoots(o.element,element)).at(-1) || null;
+
+  const scrollEligible = e => e?.nodeType === 1 && e !== e.ownerDocument.scrollingElement && !e.matches('body,html,input,textarea,select,[contenteditable="true"]') && !e.isContentEditable && ['auto','scroll'].includes(viewOf(e).getComputedStyle(e).overflowY) && e.scrollHeight > e.clientHeight;
+  const scrollContexts = new Map();
+  // A diagonal viewport cut has different vertical spans at different columns.
+  // Overlap where a DOM-present control can be revealed, rather than just where
+  // the polygon is tallest. Rectangular regions keep their full visible height.
+  const controlColumnHeight = (region, polygon, inverse, height) => {
+    const roots=[region.ownerDocument];
+    for(let i=0;i<roots.length;i++) for(const node of roots[i].querySelectorAll('*')) {
+      if(node.shadowRoot)roots.push(node.shadowRoot);
+      const lineage=ancestors(node);
+      if(!node.matches(CONTROL) || !lineage.includes(region) || !node.checkVisibility({checkVisibilityCSS:true}) || lineage.some(n=>n.matches?.('[aria-hidden="true"],[inert]')))continue;
+      // A supported CSS hover reveal can make a below-fold control actionable.
+      if(!node.checkVisibility({checkOpacity:true}) && !(hoverRevealed(node) && (revealingRegion(node) || unlabeledRegion(node))))continue;
+      const rect=node.getBoundingClientRect(),x=inverse.transformPoint({x:rect.x+rect.width/2,y:rect.y+rect.height/2}).x;
+      const span=polygonColumnHeight(polygon,x);
+      if(span>0)height=Math.min(height,span);
+    }
+    return height;
+  };
+  const scrollVisibleRect = element => {
+    if (!scrollContexts.has(element.getRootNode())) return null;
+    const context = frameContext(element.getRootNode()); if (!context) return null;
+    const box=clientBox(element),b=clippingRect(element,context);
+    const points=clippedPolygon(rectPoints({x:0,y:0,width:box.width,height:box.height}).map(p=>box.matrix.transformPoint(p)),b);
+    const inverse=box.matrix.inverse(),polygon=points.map(p=>inverse.transformPoint(p));
+    const rect=pointBounds(points.map(p=>context.matrix.transformPoint(p))),local=pointBounds(polygon);
+    const height=controlColumnHeight(element,polygon,inverse,local.height);
+    // Transforms change geometry; CSS zoom also changes the units of a delivered wheel.
+    return {...rect,wheel_height:height,wheel_scale:context.zoom*box.zoom};
+  };
+  for (const context of contexts) scrollContexts.set(context.root,context);
+  cache.scrollConnected = element => Boolean(element?.isConnected && frameContext(element.getRootNode()));
+  cache.scrollEligible = scrollEligible; cache.scrollVisibleRect = scrollVisibleRect;
+  cache.scrollHit = hitAt; cache.scrollParent = up;
+  const scrollNodes = [];
+  for (const context of contexts) for (const element of context.root.querySelectorAll('*')) {
+    if (scrollEligible(element) && scrollVisibleRect(element) && element.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}) && inViewport(element,context) && !ancestors(element).some(n=>n.matches?.('[aria-hidden="true"],[inert]'))) scrollNodes.push(element);
+  }
+  // DOM discovery order differs from painted order for assigned slot content.
+  const scrollSet=new Set(scrollNodes);
+  const scrollDepth=new Map(scrollNodes.map(node=>[node,ancestors(node).filter(parent=>scrollSet.has(parent)).length]));
+  scrollNodes.sort((a,b)=>scrollDepth.get(a)-scrollDepth.get(b));
+  const labelledName = element => {
+    const ids = (element.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean);
+    return ids.map(id=>name(referencedById(element,id))).filter(Boolean).join(' ') || element.getAttribute('aria-label') || element.getAttribute('title') || '';
+  };
+  const scrollName = element => labelledName(element) || [...element.querySelectorAll('[role="listbox"],[role="list"],table,[role="table"],[role="grid"],[role="menu"]')].map(labelledName).find(Boolean) || overlayOf(element)?.name || 'Scrollable area';
+  cache.scrollName = scrollName; cache.scrollOverlay = element => overlayOf(element)?.name || null;
+  const scrollRegions = scrollNodes.slice(0,REGION_LIMIT).map(element => ({
+    node_id:nodeId(element),name:scrollName(element).slice(0,REGION_NAME_LIMIT),overlay:overlayOf(element)?.name || null,overlay_node_id:overlayOf(element)?nodeId(overlayOf(element).element):null,
+    parent_node_id:(()=>{const p=ancestors(element).slice(1).find(n=>scrollNodes.includes(n));return p?nodeId(p):null})(),
+    can_scroll_up:element.scrollTop>1,can_scroll_down:element.scrollTop+element.clientHeight<element.scrollHeight-1,
+    scroll_top:element.scrollTop,scroll_height:element.scrollHeight,client_height:element.clientHeight,rect:scrollVisibleRect(element)
+  }));
+
   const TEXT_LIMIT = 8000;
   const visibleText = [], coveredText = []; let visibleLength = 0, coveredLength = 0;
   const appendText = (parts, value, kind, length) => {
@@ -229,10 +495,11 @@
     while ((current = walker.nextNode())) {
       const value = current.textContent.replace(/\s+/g,' ').trim(), parent = current.parentElement;
       if (!value || !parent || parent.closest('script,style,noscript,template')) continue;
-      range.selectNodeContents(current); const rect = range.getBoundingClientRect(), x = rect.x + context.offsetX, y = rect.y + context.offsetY;
-      if (!rect.width || !rect.height || y + rect.height <= 0 || x + rect.width <= 0 || y >= innerHeight || x >= innerWidth) continue;
-      if (visible(parent, context)) visibleLength = appendText(visibleText, value, 'visible_text', visibleLength);
-      else if (rendered(parent, context)) coveredLength = appendText(coveredText, value, 'covered_text', coveredLength);
+      range.selectNodeContents(current); const bounds = clippingRect(parent, context, true, true);
+      const intersects = [...range.getClientRects()].some(r => r.width > 0 && r.height > 0 && polygonArea(clippedPolygon(rectPoints(r),bounds)) > 0);
+      if (!intersects || !parent.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) continue;
+      if (!ancestors(parent).some(node => node.matches?.('[aria-hidden="true"],[inert]'))) visibleLength = appendText(visibleText, value, 'visible_text', visibleLength);
+      else coveredLength = appendText(coveredText, value, 'covered_text', coveredLength);
     }
   }
   let focused = null, focusAnchor = null, active = document.activeElement;
@@ -285,5 +552,5 @@
     dialogTexts[record.title] = text.slice(0,TEXT_LIMIT);
   }
   const finalGaps = [...new Set(gaps)], truncated = finalGaps.some(gap => gap.endsWith('_truncated'));
-  return {document_id:String(performance.timeOrigin),url:location.href,route:location.pathname+location.search,title:document.title,dialogs,focused,focus_anchor:focusAnchor,visible_text:visibleText.join('\n'),covered_text:coveredText.join('\n'),dialog_texts:dialogTexts,elements,viewport:{width:innerWidth,height:innerHeight,scroll_x:scrollX,scroll_y:scrollY,document_height:document.documentElement.scrollHeight},coverage:{viewport_complete:!truncated,open_shadow_roots:true,slots:true,same_origin_frames:!finalGaps.includes('cross_origin_frame'),gaps:finalGaps},hover_rules_unreadable:hoverRulesUnreadable,hover_regions:hoverRegions,hover_regions_truncated:regionRecords.size > REGION_LIMIT};
+  return {document_id:String(performance.timeOrigin),url:location.href,route:location.pathname+location.search,title:document.title,dialogs,focused,focus_anchor:focusAnchor,visible_text:visibleText.join('\n'),covered_text:coveredText.join('\n'),dialog_texts:dialogTexts,elements,viewport:{width:innerWidth,height:innerHeight,scroll_x:scrollX,scroll_y:scrollY,document_height:document.documentElement.scrollHeight},coverage:{viewport_complete:!truncated,open_shadow_roots:true,slots:true,same_origin_frames:!finalGaps.includes('cross_origin_frame'),gaps:finalGaps},overlay:topOverlay?{node_id:nodeId(topOverlay.element),name:topOverlay.name}:null,scroll_regions:scrollRegions,scroll_regions_truncated:scrollNodes.length>REGION_LIMIT,hover_rules_unreadable:hoverRulesUnreadable,hover_regions:hoverRegions,hover_regions_truncated:regionRecords.size > REGION_LIMIT};
 })()

@@ -16,7 +16,7 @@ mkdir -p "$live_root"
 exec > >(tee -a "$live_root/invocation.log") 2>&1
 # Control sockets and Chromium profiles need short paths, so each run's runtime directory lives in
 # a private scratch root. Its path also identifies every process this script started.
-scratch=$(mktemp -d /tmp/manuvra-hover.XXXXXX)
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/manuvra-hover.XXXXXX")
 manuvra="$repo_root/target/release/manuvra"
 server_pid=
 active_run=
@@ -238,7 +238,8 @@ run_case() {
   local label="$journey-$index"
   local case_root="$live_root/$label"
   active_state="$case_root/state"
-  active_runtime="$scratch/$label"
+  # Only one run is active; keep Chromium's own Unix socket below the path limit.
+  active_runtime="$scratch/run"
   mkdir -p "$active_state" "$case_root/evidence" "$active_runtime/tmp"
   chmod 700 "$active_runtime"
   checks="$case_root/checks.tsv"

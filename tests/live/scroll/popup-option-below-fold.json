@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "target": {
+    "kind": "browser",
+    "url": "http://127.0.0.1:4353/"
+  },
+  "context": {
+    "journey": "Choose Option 45",
+    "revision": "synthetic scroll fixture",
+    "environment": "fresh disposable fixture",
+    "actor": "coding agent",
+    "authority": "interact with this fixture"
+  },
+  "values": {},
+  "steps": [
+    {
+      "id": "choose",
+      "goal": "Open the Category picker and choose option 45 from its list",
+      "done_when": [
+        {
+          "text_visible": "Category: Option 45"
+        }
+      ],
+      "mutation_limit": 2
+    }
+  ],
+  "expectations": [],
+  "options": {
+    "allowed_origins": [
+      "http://127.0.0.1:4353"
+    ],
+    "active_timeout_ms": 180000,
+    "pause_timeout_ms": 120000,
+    "lifetime_ms": 300000,
+    "viewport": {
+      "width": 1280,
+      "height": 800
+    }
+  }
+}

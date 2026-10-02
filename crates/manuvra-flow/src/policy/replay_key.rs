@@ -14,7 +14,7 @@ impl Policy {
     ) -> Option<String> {
         match candidate.operation {
             Operation::ScrollUp | Operation::ScrollDown => {
-                Some(scroll_replay_key(observation, candidate.operation))
+                Some(self.scroll_key(observation, candidate.operation))
             }
             Operation::Hover => candidate
                 .hover_region(observation)
@@ -28,6 +28,14 @@ impl Policy {
                 .target_index
                 .and_then(|index| observation.elements.iter().find(|item| item.index == index))
                 .map(|target| replay_key(observation, target, candidate)),
+        }
+    }
+
+    fn scroll_key(&self, observation: &Observation, operation: Operation) -> String {
+        let key = scroll_replay_key(observation, operation);
+        match self.scroll_attempts.get(&key) {
+            Some(ordinal) => format!("{key}:{ordinal}"),
+            None => key,
         }
     }
 
@@ -92,12 +100,17 @@ fn hover_replay_key(observation: &Observation, region: &HoverRegion, reveal: &st
 }
 
 fn scroll_replay_key(observation: &Observation, operation: Operation) -> String {
-    let stable = serde_json::json!({
+    let mut stable = serde_json::json!({
         "operation":operation,
         "route":observation.route,
         "scroll_y":observation.viewport.scroll_y,
         "document_height":observation.viewport.document_height,
     });
+    if let super::scroll::ScrollRoute::Region(region) = super::scroll::route(observation, operation)
+    {
+        stable["scroll_target"] = serde_json::json!(region.target());
+        stable["positions"] = super::scroll::positions(observation, region);
+    }
     hex::encode(Sha256::digest(stable.to_string().as_bytes()))
 }
 
@@ -192,6 +205,121 @@ mod tests {
         assert_eq!(staging["container"], "staging");
         anchor.container = Some("Production".into());
         assert_ne!(focus_identity(anchor), staging);
+    }
+
+    #[test]
+    fn region_scroll_replay_key_tracks_target_ancestors_and_window_positions() {
+        let mut page = observation("CLICK", "button");
+        let legacy = scroll_replay_key(&page, Operation::ScrollDown);
+        assert_eq!(
+            legacy,
+            "b2992001577248ccbbca0adcfd632b046c9bcd41da9fa6f7608d15b1f155d3c9"
+        );
+        page.scroll_regions=serde_json::from_value(serde_json::json!([
+            {"node_id":1,"name":"Body","overlay":null,"parent_node_id":null,"can_scroll_up":false,"can_scroll_down":false,"scroll_top":700,"scroll_height":1000,"client_height":300,"rect":{"x":0,"y":0,"width":200,"height":300}},
+            {"node_id":2,"name":"List","overlay":null,"parent_node_id":1,"can_scroll_up":false,"can_scroll_down":true,"scroll_top":0,"scroll_height":1000,"client_height":300,"rect":{"x":0,"y":0,"width":200,"height":300}}
+        ])).unwrap();
+        let key = scroll_replay_key(&page, Operation::ScrollDown);
+        assert_ne!(key, legacy);
+        assert_eq!(
+            key,
+            "a8b0ff559c4381095ce92ce4f8a41091675a6ea0ac979810003687fbca996f6f"
+        );
+        assert_eq!(key, scroll_replay_key(&page, Operation::ScrollDown));
+        for index in 0..2 {
+            let mut changed = page.clone();
+            changed.scroll_regions[index].scroll_top += 1.0;
+            assert_ne!(key, scroll_replay_key(&changed, Operation::ScrollDown));
+        }
+        let mut changed = page.clone();
+        changed.viewport.scroll_y = 1.0;
+        assert_ne!(key, scroll_replay_key(&changed, Operation::ScrollDown));
+        page.viewport.document_height = 1000.0;
+        let with_regions = scroll_replay_key(&page, Operation::ScrollDown);
+        page.scroll_regions.clear();
+        assert_eq!(
+            with_regions,
+            scroll_replay_key(&page, Operation::ScrollDown)
+        );
+    }
+
+    #[test]
+    fn settling_another_scroll_preserves_the_pending_attempt_ordinal() {
+        let mut page = observation("CLICK", "button");
+        page.viewport.document_height = 2000.0;
+        page.viewport.scroll_y = 100.0;
+        let mut policy = Policy::new(&JobOptions::default(), &page.url);
+        let up = minted(decide_not_done(
+            &mut policy,
+            &step(),
+            &page,
+            &judgments("SCROLL_UP"),
+            false,
+        ));
+        policy.record_uncertain_scroll(&up.replay_key);
+        let down = minted(decide_not_done(
+            &mut policy,
+            &step(),
+            &page,
+            &judgments("SCROLL_DOWN"),
+            false,
+        ));
+        policy.record_observed(&down.replay_key);
+        let retry = minted(decide_not_done(
+            &mut policy,
+            &step(),
+            &page,
+            &judgments("SCROLL_UP"),
+            false,
+        ));
+        assert_eq!(retry.replay_key, format!("{}:1", up.replay_key));
+    }
+
+    #[test]
+    fn an_uncertain_scroll_does_not_reopen_an_observed_other_direction() {
+        let mut page = observation("CLICK", "button");
+        page.viewport.document_height = 2000.0;
+        page.viewport.scroll_y = 100.0;
+        let mut policy = Policy::new(&JobOptions::default(), &page.url);
+        let down = minted(decide_not_done(
+            &mut policy,
+            &step(),
+            &page,
+            &judgments("SCROLL_DOWN"),
+            false,
+        ));
+        policy.record_observed(&down.replay_key);
+        let up = minted(decide_not_done(
+            &mut policy,
+            &step(),
+            &page,
+            &judgments("SCROLL_UP"),
+            false,
+        ));
+        policy.record_uncertain_scroll(&up.replay_key);
+        assert!(matches!(
+            decide_not_done(
+                &mut policy,
+                &step(),
+                &page,
+                &judgments("SCROLL_DOWN"),
+                false
+            ),
+            Next::Stop(PolicyStop::Uncertain("replay_forbidden"))
+        ));
+        let retried = minted(decide_not_done(
+            &mut policy,
+            &step(),
+            &page,
+            &judgments("SCROLL_UP"),
+            false,
+        ));
+        assert_ne!(retried.replay_key, up.replay_key);
+        policy.record_observed(&retried.replay_key);
+        assert!(matches!(
+            decide_not_done(&mut policy, &step(), &page, &judgments("SCROLL_UP"), false),
+            Next::Stop(PolicyStop::Uncertain("replay_forbidden"))
+        ));
     }
 
     /// How a minted key permit settles before the next beat.

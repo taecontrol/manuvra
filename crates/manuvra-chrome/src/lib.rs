@@ -11,8 +11,8 @@ pub use input::{
     InputCancellation, Key, PerformError, PerformFact, PreparedInput, PreparedOperation,
 };
 pub use observation::{
-    ActiveDescendant, Coverage, Element, FocusAnchor, FocusSurface, HoverRegion, Observation, Rect,
-    SelectOption, ViewportState,
+    ActiveDescendant, Coverage, Element, FocusAnchor, FocusSurface, HoverRegion, Observation,
+    Overlay, Rect, ScrollPosition, ScrollRegion, ScrollTarget, SelectOption, ViewportState,
 };
 pub use owned::{
     BrowserConfig, BrowserError, BrowserProvenance, CapturedPage, OwnedBrowser, ProvenanceViewport,

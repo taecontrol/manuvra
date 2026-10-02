@@ -1418,7 +1418,9 @@ fn caller_loss_does_not_kill_host_and_active_request_ids_attach_without_restart(
 fn identical_active_paused_request_attaches_before_terminal_evidence_recovery() {
     let temp = hosted_temp();
     let mut job = fault_window_job();
-    job["options"]["pause_timeout_ms"] = json!(5_000);
+    // Allow the attach and stale-peer probes to finish before the synthetic host expires.
+    job["options"]["pause_timeout_ms"] = json!(30_000);
+    job["options"]["lifetime_ms"] = json!(30_000);
     let job_path = fixture(&temp, &job);
     let first = Command::new(binary())
         .args([
@@ -1625,9 +1627,14 @@ fn hosted_invoke(temp: &TempDir, args: &[&str]) -> Output {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn hosted_temp() -> TempDir {
+    // Darwin's default temporary root is too long for the hosted control socket.
+    #[cfg(target_os = "macos")]
+    let root = PathBuf::from("/tmp");
+    #[cfg(not(target_os = "macos"))]
+    let root = std::env::temp_dir();
     tempfile::Builder::new()
         .prefix("m4")
-        .tempdir_in("/tmp")
+        .tempdir_in(root)
         .unwrap()
 }
 
@@ -2676,10 +2683,30 @@ fn status_publishes_host_loss_when_host_and_watchdog_die_leaving_their_socket() 
     });
     let watchdog_pid = paused["watchdog"]["pid"].as_u64().unwrap() as u32;
     let host_pid = paused["host"]["pid"].as_u64().unwrap() as u32;
-    assert_eq!(unsafe { libc::kill(watchdog_pid as i32, libc::SIGKILL) }, 0);
-    assert_process_gone(watchdog_pid);
+    // Freeze the watchdog so it cannot reconcile host death before both deaths are injected.
+    assert_eq!(unsafe { libc::kill(watchdog_pid as i32, libc::SIGSTOP) }, 0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let state = Command::new("ps")
+            .args(["-o", "stat=", "-p", &watchdog_pid.to_string()])
+            .output()
+            .unwrap();
+        if String::from_utf8_lossy(&state.stdout)
+            .trim()
+            .starts_with('T')
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "watchdog did not stop"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     assert_eq!(unsafe { libc::kill(host_pid as i32, libc::SIGKILL) }, 0);
+    assert_eq!(unsafe { libc::kill(watchdog_pid as i32, libc::SIGKILL) }, 0);
     assert_process_gone(host_pid);
+    assert_process_gone(watchdog_pid);
     assert!(runtime_run.join("control.sock").exists());
 
     let status = hosted_invoke(&temp, &["status", run_id, "--wait-ms", "5000"]);

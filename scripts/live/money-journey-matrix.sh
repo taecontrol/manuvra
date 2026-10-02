@@ -338,6 +338,10 @@ run_case() {
     jq '.options.pause_timeout_ms=120000 | .options.lifetime_ms=300000' "$fixture" >"$job"
   fi
 
+  local run_job="$case_root/run-job.json"
+  fixture_job "$job" "$run_job"
+  job=$run_job
+
   local request_id="money-$journey-$iteration-$stamp" code started_ms ended_ms run_id state
   local assists=0 attestations=0 first_stop='' first_stop_payload='' forced_stop_seen=false failure=''
   local manifest_ok=false persistence_ok=false cleanup_ok=false leak_free=false

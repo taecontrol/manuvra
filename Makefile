@@ -1,4 +1,4 @@
-.PHONY: fmt lint test crap live live-all live-hover live-keyboard live-natural-done live-observation live-resume-dispositions live-run-lifecycle live-self-test
+.PHONY: fmt lint test crap live live-all live-hover live-keyboard live-natural-done live-observation live-resume-dispositions live-run-lifecycle live-self-test live-scroll live-money-scroll
 
 CRAP_REPORT ?= target/crap-report.json
 CRAP_GATE_MANIFEST := tools/crap-gate/Cargo.toml
@@ -21,8 +21,12 @@ crap:
 
 # Deterministic checks of the live-suite harnesses; they need no provider key, browser, or Money.
 live-self-test:
+	bash scripts/live/fixture-port-self-test.sh
 	/bin/bash scripts/live/money-journey-matrix.sh --self-test
 	/bin/bash scripts/live/money-journey-matrix.sh --runtime-self-test
+	bash scripts/live/money-scroll.sh --self-test
+	python3 scripts/live/scroll-matrix.py --self-test-detectors
+	python3 scripts/live/scroll-harness-self-test.py
 	python3 scripts/live/keyboard-matrix.py --self-test-detectors
 	python3 scripts/live/hover-journey-check.py --self-test
 	bash scripts/live/natural-done.sh --self-test
@@ -32,6 +36,12 @@ live:
 
 live-hover:
 	bash scripts/live/hover-reveal.sh
+
+live-money-scroll:
+	bash scripts/live/money-scroll.sh
+
+live-scroll:
+	python3 scripts/live/scroll-matrix.py
 
 live-keyboard:
 	python3 scripts/live/keyboard-matrix.py
@@ -57,3 +67,5 @@ live-all:
 	$(MAKE) live-run-lifecycle
 	$(MAKE) live-hover
 	$(MAKE) live-keyboard
+	$(MAKE) live-scroll
+	$(MAKE) live-money-scroll

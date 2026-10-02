@@ -29,6 +29,10 @@ pub struct ActionFact {
     /// The hover region a `HOVER` targeted, naming the controls it reveals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hover_target: Option<HoverTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scroll_target: Option<manuvra_chrome::ScrollTarget>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scroll_readback: Vec<manuvra_chrome::ScrollPosition>,
     pub value_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key: Option<manuvra_chrome::Key>,
@@ -43,6 +47,7 @@ pub struct ActionFact {
 pub enum ActionStop {
     EvidenceUnavailable,
     Uncertain,
+    UncertainScroll(String),
     ReadbackMismatch,
     IncompleteEvidence,
     InvalidPermit,
@@ -215,9 +220,17 @@ fn prepare(
     let text = resolved_text(&candidate, values)?;
     let option_node_id = selected_option_identity(&candidate, target, text)?;
     let focus_anchor = candidate.focus_anchor.clone();
-    let evidence = prepared_evidence(&candidate, target, action_sequence, &replay_key, basis);
+    let evidence = prepared_evidence(
+        &candidate,
+        target,
+        observation,
+        action_sequence,
+        &replay_key,
+        basis,
+    );
     let operation = prepared_operation(candidate.operation, candidate.key, target)?;
     let input = PreparedInput {
+        scroll_region: prepared_scroll_region(&candidate, observation)?,
         document_id,
         node_id: input_node_id(target, hover_node),
         operation,
@@ -244,11 +257,15 @@ fn prepare(
 fn prepared_evidence(
     candidate: &crate::policy::Candidate,
     target: Option<&Element>,
+    observation: &Observation,
     action_sequence: u64,
     replay_key: &str,
     basis: &str,
 ) -> Value {
     let mut evidence = json!({"event":"action_prepared","action_sequence":action_sequence,"candidate_id":candidate.id,"operation":candidate.operation,"target":target.map(|target|json!({"role":target.role,"name":target.name,"dialog":target.in_dialog})),"value_name":candidate.value_name,"replay_key":replay_key,"outcome":"not_performed","basis":basis});
+    if let Ok(Some(region)) = prepared_scroll_region(candidate, observation) {
+        evidence["scroll_target"] = json!(region.target());
+    }
     if let Some(container) = target.and_then(|target| target.container.as_ref()) {
         evidence["target"]["container"] = json!(container);
     }
@@ -302,6 +319,26 @@ fn prepared_hover_node(
         .hover_node_id(observation)
         .map(Some)
         .ok_or(ActionStop::InvalidPermit)
+}
+
+fn prepared_scroll_region(
+    candidate: &crate::policy::Candidate,
+    observation: &Observation,
+) -> Result<Option<manuvra_chrome::ScrollRegion>, ActionStop> {
+    if !matches!(
+        candidate.operation,
+        Operation::ScrollUp | Operation::ScrollDown
+    ) {
+        return Ok(None);
+    }
+    use crate::policy::scroll::{ScrollRoute, route};
+    match route(observation, candidate.operation) {
+        ScrollRoute::Window => Ok(None),
+        ScrollRoute::Region(region) if candidate.scroll_node_id() == Some(region.node_id) => {
+            Ok(Some(region.clone()))
+        }
+        _ => Err(ActionStop::InvalidPermit),
+    }
 }
 
 fn input_node_id(target: Option<&Element>, hover_node: Option<u64>) -> u64 {
@@ -384,6 +421,10 @@ fn action_fact(
     prepared: PreparedAction,
     dispatched: Result<PerformFact, PerformError>,
 ) -> (ActionFact, Option<ActionStop>) {
+    let scroll_readback = dispatched
+        .as_ref()
+        .map(|fact| fact.scroll_readback.clone())
+        .unwrap_or_default();
     let (outcome, readback_matches, stop, suboperations) = match dispatched {
         Ok(fact)
             if matches!(
@@ -411,15 +452,20 @@ fn action_fact(
         Err(PerformError::Uncertain(_)) => (
             Outcome::Uncertain,
             None,
-            Some(ActionStop::Uncertain),
+            Some(uncertain_stop(
+                prepared.candidate.operation,
+                &prepared.replay_key,
+            )),
             Vec::new(),
         ),
     };
     let fact = ActionFact {
+        scroll_readback,
         candidate_id: prepared.candidate.id,
         operation: prepared.candidate.operation,
         target_name: prepared.candidate.target_name,
         target_container: prepared.candidate.target_container,
+        scroll_target: prepared.input.scroll_region.as_ref().map(|r| r.target()),
         hover_target: prepared.candidate.hover_target,
         value_name: prepared.candidate.value_name,
         key: prepared.candidate.key,
@@ -430,6 +476,14 @@ fn action_fact(
         basis: prepared.basis,
     };
     (fact, stop)
+}
+
+fn uncertain_stop(operation: Operation, replay_key: &str) -> ActionStop {
+    if matches!(operation, Operation::ScrollUp | Operation::ScrollDown) {
+        ActionStop::UncertainScroll(replay_key.to_owned())
+    } else {
+        ActionStop::Uncertain
+    }
 }
 
 #[cfg(test)]
@@ -444,6 +498,29 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
+    #[test]
+    fn window_scroll_action_fact_keeps_its_recorded_shape() {
+        let job = job();
+        let mut page = observation();
+        page.viewport.document_height = 1000.0;
+        let permit = permit_for(&job, &page, "SCROLL_DOWN");
+        let prepared = prepare(permit, &page, &Values::new(&job), "autonomous").unwrap();
+        let replay_key = prepared.replay_key.clone();
+        let (fact, stop) = action_fact(
+            prepared,
+            Ok(PerformFact {
+                scroll_readback: Vec::new(),
+                readback: None,
+                readback_matches: None,
+                suboperations: vec!["scroll_down".into()],
+            }),
+        );
+        assert_eq!(stop, None);
+        assert_eq!(
+            serde_json::to_value(fact).unwrap(),
+            json!({"candidate_id":"c_1","operation":"SCROLL_DOWN","target_name":null,"value_name":null,"outcome":"observed","readback_matches":null,"suboperations":["scroll_down"],"replay_key":replay_key,"basis":"autonomous"})
+        );
+    }
     struct FakePerformer(Result<PerformFact, PerformError>);
     impl Performer for FakePerformer {
         fn dispatch(
@@ -463,6 +540,7 @@ mod tests {
         ) -> Result<PerformFact, PerformError> {
             *self.0.lock().unwrap() = Some(input);
             Ok(PerformFact {
+                scroll_readback: Vec::new(),
                 readback: Some("Wanted".into()),
                 readback_matches: Some(true),
                 suboperations: vec![],
@@ -478,6 +556,7 @@ mod tests {
         ) -> Result<PerformFact, PerformError> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(PerformFact {
+                scroll_readback: Vec::new(),
                 readback: Some("Wanted".into()),
                 readback_matches: None,
                 suboperations: vec![],
@@ -498,6 +577,7 @@ mod tests {
             } else {
                 self.0.fetch_add(1, Ordering::SeqCst);
                 Ok(PerformFact {
+                    scroll_readback: Vec::new(),
                     readback: None,
                     readback_matches: None,
                     suboperations: vec![],
@@ -571,6 +651,9 @@ mod tests {
             },
             coverage: Coverage::default(),
             hover_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            overlay: None,
+            scroll_regions_truncated: false,
             hover_regions_truncated: false,
             hover_rules_unreadable: false,
         }
@@ -789,6 +872,7 @@ mod tests {
         let result = perform(
             permit(&job, &obs),
             &FakePerformer(Ok(PerformFact {
+                scroll_readback: Vec::new(),
                 readback: Some("Wrong".into()),
                 readback_matches: None,
                 suboperations: vec![],
@@ -891,6 +975,7 @@ mod tests {
             perform(
                 permit(&job, &obs),
                 &FakePerformer(Ok(PerformFact {
+                    scroll_readback: Vec::new(),
                     readback: Some("Wanted".into()),
                     readback_matches: Some(true),
                     suboperations: vec!["insert_text".into()],
@@ -924,6 +1009,61 @@ mod tests {
         assert_eq!(journal.entries().len(), 1);
         journal.clear().unwrap();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn prepared_scroll_rejects_a_replaced_region_even_with_the_same_name() {
+        let job = job();
+        let mut page = observation();
+        page.scroll_regions=serde_json::from_value(json!([{"node_id":1,"name":"Rows","overlay":null,"parent_node_id":null,"can_scroll_up":false,"can_scroll_down":true,"scroll_top":0,"scroll_height":1000,"client_height":300,"rect":{"x":0,"y":0,"width":200,"height":300}}])).unwrap();
+        let (candidate, _, _, _) = permit_for(&job, &page, "SCROLL_DOWN").consume();
+        assert!(prepared_scroll_region(&candidate, &page).unwrap().is_some());
+        page.scroll_regions[0].node_id = 2;
+        assert_eq!(
+            prepared_scroll_region(&candidate, &page),
+            Err(ActionStop::InvalidPermit)
+        );
+    }
+
+    #[test]
+    fn region_action_names_are_redacted_by_the_durable_journal() {
+        let mut job = job();
+        job.values.get_mut("name").unwrap().secret = true;
+        let redactor = crate::evidence::Redactor::for_job(&job).unwrap();
+        let temp = TempDir::new().unwrap();
+        let mut journal = DurableJournal::open(temp.path(), "region", &redactor).unwrap();
+        let mut page = observation();
+        page.scroll_regions=serde_json::from_value(json!([{"node_id":876321,"name":"Wanted","overlay":null,"parent_node_id":null,"can_scroll_up":false,"can_scroll_down":true,"scroll_top":0,"scroll_height":1000,"client_height":300,"rect":{"x":0,"y":0,"width":200,"height":300}}])).unwrap();
+        let fact = perform(
+            permit_for(&job, &page, "SCROLL_DOWN"),
+            &FakePerformer(Ok(PerformFact {
+                scroll_readback: vec![manuvra_chrome::ScrollPosition {
+                    name: Some("Wanted".into()),
+                    overlay: None,
+                    document: false,
+                    before: 0.0,
+                    after: 292.0,
+                }],
+                readback: None,
+                readback_matches: None,
+                suboperations: vec![],
+            })),
+            &page,
+            &Values::new(&job),
+            &mut journal,
+            &InputCancellation::default(),
+        )
+        .unwrap();
+        assert_eq!(fact.scroll_target.unwrap().name, "Wanted");
+        assert!(
+            journal
+                .entries()
+                .iter()
+                .all(|e| !e.to_string().contains("Wanted") && !e.to_string().contains("876321"))
+        );
+        assert!(journal.entries()[0].get("scroll_target").is_some());
+        assert!(journal.entries()[1]["fact"].get("scroll_target").is_some());
+        journal.clear().unwrap();
     }
 
     fn hover_page() -> Observation {

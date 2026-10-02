@@ -28,15 +28,17 @@ run_case() {
   local status
   start_fixture "manuvra-browser-observation-$label-$stamp" "$evidence_root/$label-fixture" \
     "$evidence_root/$label-launch.json" "$evidence_root/$label-doctor.json"
+  local job="$evidence_root/$label-job.json"
+  fixture_job "$repo_root/tests/live/money/$fixture" "$job"
   set +e
   if [[ -n "$marker" ]]; then
     TYPESAFE_API_KEY="$marker" XDG_STATE_HOME="$state_root/$label" "$manuvra" run \
-      --request-id "browser-observation-$marker-$stamp" --job "$repo_root/tests/live/money/$fixture" \
+      --request-id "browser-observation-$marker-$stamp" --job "$job" \
       --evidence "$evidence_root/$label" >"$evidence_root/$label-stdout.json" \
       2>"$evidence_root/$label-stderr.txt"
   else
     XDG_STATE_HOME="$state_root/$label" "$manuvra" run \
-      --request-id "browser-observation-$label-$stamp" --job "$repo_root/tests/live/money/$fixture" \
+      --request-id "browser-observation-$label-$stamp" --job "$job" \
       --evidence "$evidence_root/$label" >"$evidence_root/$label-stdout.json" \
       2>"$evidence_root/$label-stderr.txt"
   fi
