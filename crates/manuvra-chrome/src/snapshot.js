@@ -433,7 +433,8 @@
     const roots=[region.ownerDocument];
     for(let i=0;i<roots.length;i++) for(const node of roots[i].querySelectorAll('*')) {
       if(node.shadowRoot)roots.push(node.shadowRoot);
-      if(!node.matches(CONTROL) || !ancestors(node).includes(region) || !node.checkVisibility({checkVisibilityCSS:true}))continue;
+      const lineage=ancestors(node);
+      if(!node.matches(CONTROL) || !lineage.includes(region) || !node.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}) || lineage.some(n=>n.matches?.('[aria-hidden="true"],[inert]')))continue;
       const rect=node.getBoundingClientRect(),x=inverse.transformPoint({x:rect.x+rect.width/2,y:rect.y+rect.height/2}).x;
       const span=polygonColumnHeight(polygon,x);
       if(span>0)height=Math.min(height,span);

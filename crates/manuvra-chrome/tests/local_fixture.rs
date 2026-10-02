@@ -3817,13 +3817,19 @@ fn rotated_viewport_clipping_keeps_each_control_column_overlapping() {
         );
     }
 
-    let baseline = r#"<!doctype html><style>body{margin:0;overflow:hidden}#region{position:absolute;left:-100px;top:100px;width:300px;height:300px;overflow:auto;transform:rotate(45deg);transform-origin:top left;scrollbar-width:none}#target{position:absolute;left:140px;top:30px;width:80px;height:20px}#host{position:absolute;left:140px;top:10px;width:10px;height:10px}</style><div id="region" aria-label="Diagonal"><div style="height:1000px"></div><button id="target">Target</button>SHADOW</div><p id="result">Not selected</p>"#;
+    let baseline = r#"<!doctype html><style>body{margin:0;overflow:hidden}#region{position:absolute;left:-100px;top:100px;width:300px;height:300px;overflow:auto;transform:rotate(45deg);transform-origin:top left;scrollbar-width:none}#target{position:absolute;left:140px;top:200px;width:80px;height:20px}#host{position:absolute;left:140px;top:10px;width:10px;height:10px}</style><div id="region" aria-label="Diagonal"><div style="height:1000px"></div><button id="target" onclick="result.textContent='Target selected'">Target</button>SHADOW</div><p id="result">Not selected</p>"#;
     let mut distances = Vec::new();
     let plain = baseline.replace("SHADOW", "");
     for (index,html) in [
         plain.clone(),
         format!(r#"{plain}<button style="position:fixed;left:95px;top:95px;width:10px;height:10px">Unrelated</button>"#),
-        plain.replace("<button id=\"target\">",r#"<button style="visibility:hidden;position:absolute;left:138px;top:0;width:8px;height:10px">Hidden</button><button id="target">"#),
+        plain.replace("<button id=\"target\"",r#"<button style="visibility:hidden;position:absolute;left:138px;top:0;width:8px;height:10px">Hidden</button><button id="target""#),
+        plain.replace("<button id=\"target\"",r#"<button style="opacity:0;position:absolute;left:145px;top:0;width:10px;height:10px">Hidden</button><button id="target""#),
+        plain.replace("<button id=\"target\"",r#"<button aria-hidden="true" style="position:absolute;left:145px;top:0;width:10px;height:10px">Hidden</button><button id="target""#),
+        plain.replace("<button id=\"target\"",r#"<button inert style="position:absolute;left:145px;top:0;width:10px;height:10px">Hidden</button><button id="target""#),
+        plain.replace("<button id=\"target\"",r#"<div style="opacity:0"><button style="position:absolute;left:145px;top:0;width:10px;height:10px">Hidden</button></div><button id="target""#),
+        plain.replace("<button id=\"target\"",r#"<div aria-hidden="true"><button style="position:absolute;left:145px;top:0;width:10px;height:10px">Hidden</button></div><button id="target""#),
+        plain.replace("<button id=\"target\"",r#"<div inert><button style="position:absolute;left:145px;top:0;width:10px;height:10px">Hidden</button></div><button id="target""#),
         baseline.replace("SHADOW",r#"<div id="host"></div><script>host.attachShadow({mode:'open'}).innerHTML='<button style="width:10px;height:10px;padding:0;border:0" onclick="result.textContent=\'Shadow selected\'">Shadow target</button>'</script>"#),
     ].into_iter().enumerate() {
         let server=FixtureServer::with_body(Box::leak(html.into_boxed_str()));
@@ -3831,30 +3837,34 @@ fn rotated_viewport_clipping_keeps_each_control_column_overlapping() {
         let observed=browser.observe().unwrap();
         let fact=browser.perform(prepared_scroll(&observed,false,1), &InputCancellation::default()).unwrap();
         distances.push(fact.scroll_readback[0].after);
-        if index==3 {
+        {
+            let goal=if index==9 {"Shadow target"} else {"Target"};
+            let effect=if index==9 {"Shadow selected"} else {"Target selected"};
             let mut observed=browser.observe().unwrap();
             let mut clicked=false;
             for ordinal in 2..=8 {
                 // Require a centre actually inside the window, then prove the
                 // native hit and effect rather than trusting a partial candidate.
-                if observed.elements.iter().any(|e|e.name=="Shadow target" && e.rect.x+e.rect.width/2.0>1.0) {
-                    browser.perform(prepared(&observed,"Shadow target",PreparedOperation::Click,None,None,ordinal), &InputCancellation::default()).unwrap();
+                if observed.elements.iter().any(|e|e.name==goal && e.rect.x+e.rect.width/2.0>1.0) {
+                    browser.perform(prepared(&observed,goal,PreparedOperation::Click,None,None,ordinal), &InputCancellation::default()).unwrap();
                     clicked=true;break;
                 }
                 browser.perform(prepared_scroll(&observed,false,ordinal), &InputCancellation::default()).unwrap();
                 observed=browser.observe().unwrap();
             }
-            assert!(clicked,"reachable shadow control was skipped");
-            assert!(browser.observe().unwrap().visible_text.contains("Shadow selected"));
+            assert!(clicked,"reachable {goal} was skipped in case {index}");
+            assert!(browser.observe().unwrap().visible_text.contains(effect));
         }
     }
     assert_eq!(
         distances[0], distances[1],
         "unrelated control: {distances:?}"
     );
-    assert_eq!(distances[0], distances[2], "hidden control: {distances:?}");
+    for distance in &distances[2..9] {
+        assert_eq!(distances[0], *distance, "hidden control: {distances:?}");
+    }
     assert!(
-        distances[3] + 5.0 < distances[0],
+        distances[9] + 5.0 < distances[0],
         "shadow column must constrain overlap: {distances:?}"
     );
     browser.close().unwrap();
@@ -3923,14 +3933,15 @@ fn boxless_overflow_wrappers_keep_painted_controls_and_text() {
 fn native_svg_coordinates_clip_html_regions_and_preserve_visible_clicks() {
     let _serial = REAL_BROWSER.lock().unwrap();
     let mut browser = launch_headless();
-    for (viewbox, svg_css, foreign_transform, height, top, initially_visible) in [
-        (600, "none", "", 50.0, 160, false),
-        (150, "none", "", 200.0, 70, true),
-        (150, "scale(.5)", "", 100.0, 70, true),
-        (150, "none", "scale(.5,.75)", 150.0, 70, true),
+    for (viewbox, svg_css, foreign_transform, html_css, height, top, initially_visible) in [
+        (600, "none", "", "none", 50.0, 160, false),
+        (150, "none", "", "none", 200.0, 70, true),
+        (150, "scale(.5)", "", "none", 100.0, 70, true),
+        (150, "none", "scale(.5,.75)", "none", 150.0, 70, true),
+        (150, "none", "", "scale(.5)", 100.0, 160, false),
     ] {
         let body = format!(
-            r#"<!doctype html><style>body{{margin:0;overflow:hidden}}</style><svg width="300" height="300" viewBox="0 0 {viewbox} {viewbox}" style="transform:{svg_css};transform-origin:top left"><foreignObject width="{viewbox}" height="{viewbox}" transform="{foreign_transform}"><div xmlns="http://www.w3.org/1999/xhtml" aria-label="SVG rows" style="width:100px;height:100px;overflow:auto;position:relative;scrollbar-width:none"><div style="height:1000px"></div><button style="position:absolute;top:{top}px;left:5px;width:70px;height:20px;font-size:8px" onclick="result.textContent='Selected goal'">SVG goal</button></div></foreignObject></svg><p id="result">Selected: none</p>"#
+            r#"<!doctype html><style>body{{margin:0;overflow:hidden}}</style><svg width="300" height="300" viewBox="0 0 {viewbox} {viewbox}" style="transform:{svg_css};transform-origin:top left"><foreignObject width="{viewbox}" height="{viewbox}" transform="{foreign_transform}"><div xmlns="http://www.w3.org/1999/xhtml" aria-label="SVG rows" style="width:100px;height:100px;overflow:auto;position:relative;scrollbar-width:none;transform:{html_css};transform-origin:top left"><div style="height:1000px"></div><button style="position:absolute;top:{top}px;left:5px;width:70px;height:20px;font-size:8px" onclick="result.textContent='Selected goal'">SVG goal</button></div></foreignObject></svg><p id="result">Selected: none</p>"#
         );
         let server = FixtureServer::with_body(Box::leak(body.into_boxed_str()));
         browser.navigate(&server.url()).unwrap();
