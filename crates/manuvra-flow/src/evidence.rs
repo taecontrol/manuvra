@@ -1326,8 +1326,8 @@ mod tests {
     }
 
     #[test]
-    fn classified_values_equal_to_hover_vocabulary_do_not_trip_the_leak_scan() {
-        let exported = br#"{"hover_regions":[{"index":1,"name":"Groceries","reveals_on_hover":["Actions"]}],"hover_regions_truncated":true,"hover_rules_unreadable":true,"container":"Alpha","target_container":"Alpha","shares_name":true,"gate_reason":"target_below_gate","contenders":[{"probability":0.69}],"hover_target":{"reveal":"Edit"},"reveal_roles":["button"],"revealed_by_hover":true,"operation":"HOVER"}"#;
+    fn classified_values_equal_to_scroll_and_hover_vocabulary_do_not_trip_the_leak_scan() {
+        let exported = br#"{"hover_regions":[{"index":1,"name":"Groceries","reveals_on_hover":["Actions"]}],"hover_regions_truncated":true,"hover_rules_unreadable":true,"container":"Alpha","target_container":"Alpha","shares_name":true,"gate_reason":"target_below_gate","contenders":[{"probability":0.69}],"hover_target":{"reveal":"Edit"},"reveal_roles":["button"],"revealed_by_hover":true,"operation":"HOVER","scroll_regions":[{"name":"Rows","in_dialog":null,"can_scroll":["up","down"],"scroll_top":0,"scroll_height":1000,"client_height":300,"can_scroll_up":false,"can_scroll_down":true}],"scroll_regions_truncated":false,"scroll_target":{"name":"Rows","overlay":"Choices","document":false},"scroll_readback":[{"name":"Rows","overlay":"Choices","document":false,"before":0,"after":292}]}"#;
         for owned in [
             "scroll_regions",
             "scroll_regions_truncated",
