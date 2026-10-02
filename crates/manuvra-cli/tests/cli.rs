@@ -1625,9 +1625,14 @@ fn hosted_invoke(temp: &TempDir, args: &[&str]) -> Output {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn hosted_temp() -> TempDir {
+    // Darwin's default temporary root is too long for the hosted control socket.
+    #[cfg(target_os = "macos")]
+    let root = PathBuf::from("/tmp");
+    #[cfg(not(target_os = "macos"))]
+    let root = std::env::temp_dir();
     tempfile::Builder::new()
         .prefix("m4")
-        .tempdir_in("/tmp")
+        .tempdir_in(root)
         .unwrap()
 }
 
