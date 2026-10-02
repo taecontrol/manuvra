@@ -1,0 +1,16 @@
+<!doctype html><html><head><title>Picker</title><style>
+body{margin:0;font:14px sans-serif}.page{min-height:1600px;padding:20px}
+.pop{position:fixed;top:90px;left:40px;width:280px;border:1px solid #888;background:#fff;padding:8px}
+.list{max-height:300px;overflow-y:auto}.opt{padding:6px 8px;cursor:pointer}.opt:hover{background:#eef}
+body.locked{overflow:hidden}body.locked .page{pointer-events:none}
+</style></head><body><div class="page"><h1>Expense: Coffee</h1><p id="status">Category: none</p>
+<button id="trigger" aria-haspopup="dialog" aria-controls="category-popup" aria-expanded="false">Category</button><p>Other page content.</p></div>
+<script>
+const trigger=document.getElementById('trigger');let pop=null;
+const block=e=>{if(!e.target.closest('.pop'))e.preventDefault()};
+function close(){pop?.remove();pop=null;document.body.classList.remove('locked');trigger.setAttribute('aria-expanded','false');document.removeEventListener('wheel',block)}
+trigger.onclick=()=>{if(pop)return close();pop=document.createElement('div');pop.className='pop';pop.id='category-popup';pop.setAttribute('role','dialog');pop.setAttribute('aria-label','Choose category');
+const l=document.createElement('div');l.className='list';l.setAttribute('role','listbox');l.setAttribute('aria-label','Categories');
+for(let i=1;i<=50;i++){const o=document.createElement('div');o.className='opt';o.setAttribute('role','option');o.setAttribute('aria-selected','false');o.textContent='Option '+i;o.onclick=()=>{document.getElementById('status').textContent='Category: Option '+i;close()};l.append(o)}
+pop.append(l);document.body.append(pop);document.body.classList.add('locked');trigger.setAttribute('aria-expanded','true');document.addEventListener('wheel',block,{passive:false});if(new URLSearchParams(location.search).has('reverse'))l.scrollTop=39*l.firstElementChild.offsetHeight};
+</script></body></html>

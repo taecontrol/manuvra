@@ -39,11 +39,37 @@
     return values;
   };
   const nearestDialog = (element) => ancestors(element).find(node => node.matches?.('dialog,[role="dialog"],[role="alertdialog"]')) || null;
-  const inViewport = (element, context) => {
-    const r = element.getBoundingClientRect(), x = r.x + context.offsetX, y = r.y + context.offsetY;
-    return r.width > 0 && r.height > 0 && y + r.height > 0 && x + r.width > 0 && y < innerHeight && x < innerWidth;
+  const viewOfElement = element => element.ownerDocument.defaultView;
+  // Only ancestors below the containing block can be escaped by positioned descendants.
+  const clippingRect = (element, context) => {
+    const bounds = {left:-context.offsetX, top:-context.offsetY, right:innerWidth-context.offsetX, bottom:innerHeight-context.offsetY};
+    let current = element;
+    while (current) {
+      const style = viewOfElement(current).getComputedStyle(current);
+      const positioned = style.position === 'absolute' || style.position === 'fixed';
+      const parent = current.parentElement || current.getRootNode()?.host;
+      let next = parent;
+      if (positioned) next = current.offsetParent;
+      if (!next || next.ownerDocument !== element.ownerDocument) break;
+      const css = viewOfElement(next).getComputedStyle(next), r = next.getBoundingClientRect();
+      if (css.overflowX !== 'visible') { bounds.left = Math.max(bounds.left,r.left+next.clientLeft); bounds.right = Math.min(bounds.right,r.left+next.clientLeft+next.clientWidth); }
+      if (css.overflowY !== 'visible') { bounds.top = Math.max(bounds.top,r.top+next.clientTop); bounds.bottom = Math.min(bounds.bottom,r.top+next.clientTop+next.clientHeight); }
+      current = next;
+    }
+    return bounds;
   };
-  const rendered = (element, context) => Boolean(element) && element.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}) && inViewport(element, context);
+  const inViewport = (element, context) => {
+    const r = element.getBoundingClientRect(), b = clippingRect(element, context);
+    return r.width > 0 && r.height > 0 && r.bottom > b.top && r.right > b.left && r.top < b.bottom && r.left < b.right;
+  };
+  const centerUnclipped = (element, context) => {
+    const r = element.getBoundingClientRect(), b = clippingRect(element, context), x = r.x+r.width/2, y = r.y+r.height/2;
+    // Keep the existing viewport-intersection rule; apply centers only to ancestor clipping.
+    const withinX = x >= b.left || b.left === -context.offsetX;
+    const withinY = y >= b.top || b.top === -context.offsetY;
+    return withinX && withinY && (x < b.right || b.right === innerWidth-context.offsetX) && (y < b.bottom || b.bottom === innerHeight-context.offsetY);
+  };
+  const rendered = (element, context) => Boolean(element) && element.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}) && inViewport(element, context) && centerUnclipped(element, context);
   const visible = (element, context) => rendered(element, context) && !ancestors(element).some(node => node.matches?.('[aria-hidden="true"],[inert]'));
   const referencedById = (element, id) => element.getRootNode().getElementById?.(id);
   const name = (element, seen = new Set()) => {
@@ -131,7 +157,7 @@
   for (const [element, index] of elementIndices) elements[index - 1].shares_name = twinCounts.get(twinKey(element)) > 1;
 
   const REGION_LIMIT = 20, REGION_NAME_LIMIT = 120;
-  const hiddenByOpacity = (element, context) => inViewport(element, context) && element.checkVisibility({checkVisibilityCSS:true}) &&
+  const hiddenByOpacity = (element, context) => inViewport(element, context) && centerUnclipped(element, context) && element.checkVisibility({checkVisibilityCSS:true}) &&
     !element.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}) && !ancestors(element).some(node => node.matches?.('[aria-hidden="true"],[inert]'));
   const revealingRegion = (element) => ancestors(element).slice(1).find(node => node.checkVisibility({checkOpacity:true}) &&
     (node.matches('li,tr,[role=row],[role=listitem]') || node.hasAttribute('aria-label')));
@@ -229,10 +255,11 @@
     while ((current = walker.nextNode())) {
       const value = current.textContent.replace(/\s+/g,' ').trim(), parent = current.parentElement;
       if (!value || !parent || parent.closest('script,style,noscript,template')) continue;
-      range.selectNodeContents(current); const rect = range.getBoundingClientRect(), x = rect.x + context.offsetX, y = rect.y + context.offsetY;
-      if (!rect.width || !rect.height || y + rect.height <= 0 || x + rect.width <= 0 || y >= innerHeight || x >= innerWidth) continue;
-      if (visible(parent, context)) visibleLength = appendText(visibleText, value, 'visible_text', visibleLength);
-      else if (rendered(parent, context)) coveredLength = appendText(coveredText, value, 'covered_text', coveredLength);
+      range.selectNodeContents(current); const bounds = clippingRect(parent, context);
+      const intersects = [...range.getClientRects()].some(r => r.width > 0 && r.height > 0 && r.bottom > bounds.top && r.right > bounds.left && r.top < bounds.bottom && r.left < bounds.right);
+      if (!intersects || !parent.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) continue;
+      if (!ancestors(parent).some(node => node.matches?.('[aria-hidden="true"],[inert]'))) visibleLength = appendText(visibleText, value, 'visible_text', visibleLength);
+      else coveredLength = appendText(coveredText, value, 'covered_text', coveredLength);
     }
   }
   let focused = null, focusAnchor = null, active = document.activeElement;

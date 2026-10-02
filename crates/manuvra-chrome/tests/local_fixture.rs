@@ -2382,3 +2382,74 @@ fn opacity_increase_under_negative_hover_is_not_a_reveal() {
     browser.close().unwrap();
     lifecycle.assert_cleaned();
 }
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn clipped_options_and_text_follow_the_visible_fold() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(include_str!(
+        "../../../tests/browser/scroll-popup-list.html"
+    ));
+    let mut browser = launch_headless();
+    browser.navigate(&server.url()).unwrap();
+    let observed = browser.observe().unwrap();
+    browser
+        .perform(
+            prepared(
+                &observed,
+                "Category",
+                PreparedOperation::Click,
+                None,
+                None,
+                1,
+            ),
+            &InputCancellation::default(),
+        )
+        .unwrap();
+    let observed = browser.observe().unwrap();
+    let options: Vec<_> = observed
+        .elements
+        .iter()
+        .filter(|e| e.role == "option")
+        .map(|e| e.name.as_str())
+        .collect();
+    assert_eq!(
+        options,
+        (1..=11).map(|i| format!("Option {i}")).collect::<Vec<_>>()
+    );
+    assert!(has_line(&observed, "Option 11"));
+    for i in 12..=50 {
+        assert!(!has_line(&observed, &format!("Option {i}")));
+        assert!(
+            !observed
+                .covered_text
+                .lines()
+                .any(|line| line == format!("Option {i}"))
+        );
+    }
+    browser.close().unwrap();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn clipping_respects_containing_blocks_and_text_intersection() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(
+        r#"<!doctype html><style>
+        body{margin:0}.clip{overflow:hidden;width:200px;height:30px}
+        .row{height:20px;margin:0;display:block} .fixed{position:fixed;top:200px}
+        .absolute{position:absolute;top:250px}
+        </style><div class="clip"><button class="row">First</button><button class="row">Fold</button><button class="row">Clipped</button>
+        <button class="fixed">Fixed</button><button class="absolute">Absolute</button><p>Invisible text</p></div>"#,
+    );
+    let mut browser = launch_headless();
+    browser.navigate(&server.url()).unwrap();
+    let observed = browser.observe().unwrap();
+    let names: Vec<_> = observed.elements.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, ["First", "Fixed", "Absolute"]);
+    assert!(has_line(&observed, "Fold"));
+    assert!(!has_line(&observed, "Clipped"));
+    assert!(!observed.visible_text.contains("Invisible text"));
+    assert!(!observed.covered_text.contains("Invisible text"));
+    browser.close().unwrap();
+}
