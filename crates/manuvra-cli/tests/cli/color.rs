@@ -331,7 +331,18 @@ fn color_cli_exact_text_case_whitespace_named_roles_and_literal_alpha() {
 #[test]
 #[ignore = "requires the local Chromium executable"]
 fn color_cli_unicode_text_targets_match_painted_segments_without_a_provider() {
-    for text in ["Amount\u{85}line", "Amount\u{feff}line"] {
+    for text in [
+        "Amount\u{85}line",
+        "Amount\u{feff}line",
+        concat!(
+            "Amount\t\n\u{b}\u{c}\r \u{a0}\u{1680}",
+            "\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}",
+            "\u{2006}\u{2007}\u{2008}\u{2009}\u{200a}",
+            "\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}\u{feff}line"
+        ),
+        "Amount\u{180e}line",
+        "Amount\u{200b}line",
+    ] {
         let body = format!(
             "<!doctype html><meta charset='utf-8'><p>Ready</p><p style='color:#b91c1c'>{text}</p>"
         );

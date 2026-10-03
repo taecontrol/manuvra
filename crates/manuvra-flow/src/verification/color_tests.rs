@@ -47,6 +47,17 @@ fn color_text_uses_the_browser_unicode_whitespace_set() {
     for (requested, painted) in [
         ("Amount\u{85}line", "Amount\u{85}line"),
         ("Amount\u{feff}line", "Amount line"),
+        (
+            concat!(
+                "Amount\t\n\u{b}\u{c}\r \u{a0}\u{1680}",
+                "\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}",
+                "\u{2006}\u{2007}\u{2008}\u{2009}\u{200a}",
+                "\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}\u{feff}line"
+            ),
+            "Amount line",
+        ),
+        ("Amount\u{180e}line", "Amount\u{180e}line"),
+        ("Amount\u{200b}line", "Amount\u{200b}line"),
     ] {
         let observed = page(vec![color(painted, [185, 28, 28, 255], 1)]);
         assert_eq!(
