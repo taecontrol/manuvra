@@ -89,6 +89,10 @@ fn preliminary_verdict(
 }
 
 impl VerificationPlan {
+    pub fn preliminary_report(&self) -> VerificationReport {
+        verification_report(self.verdicts.clone(), Value::Null)
+    }
+
     pub fn needs_provider(&self) -> bool {
         self.verdicts
             .iter()
@@ -121,11 +125,15 @@ impl VerificationPlan {
         } else {
             Value::Null
         };
-        Ok(VerificationReport {
-            outcome: aggregate_expectations(&self.verdicts),
-            record: json!({"phase":"verification","expectations":self.verdicts,"provider":provider}),
-            verdicts: self.verdicts,
-        })
+        Ok(verification_report(self.verdicts, provider))
+    }
+}
+
+fn verification_report(verdicts: Vec<ExpectationVerdict>, provider: Value) -> VerificationReport {
+    VerificationReport {
+        outcome: aggregate_expectations(&verdicts),
+        record: json!({"phase":"verification","expectations":verdicts,"provider":provider}),
+        verdicts,
     }
 }
 

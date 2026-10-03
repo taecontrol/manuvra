@@ -39,7 +39,15 @@ pub(super) fn verify_final(
             BTreeMap::new(),
         ));
     }
-    let report = match evaluate_final(job, &captured.raw, values, evaluator, policy) {
+    let report = match evaluate_final(
+        job,
+        redactor,
+        &captured.raw,
+        values,
+        evaluator,
+        policy,
+        artifacts,
+    ) {
         Ok(report) => report,
         Err(stop) => return VerificationProgress::Stop(stop),
     };
@@ -97,21 +105,44 @@ pub(super) fn capture_verification_advance(
 
 pub(super) fn evaluate_final(
     job: &Job,
+    redactor: &Redactor,
     observation: &Observation,
     values: &Values<'_>,
     evaluator: &impl manuvra_jev::Evaluator,
     policy: &mut policy::Policy,
+    artifacts: &mut RunArtifacts,
 ) -> Result<crate::verification::VerificationReport, Stop> {
     let plan = prepare_verification(&job.expectations, observation, values);
     let deadline = if !plan.needs_provider() {
         Instant::now()
     } else {
+        store_verification(&plan.preliminary_report(), redactor, artifacts);
         policy
             .record_model_call()
             .map_err(verification_policy_stop)?
     };
     plan.finish(&job.expectations, observation, values, evaluator, deadline)
-        .map_err(|error| verification_provider_stop(&error))
+        .map_err(|error| {
+            let stop = verification_provider_stop(&error);
+            if let Some(record) = &mut artifacts.verification {
+                record["provider"] = json!({
+                    "attempted":true,"failed":true,
+                    "reason":{"code":stop.code,"details":redacted_value(&json!(stop.details), redactor)}
+                });
+            }
+            stop
+        })
+}
+
+fn store_verification(
+    report: &crate::verification::VerificationReport,
+    redactor: &Redactor,
+    artifacts: &mut RunArtifacts,
+) {
+    artifacts.expectation_verdicts = redacted_expectation_verdicts(&report.verdicts, redactor);
+    let mut record = redacted_value(&report.record, redactor);
+    record["expectations"] = json!(artifacts.expectation_verdicts);
+    artifacts.verification = Some(record);
 }
 
 pub(super) fn record_verification(
@@ -121,10 +152,7 @@ pub(super) fn record_verification(
     artifacts: &mut RunArtifacts,
     uncertainty_reason: &'static str,
 ) -> VerificationProgress {
-    artifacts.expectation_verdicts = redacted_expectation_verdicts(&report.verdicts, redactor);
-    let mut record = redacted_value(&report.record, redactor);
-    record["expectations"] = json!(artifacts.expectation_verdicts);
-    artifacts.verification = Some(record);
+    store_verification(&report, redactor, artifacts);
     match report.outcome {
         DoneResult::Satisfied => VerificationProgress::Complete,
         DoneResult::NotSatisfied => {
@@ -179,7 +207,7 @@ mod tests {
     use super::*;
     use crate::run::tests::support::*;
     use crate::{policy::Policy, values::Values};
-    use manuvra_contract::VerdictResult;
+    use manuvra_contract::{RunState, VerdictResult};
 
     #[test]
     fn final_verification_uses_a_fresh_observation_and_fails_missing_literals() {
@@ -233,5 +261,145 @@ mod tests {
             .expect_err("advance cannot attest an observation after the active budget expires");
         assert_eq!(stop.code, "budget_exhausted");
         assert_eq!(browser.dispatched(), 0);
+    }
+
+    fn mixed_color_job(max_model_calls: u16) -> Job {
+        let mut wire = serde_json::to_value(expectation_job()).unwrap();
+        wire["expectations"] = json!([
+            {"id":"color","assertions":[{"color":{"target":{"text":"Amount"},"equals":"#b91c1c","tolerance":1}}]},
+            {"id":"natural","claim":"Ready is present"}
+        ]);
+        wire["values"] =
+            json!({"amount":{"value":"Amount","description":"classified subject","secret":true}});
+        wire["options"]["max_model_calls"] = json!(max_model_calls);
+        parse_job(wire)
+    }
+
+    fn color_page(red: u8) -> Observation {
+        let mut value = serde_json::to_value(observed("Ready")).unwrap();
+        value["colors"] = json!([{
+            "node_id":1,"context":"main","text":"Amount","name":null,"role":null,
+            "in_dialog":null,"container":null,"dialog_node_id":null,"container_node_id":null,
+            "channel":"accessible","color":{"raw":"fixture computed color","rgba":[red,28,28,255]}
+        }]);
+        value["colors_complete"] = json!(true);
+        value["color_scopes"] = json!([]);
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn assert_preliminary_evidence(artifacts: &RunArtifacts, red: u8, budget: bool) {
+        assert_eq!(
+            artifacts.expectation_verdicts[0].result,
+            VerdictResult::Satisfied
+        );
+        assert_eq!(
+            artifacts.expectation_verdicts[1].result,
+            VerdictResult::NotRun
+        );
+        assert!(artifacts.expectation_verdicts[1].noul.is_none());
+        let record = artifacts
+            .verification
+            .as_ref()
+            .expect("computed checks are recorded");
+        assert_eq!(
+            record["expectations"][0]["assertion_checks"][0]["color"]["target"]["rgba"],
+            json!([red, 28, 28, 255])
+        );
+        assert!(!record.to_string().contains("Amount"));
+        if budget {
+            assert!(record["provider"].is_null());
+        } else {
+            assert_eq!(record["provider"]["attempted"], true);
+            assert_eq!(record["provider"]["failed"], true);
+            assert_eq!(record["provider"]["reason"]["code"], "provider_unavailable");
+        }
+        assert!(artifacts.escalation.is_none());
+        assert!(!artifacts.caller_assisted);
+    }
+
+    fn initial_failure_retains_preliminary_evidence(budget: bool) {
+        let job = mixed_color_job(1);
+        let redactor = Redactor::for_job_with_provider_key(&job, None).unwrap();
+        let browser = FakeBrowser::new([color_page(185)]);
+        let values = Values::new(&job);
+        let mut policy = Policy::new(&job.options, "http://127.0.0.1:4351/");
+        if budget {
+            policy.record_model_call().unwrap();
+        }
+        let mut artifacts = RunArtifacts::new(&job, &redactor);
+        let VerificationProgress::Stop(stop) = verify_final(
+            &job,
+            &redactor,
+            &browser,
+            &NoProvider,
+            &values,
+            &mut policy,
+            &mut artifacts,
+        ) else {
+            panic!("a natural expectation cannot complete without its provider result");
+        };
+        assert_eq!(stop.state, RunState::Blocked);
+        assert_eq!(
+            stop.code,
+            if budget {
+                "budget_exhausted"
+            } else {
+                "provider_unavailable"
+            }
+        );
+        assert_preliminary_evidence(&artifacts, 185, budget);
+        assert_eq!(browser.dispatched(), 0);
+    }
+
+    #[test]
+    fn initial_provider_failure_retains_preliminary_color_evidence() {
+        initial_failure_retains_preliminary_evidence(false);
+    }
+
+    #[test]
+    fn initial_budget_failure_retains_preliminary_color_evidence() {
+        initial_failure_retains_preliminary_evidence(true);
+    }
+
+    fn changed_advance_failure_retains_preliminary_evidence(budget: bool) {
+        let job = mixed_color_job(if budget { 1 } else { 2 });
+        let redactor = Redactor::for_job_with_provider_key(&job, None).unwrap();
+        let browser = FakeBrowser::new([color_page(185), color_page(185), color_page(184)]);
+        let provider = ScriptedProvider::new([Turn::verdict(0.5)]);
+        let mut machine = super::super::machine::HostedMachine::new(&job, &redactor);
+        let mut journal = MemoryJournal::default();
+        drive(&mut machine, &browser, &provider, &mut journal);
+        assert!(machine.paused_escalation_id().is_some());
+        dispose(
+            &mut machine,
+            advance("Ready is present"),
+            &browser,
+            &NoProvider,
+            &mut journal,
+        );
+        let stop = machine.artifacts.stop.as_ref().unwrap();
+        assert_eq!(stop.state, RunState::Blocked);
+        assert_eq!(
+            stop.code,
+            if budget {
+                "budget_exhausted"
+            } else {
+                "provider_unavailable"
+            }
+        );
+        assert_preliminary_evidence(&machine.artifacts, 184, budget);
+        assert!(!machine.verification_complete);
+        assert_eq!(provider.calls(), 1);
+        assert_eq!(browser.dispatched(), 0);
+    }
+
+    #[test]
+    fn changed_advance_provider_failure_retains_preliminary_color_evidence() {
+        changed_advance_failure_retains_preliminary_evidence(false);
+    }
+
+    #[test]
+    fn changed_advance_budget_failure_retains_preliminary_color_evidence() {
+        changed_advance_failure_retains_preliminary_evidence(true);
     }
 }

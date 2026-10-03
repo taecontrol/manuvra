@@ -573,6 +573,7 @@ fn is_protocol_collision(value: &str) -> bool {
         "not_satisfied",
         "unresolved",
         "not_run",
+        "attempted",
         "structured",
         "headed",
         "headless",

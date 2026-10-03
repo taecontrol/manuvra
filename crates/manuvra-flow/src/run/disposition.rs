@@ -148,10 +148,12 @@ impl HostedMachine<'_> {
         self.artifacts.pending_verification = None;
         let report = match evaluate_final(
             self.job,
+            self.redactor,
             &observation,
             &self.values,
             evaluator,
             &mut self.policy,
+            &mut self.artifacts,
         ) {
             Ok(report) => report,
             Err(stop) => return self.end_with(stop),
