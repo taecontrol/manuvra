@@ -378,6 +378,11 @@ fn classified_shadow_text_with_unsupported_mask_geometry_is_withheld() {
         "<style>html{margin:50px;will-change:transform}</style><div id='bare' aria-hidden='true'></div><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret'</script>",
         "<style>[data-manuvra-mask]::after{content:'bare-shadow-secret';color:white;font:32px monospace}</style><span id='bare' aria-hidden='true'></span><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret'</script>",
         "<style>@keyframes slide{from{transform:translateX(0)}to{transform:translateX(500px)}}#bare{animation:slide .1s linear infinite alternate}</style><div id='bare' aria-hidden='true'></div><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret'</script>",
+        "<style>@keyframes slide{from{transform:translateX(0)}to{transform:translateX(500px)}}#bare{position:fixed;animation:slide .1s linear infinite alternate}</style><span id='bare' aria-hidden='true'></span><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret'</script>",
+        "<span id='bare'>bare-shadow-secret</span><script>bare.attachShadow({mode:'open'}).innerHTML='<span aria-hidden=true style=\"display:inline-block;filter:drop-shadow(0 40px 0 black)\"><slot></slot></span>'</script>",
+        r#"<iframe aria-hidden='true' style='border:0;filter:drop-shadow(0 40px 0 black)' srcdoc="<span>bare-shadow-secret</span>"></iframe>"#,
+        r#"<iframe aria-hidden='true' style='margin:100px;width:400px;height:200px;border:0;rotate:15deg' srcdoc="<span>bare-shadow-secret</span>"></iframe>"#,
+        r#"<iframe aria-hidden='true' style='margin:100px;width:400px;height:200px;border:0;scale:2' srcdoc="<span>bare-shadow-secret</span>"></iframe>"#,
         "<div id='bare' aria-hidden='true' style='text-shadow:0 40px black'></div><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret'</script>",
         "<div id='bare' aria-hidden='true' style='filter:drop-shadow(0 40px 0 black)'></div><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret'</script>",
         "<style>@keyframes grow{from{width:0}to{width:500px}}#row{display:flex}#sibling{flex:none;animation:grow .1s linear infinite alternate}</style><div id='row'><div id='sibling'>Spacer</div><div id='bare' aria-hidden='true'></div></div><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret'</script>",
@@ -401,6 +406,42 @@ fn classified_shadow_text_with_unsupported_mask_geometry_is_withheld() {
             "{body}"
         );
         browser.close().unwrap();
+    }
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn classified_normalized_and_split_text_with_paint_effects_is_withheld() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    for (body, retained) in [
+        (
+            "<span id='bare' aria-hidden='true' style='text-shadow:0 40px black'></span><script>bare.attachShadow({mode:'open'}).textContent='bare   shadow   secret'</script>",
+            "bare shadow secret",
+        ),
+        (
+            "<span id='bare' aria-hidden='true'></span><script>bare.attachShadow({mode:'open'}).innerHTML='bare shadow <span style=\"filter:drop-shadow(0 40px 0 black)\">secret</span>'</script>",
+            "bare shadow\nsecret",
+        ),
+    ] {
+        let server = FixtureServer::with_body(&format!("<!doctype html><p>Ready</p>{body}"));
+        let mut browser = launch_headless();
+        browser.navigate(&server.url()).unwrap();
+        let observed = browser.observe().unwrap();
+        assert_eq!(
+            observed
+                .painted_text
+                .as_ref()
+                .unwrap()
+                .viewport
+                .painted_aria_hidden,
+            retained
+        );
+        let masked = browser.capture_redacted(&["bare shadow secret".into()]);
+        browser.close().unwrap();
+        assert!(
+            matches!(masked, Err(BrowserError::Control(message)) if message == "redaction_unverifiable"),
+            "{body}"
+        );
     }
 }
 
@@ -506,7 +547,7 @@ fn classified_masks_paint_opaque_rectangles_despite_page_styles() {
         // SVG provides an independent opaque-paint oracle, unaffected by the page's div rules.
         let body = format!(
             r#"<!doctype html><style>{css}</style><p>Ready</p>
-<span id='bare' aria-hidden='true' style='font:32px monospace'></span>
+<span id='bare' aria-hidden='true' style='font:32px monospace;color:#b91c1c;position:relative;left:.25px;top:.25px;z-index:1'></span>
 <script>
 const root=bare.attachShadow({{mode:'open'}});root.textContent='bare-shadow-secret';
 if(location.search) {{

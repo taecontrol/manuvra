@@ -322,6 +322,73 @@ mod tests {
     use crate::run::tests::support::*;
     use manuvra_chrome::{Element, FocusAnchor, Rect};
 
+    struct ColorEffectChangingBrowser {
+        before: Observation,
+        after: Observation,
+    }
+
+    impl BrowserPage for ColorEffectChangingBrowser {
+        fn capture_redacted_page(&self, _: &[String]) -> Result<CapturedPage, BrowserError> {
+            captured(self.before.clone())
+        }
+
+        fn capture_redacted_matching_page(
+            &self,
+            _: &[String],
+            unchanged: &dyn Fn(&Observation, &Observation) -> bool,
+        ) -> Result<CapturedPage, BrowserError> {
+            if unchanged(&self.before, &self.after) {
+                captured(self.before.clone())
+            } else {
+                Err(BrowserError::Control(
+                    "page changed throughout screenshot fencing".into(),
+                ))
+            }
+        }
+
+        fn observe_page(&self) -> Result<Observation, BrowserError> {
+            Ok(self.after.clone())
+        }
+    }
+
+    fn color_effect_observation(stable: bool) -> Observation {
+        let mut wire = serde_json::to_value(observed("Ready")).unwrap();
+        wire["colors_complete"] = json!(true);
+        wire["colors"] = json!([{
+            "node_id":1,"context":"main","text":"Amount","name":null,"role":null,
+            "in_dialog":null,"container":null,"dialog_node_id":null,"container_node_id":null,
+            "channel":"accessible","capture_stable":stable,
+            "color":{"raw":"rgb(185, 28, 28)","rgba":[185,28,28,255]}
+        }]);
+        serde_json::from_value(wire).unwrap()
+    }
+
+    #[test]
+    fn selected_color_capture_requires_stability_before_and_after_the_screenshot() {
+        let job = job("Ready");
+        let assertions: Vec<Assertion> = serde_json::from_value(json!([
+            {"color":{"target":{"text":"Amount"},"equals":"#b91c1c"}}
+        ]))
+        .unwrap();
+        for (before, after) in [(false, true), (true, false)] {
+            let browser = ColorEffectChangingBrowser {
+                before: color_effect_observation(before),
+                after: color_effect_observation(after),
+            };
+            assert!(
+                capture_step(
+                    &browser,
+                    &Redactor::for_job(&job).unwrap(),
+                    &assertions,
+                    0,
+                    1,
+                )
+                .is_err(),
+                "foreground activity at either observation epoch invalidates the capture"
+            );
+        }
+    }
+
     struct PaintChangingBrowser {
         before: Observation,
         after: Observation,
