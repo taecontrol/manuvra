@@ -192,7 +192,7 @@ impl Redactor {
         else {
             return true;
         };
-        export_without_color_channels(bytes, keys)
+        export_without_color_numbers(bytes, keys)
             .is_none_or(|export| self.contains_raw_export_leak(&export))
     }
 
@@ -269,17 +269,17 @@ fn export_without_manifest_digests(bytes: &[u8]) -> Option<Vec<u8>> {
     serde_json::to_vec(&value).ok()
 }
 
-/// Canonical color channels are owned numeric facts, even when a classified text happens to
+/// Color channels and tolerances are owned numeric facts, even when classified text happens to
 /// contain the same digits. Strip only those typed facts from the scan, preserving every string
 /// and key. Invalid JSON and non-JSON evidence retain the original byte scan.
-fn export_without_color_channels(bytes: &[u8], keys: usize) -> Option<Vec<u8>> {
+fn export_without_color_numbers(bytes: &[u8], keys: usize) -> Option<Vec<u8>> {
     let mut output = Vec::new();
     let mut changed = false;
     let mut parsed_keys = 0;
     for value in serde_json::Deserializer::from_slice(bytes).into_iter::<Value>() {
         let mut value = value.ok()?;
         parsed_keys += json_key_count(&value);
-        changed |= omit_color_channels(&mut value);
+        changed |= omit_color_numbers(&mut value);
         serde_json::to_writer(&mut output, &value).ok()?;
         output.push(b'\n');
     }
@@ -294,35 +294,46 @@ fn json_key_count(value: &Value) -> usize {
     }
 }
 
-fn omit_color_channels(value: &mut Value) -> bool {
+fn omit_color_numbers(value: &mut Value) -> bool {
     match value {
         Value::Object(fields) => {
             let own = fields
                 .get_mut("color")
-                .is_some_and(omit_typed_color_channels);
+                .is_some_and(omit_typed_color_numbers);
             fields
                 .values_mut()
-                .fold(own, |changed, item| omit_color_channels(item) | changed)
+                .fold(own, |changed, item| omit_color_numbers(item) | changed)
         }
         Value::Array(items) => items
             .iter_mut()
-            .fold(false, |changed, item| omit_color_channels(item) | changed),
+            .fold(false, |changed, item| omit_color_numbers(item) | changed),
         _ => false,
     }
 }
 
-fn omit_typed_color_channels(color: &mut Value) -> bool {
+fn omit_typed_color_numbers(color: &mut Value) -> bool {
     if serde_json::from_value::<manuvra_contract::ColorCheckEvidence>(color.clone()).is_ok() {
-        let mut changed = omit_rgba(&mut color["target"]);
+        let mut changed = omit_tolerance(color) | omit_rgba(&mut color["target"]);
         if let Some(reference) = color.get_mut("reference") {
             changed |= omit_rgba(reference);
         }
         changed
     } else if serde_json::from_value::<manuvra_chrome::ComputedColor>(color.clone()).is_ok() {
         omit_rgba(color)
+    } else if serde_json::from_value::<manuvra_contract::ColorCheck>(color.clone()).is_ok() {
+        // Job admission already validated caller strings that classification may now mask.
+        omit_tolerance(color)
     } else {
         false
     }
+}
+
+fn omit_tolerance(color: &mut Value) -> bool {
+    let Some(tolerance @ Value::Number(_)) = color.get_mut("tolerance") else {
+        return false;
+    };
+    *tolerance = Value::Null;
+    true
 }
 
 fn omit_rgba(color: &mut Value) -> bool {
@@ -1807,6 +1818,58 @@ mod tests {
             fs::read(temporary.path().join("manifest.json")).unwrap(),
             bytes
         );
+    }
+
+    #[test]
+    fn typed_color_tolerances_do_not_collide_with_classified_text() {
+        for literal in ["#b91c1c", "#185185"] {
+            let temporary = TempDir::new().unwrap();
+            let mut wire = serde_json::to_value(test_job(true)).unwrap();
+            wire["values"]["marker"]["value"] = json!("185");
+            wire["expectations"] = json!([{"id":"amount","assertions":[{
+                "color":{"target":{"text":"185"},"equals":literal,"tolerance":185}
+            }]}]);
+            let job = Job::parse(&serde_json::to_vec(&wire).unwrap()).unwrap();
+            let redactor = Redactor::for_job_with_provider_key(&job, None).unwrap();
+            let normalized = redacted_job(&job, &redactor).unwrap();
+            let check = json!({"color":{
+                "target":{"selector":{"text":redactor.redact_export_text("185")},"channel":"accessible","raw":"rgb(12, 28, 28)","rgba":[12,28,28,255]},
+                "comparator":"equals","equals":redactor.redact_export_text(literal),"tolerance":185,"result":"satisfied"
+            }});
+            let mut evidence = bundle("safe", b"png".to_vec());
+            evidence.job = normalized.clone();
+            evidence.verification = Some(json!({"phase":"verification","expectations":[{
+                "id":"amount","result":"satisfied","noul":null,"numeric_checks":[],"assertion_checks":[check.clone()]
+            }],"provider":null}));
+            publish(temporary.path(), "r_tolerance", evidence, &redactor).expect(
+                "a valid color tolerance must retain its numeric value in redacted evidence",
+            );
+            let final_record: Value = serde_json::from_slice(
+                &fs::read(temporary.path().join("r_tolerance/verification/final.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                final_record["expectations"][0]["assertion_checks"][0]["color"]["tolerance"],
+                185
+            );
+            assert_eq!(
+                normalized["expectations"][0]["assertions"][0]["color"]["tolerance"],
+                185
+            );
+            for leaked in [
+                json!({"text":"185","assertion_checks":[check.clone()]}),
+                json!({"tolerance":185,"assertion_checks":[check.clone()]}),
+                json!({"color":{"tolerance":185}}),
+                json!({"color":{"target":{"text":"safe"},"equals":"#b91c1c","tolerance":"185"}}),
+                json!({"color":{"target":{"text":"safe"},"equals":"#b91c1c","tolerance":185.0}}),
+                json!({"color":{"target":{"text":"safe"},"equals":"#b91c1c","tolerance":3185}}),
+                json!({"color":{"target":{"text":"safe"},"equals":"#b91c1c","tolerance":185,"unknown":true}}),
+            ] {
+                assert!(redactor.contains_export_leak(leaked.to_string().as_bytes()));
+            }
+            let malformed = format!("{check} trailing data");
+            assert!(redactor.contains_export_leak(malformed.as_bytes()));
+        }
     }
 
     #[cfg(unix)]
