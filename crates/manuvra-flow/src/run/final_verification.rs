@@ -75,6 +75,7 @@ fn capture_final(
         "event":"final_verification_observation",
         "redaction_verified":captured.redaction_verified,
     }));
+    policy.check_active().map_err(verification_policy_stop)?;
     Ok(captured)
 }
 
@@ -174,7 +175,9 @@ fn redacted_expectation_verdicts(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::run::tests::support::*;
+    use crate::{policy::Policy, values::Values};
     use manuvra_contract::VerdictResult;
 
     #[test]
@@ -198,5 +201,37 @@ mod tests {
         assert_eq!(artifacts.expectation_verdicts[0].noul, Some(0.95));
         assert!(!artifacts.expectation_verdicts[0].numeric_checks[0].present);
         assert!(artifacts.verification.is_some());
+    }
+
+    #[test]
+    fn structured_final_and_advance_stop_when_the_active_budget_is_expired() {
+        let mut wire = serde_json::to_value(expectation_job()).unwrap();
+        wire["expectations"] = json!([{"id":"ready","assertions":[{"text_visible":"Ready"}]}]);
+        let mut job = parse_job(wire);
+        // Represent an already-expired policy deterministically, without sleeping during capture.
+        job.options.active_timeout_ms = Some(0);
+        let redactor = Redactor::for_job(&job).unwrap();
+        let browser = FakeBrowser::new([observed("Ready")]);
+        let values = Values::new(&job);
+        let mut policy = Policy::new(&job.options, "http://127.0.0.1:4351/");
+        let mut artifacts = RunArtifacts::new(&job, &redactor);
+        let result = verify_final(
+            &job,
+            &redactor,
+            &browser,
+            &NoProvider,
+            &values,
+            &mut policy,
+            &mut artifacts,
+        );
+        let VerificationProgress::Stop(stop) = result else {
+            panic!("an expired final observation cannot complete verification");
+        };
+        assert_eq!(stop.code, "budget_exhausted");
+        let stop = capture_verification_advance(&job, &redactor, &browser, &policy, &mut artifacts)
+            .err()
+            .expect("advance cannot attest an observation after the active budget expires");
+        assert_eq!(stop.code, "budget_exhausted");
+        assert_eq!(browser.dispatched(), 0);
     }
 }
