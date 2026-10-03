@@ -338,11 +338,8 @@ impl OwnedBrowser {
             self.lifecycle = Lifecycle::Terminated;
         }
         if self.lifecycle == Lifecycle::Terminated {
-            retry_profile_removal(
-                || fs::remove_dir_all(&self.profile),
-                Instant::now() + PROFILE_REMOVAL_TIMEOUT,
-            )
-            .map_err(|error| BrowserError::Control(safe_error(&error.to_string())))?;
+            retry_profile_removal(|| fs::remove_dir_all(&self.profile))
+                .map_err(|error| BrowserError::Control(safe_error(&error.to_string())))?;
             self.lifecycle = Lifecycle::Closed;
         }
         Ok(())
@@ -356,10 +353,8 @@ enum Lifecycle {
     Closed,
 }
 
-fn retry_profile_removal(
-    mut remove: impl FnMut() -> std::io::Result<()>,
-    deadline: Instant,
-) -> std::io::Result<()> {
+fn retry_profile_removal(mut remove: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
+    let deadline = Instant::now() + PROFILE_REMOVAL_TIMEOUT;
     loop {
         match remove() {
             Err(error)
@@ -1332,44 +1327,29 @@ mod tests {
             ),
         ] {
             let mut calls = 0;
-            let result = retry_profile_removal(
-                || {
-                    let error = errors[calls.min(errors.len() - 1)];
-                    calls += 1;
-                    error.map_or(Ok(()), |code| Err(std::io::Error::from_raw_os_error(code)))
-                },
-                Instant::now() + PROFILE_REMOVAL_TIMEOUT,
-            );
+            let result = retry_profile_removal(|| {
+                let error = errors[calls.min(errors.len() - 1)];
+                calls += 1;
+                error.map_or(Ok(()), |code| Err(std::io::Error::from_raw_os_error(code)))
+            });
             assert_eq!(
                 result.err().and_then(|error| error.raw_os_error()),
                 expected_error
             );
             assert_eq!(calls, expected_calls);
         }
-        let mut calls = 0;
-        let result = retry_profile_removal(
-            || {
-                calls += 1;
-                Err(std::io::Error::from_raw_os_error(libc::ENOTEMPTY))
-            },
-            Instant::now(),
-        );
-        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOTEMPTY));
-        assert_eq!(
-            calls, 1,
-            "a continuing writer cannot make cleanup unbounded"
-        );
         let started = Instant::now();
         let mut calls = 0;
-        let result = retry_profile_removal(
-            || {
-                calls += 1;
-                Err(std::io::Error::from_raw_os_error(libc::ENOTEMPTY))
-            },
-            started + PROFILE_REMOVAL_TIMEOUT,
-        );
+        let result = retry_profile_removal(|| {
+            calls += 1;
+            Err(std::io::Error::from_raw_os_error(libc::ENOTEMPTY))
+        });
         assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOTEMPTY));
         assert!(calls > 1, "transient writes receive bounded retries");
+        assert!(
+            calls <= 150,
+            "cleanup retries must be paced rather than spinning"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "the production cleanup budget must bound a persistent writer"
