@@ -139,8 +139,26 @@ fn redacted_observation(raw: &Observation, redactor: &Redactor) -> Result<Value,
     if let Value::Object(fields) = &mut exported {
         fields.extend(exported_hover_regions(raw, redactor));
         fields.extend(exported_scroll_regions(raw, redactor));
+        fields.extend(exported_colors(raw, redactor));
     }
     Ok(exported)
+}
+
+fn exported_colors(raw: &Observation, redactor: &Redactor) -> Vec<(String, Value)> {
+    if !raw.colors_complete && raw.colors.is_empty() && raw.color_scopes.is_empty() {
+        return Vec::new();
+    }
+    let redact = |text: &str| redactor.redact_external_text(text);
+    let optional = |text: &Option<String>| text.as_deref().map(redact);
+    vec![
+        ("colors_complete".into(), json!(raw.colors_complete)),
+        ("colors".into(), json!(raw.colors.iter().map(|color| json!({
+            "text":optional(&color.text),"name":optional(&color.name),"role":optional(&color.role),
+            "in_dialog":optional(&color.in_dialog),"container":optional(&color.container),"channel":color.channel,
+            "color":{"raw":redact(&color.color.raw),"rgba":color.color.rgba}
+        })).collect::<Vec<_>>())),
+        ("color_scopes".into(), json!(raw.color_scopes.iter().map(|scope| json!({"name":redact(&scope.name),"kind":scope.kind})).collect::<Vec<_>>())),
+    ]
 }
 
 fn exported_scroll_regions(raw: &Observation, redactor: &Redactor) -> Vec<(String, Value)> {
@@ -208,9 +226,17 @@ pub(super) fn record_capture(
     done: DoneResult,
 ) {
     artifacts.observations.push(captured.artifact.clone());
-    artifacts
-        .trace
-        .push(json!({"event":event,"step_id":redactor.redact_export_text(&step.id),"done":done}));
+    let mut record =
+        json!({"event":event,"step_id":redactor.redact_export_text(&step.id),"done":done});
+    if let manuvra_contract::DoneCondition::Structured(assertions) = &step.done_when {
+        let checks = crate::verification::color_assertion_checks(assertions, &captured.raw);
+        if !checks.is_empty() {
+            record["assertion_checks"] = json!(crate::evidence::redacted_assertion_checks(
+                &checks, redactor
+            ));
+        }
+    }
+    artifacts.trace.push(record);
 }
 
 #[cfg(test)]

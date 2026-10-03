@@ -196,6 +196,54 @@ impl Redactor {
     }
 }
 
+/// Redact caller and page strings while retaining the typed protocol and numeric color facts.
+pub(crate) fn redacted_assertion_checks(
+    checks: &[manuvra_contract::AssertionCheck],
+    redactor: &Redactor,
+) -> Vec<manuvra_contract::AssertionCheck> {
+    checks
+        .iter()
+        .cloned()
+        .map(|mut assertion| {
+            let manuvra_contract::AssertionCheck::Color(check) = &mut assertion;
+            redact_color_target(&mut check.target, redactor);
+            if let Some(reference) = &mut check.reference {
+                redact_color_target(reference, redactor);
+            }
+            redact_optional_text(&mut check.equals, redactor);
+            assertion
+        })
+        .collect()
+}
+
+fn redact_color_target(target: &mut manuvra_contract::ColorTargetEvidence, redactor: &Redactor) {
+    let (subject, dialog, container) = match &mut target.selector {
+        manuvra_contract::ColorTarget::Text(selector) => (
+            &mut selector.text,
+            &mut selector.dialog,
+            &mut selector.container,
+        ),
+        manuvra_contract::ColorTarget::Name(selector) => {
+            redact_optional_text(&mut selector.role, redactor);
+            (
+                &mut selector.name,
+                &mut selector.dialog,
+                &mut selector.container,
+            )
+        }
+    };
+    *subject = redactor.redact_export_text(subject);
+    for text in [dialog, container, &mut target.raw] {
+        redact_optional_text(text, redactor);
+    }
+}
+
+fn redact_optional_text(text: &mut Option<String>, redactor: &Redactor) {
+    if let Some(text) = text {
+        *text = redactor.redact_export_text(text);
+    }
+}
+
 /// A value as it appears inside a serialized JSON string, without the surrounding quotes.
 fn json_escaped(value: &str) -> String {
     let quoted = Value::String(value.to_owned()).to_string();
@@ -204,6 +252,30 @@ fn json_escaped(value: &str) -> String {
 
 fn is_protocol_collision(value: &str) -> bool {
     const OWNED_VOCABULARY: &[&str] = &[
+        "color",
+        "colors",
+        "colors_complete",
+        "color_scopes",
+        "assertions",
+        "assertion_checks",
+        "selector",
+        "same_as",
+        "different_from",
+        "equals",
+        "tolerance",
+        "comparator",
+        "reference",
+        "raw",
+        "rgba",
+        "channel",
+        "accessible",
+        "painted_aria_hidden",
+        "missing",
+        "ambiguous_owner",
+        "ambiguous_scope",
+        "incomplete_coverage",
+        "unsupported_color",
+        "transparent",
         "scroll_regions",
         "scroll_regions_truncated",
         "can_scroll",

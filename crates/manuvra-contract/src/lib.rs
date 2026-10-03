@@ -7,6 +7,9 @@ use url::Url;
 
 pub const SCHEMA_VERSION: u32 = 1;
 
+mod color;
+pub use color::*;
+
 #[cfg(test)]
 mod color_tests;
 
@@ -162,6 +165,7 @@ pub enum DoneCondition {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum Assertion {
+    Color(ColorAssertion),
     TextVisible(TextVisible),
     TextAbsent(TextAbsent),
     FieldNonempty(FieldNonempty),
@@ -259,11 +263,27 @@ pub struct UrlContains {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct Expectation {
+#[serde(untagged)]
+pub enum Expectation {
+    NaturalLanguage(NaturalExpectation),
+    Structured(StructuredExpectation),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NaturalExpectation {
     pub id: String,
     pub claim: String,
     #[serde(default)]
     pub exact_literals: Vec<ExactLiteral>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StructuredExpectation {
+    pub id: String,
+    #[schemars(length(min = 1))]
+    pub assertions: Vec<Assertion>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -384,6 +404,8 @@ pub struct ExpectationVerdict {
     pub noul: Option<f64>,
     #[serde(default)]
     pub numeric_checks: Vec<NumericCheck>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assertion_checks: Vec<AssertionCheck>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -559,9 +581,7 @@ impl Job {
     }
 
     fn expectation_ids(&self) -> impl Iterator<Item = &str> {
-        self.expectations
-            .iter()
-            .map(|expectation| expectation.id.as_str())
+        self.expectations.iter().map(Expectation::id)
     }
 }
 
@@ -713,6 +733,9 @@ impl DoneCondition {
 
 impl Assertion {
     fn validate(&self) -> Result<(), ValidationError> {
+        if let Self::Color(assertion) = self {
+            return assertion.color.validate();
+        }
         let (name, subject) = self.subject();
         validate_nonempty(name, subject)?;
         if let Self::FieldEqualsValue(value) = self {
@@ -723,19 +746,53 @@ impl Assertion {
 
     fn subject(&self) -> (&'static str, &str) {
         match self {
-            Self::TextVisible(value) => ("text_visible", &value.text_visible),
-            Self::TextAbsent(value) => ("text_absent", &value.text_absent),
             Self::FieldNonempty(FieldNonempty { field, .. })
             | Self::FieldEqualsValue(FieldEqualsValue { field, .. }) => ("field", field),
             Self::Focused(value) => ("focused", &value.focused),
+            _ => self.page_subject(),
+        }
+    }
+
+    fn page_subject(&self) -> (&'static str, &str) {
+        match self {
+            Self::TextVisible(value) => ("text_visible", &value.text_visible),
+            Self::TextAbsent(value) => ("text_absent", &value.text_absent),
             Self::DialogOpen(value) => ("dialog_open", &value.dialog_open),
             Self::DialogClosed(value) => ("dialog_closed", &value.dialog_closed),
             Self::UrlContains(value) => ("url_contains", &value.url_contains),
+            _ => unreachable!("color, field and focus assertions are validated separately"),
         }
     }
 }
 
 impl Expectation {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::NaturalLanguage(expectation) => &expectation.id,
+            Self::Structured(expectation) => &expectation.id,
+        }
+    }
+
+    pub fn natural(&self) -> Option<&NaturalExpectation> {
+        match self {
+            Self::NaturalLanguage(expectation) => Some(expectation),
+            Self::Structured(_) => None,
+        }
+    }
+
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_nonempty("expectation.id", self.id())?;
+        match self {
+            Self::NaturalLanguage(expectation) => expectation.validate(),
+            Self::Structured(expectation) => {
+                validate_nonempty_assertions(&expectation.id, &expectation.assertions)?;
+                validate_all(expectation.assertions.iter().map(Assertion::validate))
+            }
+        }
+    }
+}
+
+impl NaturalExpectation {
     fn validate(&self) -> Result<(), ValidationError> {
         validate_nonempty("expectation.id", &self.id)?;
         validate_nonempty(&format!("expectation {} claim", self.id), &self.claim)?;

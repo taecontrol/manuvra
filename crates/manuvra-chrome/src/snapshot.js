@@ -293,6 +293,56 @@
     return v.replace(/\s+/g, ' ').slice(0, 120); };
   const containerOf = (control) => { const node = containerNode(control); return node ? containerLabel(node) : null; };
 
+  const COLOR_LIMIT = 512, colors = [], colorScopes = [], seenColorScopes = new Set(), normalizedColors = new Map();
+  let colorsComplete = true, colorCanvas;
+  // Convert an opaque native color, then quantize alpha separately. Drawing the original
+  // translucent color loses straight RGB through the canvas's premultiplied storage.
+  // Only computed serializations enter this boundary; unsupported syntax stays unresolved.
+  const canonicalColor = raw => {
+    if (normalizedColors.has(raw)) return normalizedColors.get(raw);
+    let rgba = null;
+    try {
+      let opaque = raw, alpha = 1;
+      const slash = raw.match(/\/\s*([+-]?(?:\d*\.)?\d+(?:e[+-]?\d+)?)\s*\)$/i);
+      if (slash) { alpha = Number(slash[1]); opaque = raw.replace(/\/[^)]+\)$/, '/ 1)'); }
+      else if (raw.startsWith('rgba(')) {
+        const parts = raw.slice(5, -1).split(',');
+        if (parts.length !== 4) throw new Error('unsupported computed rgba');
+        alpha = Number(parts.pop()); opaque = 'rgb(' + parts.join(',') + ')';
+      } else if (raw.includes('/')) throw new Error('unsupported computed alpha');
+      if (!Number.isFinite(alpha)) throw new Error('unsupported computed alpha');
+      colorCanvas ||= new OffscreenCanvas(1, 1).getContext('2d', {colorSpace:'srgb'});
+      colorCanvas.fillStyle = '#010203'; colorCanvas.fillStyle = opaque; const first = colorCanvas.fillStyle;
+      colorCanvas.fillStyle = '#040506'; colorCanvas.fillStyle = opaque;
+      if (first !== colorCanvas.fillStyle) throw new Error('unsupported canvas color');
+      colorCanvas.clearRect(0, 0, 1, 1); colorCanvas.fillRect(0, 0, 1, 1);
+      const pixel = colorCanvas.getImageData(0, 0, 1, 1).data;
+      if (pixel[3] !== 255) throw new Error('unsupported opaque conversion');
+      rgba = [...pixel].slice(0, 3).concat(Math.round(Math.max(0, Math.min(1, alpha)) * 255));
+    } catch (_) { /* A normalization failure must not become a guessed color. */ }
+    normalizedColors.set(raw, rgba); return rgba;
+  };
+  const colorEligible = element => !ancestors(element).some(node => node.matches?.('[inert]')) && element.checkVisibility({checkOpacity:true,checkVisibilityCSS:true});
+  const addColorScope = (node, context, kind) => {
+    if (!node || seenColorScopes.has(node)) return;
+    seenColorScopes.add(node);
+    if (colorScopes.length >= COLOR_LIMIT) { colorsComplete = false; return; }
+    const dialog = kind === 'dialog' ? null : nearestDialog(node);
+    colorScopes.push({node_id:nodeId(node),context:context.context,name:kind === 'dialog'?dialogTitle(node):containerLabel(node),kind,dialog_node_id:dialog?nodeId(dialog):null});
+  };
+  const addColor = (element, context, text, indexed) => {
+    if (!colorEligible(element)) return;
+    if (colors.length >= COLOR_LIMIT || (text?.length || 0) > 8000) { colorsComplete = false; return; }
+    const dialog = nearestDialog(element), container = containerNode(element);
+    addColorScope(dialog, context, 'dialog'); addColorScope(container, context, 'container');
+    const raw = viewOfElement(element).getComputedStyle(element).color;
+    colors.push({node_id:nodeId(element),context:context.context,text,name:indexed?.name || null,role:indexed?.role || null,
+      in_dialog:dialog?dialogTitle(dialog):null,container:container?containerLabel(container):null,
+      dialog_node_id:dialog?nodeId(dialog):null,container_node_id:container?nodeId(container):null,
+      channel:ancestors(element).some(node=>node.matches?.('[aria-hidden="true"]'))?'painted_aria_hidden':'accessible',
+      color:{raw,rgba:canonicalColor(raw)}});
+  };
+
   const elements = [], elementIndices = new Map(), seenElements = new Set(); let index = 1;
   for (const context of contexts) for (const element of context.root.querySelectorAll(selector)) {
     if (seenElements.has(element) || !visible(element, context)) continue; seenElements.add(element);
@@ -303,6 +353,7 @@
     elementIndices.set(element, current); const boolAttr = key => element.hasAttribute(key) ? element.getAttribute(key) !== 'false' : null;
     const selectOptions = element.tagName === 'SELECT' ? [...element.options].map(option => ({node_id:nodeId(option),label:option.label||option.textContent.trim(),value:String(option.value),disabled:Boolean(option.disabled),selected:Boolean(option.selected)})) : [];
     elements.push({index:current,node_id:nodeId(element),context:context.context,role:elementRole,name:name(element)||elementRole,input_type:element.tagName==='INPUT'?element.type:null,value:'value' in element?String(element.value):(element.isContentEditable?element.innerText.trim():''),checked:'checked' in element?Boolean(element.checked):boolAttr('aria-checked'),selected:'selected' in element?Boolean(element.selected):boolAttr('aria-selected'),expanded:boolAttr('aria-expanded'),disabled:Boolean(element.disabled)||element.getAttribute('aria-disabled')==='true',in_dialog:containingDialog?dialogTitle(containingDialog):null,container:containerOf(element),operations,select_options:selectOptions,rect:{x:rect.x+context.offsetX,y:rect.y+context.offsetY,width:rect.width,height:rect.height}});
+    addColor(element, context, null, elements.at(-1));
   }
 
   // Twins include opacity-hidden and offscreen controls, but never display:none controls.
@@ -480,6 +531,7 @@
   }));
 
   const TEXT_LIMIT = 8000;
+  const seenColorTexts = new Set();
   const visibleText = [], coveredText = []; let visibleLength = 0, coveredLength = 0;
   const appendText = (parts, value, kind, length) => {
     const separator = parts.length ? 1 : 0, available = TEXT_LIMIT - length;
@@ -498,6 +550,7 @@
       range.selectNodeContents(current); const bounds = clippingRect(parent, context, true, true);
       const intersects = [...range.getClientRects()].some(r => r.width > 0 && r.height > 0 && polygonArea(clippedPolygon(rectPoints(r),bounds)) > 0);
       if (!intersects || !parent.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) continue;
+      if (!seenColorTexts.has(current)) { seenColorTexts.add(current); addColor(parent, context, value, null); }
       if (!ancestors(parent).some(node => node.matches?.('[aria-hidden="true"],[inert]'))) visibleLength = appendText(visibleText, value, 'visible_text', visibleLength);
       else coveredLength = appendText(coveredText, value, 'covered_text', coveredLength);
     }
@@ -538,6 +591,10 @@
     focusAnchor = {active_descendant:activeDescendant,expanded:boolAttr('aria-expanded'),selected:'selected' in active ? Boolean(active.selected) : boolAttr('aria-selected'),checked:'checked' in active ? Boolean(active.checked) : boolAttr('aria-checked'),position,node_id:nodeId(active),context:context?.context || 'main',role:anchorRole,name:indexed?.name || (active === containingDialog ? dialog : ariaName),in_dialog:indexed?.in_dialog || dialog,container:containerOf(active),covered:!closed && !crossOrigin,surface:crossOrigin?'cross_origin_frame':closed?'closed_shadow_root':active.tagName==='CANVAS'?'canvas':null};
   }
   for (const context of contexts) for (const element of context.root.querySelectorAll('*')) {
+    if (colorEligible(element) && rendered(element, context)) {
+      if (isDialog(element)) addColorScope(element, context, 'dialog');
+      else if (semantic(element) || repeated(element)) addColorScope(element, context, 'container');
+    }
     if (element.tagName === 'CANVAS') gaps.push('canvas');
     const view = element.ownerDocument?.defaultView || window;
     for (const pseudo of ['::before', '::after']) {
@@ -552,5 +609,5 @@
     dialogTexts[record.title] = text.slice(0,TEXT_LIMIT);
   }
   const finalGaps = [...new Set(gaps)], truncated = finalGaps.some(gap => gap.endsWith('_truncated'));
-  return {document_id:String(performance.timeOrigin),url:location.href,route:location.pathname+location.search,title:document.title,dialogs,focused,focus_anchor:focusAnchor,visible_text:visibleText.join('\n'),covered_text:coveredText.join('\n'),dialog_texts:dialogTexts,elements,viewport:{width:innerWidth,height:innerHeight,scroll_x:scrollX,scroll_y:scrollY,document_height:document.documentElement.scrollHeight},coverage:{viewport_complete:!truncated,open_shadow_roots:true,slots:true,same_origin_frames:!finalGaps.includes('cross_origin_frame'),gaps:finalGaps},overlay:topOverlay?{node_id:nodeId(topOverlay.element),name:topOverlay.name}:null,scroll_regions:scrollRegions,scroll_regions_truncated:scrollNodes.length>REGION_LIMIT,hover_rules_unreadable:hoverRulesUnreadable,hover_regions:hoverRegions,hover_regions_truncated:regionRecords.size > REGION_LIMIT};
+  return {document_id:String(performance.timeOrigin),url:location.href,route:location.pathname+location.search,title:document.title,dialogs,focused,focus_anchor:focusAnchor,visible_text:visibleText.join('\n'),covered_text:coveredText.join('\n'),dialog_texts:dialogTexts,elements,colors,colors_complete:colorsComplete,color_scopes:colorScopes,viewport:{width:innerWidth,height:innerHeight,scroll_x:scrollX,scroll_y:scrollY,document_height:document.documentElement.scrollHeight},coverage:{viewport_complete:!truncated,open_shadow_roots:true,slots:true,same_origin_frames:!finalGaps.includes('cross_origin_frame'),gaps:finalGaps},overlay:topOverlay?{node_id:nodeId(topOverlay.element),name:topOverlay.name}:null,scroll_regions:scrollRegions,scroll_regions_truncated:scrollNodes.length>REGION_LIMIT,hover_rules_unreadable:hoverRulesUnreadable,hover_regions:hoverRegions,hover_regions_truncated:regionRecords.size > REGION_LIMIT};
 })()

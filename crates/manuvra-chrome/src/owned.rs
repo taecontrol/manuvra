@@ -319,7 +319,7 @@ impl OwnedBrowser {
         let screenshot =
             page::capture_screenshot(&self.client, deadline(), Arc::new(AtomicBool::new(false)))
                 .map_err(|error| BrowserError::Control(error.to_string()))?;
-        if page_changed_since(&self.client, fence) {
+        if !self.capture_stable(&observation, fence)? {
             return Ok(None);
         }
         Ok(Some(CapturedPage {
@@ -327,6 +327,30 @@ impl OwnedBrowser {
             screenshot,
             redaction: masks.proof.clone(),
         }))
+    }
+
+    fn capture_stable(&self, observation: &Observation, fence: u64) -> Result<bool, BrowserError> {
+        if observation.colors_complete && !self.appearance_unchanged(observation)? {
+            return Ok(false);
+        }
+        Ok(!page_changed_since(&self.client, fence))
+    }
+
+    /// CSS animation and stylesheet edits need not emit a DOM mutation. Fence the computed
+    /// appearance as well, so color evidence and its screenshot describe one stable capture.
+    fn appearance_unchanged(&self, before: &Observation) -> Result<bool, BrowserError> {
+        let after = self.observe()?;
+        Ok((
+            &before.document_id,
+            &before.colors,
+            &before.color_scopes,
+            before.colors_complete,
+        ) == (
+            &after.document_id,
+            &after.colors,
+            &after.color_scopes,
+            after.colors_complete,
+        ))
     }
 
     /// Terminates the browser at most once, then removes its profile. A failed
@@ -1425,6 +1449,30 @@ mod tests {
             chrome.received("Runtime.evaluate")[0]["params"]["expression"],
             SNAPSHOT
         );
+    }
+
+    #[test]
+    fn capture_fence_rejects_color_only_changes_without_dom_events() {
+        let chrome = ScriptedChrome::start();
+        let mut snapshot = snapshot_value();
+        snapshot["colors_complete"] = json!(true);
+        snapshot["colors"] = json!([{"node_id":1,"context":"main","text":"Amount","name":null,"role":null,
+            "in_dialog":null,"container":null,"dialog_node_id":null,"container_node_id":null,
+            "channel":"accessible","color":{"raw":"rgb(185, 28, 28)","rgba":[185,28,28,255]}}]);
+        let before: Observation = serde_json::from_value(snapshot.clone()).unwrap();
+        chrome.reply_evaluation(SNAPSHOT, json!({"result":{"value":snapshot.clone()}}));
+        let browser = browser_with_client(chrome.connect_raw());
+        let fence = browser.client.cursor();
+        assert!(browser.capture_stable(&before, fence).unwrap());
+        snapshot["colors"][0]["color"] = json!({"raw":"rgb(31, 41, 55)","rgba":[31,41,55,255]});
+        chrome.reply_evaluation(SNAPSHOT, json!({"result":{"value":snapshot}}));
+        assert!(!browser.capture_stable(&before, fence).unwrap());
+        assert!(
+            !page_changed_since(&browser.client, fence),
+            "this must prove the appearance fence independently of DOM events"
+        );
+        chrome.reject("Runtime.evaluate");
+        assert!(browser.capture_stable(&before, fence).is_err());
     }
 
     #[test]

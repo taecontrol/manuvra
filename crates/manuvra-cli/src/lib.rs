@@ -923,7 +923,7 @@ fn initial_watchdog_result(prepared: &Prepared) -> Value {
                 "result":if index == 0 {"unresolved"} else {"not_run"}
             })).collect::<Vec<_>>(),
             "expectations":prepared.job.expectations.iter().map(|expectation|json!({
-                "id":prepared.redactor.redact_export_text(&expectation.id),
+                "id":prepared.redactor.redact_export_text(expectation.id()),
                 "result":"not_run",
                 "numeric_checks":[]
             })).collect::<Vec<_>>(),

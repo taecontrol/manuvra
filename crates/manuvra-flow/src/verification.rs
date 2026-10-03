@@ -1,14 +1,16 @@
 use crate::values::Values;
 use manuvra_chrome::{Element, Observation};
 use manuvra_contract::{
-    Assertion, AssertionScope, Expectation, ExpectationVerdict, JobValue, NumericCheck,
-    VerdictResult,
+    Assertion, AssertionCheck, AssertionScope, Expectation, ExpectationVerdict, JobValue,
+    NaturalExpectation, NumericCheck, VerdictResult,
 };
 use manuvra_jev::{Answer, Evaluator, JevError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::time::Instant;
+
+mod color;
 
 #[cfg(test)]
 #[path = "verification/color_tests.rs"]
@@ -36,37 +38,105 @@ pub fn verify(
     evaluator: &(impl Evaluator + ?Sized),
     deadline: Instant,
 ) -> Result<VerificationReport, JevError> {
-    if expectations.is_empty() {
-        return Ok(VerificationReport {
-            verdicts: Vec::new(),
-            outcome: DoneResult::Satisfied,
-            record: json!({"phase":"verification","expectations":[],"provider":null}),
-        });
+    prepare_verification(expectations, observation, values).finish(
+        expectations,
+        observation,
+        values,
+        evaluator,
+        deadline,
+    )
+}
+
+/// Deterministic checks run before a model-call budget is consumed. A false structured
+/// expectation is decisive even when a natural claim appears earlier in the job.
+pub struct VerificationPlan {
+    verdicts: Vec<ExpectationVerdict>,
+}
+
+pub fn prepare_verification(
+    expectations: &[Expectation],
+    observation: &Observation,
+    values: &Values<'_>,
+) -> VerificationPlan {
+    VerificationPlan {
+        verdicts: expectations
+            .iter()
+            .map(|expectation| preliminary_verdict(expectation, observation, values))
+            .collect(),
     }
-    let request = expectation_request(expectations, observation, values);
-    let evaluation = evaluator.evaluate(&request, deadline)?;
-    let nouls = expectation_nouls(expectations, &evaluation.answers)?;
-    let verdicts = expectations
-        .iter()
-        .zip(nouls.iter().copied())
-        .map(|(expectation, noul)| expectation_verdict(expectation, observation, values, noul))
-        .collect::<Vec<_>>();
-    let outcome = aggregate_expectations(&verdicts);
-    Ok(VerificationReport {
-        record: json!({
-            "phase":"verification",
-            "expectations":verdicts,
-            "provider":{
-                "model":evaluation.model,
-                "request_id":evaluation.request_id,
-                "usage":evaluation.usage,
-                "request":request,
-                "nouls":nouls,
+}
+
+fn preliminary_verdict(
+    expectation: &Expectation,
+    observation: &Observation,
+    values: &Values<'_>,
+) -> ExpectationVerdict {
+    let (result, assertion_checks) = match expectation {
+        Expectation::NaturalLanguage(_) => (VerdictResult::NotRun, Vec::new()),
+        Expectation::Structured(expectation) => {
+            let report =
+                evaluate_assertions(&expectation.assertions, observation, values.provided());
+            (report.outcome.verdict(), report.assertion_checks)
+        }
+    };
+    ExpectationVerdict {
+        id: expectation.id().into(),
+        result,
+        noul: None,
+        numeric_checks: Vec::new(),
+        assertion_checks,
+    }
+}
+
+impl VerificationPlan {
+    pub fn needs_provider(&self) -> bool {
+        self.verdicts
+            .iter()
+            .any(|verdict| verdict.result == VerdictResult::NotRun)
+            && !self
+                .verdicts
+                .iter()
+                .any(|verdict| verdict.result == VerdictResult::NotSatisfied)
+    }
+
+    pub fn finish(
+        mut self,
+        expectations: &[Expectation],
+        observation: &Observation,
+        values: &Values<'_>,
+        evaluator: &(impl Evaluator + ?Sized),
+        deadline: Instant,
+    ) -> Result<VerificationReport, JevError> {
+        let provider = if self.needs_provider() {
+            let request = expectation_request(expectations, observation, values);
+            let evaluation = evaluator.evaluate(&request, deadline)?;
+            let nouls = expectation_nouls(expectations, &evaluation.answers)?;
+            for (index, noul) in &nouls {
+                if let Some(expectation) = expectations[*index].natural() {
+                    self.verdicts[*index] =
+                        expectation_verdict(expectation, observation, values, *noul);
+                }
             }
-        }),
-        verdicts,
-        outcome,
-    })
+            json!({"model":evaluation.model,"request_id":evaluation.request_id,"usage":evaluation.usage,"request":request,"nouls":nouls.values().collect::<Vec<_>>()})
+        } else {
+            Value::Null
+        };
+        Ok(VerificationReport {
+            outcome: aggregate_expectations(&self.verdicts),
+            record: json!({"phase":"verification","expectations":self.verdicts,"provider":provider}),
+            verdicts: self.verdicts,
+        })
+    }
+}
+
+impl DoneResult {
+    fn verdict(self) -> VerdictResult {
+        match self {
+            Self::Satisfied => VerdictResult::Satisfied,
+            Self::NotSatisfied => VerdictResult::NotSatisfied,
+            Self::Unknown => VerdictResult::Unresolved,
+        }
+    }
 }
 
 fn expectation_request(
@@ -77,6 +147,7 @@ fn expectation_request(
     let questions = expectations
         .iter()
         .enumerate()
+        .filter_map(|(index, expectation)| expectation.natural().map(|claim| (index,claim)))
         .map(|(index, expectation)| {
             let claim = values.mask(&expectation.claim);
             (
@@ -97,7 +168,7 @@ fn expectation_request(
         "state":{
             "phase":"final_verification",
             "page":values.model_view(observation),
-            "claims":expectations.iter().enumerate().map(|(index, expectation)|json!({
+            "claims":expectations.iter().enumerate().filter_map(|(index, expectation)|expectation.natural().map(|claim|(index,claim))).map(|(index, expectation)|json!({
                 "question_id":expectation_question_id(index),
                 "claim":values.mask(&expectation.claim)
             })).collect::<Vec<_>>()
@@ -109,8 +180,13 @@ fn expectation_request(
 fn expectation_nouls(
     expectations: &[Expectation],
     answers: &BTreeMap<String, Answer>,
-) -> Result<Vec<f64>, JevError> {
-    if answers.len() != expectations.len() {
+) -> Result<BTreeMap<usize, f64>, JevError> {
+    if answers.len()
+        != expectations
+            .iter()
+            .filter(|expectation| expectation.natural().is_some())
+            .count()
+    {
         return Err(JevError::InvalidResponse(
             "expectation answer ids do not match claims".into(),
         ));
@@ -118,10 +194,11 @@ fn expectation_nouls(
     expectations
         .iter()
         .enumerate()
+        .filter(|(_, expectation)| expectation.natural().is_some())
         .map(
             |(index, _)| match answers.get(&expectation_question_id(index)) {
                 Some(Answer::Noul { noul }) if noul.is_finite() && (0.0..=1.0).contains(noul) => {
-                    Ok(*noul)
+                    Ok((index, *noul))
                 }
                 Some(Answer::Noul { .. }) => Err(JevError::InvalidResponse(
                     "expectation Noul was outside 0 to 1".into(),
@@ -140,7 +217,7 @@ fn expectation_question_id(index: usize) -> String {
 }
 
 fn expectation_verdict(
-    expectation: &Expectation,
+    expectation: &NaturalExpectation,
     observation: &Observation,
     values: &Values<'_>,
     noul: f64,
@@ -164,6 +241,7 @@ fn expectation_verdict(
         result,
         noul: Some(noul),
         numeric_checks: checks.into_iter().map(|check| check.exported).collect(),
+        assertion_checks: Vec::new(),
     }
 }
 
@@ -196,7 +274,7 @@ struct EvaluatedNumericCheck {
 }
 
 fn expectation_numeric_checks(
-    expectation: &Expectation,
+    expectation: &NaturalExpectation,
     observation: &Observation,
     values: &Values<'_>,
 ) -> Vec<EvaluatedNumericCheck> {
@@ -295,18 +373,63 @@ pub fn check_done(
     observation: &Observation,
     values: &BTreeMap<String, JobValue>,
 ) -> DoneResult {
+    evaluate_assertions(assertions, observation, values).outcome
+}
+
+pub struct DoneReport {
+    pub outcome: DoneResult,
+    pub assertion_checks: Vec<AssertionCheck>,
+}
+
+pub fn color_assertion_checks(
+    assertions: &[Assertion],
+    observation: &Observation,
+) -> Vec<AssertionCheck> {
+    assertions
+        .iter()
+        .filter_map(|assertion| match assertion {
+            Assertion::Color(assertion) => Some(AssertionCheck::Color(color::evaluate(
+                &assertion.color,
+                observation,
+            ))),
+            _ => None,
+        })
+        .collect()
+}
+
+pub fn evaluate_assertions(
+    assertions: &[Assertion],
+    observation: &Observation,
+    values: &BTreeMap<String, JobValue>,
+) -> DoneReport {
     let mut unknown = false;
+    let mut not_satisfied = false;
+    let mut assertion_checks = Vec::new();
     for assertion in assertions {
-        match check_assertion(assertion, observation, values) {
-            DoneResult::NotSatisfied => return DoneResult::NotSatisfied,
+        let result = if let Assertion::Color(assertion) = assertion {
+            let check = color::evaluate(&assertion.color, observation);
+            let result = color::outcome(check.result);
+            assertion_checks.push(AssertionCheck::Color(check));
+            result
+        } else {
+            check_assertion(assertion, observation, values)
+        };
+        match result {
+            DoneResult::NotSatisfied => not_satisfied = true,
             DoneResult::Unknown => unknown = true,
             DoneResult::Satisfied => {}
         }
     }
-    if unknown {
+    let outcome = if not_satisfied {
+        DoneResult::NotSatisfied
+    } else if unknown {
         DoneResult::Unknown
     } else {
         DoneResult::Satisfied
+    };
+    DoneReport {
+        outcome,
+        assertion_checks,
     }
 }
 
@@ -664,6 +787,9 @@ mod tests {
             focus_anchor: None,
             visible_text: "Saved Create account".into(),
             covered_text: "Hidden background".into(),
+            colors: Vec::new(),
+            colors_complete: false,
+            color_scopes: Vec::new(),
             dialog_texts: BTreeMap::from([("Create account".into(), "Account name Saved".into())]),
             elements: vec![Element {
                 index: 1,
@@ -856,7 +982,7 @@ mod tests {
         let values = Values::new(&job);
         let mut observed = observation();
         observed.visible_text = "Wallet\nBalance 12.34\nDelta -7 and +2".into();
-        let expectation = Expectation {
+        let expectation = NaturalExpectation {
             id: "balance".into(),
             claim: "The balance is 12.34 and delta is -7 with +2 entries.".into(),
             exact_literals: Vec::new(),
@@ -886,7 +1012,7 @@ mod tests {
         let values = Values::new(&job);
         let mut observed = observation();
         observed.visible_text = "Balance 12.34".into();
-        let expectation = Expectation {
+        let expectation = NaturalExpectation {
             id: "balance".into(),
             claim: "The balance is 12.34.".into(),
             exact_literals: Vec::new(),
@@ -907,7 +1033,7 @@ mod tests {
         let job = job_without_values();
         let values = Values::new(&job);
         let mut observed = observation();
-        let expectation = Expectation {
+        let expectation = NaturalExpectation {
             id: "wallet".into(),
             claim: "The wallet exists.".into(),
             exact_literals: vec![manuvra_contract::ExactLiteral {
@@ -953,7 +1079,7 @@ mod tests {
             literal: "12.34".into(),
             within_text: within_text.map(str::to_owned),
         };
-        let expectation = |exact_literals| Expectation {
+        let expectation = |exact_literals| NaturalExpectation {
             id: "balance".into(),
             claim: "The final balance is 12.34.".into(),
             exact_literals,
@@ -1025,11 +1151,11 @@ mod tests {
     fn verification_request_never_lists_hover_regions() {
         let job = job_without_values();
         let values = Values::new(&job);
-        let expectations = [Expectation {
+        let expectations = [Expectation::NaturalLanguage(NaturalExpectation {
             id: "saved".into(),
             claim: "The account is saved.".into(),
             exact_literals: Vec::new(),
-        }];
+        })];
         let mut with_regions = observation();
         with_regions.hover_regions = vec![manuvra_chrome::HoverRegion {
             index: 1,

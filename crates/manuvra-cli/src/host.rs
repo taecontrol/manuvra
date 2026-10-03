@@ -449,7 +449,7 @@ fn running_result(
         "verdict": {
             "overall": VerdictResult::Unresolved,
             "steps": bootstrap.job.steps.iter().enumerate().map(|(index,step)| json!({"id":redactor.redact_export_text(&step.id),"result":if index == 0 {"unresolved"} else {"not_run"}})).collect::<Vec<_>>(),
-            "expectations": bootstrap.job.expectations.iter().map(|expectation| json!({"id":redactor.redact_export_text(&expectation.id),"result":"not_run","numeric_checks":[]})).collect::<Vec<_>>(),
+            "expectations": bootstrap.job.expectations.iter().map(|expectation| json!({"id":redactor.redact_export_text(expectation.id()),"result":"not_run","numeric_checks":[]})).collect::<Vec<_>>(),
             "caller_assisted": false
         },
         "evidence": {"manifest":manifest,"complete":false},

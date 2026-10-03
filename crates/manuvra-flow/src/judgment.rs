@@ -457,6 +457,9 @@ mod tests {
             }),
             visible_text: "provider-secret-419".into(),
             covered_text: "".into(),
+            colors: Vec::new(),
+            colors_complete: false,
+            color_scopes: Vec::new(),
             dialog_texts: BTreeMap::new(),
             elements: vec![Element {
                 index: 1,
@@ -584,6 +587,9 @@ mod tests {
             focus_anchor: None,
             visible_text: "Savings 4417 Groceries $400.00".into(),
             covered_text: "Rent".into(),
+            colors: Vec::new(),
+            colors_complete: false,
+            color_scopes: Vec::new(),
             dialog_texts: BTreeMap::new(),
             elements: vec![
                 golden_element(

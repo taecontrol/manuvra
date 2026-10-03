@@ -284,10 +284,11 @@ fn blocked_result(
                 .expectations
                 .iter()
                 .map(|expectation| ExpectationVerdict {
-                    id: redactor.redact_export_text(&expectation.id),
+                    id: redactor.redact_export_text(expectation.id()),
                     result: VerdictResult::NotRun,
                     noul: None,
                     numeric_checks: Vec::new(),
+                    assertion_checks: Vec::new(),
                 })
                 .collect(),
             caller_assisted: false,

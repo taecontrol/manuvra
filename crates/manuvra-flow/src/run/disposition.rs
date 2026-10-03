@@ -353,6 +353,11 @@ fn relevant_state(observation: &Observation) -> Value {
         "elements": observation.elements,
         "coverage": observation.coverage,
     });
+    if observation.colors_complete || !observation.colors.is_empty() {
+        state["colors"] = json!(observation.colors);
+        state["colors_complete"] = json!(observation.colors_complete);
+        state["color_scopes"] = json!(observation.color_scopes);
+    }
     if !observation.hover_regions.is_empty() {
         state["hover_regions"] = json!(observation.hover_regions);
     }
@@ -443,7 +448,12 @@ mod tests {
     #[test]
     fn verification_attestation_rechecks_changed_facts_identity_and_focus() {
         let mut scoped = expectation_job();
-        scoped.expectations[0].exact_literals = vec![manuvra_contract::ExactLiteral {
+        let manuvra_contract::Expectation::NaturalLanguage(expectation) =
+            &mut scoped.expectations[0]
+        else {
+            panic!("natural expectation")
+        };
+        expectation.exact_literals = vec![manuvra_contract::ExactLiteral {
             literal: "12.34".into(),
             within_text: Some("Wallet".into()),
         }];

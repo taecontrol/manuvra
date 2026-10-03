@@ -21,6 +21,12 @@ pub struct Observation {
     pub covered_text: String,
     #[serde(default)]
     pub dialog_texts: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub colors: Vec<ColorObservation>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub colors_complete: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub color_scopes: Vec<ColorScope>,
     #[serde(default)]
     pub elements: Vec<Element>,
     pub viewport: ViewportState,
@@ -41,6 +47,53 @@ pub struct Observation {
     /// CSSOM hover rules could not be read. Detection-only; not a coverage gap.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hover_rules_unreadable: bool,
+}
+
+/// An exact painted text segment or indexed control and its own computed foreground color.
+/// Identities only establish uniqueness inside the browser observation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ColorObservation {
+    pub node_id: u64,
+    pub context: String,
+    pub text: Option<String>,
+    pub name: Option<String>,
+    pub role: Option<String>,
+    pub in_dialog: Option<String>,
+    pub container: Option<String>,
+    pub dialog_node_id: Option<u64>,
+    pub container_node_id: Option<u64>,
+    pub channel: ColorChannel,
+    pub color: ComputedColor,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComputedColor {
+    pub raw: String,
+    /// Straight sRGB, clamped and quantized independently of alpha. None means unsupported.
+    pub rgba: Option<[u8; 4]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColorScope {
+    pub node_id: u64,
+    pub context: String,
+    pub name: String,
+    pub kind: ColorScopeKind,
+    pub dialog_node_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColorChannel {
+    Accessible,
+    PaintedAriaHidden,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColorScopeKind {
+    Dialog,
+    Container,
 }
 
 /// A visible, vertically overflowing region. Node identities are browser-internal.

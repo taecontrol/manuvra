@@ -6,7 +6,7 @@ use super::capture::{Captured, DriveBrowser, capture_step, redacted_value};
 use super::escalation::escalate_verification;
 use super::stops::{Stop, control_stop, verification_policy_stop, verification_provider_stop};
 use crate::evidence::Redactor;
-use crate::verification::{DoneResult, verify};
+use crate::verification::{DoneResult, prepare_verification};
 use crate::{policy, values::Values};
 use manuvra_chrome::Observation;
 use manuvra_contract::{ExpectationVerdict, Job};
@@ -100,14 +100,15 @@ pub(super) fn evaluate_final(
     evaluator: &impl manuvra_jev::Evaluator,
     policy: &mut policy::Policy,
 ) -> Result<crate::verification::VerificationReport, Stop> {
-    let deadline = if job.expectations.is_empty() {
+    let plan = prepare_verification(&job.expectations, observation, values);
+    let deadline = if !plan.needs_provider() {
         Instant::now()
     } else {
         policy
             .record_model_call()
             .map_err(verification_policy_stop)?
     };
-    verify(&job.expectations, observation, values, evaluator, deadline)
+    plan.finish(&job.expectations, observation, values, evaluator, deadline)
         .map_err(|error| verification_provider_stop(&error))
 }
 
@@ -119,7 +120,9 @@ pub(super) fn record_verification(
     uncertainty_reason: &'static str,
 ) -> VerificationProgress {
     artifacts.expectation_verdicts = redacted_expectation_verdicts(&report.verdicts, redactor);
-    artifacts.verification = Some(redacted_value(&report.record, redactor));
+    let mut record = redacted_value(&report.record, redactor);
+    record["expectations"] = json!(artifacts.expectation_verdicts);
+    artifacts.verification = Some(record);
     match report.outcome {
         DoneResult::Satisfied => VerificationProgress::Complete,
         DoneResult::NotSatisfied => {
@@ -143,28 +146,30 @@ fn redacted_expectation_verdicts(
     verdicts: &[ExpectationVerdict],
     redactor: &Redactor,
 ) -> Vec<ExpectationVerdict> {
-    serde_json::from_value(redacted_value(&verdicts, redactor)).unwrap_or_else(|_| {
-        verdicts
-            .iter()
-            .map(|verdict| ExpectationVerdict {
-                id: redactor.redact_export_text(&verdict.id),
-                result: verdict.result,
-                noul: verdict.noul,
-                numeric_checks: verdict
-                    .numeric_checks
-                    .iter()
-                    .map(|check| manuvra_contract::NumericCheck {
-                        literal: redactor.redact_export_text(&check.literal),
-                        present: check.present,
-                        within_text: check
-                            .within_text
-                            .as_ref()
-                            .map(|text| redactor.redact_export_text(text)),
-                    })
-                    .collect(),
-            })
-            .collect()
-    })
+    verdicts
+        .iter()
+        .map(|verdict| ExpectationVerdict {
+            id: redactor.redact_export_text(&verdict.id),
+            result: verdict.result,
+            noul: verdict.noul,
+            assertion_checks: crate::evidence::redacted_assertion_checks(
+                &verdict.assertion_checks,
+                redactor,
+            ),
+            numeric_checks: verdict
+                .numeric_checks
+                .iter()
+                .map(|check| manuvra_contract::NumericCheck {
+                    literal: redactor.redact_export_text(&check.literal),
+                    present: check.present,
+                    within_text: check
+                        .within_text
+                        .as_ref()
+                        .map(|text| redactor.redact_export_text(text)),
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 #[cfg(test)]

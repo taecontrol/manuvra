@@ -1,4 +1,4 @@
-.PHONY: fmt lint test crap live live-all live-hover live-keyboard live-natural-done live-observation live-resume-dispositions live-run-lifecycle live-self-test live-scroll live-money-scroll
+.PHONY: fmt lint test crap live live-all live-color live-hover live-keyboard live-natural-done live-observation live-resume-dispositions live-run-lifecycle live-self-test live-scroll live-money-scroll
 
 CRAP_REPORT ?= target/crap-report.json
 CRAP_GATE_MANIFEST := tools/crap-gate/Cargo.toml
@@ -34,6 +34,9 @@ live-self-test:
 live:
 	/bin/bash scripts/live/money-journey-matrix.sh
 
+live-color:
+	python3 scripts/live/color.py
+
 live-hover:
 	bash scripts/live/hover-reveal.sh
 
@@ -60,6 +63,7 @@ live-run-lifecycle:
 
 # Sequential even under -j: the Money suites share fixture port 4351.
 live-all:
+	$(MAKE) live-color
 	$(MAKE) live
 	$(MAKE) live-observation
 	$(MAKE) live-natural-done
