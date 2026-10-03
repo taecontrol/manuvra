@@ -172,7 +172,7 @@ def matrix():
             assert all(b"-$9.00" not in content for files in evidence(value).values() for content in files)
     value = run("duplicates", job("duplicates", [color({"text": "$0.00"})]))
     assert value["state"] == "uncertain" and value["escalation"]["dispositions"] == ["retry_observation", "abort"], value
-    terminal("duplicates", abort("duplicates", value), "aborted", assisted=True)
+    terminal("duplicates", abort("duplicates", value), "aborted")
 
     wire = job("theme", [color(negative, "same_as", reference), color(negative, "different_from", {"text": "$12.34"})])
     wire["steps"].append({"id": "theme", "goal": "Click the Theme button once to switch to the dark theme.",
