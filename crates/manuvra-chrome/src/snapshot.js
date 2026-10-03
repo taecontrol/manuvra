@@ -328,6 +328,20 @@
     for(let node=element;node;node=up(node) || node.ownerDocument.defaultView.frameElement)nodes.push(node);
     return nodes;
   };
+  const colorAnimations = new Map();
+  const colorCaptureStable = element => {
+    const lineage=colorAncestors(element), owners=new Set(lineage);
+    for (const owner of new Set(lineage.map(node=>node.ownerDocument))) {
+      if (!colorAnimations.has(owner)) colorAnimations.set(owner,owner.getAnimations());
+      for (const animation of colorAnimations.get(owner)) {
+        if ((!animation.pending && animation.playState!=='running') || !owners.has(animation.effect?.target)) continue;
+        // Background-only effects do not change foreground or paint eligibility. Unknown effects do.
+        const frames=animation.effect?.getKeyframes?.();
+        if (!frames || frames.some(frame=>Object.keys(frame).some(key=>!['offset','computedOffset','easing','composite','backgroundColor'].includes(key)))) return false;
+      }
+    }
+    return true;
+  };
   const colorVisible = element => {
     const css=viewOfElement(element).getComputedStyle(element);
     if(css.visibility!=='visible')return false;
@@ -399,7 +413,7 @@
     colors.push({node_id:nodeId(element),context:context.context,text,name:indexed?.name || null,role:indexed?.role || null,
       in_dialog:dialog?dialogTitle(dialog):null,container:container?containerLabel(container):null,
       dialog_node_id:dialog?nodeId(dialog):null,container_node_id:container?nodeId(container):null,
-      channel:colorAncestors(element).some(node=>node.matches?.('[aria-hidden="true"]'))?'painted_aria_hidden':'accessible',paint_complete:paint.complete,
+      channel:colorAncestors(element).some(node=>node.matches?.('[aria-hidden="true"]'))?'painted_aria_hidden':'accessible',paint_complete:paint.complete,capture_stable:colorCaptureStable(element),
       color:{raw,rgba:canonicalColor(raw)}});
   };
 

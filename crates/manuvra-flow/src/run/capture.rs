@@ -68,8 +68,11 @@ fn capture_assertions(
     }
     let facts =
         |observation: &Observation| crate::verification::assertion_checks(assertions, observation);
-    browser
-        .capture_redacted_matching_page(sensitive, &|before, after| facts(before) == facts(after))
+    browser.capture_redacted_matching_page(sensitive, &|before, after| {
+        crate::verification::capture_stable(assertions, before)
+            && crate::verification::capture_stable(assertions, after)
+            && facts(before) == facts(after)
+    })
 }
 
 fn needs_painted_fence(assertion: &Assertion) -> bool {

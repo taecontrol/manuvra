@@ -84,7 +84,14 @@ pub struct ColorObservation {
     /// False when a painted shape cannot be established from supported clip geometry.
     #[serde(default = "complete_paint")]
     pub paint_complete: bool,
+    /// False while an active effect can change this owner's foreground or paint eligibility.
+    #[serde(default = "complete_paint", skip_serializing_if = "is_true")]
+    pub capture_stable: bool,
     pub color: ComputedColor,
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 fn complete_paint() -> bool {

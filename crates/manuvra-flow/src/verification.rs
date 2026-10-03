@@ -404,6 +404,13 @@ pub fn assertion_checks(
         .collect()
 }
 
+pub(crate) fn capture_stable(assertions: &[Assertion], observation: &Observation) -> bool {
+    assertions.iter().all(|assertion| match assertion {
+        Assertion::Color(check) => color::capture_stable(&check.color, observation),
+        _ => true,
+    })
+}
+
 fn assertion_evidence(assertion: &Assertion, observation: &Observation) -> Option<AssertionCheck> {
     let check = match assertion {
         Assertion::Color(assertion) => {

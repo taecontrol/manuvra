@@ -72,11 +72,13 @@
     const right = Math.ceil(rect.x + x + rect.width), bottom = Math.ceil(rect.y + y + rect.height);
     const mask = document.createElement('div');
     mask.setAttribute('data-manuvra-mask', '');
-    Object.assign(mask.style, {position: 'fixed', left: `${left}px`, top: `${top}px`, width: `${right - left}px`, height: `${bottom - top}px`, background: '#000', zIndex: '2147483647', pointerEvents: 'none'});
+    // Own the whole paint shape: author rules must not clip, round, blend or fade masks.
+    for (const [name, value] of Object.entries({all:'initial',display:'block',position:'fixed',left:`${left}px`,top:`${top}px`,width:`${right-left}px`,height:`${bottom-top}px`,background:'#000','z-index':'2147483647','pointer-events':'none'})) mask.style.setProperty(name,value,'important');
     document.documentElement.appendChild(mask); masks.push(mask);
     // The root may establish another fixed-position containing block. Trust native coverage.
     const actual = mask.getBoundingClientRect(), css = window.getComputedStyle(mask);
-    if (!mask.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}) || css.opacity !== '1' || css.backgroundColor !== 'rgb(0, 0, 0)' || !stableTextPaint(mask) ||
+    const generated = ['::before','::after'].some(pseudo => !['none','normal'].includes(window.getComputedStyle(mask,pseudo).content));
+    if (generated || !mask.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}) || css.opacity !== '1' || css.backgroundColor !== 'rgb(0, 0, 0)' || !stableTextPaint(mask) ||
         actual.left > rect.x + x || actual.top > rect.y + y || actual.right < rect.x + x + rect.width || actual.bottom < rect.y + y + rect.height) unverifiable = true;
   };
   const coverRange = (range, context) => {

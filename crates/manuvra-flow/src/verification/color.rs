@@ -7,6 +7,13 @@ use manuvra_contract::{
 };
 use std::collections::BTreeMap;
 
+pub(super) fn capture_stable(check: &ColorCheck, observation: &Observation) -> bool {
+    std::iter::once(check.target())
+        .chain(check.reference())
+        .filter_map(|target| owner(target, observation).ok())
+        .all(|owner| owner.capture_stable)
+}
+
 pub(super) fn evaluate(check: &ColorCheck, observation: &Observation) -> ColorCheckEvidence {
     let target = resolve(check.target(), observation);
     let reference = check.reference().map(|wanted| resolve(wanted, observation));
