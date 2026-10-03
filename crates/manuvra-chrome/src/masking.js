@@ -1,7 +1,7 @@
 (values) => {
   window.__manuvraRemoveMasks?.();
   // A channel can join retained nodes across roots; raw ranges cannot prove that assembly.
-  const masks = [], matched = new Set(); let unverifiable = values.some(value => value.includes('\n'));
+  const masks = [], matched = new Set(), sources = new Set(); let unverifiable = values.some(value => value.includes('\n'));
   const painted = (element) => element.checkVisibility({checkVisibilityCSS: true});
   const hasArea = (rect) => rect.width > 0 && rect.height > 0;
   const shown = (element) => painted(element) && hasArea(element.getBoundingClientRect());
@@ -29,6 +29,10 @@
       if (root.getAnimations().some(animation => running(animation) && !independentAnimation(animation, lineage))) return false;
     }
     return true;
+  };
+  const trackSource = (element) => {
+    sources.add(element);
+    if (!stableTextPaint(element)) unverifiable = true;
   };
   // Frame ranges use child CSS pixels. Offset-only masks require an unscaled parent space.
   const translatedSpace = (root) => {
@@ -125,7 +129,7 @@
     for (const element of context.root.querySelectorAll('*')) {
       if (boxless(element)) continue;
       if (element.matches('input,textarea,select,[contenteditable="true"]') && hasArea(element.getBoundingClientRect())) {
-        matches(controlText(element), () => { if (!stableTextPaint(element)) unverifiable = true; cover(element.getBoundingClientRect(), context.x, context.y); });
+        matches(controlText(element), () => { trackSource(element); cover(element.getBoundingClientRect(), context.x, context.y); });
       }
       const view = element.ownerDocument?.defaultView || window;
       for (const pseudo of ['::before', '::after']) {
@@ -141,7 +145,7 @@
       nodes.push({node, start, end: text.length});
       const normalized = normalizedText(node.textContent || '');
       matches(normalized.text, (start, end) => {
-        if (!stableTextPaint(up(node))) unverifiable = true;
+        trackSource(up(node));
         const range = owner.createRange();
         range.setStart(node, normalized.starts[start]); range.setEnd(node, normalized.ends[end - 1]);
         coverRange(range, context);
@@ -150,13 +154,15 @@
     matches(text, (start, end) => {
       const first = nodes.find(item => item.start <= start && start < item.end), last = nodes.find(item => item.start < end && end <= item.end);
       if (!first || !last) { unverifiable = true; return; }
-      if (nodes.some(item => item.end > start && item.start < end && !stableTextPaint(up(item.node)))) unverifiable = true;
+      nodes.filter(item => item.end > start && item.start < end).forEach(item => trackSource(up(item.node)));
       const range = owner.createRange();
       range.setStart(first.node, start - first.start); range.setEnd(last.node, end - last.start);
       coverRange(range, context);
     });
   }
 
+  // Appending masks can activate author CSS effects on their matched source owners.
+  if ([...sources].some(element => !stableTextPaint(element))) unverifiable = true;
   window.__manuvraRemoveMasks = () => { masks.forEach(mask => mask.remove()); delete window.__manuvraRemoveMasks; };
   return {verified: !unverifiable, sensitive_values_checked: values.length, matched_values: matched.size, mask_count: masks.length};
 }
