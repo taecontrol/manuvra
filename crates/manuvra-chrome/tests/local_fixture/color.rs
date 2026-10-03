@@ -210,3 +210,42 @@ fn color_inventory_and_native_normalization_fail_closed() {
     assert_eq!(text(&snapshot, "Amount")[0]["color"]["rgba"], Value::Null);
     browser.close().unwrap();
 }
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn color_clip_geometry_preserves_unverifiable_owners_and_excludes_clipped_scopes() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(include_str!(
+        "../../../../tests/browser/color-eligibility.html"
+    ));
+    let mut browser = launch_headless();
+    browser.navigate(&server.url()).unwrap();
+    let snapshot = observation(&browser);
+    assert_eq!(
+        text(&snapshot, "Inline clip amount").len(),
+        1,
+        "unverifiable paint must retain its owner"
+    );
+    assert_eq!(
+        text(&snapshot, "Inline clip amount")[0]["paint_complete"],
+        false
+    );
+    assert_eq!(
+        text(&snapshot, "Boxless clip amount")[0]["paint_complete"],
+        true
+    );
+    assert_eq!(
+        text(&snapshot, "Boxless clip amount")[0]["color"]["rgba"],
+        json!([185, 28, 28, 255])
+    );
+    assert_eq!(
+        snapshot["color_scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|scope| scope["name"] == "Filtered checking")
+            .count(),
+        1
+    );
+    browser.close().unwrap();
+}

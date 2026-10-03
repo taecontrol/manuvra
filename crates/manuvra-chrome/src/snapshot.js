@@ -337,13 +337,17 @@
   };
   const colorEligible = element => colorVisible(element) && !colorAncestors(element).some(node =>
     node.matches?.('[inert]') || ((node.tagName==='IFRAME' || node.tagName==='FRAME') && !colorVisible(node)));
+  const finiteColorBox = box => Number.isFinite(box.width) && Number.isFinite(box.height) &&
+    [box.matrix.a,box.matrix.b,box.matrix.c,box.matrix.d,box.matrix.e,box.matrix.f].every(Number.isFinite);
   const appendColorClips = (element, bounds, mapping) => {
     let complete=true;
     for(const node of ancestors(element)) {
       const css=viewOfElement(node).getComputedStyle(node);
+      // A boxless element has no clip shape; its descendants still paint through their ranges.
+      if(css.display==='contents')continue;
       if(css.clipPath==='none' && (css.clip==='auto' || !['absolute','fixed'].includes(css.position)))continue;
       const geometry=elementGeometry(node);
-      if(!geometry){complete=false;continue;}
+      if(!geometry || !finiteColorBox(geometry)){complete=false;continue;}
       const box = (left,top,right,bottom) => bounds.clips.push({box:{matrix:mapping.multiply(geometry.matrix).translate(left,top),width:Math.max(0,right-left),height:Math.max(0,bottom-top)},clipX:true,clipY:true});
       if(css.clip!=='auto' && ['absolute','fixed'].includes(css.position)) {
         const parts=css.clip.match(/^rect\(([^)]+)\)$/)?.[1].split(/[,\s]+/).filter(Boolean);
@@ -371,6 +375,10 @@
       for(const clip of frameBounds.clips)bounds.clips.push({...clip,box:{...clip.box,matrix:mapping.multiply(clip.box.matrix)}});
       complete=appendColorClips(entry.frame,bounds,mapping) && complete;
     }
+    bounds.clips=bounds.clips.filter(clip=>{
+      if(finiteColorBox(clip.box))return true;
+      complete=false;return false;
+    });
     return {complete,intersects:rects.some(r=>r.width>0 && r.height>0 && polygonArea(clippedPolygon(rectPoints(r),bounds))>0)};
   };
   const addColorScope = (node, context, kind) => {
@@ -643,10 +651,9 @@
     focusAnchor = {active_descendant:activeDescendant,expanded:boolAttr('aria-expanded'),selected:'selected' in active ? Boolean(active.selected) : boolAttr('aria-selected'),checked:'checked' in active ? Boolean(active.checked) : boolAttr('aria-checked'),position,node_id:nodeId(active),context:context?.context || 'main',role:anchorRole,name:indexed?.name || (active === containingDialog ? dialog : ariaName),in_dialog:indexed?.in_dialog || dialog,container:containerOf(active),covered:!closed && !crossOrigin,surface:crossOrigin?'cross_origin_frame':closed?'closed_shadow_root':active.tagName==='CANVAS'?'canvas':null};
   }
   for (const context of contexts) for (const element of context.root.querySelectorAll('*')) {
-    if (colorEligible(element) && rendered(element, context)) {
-      if (isDialog(element)) addColorScope(element, context, 'dialog');
-      else if (semantic(element) || repeated(element)) addColorScope(element, context, 'container');
-    }
+    const colorKind=isDialog(element)?'dialog':semantic(element) || repeated(element)?'container':null;
+    if (colorKind && colorEligible(element) && colorPaint(element, context, [element.getBoundingClientRect()]).intersects)
+      addColorScope(element, context, colorKind);
     if (element.tagName === 'CANVAS') gaps.push('canvas');
     const view = element.ownerDocument?.defaultView || window;
     for (const pseudo of ['::before', '::after']) {

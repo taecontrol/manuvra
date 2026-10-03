@@ -146,6 +146,41 @@ fn color_missing_owner_dominates_an_unsupported_relative_owner() {
     }
 }
 
+#[test]
+fn transparent_duplicates_do_not_make_an_eligible_owner_ambiguous() {
+    let observed = page(vec![
+        color("Amount", [185, 28, 28, 255], 1),
+        color("Amount", [185, 28, 28, 0], 2),
+    ]);
+    assert_eq!(
+        verify_color(
+            json!({"target":{"text":"Amount"},"equals":"#b91c1c"}),
+            &observed
+        )
+        .outcome,
+        DoneResult::Satisfied
+    );
+}
+
+#[test]
+fn color_scope_kind_and_case_distinguish_dialogs_from_containers() {
+    let mut amount = color("Amount", [185, 28, 28, 255], 1);
+    amount["container_node_id"] = json!(10);
+    let mut snapshot = serde_json::to_value(page(vec![amount])).unwrap();
+    snapshot["color_scopes"] = json!([
+        {"node_id":10,"context":"main","name":"Shared","kind":"container","dialog_node_id":null},
+        {"node_id":11,"context":"main","name":"Shared","kind":"dialog","dialog_node_id":null}
+    ]);
+    assert_eq!(
+        verify_color(
+            json!({"target":{"text":"Amount","container":"SHARED"},"equals":"#b91c1c"}),
+            &serde_json::from_value(snapshot).unwrap()
+        )
+        .outcome,
+        DoneResult::Satisfied
+    );
+}
+
 fn final_color(body: Value) -> Value {
     json!({"id":"color","assertions":[{"color":body}]})
 }

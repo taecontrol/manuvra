@@ -241,6 +241,7 @@ fn color_cli_scoped_shadow_owners_share_their_main_document_scopes() {
         json!({"text":"Scoped shadow amount","dialog":"Shadow details","container":"Shadow checking"}),
         json!({"name":"Scoped shadow choice","role":"button","dialog":"Shadow details","container":"Shadow checking"}),
         json!({"text":"$0.01","container":"Direct checking"}),
+        json!({"text":"Scoped visible amount","container":"Filtered checking"}),
     ] {
         let temp = hosted_temp();
         let job = color_job(
@@ -362,6 +363,27 @@ fn color_cli_classified_scopes_and_canonical_channel_numerals_publish_complete_e
             assert!(!target["raw"].as_str().unwrap().contains(secret));
         }
     }
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn color_cli_classified_relative_reference_retains_both_numeric_values() {
+    let http = HttpFixture::with_body(COLOR_FIXTURE);
+    let temp = hosted_temp();
+    let mut job = color_job(
+        &http.url(),
+        json!([{"color":{"target":{"text":"-$12.34"},"same_as":{"text":"Destructive reference"}}}]),
+    );
+    job["values"] = json!({"marker":{"value":"Destructive reference","description":"classified reference","secret":true}});
+    let (exit, result) = run(&temp, &job);
+    assert_eq!(exit, 0, "{result}");
+    assert_read_only(&result);
+    let check =
+        artifact(&result, "verification")["expectations"][0]["assertion_checks"][0]["color"]
+            .clone();
+    assert_eq!(check["target"]["rgba"], json!([185, 28, 28, 255]));
+    assert_eq!(check["reference"]["rgba"], json!([185, 28, 28, 255]));
+    assert!(!check.to_string().contains("Destructive reference"));
 }
 
 #[test]

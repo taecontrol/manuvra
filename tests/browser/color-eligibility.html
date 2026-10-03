@@ -9,10 +9,14 @@
 </style>
 <h1>Ready</h1>
 <p><span style="display:contents;color:#b91c1c">Contents amount</span></p>
+<p><span style="display:contents;clip-path:inset(100%);color:#b91c1c">Boxless clip amount</span></p>
+<p><span style="clip-path:inset(0px);color:#b91c1c">Inline clip amount</span></p>
 <p style="clip-path:inset(100%);color:#b91c1c">Clip path amount</p>
 <p style="position:absolute;clip:rect(0px,0px,0px,0px);color:#b91c1c">Legacy clip amount</p>
 <p style="clip-path:circle(10px);color:#b91c1c">Unverifiable clip amount</p>
 <p style="clip-path:inset(0px 0px 0px 10px);color:#b91c1c">Partial clip amount</p>
+<fieldset aria-label="Filtered checking"><p style="color:#b91c1c">Scoped visible amount</p></fieldset>
+<fieldset aria-label="Filtered checking" style="clip-path:inset(100%)"><p>Clipped duplicate scope</p></fieldset>
 <div class="frames">
   <iframe style="opacity:0" srcdoc="<p style='color:#b91c1c'>Opacity frame</p><button style='color:#b91c1c'>Opacity choice</button>"></iframe>
   <iframe style="visibility:hidden" srcdoc="<p style='color:#b91c1c'>Hidden frame</p><button style='color:#b91c1c'>Hidden choice</button>"></iframe>
