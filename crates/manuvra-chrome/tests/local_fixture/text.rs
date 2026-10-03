@@ -1,6 +1,27 @@
 use super::*;
 use serde_json::{Value, json};
 
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn classified_shadow_text_with_reflected_paint_is_withheld() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(
+        "<!doctype html><p>Ready</p><span id='bare' aria-hidden='true' style='font:32px monospace;display:inline-block;-webkit-box-reflect:below 20px'></span><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret'</script>",
+    );
+    let mut browser = launch_headless();
+    browser.navigate(&server.url()).unwrap();
+    let observed = browser.observe().unwrap();
+    let painted = &observed.painted_text.as_ref().unwrap().viewport;
+    assert!(painted.complete);
+    assert_eq!(painted.painted_aria_hidden, "bare-shadow-secret");
+    let masked = browser.capture_redacted(&["bare-shadow-secret".into()]);
+    browser.close().unwrap();
+    assert!(
+        matches!(masked, Err(BrowserError::Control(message)) if message == "redaction_unverifiable"),
+        "reflected classified paint cannot be covered by masks on the foreground ranges"
+    );
+}
+
 const TEXT_FIXTURE: &str = include_str!("../../../../tests/browser/text.html");
 
 fn snapshot(browser: &OwnedBrowser) -> Value {
