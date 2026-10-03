@@ -30,6 +30,9 @@ static REAL_BROWSER: Mutex<()> = Mutex::new(());
 #[path = "local_fixture/viewport.rs"]
 mod viewport;
 
+#[path = "local_fixture/color.rs"]
+mod color;
+
 /// The owned browser's process group and profile, observed from outside the crate.
 struct BrowserLifecycle {
     process_group: i32,

@@ -72,7 +72,7 @@ fn provenance(result: &Value) -> Value {
         .unwrap()
 }
 
-fn assert_no_step_input(result: &Value) {
+pub(super) fn assert_no_step_input(result: &Value) {
     let manifest = PathBuf::from(result["evidence"]["manifest"].as_str().unwrap());
     let trace = fs::read_to_string(manifest.parent().unwrap().join("trace.jsonl")).unwrap();
     for line in trace.lines() {

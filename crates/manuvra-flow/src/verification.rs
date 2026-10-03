@@ -10,6 +10,10 @@ use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::time::Instant;
 
+#[cfg(test)]
+#[path = "verification/color_tests.rs"]
+mod color_tests;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DoneResult {

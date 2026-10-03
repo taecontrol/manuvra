@@ -7,6 +7,9 @@ use url::Url;
 
 pub const SCHEMA_VERSION: u32 = 1;
 
+#[cfg(test)]
+mod color_tests;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SchemaVersion;
 

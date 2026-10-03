@@ -1,0 +1,48 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Color assertions</title>
+<style>
+  body { color:rgb(31,41,55); font:16px system-ui; margin:20px; }
+  main { display:grid; grid-template-columns:repeat(3,1fr); gap:16px; }
+  section,fieldset { margin:0; padding:8px; border:1px solid #ccc; }
+  p { margin:6px 0; } button { color:rgb(31,41,55); }
+  .red { color:#b91c1c; } body.dark .themed { color:#f87171; }
+  dialog[open] { position:static; margin:0; width:auto; padding:8px; }
+</style>
+<h1>Ready</h1>
+<button aria-label="Theme" onclick="document.body.classList.toggle('dark')">Theme</button>
+<main>
+  <section>
+    <p><span><span class="red themed">-$12.34</span></span></p>
+    <p><span>$12.34</span></p>
+    <p><span class="red themed">Destructive reference</span></p>
+    <p class="red"><span>Inherited amount</span></p>
+    <p><span style="color:hsl(0 73.70892018779342% 41.76470588235294%)">HSL amount</span></p>
+    <p><span style="color:oklch(0.5 0.18 29)">Modern amount</span></p>
+    <p><span style="color:rgb(1 2 3 / .1)">Low alpha amount</span></p>
+    <p><span style="color:oklch(0.7 0.3 145 / .1)">Clamped amount</span></p>
+  </section>
+  <section>
+    <button aria-label="Current month"><span aria-hidden="true" class="red">-$9.00</span></button>
+    <p style="display:none;color:#b91c1c">Hidden amount</p>
+    <p style="opacity:0;color:#b91c1c">Opacity zero amount</p>
+    <p style="color:rgb(185 28 28 / 0)">Transparent amount</p>
+    <p inert class="red">Inert amount</p>
+    <p style="height:1px;width:1px;overflow:hidden"><span style="display:inline-block;transform:translateX(50px);color:#b91c1c">Clipped amount</span></p>
+    <p><span class="red">-$</span><span>42.00</span></p>
+    <p class="red" style="position:absolute;top:2000px">Offscreen amount</p>
+  </section>
+  <section>
+    <fieldset aria-label="Checking"><button aria-label="Choose Checking">Choose</button><span class="red">$0.00</span></fieldset>
+    <fieldset aria-label="Savings"><button aria-label="Choose Savings">Choose</button><span>$0.00</span></fieldset>
+    <span style="display:none">$0.00</span>
+    <dialog open aria-label="Amount details"><span class="red">$0.00</span></dialog>
+  </section>
+  <section id="shadow"></section>
+  <section id="slot"><span slot="amount" class="red">Slotted amount</span></section>
+  <iframe title="Same origin colors" style="height:90px;width:300px" srcdoc="<p style='color:#b91c1c'>Frame amount</p><button aria-label='Frame choice' style='color:#b91c1c'>Choose</button>"></iframe>
+</main>
+<script>
+  document.getElementById('shadow').attachShadow({mode:'open'}).innerHTML='<p style="color:#b91c1c">Shadow amount</p><button aria-label="Shadow choice" style="color:#b91c1c">Choose</button>';
+  document.getElementById('slot').attachShadow({mode:'open'}).innerHTML='<slot name="amount"></slot>';
+</script>

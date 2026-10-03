@@ -98,10 +98,11 @@ fn target_url(job: &Job) -> &str {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    mod color;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(super) mod live;
-    pub(super) mod support;
+    pub(crate) mod support;
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[test]
