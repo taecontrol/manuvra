@@ -24,6 +24,128 @@ fn page(colors: Vec<Value>) -> Observation {
     serde_json::from_value(value).unwrap()
 }
 
+#[test]
+fn color_text_normalizes_requested_whitespace_but_preserves_case() {
+    let observed = page(vec![color("Inherited amount", [185, 28, 28, 255], 1)]);
+    for (text, outcome) in [
+        ("  Inherited  amount  ", DoneResult::Satisfied),
+        ("inherited amount", DoneResult::NotSatisfied),
+    ] {
+        assert_eq!(
+            verify_color(
+                json!({"target":{"text":text},"equals":"#b91c1c"}),
+                &observed
+            )
+            .outcome,
+            outcome
+        );
+    }
+}
+
+#[test]
+fn color_names_ignore_case_and_enforce_the_requested_role() {
+    let mut control = color("", [31, 41, 55, 255], 1);
+    control["text"] = Value::Null;
+    control["name"] = json!("Current month");
+    control["role"] = json!("button");
+    let observed = page(vec![control]);
+    for (name, role, outcome) in [
+        ("CURRENT MONTH", "button", DoneResult::Satisfied),
+        ("Current month", "link", DoneResult::NotSatisfied),
+    ] {
+        assert_eq!(
+            verify_color(
+                json!({"target":{"name":name,"role":role},"equals":"#1f2937"}),
+                &observed
+            )
+            .outcome,
+            outcome
+        );
+    }
+}
+
+#[test]
+fn color_false_conjunct_dominates_unknown_in_both_orders_and_skips_natural_claims() {
+    let observed = page(vec![
+        color("False", [31, 41, 55, 255], 1),
+        color("Duplicate", [185, 28, 28, 255], 2),
+        color("Duplicate", [185, 28, 28, 255], 3),
+    ]);
+    for order in [["False", "Duplicate"], ["Duplicate", "False"]] {
+        let assertions =
+            order.map(|text| json!({"color":{"target":{"text":text},"equals":"#b91c1c"}}));
+        let job = job(
+            json!([{"id":"both","assertions":assertions}, {"id":"natural","claim":"Ready exists"}]),
+        );
+        let report = verify(
+            &job.expectations,
+            &observed,
+            &Values::new(&job),
+            &NoProvider,
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(report.outcome, DoneResult::NotSatisfied);
+        assert_eq!(report.verdicts[0].result, VerdictResult::NotSatisfied);
+        assert_eq!(report.verdicts[1].result, VerdictResult::NotRun);
+    }
+}
+
+#[test]
+fn color_ancestor_scopes_keep_their_identity_across_shadow_contexts() {
+    let mut amount = color("Amount", [185, 28, 28, 255], 1);
+    amount["context"] = json!("main/shadow:2");
+    amount["dialog_node_id"] = json!(10);
+    amount["container_node_id"] = json!(11);
+    let mut snapshot = serde_json::to_value(page(vec![amount])).unwrap();
+    snapshot["color_scopes"] = json!([
+        {"node_id":10,"context":"main","name":"Details","kind":"dialog","dialog_node_id":null},
+        {"node_id":11,"context":"main","name":"Checking","kind":"container","dialog_node_id":10}
+    ]);
+    assert_eq!(verify_color(json!({"target":{"text":"Amount","dialog":"Details","container":"Checking"},"equals":"#b91c1c"}), &serde_json::from_value(snapshot).unwrap()).outcome, DoneResult::Satisfied);
+}
+
+#[test]
+fn color_unverifiable_paint_fails_closed_for_its_owner() {
+    let mut amount = color("Amount", [185, 28, 28, 255], 1);
+    amount["paint_complete"] = json!(false);
+    let observed = page(vec![amount, color("Reference", [185, 28, 28, 255], 2)]);
+    assert_eq!(
+        verify_color(
+            json!({"target":{"text":"Amount"},"equals":"#b91c1c"}),
+            &observed
+        )
+        .outcome,
+        DoneResult::Unknown
+    );
+    assert_eq!(
+        verify_color(
+            json!({"target":{"text":"Reference"},"equals":"#b91c1c"}),
+            &observed
+        )
+        .outcome,
+        DoneResult::Satisfied
+    );
+}
+
+#[test]
+fn color_missing_owner_dominates_an_unsupported_relative_owner() {
+    let mut unsupported = color("Unsupported", [185, 28, 28, 255], 1);
+    unsupported["color"]["rgba"] = Value::Null;
+    let observed = page(vec![unsupported]);
+    for (target, reference) in [("Missing", "Unsupported"), ("Unsupported", "Missing")] {
+        let report = verify_color(
+            json!({"target":{"text":target},"different_from":{"text":reference}}),
+            &observed,
+        );
+        assert_eq!(report.outcome, DoneResult::NotSatisfied);
+        assert_eq!(
+            report.record["expectations"][0]["assertion_checks"][0]["color"]["reason"],
+            "missing"
+        );
+    }
+}
+
 fn final_color(body: Value) -> Value {
     json!({"id":"color","assertions":[{"color":body}]})
 }

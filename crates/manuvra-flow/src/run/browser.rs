@@ -95,6 +95,14 @@ impl HostedBrowser for OwnedBrowser {
 }
 
 impl BrowserPage for OwnedBrowser {
+    fn capture_redacted_matching_page(
+        &self,
+        sensitive: &[String],
+        unchanged: &dyn Fn(&Observation, &Observation) -> bool,
+    ) -> Result<CapturedPage, BrowserError> {
+        self.capture_redacted_matching(sensitive, unchanged)
+    }
+
     fn capture_redacted_page(&self, sensitive: &[String]) -> Result<CapturedPage, BrowserError> {
         self.capture_redacted(sensitive)
     }

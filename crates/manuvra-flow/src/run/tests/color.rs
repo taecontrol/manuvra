@@ -167,6 +167,87 @@ fn unchanged_satisfied_color_and_uncertain_claim_allow_natural_attestation() {
 }
 
 #[test]
+fn unrelated_color_changes_do_not_invalidate_eligible_natural_attestation() {
+    for structured in [false, true] {
+        let mut wire = serde_json::to_value(job(true)).unwrap();
+        if !structured {
+            wire["expectations"].as_array_mut().unwrap().remove(0);
+        }
+        let job = parse_job(wire);
+        let mut first = page(Some([185, 28, 28, 255]));
+        let mut unrelated = first.colors[0].clone();
+        unrelated.node_id = 2;
+        unrelated.text = Some("Animated decoration".into());
+        first.colors.push(unrelated);
+        let mut changed = first.clone();
+        changed.colors[1].color.rgba = Some([31, 41, 55, 255]);
+        let browser = FakeBrowser::new([first.clone(), first, changed]);
+        let provider = ScriptedProvider::new([Turn::verdict(0.5)]);
+        let redactor = Redactor::for_job(&job).unwrap();
+        let mut machine = HostedMachine::new(&job, &redactor);
+        let mut journal = MemoryJournal::default();
+        drive(&mut machine, &browser, &provider, &mut journal);
+        dispose(
+            &mut machine,
+            advance("Ready is present"),
+            &browser,
+            &provider,
+            &mut journal,
+        );
+        assert!(
+            machine.verification_complete,
+            "irrelevant color changed with structured={structured}"
+        );
+        assert!(machine.artifacts.caller_assisted);
+        assert_eq!(provider.calls(), 1);
+    }
+}
+
+#[test]
+fn scope_only_ambiguity_while_paused_cannot_be_advance_attested() {
+    let mut wire = serde_json::to_value(job(true)).unwrap();
+    wire["expectations"][0]["assertions"][0]["color"]["target"]["container"] = json!("Checking");
+    let job = parse_job(wire);
+    let mut first = page(Some([185, 28, 28, 255]));
+    first.colors[0].container_node_id = Some(10);
+    first.colors[0].container = Some("Checking".into());
+    first.color_scopes.push(manuvra_chrome::ColorScope {
+        node_id: 10,
+        context: "main".into(),
+        name: "Checking".into(),
+        kind: manuvra_chrome::ColorScopeKind::Container,
+        dialog_node_id: None,
+    });
+    let mut changed = first.clone();
+    let mut duplicate = changed.color_scopes[0].clone();
+    duplicate.node_id = 11;
+    changed.color_scopes.push(duplicate);
+    let browser = FakeBrowser::new([first.clone(), first, changed]);
+    let provider = ScriptedProvider::new([Turn::verdict(0.5), Turn::verdict(0.5)]);
+    let redactor = Redactor::for_job(&job).unwrap();
+    let mut machine = HostedMachine::new(&job, &redactor);
+    let mut journal = MemoryJournal::default();
+    drive(&mut machine, &browser, &provider, &mut journal);
+    dispose(
+        &mut machine,
+        advance("Ready is present"),
+        &browser,
+        &provider,
+        &mut journal,
+    );
+    assert!(!machine.verification_complete);
+    assert!(!machine.artifacts.caller_assisted);
+    assert_eq!(
+        machine.artifacts.expectation_verdicts[0].result,
+        VerdictResult::Unresolved
+    );
+    assert_eq!(
+        machine.artifacts.escalation.as_ref().unwrap().dispositions,
+        [DispositionKind::RetryObservation, DispositionKind::Abort]
+    );
+}
+
+#[test]
 fn structured_final_consumes_no_model_call_even_when_the_budget_is_used() {
     let mut wire = serde_json::to_value(job(false)).unwrap();
     wire["options"] = json!({"max_model_calls":1});

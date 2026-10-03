@@ -54,6 +54,7 @@ fn color_snapshot_preserves_straight_channels_and_exact_text_owners() {
         "Offscreen amount",
         "Clipped amount",
         "-$42.00",
+        "BeforeMiddleAfter",
     ] {
         assert!(
             text(&snapshot, label).is_empty(),
@@ -91,5 +92,121 @@ fn color_normalization_is_read_only_during_fenced_capture() {
         json!([1, 2, 3, 26])
     );
     assert!(!captured.screenshot.bytes.is_empty());
+    browser.close().unwrap();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn color_paint_eligibility_crosses_embedding_frames_and_boxless_text_owners() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(include_str!(
+        "../../../../tests/browser/color-eligibility.html"
+    ));
+    let mut browser = launch_headless();
+    browser.navigate(&server.url()).unwrap();
+    let snapshot = observation(&browser);
+    for label in [
+        "Opacity frame",
+        "Hidden frame",
+        "Inert frame",
+        "Clipped frame",
+        "Clip path amount",
+        "Legacy clip amount",
+    ] {
+        assert!(
+            text(&snapshot, label).is_empty(),
+            "unpainted {label}: {snapshot}"
+        );
+    }
+    for name in [
+        "Opacity choice",
+        "Hidden choice",
+        "Inert choice",
+        "Clipped choice",
+    ] {
+        assert!(
+            !snapshot["colors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["name"] == name),
+            "unpainted control {name}"
+        );
+    }
+    assert_eq!(
+        text(&snapshot, "Contents amount")[0]["color"]["rgba"],
+        json!([185, 28, 28, 255])
+    );
+    assert_eq!(
+        text(&snapshot, "Painted hidden frame")[0]["channel"],
+        "painted_aria_hidden"
+    );
+    assert_eq!(
+        text(&snapshot, "Unverifiable clip amount")[0]["paint_complete"],
+        false
+    );
+    assert_eq!(
+        text(&snapshot, "Partial clip amount")[0]["color"]["rgba"],
+        json!([185, 28, 28, 255])
+    );
+    assert!(
+        !snapshot["visible_text"]
+            .as_str()
+            .unwrap()
+            .contains("Contents amount"),
+        "existing TextVisible eligibility remains unchanged"
+    );
+    browser.close().unwrap();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn color_inventory_and_native_normalization_fail_closed() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let cells = "<span>A</span>".repeat(513);
+    let crowded = format!(
+        "<!doctype html><main style='display:grid;grid-template-columns:repeat(30,10px);font:1px system-ui'>{cells}</main>"
+    );
+    let server = FixtureServer::with_body(&crowded);
+    let mut browser = launch_headless();
+    browser.navigate(&server.url()).unwrap();
+    let snapshot = observation(&browser);
+    assert!(
+        !snapshot
+            .get("colors_complete")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    );
+    assert_eq!(snapshot["colors"].as_array().unwrap().len(), 512);
+    browser.close().unwrap();
+
+    let scopes = "<fieldset aria-label='Other' style='height:1px;min-width:0;margin:0;padding:0;border:0'></fieldset>".repeat(513);
+    let crowded = format!(
+        "<!doctype html><main style='display:grid;grid-template-columns:repeat(30,10px);font:1px system-ui'>{scopes}</main>"
+    );
+    let server = FixtureServer::with_body(&crowded);
+    let mut browser = launch_headless();
+    browser.navigate(&server.url()).unwrap();
+    let snapshot = observation(&browser);
+    assert!(
+        !snapshot
+            .get("colors_complete")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    );
+    assert_eq!(snapshot["color_scopes"].as_array().unwrap().len(), 512);
+    browser.close().unwrap();
+
+    let server = FixtureServer::with_body(
+        "<!doctype html><p style='color:#b91c1c'>Amount</p><script>window.OffscreenCanvas=undefined</script>",
+    );
+    let mut browser = launch_headless();
+    browser.navigate(&server.url()).unwrap();
+    let snapshot = observation(&browser);
+    assert_eq!(
+        text(&snapshot, "Amount")[0]["color"]["raw"],
+        "rgb(185, 28, 28)"
+    );
+    assert_eq!(text(&snapshot, "Amount")[0]["color"]["rgba"], Value::Null);
     browser.close().unwrap();
 }

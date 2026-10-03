@@ -153,6 +153,7 @@ fn color_cli_rejects_ambiguous_scopes_and_records_painted_aria_hidden_evidence()
         (json!({"text":"-$9.00"}), "passed"),
         (json!({"name":"Current month","role":"button"}), "failed"),
         (json!({"text":"-$42.00"}), "failed"),
+        (json!({"text":"BeforeMiddleAfter"}), "failed"),
         (json!({"text":"Transparent amount"}), "failed"),
     ] {
         let temp = hosted_temp();
@@ -228,6 +229,139 @@ fn color_cli_classified_text_is_redacted_in_every_persisted_artifact() {
             ["rgba"],
         json!([185, 28, 28, 255])
     );
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn color_cli_scoped_shadow_owners_share_their_main_document_scopes() {
+    let http = HttpFixture::with_body(include_str!(
+        "../../../../tests/browser/color-eligibility.html"
+    ));
+    for target in [
+        json!({"text":"Scoped shadow amount","dialog":"Shadow details","container":"Shadow checking"}),
+        json!({"name":"Scoped shadow choice","role":"button","dialog":"Shadow details","container":"Shadow checking"}),
+        json!({"text":"$0.01","container":"Direct checking"}),
+    ] {
+        let temp = hosted_temp();
+        let job = color_job(
+            &http.url(),
+            json!([{"color":{"target":target,"equals":"#b91c1c"}}]),
+        );
+        let (exit, result) = run(&temp, &job);
+        assert_eq!(exit, 0, "{result}");
+        assert_read_only(&result);
+    }
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn colorless_capture_and_stable_color_targets_allow_unrelated_color_animation() {
+    let http = HttpFixture::with_body(
+        r#"<!doctype html><style>@keyframes pulse{from{color:black}to{color:white}}#pulse{animation:pulse 1s linear infinite alternate}</style><p id=pulse>Animated</p><p>Ready</p><p style='color:#b91c1c'>Amount</p>"#,
+    );
+    for assertions in [
+        json!([{"text_visible":"Ready"}]),
+        json!([{"color":{"target":{"text":"Amount"},"equals":"#b91c1c"}}]),
+    ] {
+        let temp = hosted_temp();
+        let mut job = color_job(&http.url(), assertions);
+        job["steps"][0]["done_when"] = json!([{"text_visible":"Ready"}]);
+        let (exit, result) = run(&temp, &job);
+        assert_eq!(exit, 0, "{result}");
+        assert_read_only(&result);
+    }
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn color_cli_exact_text_case_whitespace_named_roles_and_literal_alpha() {
+    let http = HttpFixture::with_body(COLOR_FIXTURE);
+    for (target, equals, state) in [
+        (json!({"text":"inherited amount"}), "#b91c1c", "failed"),
+        (json!({"text":"  Inherited  amount  "}), "#b91c1c", "passed"),
+        (
+            json!({"name":"CURRENT MONTH","role":"button"}),
+            "#1f2937",
+            "passed",
+        ),
+        (
+            json!({"name":"Current month","role":"link"}),
+            "#1f2937",
+            "failed",
+        ),
+        (json!({"text":"Low alpha amount"}), "#0102031a", "passed"),
+    ] {
+        let temp = hosted_temp();
+        let job = color_job(
+            &http.url(),
+            json!([{"color":{"target":target,"equals":equals}}]),
+        );
+        let (_, result) = run(&temp, &job);
+        assert_eq!(result["state"], state, "{job}: {result}");
+        assert_read_only(&result);
+    }
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn color_cli_duplicate_owners_in_shadow_and_frame_contexts_remain_unresolved() {
+    let http = HttpFixture::with_body(&COLOR_FIXTURE.replace("Frame amount", "Shadow amount"));
+    let temp = hosted_temp();
+    let job = color_job(
+        &http.url(),
+        json!([{"color":{"target":{"text":"Shadow amount"},"equals":"#b91c1c"}}]),
+    );
+    let (_, result) = run(&temp, &job);
+    assert_eq!(result["state"], "uncertain", "{result}");
+    assert_eq!(
+        artifact(&result, "verification")["expectations"][0]["assertion_checks"][0]["color"]["reason"],
+        "ambiguous_owner"
+    );
+    let (_, ended) = invoke(
+        &temp,
+        &[
+            "abort",
+            result["run_id"].as_str().unwrap(),
+            "--request-id",
+            "duplicate-context-abort",
+        ],
+    );
+    assert_eq!(ended["cleanup"]["browser"], "closed");
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn color_cli_classified_scopes_and_canonical_channel_numerals_publish_complete_evidence() {
+    for (body, target, secret) in [
+        (
+            "<!doctype html><p>Ready</p><p style='color:#b91c1c'>185</p>".to_owned(),
+            json!({"text":"185"}),
+            "185",
+        ),
+        (
+            COLOR_FIXTURE.to_owned(),
+            json!({"text":"$0.00","container":"Checking"}),
+            "Checking",
+        ),
+    ] {
+        let http = HttpFixture::with_body(&body);
+        let temp = hosted_temp();
+        let mut job = color_job(
+            &http.url(),
+            json!([{"color":{"target":target,"equals":"#b91c1c"}}]),
+        );
+        job["values"] =
+            json!({"marker":{"value":secret,"description":"classified value","secret":true}});
+        let (exit, result) = run(&temp, &job);
+        assert_eq!(exit, 0, "{result}");
+        assert_read_only(&result);
+        let target = artifact(&result,"verification")["expectations"][0]["assertion_checks"][0]["color"]["target"].clone();
+        assert_eq!(target["rgba"], json!([185, 28, 28, 255]));
+        assert!(!target["selector"].to_string().contains(secret));
+        if secret == "185" {
+            assert!(!target["raw"].as_str().unwrap().contains(secret));
+        }
+    }
 }
 
 #[test]

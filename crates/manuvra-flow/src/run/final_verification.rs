@@ -2,7 +2,7 @@
 //! redacted observation after the last step.
 
 use super::artifacts::{PendingVerification, RunArtifacts};
-use super::capture::{Captured, DriveBrowser, capture_step, redacted_value};
+use super::capture::{Captured, DriveBrowser, capture_step, final_assertions, redacted_value};
 use super::escalation::escalate_verification;
 use super::stops::{Stop, control_stop, verification_policy_stop, verification_provider_stop};
 use crate::evidence::Redactor;
@@ -63,6 +63,7 @@ fn capture_final(
     let captured = capture_step(
         browser,
         redactor,
+        &final_assertions(job),
         job.steps.len() + 1,
         artifacts.observations.len() + 1,
     )

@@ -63,7 +63,14 @@ pub struct ColorObservation {
     pub dialog_node_id: Option<u64>,
     pub container_node_id: Option<u64>,
     pub channel: ColorChannel,
+    /// False when a painted shape cannot be established from supported clip geometry.
+    #[serde(default = "complete_paint")]
+    pub paint_complete: bool,
     pub color: ComputedColor,
+}
+
+fn complete_paint() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

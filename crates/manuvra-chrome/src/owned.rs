@@ -21,6 +21,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::thread;
 use std::time::{Duration, Instant};
+
+type AppearanceFence<'a> = Option<&'a dyn Fn(&Observation, &Observation) -> bool>;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -280,23 +282,48 @@ impl OwnedBrowser {
     }
 
     pub fn capture(&self) -> Result<CapturedPage, BrowserError> {
-        self.capture_fenced(None)
+        self.capture_fenced(None, None)
     }
 
     pub fn capture_redacted(&self, sensitive: &[String]) -> Result<CapturedPage, BrowserError> {
+        self.capture_redacted_with_fence(sensitive, None)
+    }
+
+    /// Fences caller-selected appearance facts in addition to the document and screenshot.
+    /// Unrelated CSS animation must not prevent an otherwise stable capture.
+    pub fn capture_redacted_matching(
+        &self,
+        sensitive: &[String],
+        unchanged: &dyn Fn(&Observation, &Observation) -> bool,
+    ) -> Result<CapturedPage, BrowserError> {
+        self.capture_redacted_with_fence(sensitive, Some(unchanged))
+    }
+
+    fn capture_redacted_with_fence(
+        &self,
+        sensitive: &[String],
+        unchanged: AppearanceFence<'_>,
+    ) -> Result<CapturedPage, BrowserError> {
         if sensitive.is_empty() {
-            return self.capture();
+            return self.capture_fenced(None, unchanged);
         }
-        self.capture_fenced(Some(Masking {
-            expression: masking_script(sensitive)?,
-            values: sensitive.len(),
-        }))
+        self.capture_fenced(
+            Some(Masking {
+                expression: masking_script(sensitive)?,
+                values: sensitive.len(),
+            }),
+            unchanged,
+        )
     }
 
     /// Retries until the observation and screenshot come from one unchanged page.
-    fn capture_fenced(&self, masking: Option<Masking>) -> Result<CapturedPage, BrowserError> {
+    fn capture_fenced(
+        &self,
+        masking: Option<Masking>,
+        unchanged: AppearanceFence<'_>,
+    ) -> Result<CapturedPage, BrowserError> {
         for _ in 0..CAPTURE_ATTEMPTS {
-            if let Some(captured) = self.capture_once(masking.as_ref())? {
+            if let Some(captured) = self.capture_once(masking.as_ref(), unchanged)? {
                 return Ok(captured);
             }
             thread::sleep(QUIET_WINDOW);
@@ -311,6 +338,7 @@ impl OwnedBrowser {
     fn capture_once(
         &self,
         masking: Option<&Masking>,
+        unchanged: AppearanceFence<'_>,
     ) -> Result<Option<CapturedPage>, BrowserError> {
         let _mutations = DomMutationWatch::start(&self.client)?;
         let fence = self.client.cursor();
@@ -319,7 +347,7 @@ impl OwnedBrowser {
         let screenshot =
             page::capture_screenshot(&self.client, deadline(), Arc::new(AtomicBool::new(false)))
                 .map_err(|error| BrowserError::Control(error.to_string()))?;
-        if !self.capture_stable(&observation, fence)? {
+        if !self.capture_stable(&observation, fence, unchanged)? {
             return Ok(None);
         }
         Ok(Some(CapturedPage {
@@ -329,28 +357,19 @@ impl OwnedBrowser {
         }))
     }
 
-    fn capture_stable(&self, observation: &Observation, fence: u64) -> Result<bool, BrowserError> {
-        if observation.colors_complete && !self.appearance_unchanged(observation)? {
-            return Ok(false);
+    fn capture_stable(
+        &self,
+        observation: &Observation,
+        fence: u64,
+        unchanged: AppearanceFence<'_>,
+    ) -> Result<bool, BrowserError> {
+        if let Some(unchanged) = unchanged {
+            let after = self.observe()?;
+            if observation.document_id != after.document_id || !unchanged(observation, &after) {
+                return Ok(false);
+            }
         }
         Ok(!page_changed_since(&self.client, fence))
-    }
-
-    /// CSS animation and stylesheet edits need not emit a DOM mutation. Fence the computed
-    /// appearance as well, so color evidence and its screenshot describe one stable capture.
-    fn appearance_unchanged(&self, before: &Observation) -> Result<bool, BrowserError> {
-        let after = self.observe()?;
-        Ok((
-            &before.document_id,
-            &before.colors,
-            &before.color_scopes,
-            before.colors_complete,
-        ) == (
-            &after.document_id,
-            &after.colors,
-            &after.color_scopes,
-            after.colors_complete,
-        ))
     }
 
     /// Terminates the browser at most once, then removes its profile. A failed
@@ -1463,16 +1482,30 @@ mod tests {
         chrome.reply_evaluation(SNAPSHOT, json!({"result":{"value":snapshot.clone()}}));
         let browser = browser_with_client(chrome.connect_raw());
         let fence = browser.client.cursor();
-        assert!(browser.capture_stable(&before, fence).unwrap());
+        let unchanged = |before: &Observation, after: &Observation| before.colors == after.colors;
+        assert!(
+            browser
+                .capture_stable(&before, fence, Some(&unchanged))
+                .unwrap()
+        );
         snapshot["colors"][0]["color"] = json!({"raw":"rgb(31, 41, 55)","rgba":[31,41,55,255]});
         chrome.reply_evaluation(SNAPSHOT, json!({"result":{"value":snapshot}}));
-        assert!(!browser.capture_stable(&before, fence).unwrap());
+        assert!(
+            !browser
+                .capture_stable(&before, fence, Some(&unchanged))
+                .unwrap()
+        );
         assert!(
             !page_changed_since(&browser.client, fence),
             "this must prove the appearance fence independently of DOM events"
         );
         chrome.reject("Runtime.evaluate");
-        assert!(browser.capture_stable(&before, fence).is_err());
+        assert!(
+            browser
+                .capture_stable(&before, fence, Some(&unchanged))
+                .is_err()
+        );
+        assert!(browser.capture_stable(&before, fence, None).unwrap());
     }
 
     #[test]

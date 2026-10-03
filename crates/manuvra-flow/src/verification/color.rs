@@ -116,6 +116,9 @@ fn resolve(target: &ColorTarget, observation: &Observation) -> ColorTargetEviden
 }
 
 fn color_failure(owner: &ColorObservation) -> Option<ColorFailure> {
+    if !owner.paint_complete {
+        return Some(ColorFailure::IncompleteCoverage);
+    }
     match owner.color.rgba {
         None => Some(ColorFailure::UnsupportedColor),
         Some([_, _, _, 0]) => Some(ColorFailure::Transparent),
@@ -139,8 +142,8 @@ fn owner<'a>(
         .iter()
         .filter(|owner| {
             matches_target(target, owner)
-                && in_scope(owner.dialog_node_id, &owner.context, dialog)
-                && in_scope(owner.container_node_id, &owner.context, container)
+                && in_scope(owner.dialog_node_id, dialog)
+                && in_scope(owner.container_node_id, container)
         })
         .map(|owner| ((owner.context.as_str(), owner.node_id), owner))
         .collect::<BTreeMap<_, _>>();
@@ -178,8 +181,9 @@ fn matches_target(target: &ColorTarget, owner: &ColorObservation) -> bool {
     }
 }
 
-fn in_scope(node_id: Option<u64>, context: &str, scope: Option<&ColorScope>) -> bool {
-    scope.is_none_or(|scope| node_id == Some(scope.node_id) && context == scope.context)
+fn in_scope(node_id: Option<u64>, scope: Option<&ColorScope>) -> bool {
+    // The browser allocates node IDs across contexts; an ancestor can be outside a shadow root.
+    scope.is_none_or(|scope| node_id == Some(scope.node_id))
 }
 
 fn scope<'a>(
@@ -197,7 +201,7 @@ fn scope<'a>(
         .filter(|scope| {
             scope.kind == kind
                 && scope.name.eq_ignore_ascii_case(wanted)
-                && in_scope(scope.dialog_node_id, &scope.context, dialog)
+                && in_scope(scope.dialog_node_id, dialog)
         })
         .collect::<Vec<_>>();
     match matches.as_slice() {
