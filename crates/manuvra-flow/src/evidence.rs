@@ -1724,13 +1724,13 @@ mod tests {
 
     #[test]
     fn canonical_color_channels_do_not_hide_classified_string_leaks() {
-        for classified in ["185", "255"] {
+        for (classified, text) in [("185", "185"), ("255", "255"), ("185", "Amount \"quoted")] {
             let temporary = TempDir::new().unwrap();
             let mut job = test_job(true);
             job.values.get_mut("marker").unwrap().value = classified.into();
             let redactor = Redactor::for_job_with_provider_key(&job, None).unwrap();
             let raw = redactor.redact_export_text("rgb(185, 28, 28)");
-            let subject = redactor.redact_export_text(classified);
+            let subject = redactor.redact_export_text(text);
             let check = json!({"color":{
                 "target":{"selector":{"text":subject},"channel":"accessible","raw":raw,"rgba":[185,28,28,255]},
                 "comparator":"equals","equals":"#b91c1c","tolerance":0,"result":"satisfied"
@@ -1756,6 +1756,11 @@ mod tests {
             assert_eq!(
                 final_record["expectations"][0]["assertion_checks"][0]["color"]["target"]["rgba"],
                 json!([185, 28, 28, 255])
+            );
+            assert_eq!(
+                final_record["expectations"][0]["assertion_checks"][0]["color"]["target"]["selector"]
+                    ["text"],
+                subject
             );
             for mut leaked in [
                 json!({"text":classified,"assertion_checks":[check.clone()]}),
@@ -1890,6 +1895,37 @@ mod tests {
             }
             let malformed = format!("{check} trailing data");
             assert!(redactor.contains_export_leak(malformed.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn relative_color_tolerances_publish_redacted_normalized_jobs() {
+        for comparison in ["same_as", "different_from"] {
+            let temporary = TempDir::new().unwrap();
+            let mut wire = serde_json::to_value(test_job(true)).unwrap();
+            wire["values"]["marker"]["value"] = json!("185");
+            let mut color = json!({"target":{"text":"185"},"tolerance":185});
+            color[comparison] = json!({"text":"Reference"});
+            wire["expectations"] = json!([{"id":"relative","assertions":[{"color":color}]}]);
+            let job = Job::parse(&serde_json::to_vec(&wire).unwrap()).unwrap();
+            let redactor = Redactor::for_job_with_provider_key(&job, None).unwrap();
+            let mut evidence = bundle("safe", b"png".to_vec());
+            evidence.job = redacted_job(&job, &redactor).unwrap();
+            publish(temporary.path(), "r_relative", evidence, &redactor)
+                .expect("relative assertions preserve typed tolerances after redaction");
+            let manifest: Value = serde_json::from_slice(
+                &fs::read(temporary.path().join("r_relative/manifest.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(manifest["complete"], true);
+            let normalized: Value = serde_json::from_slice(
+                &fs::read(temporary.path().join("r_relative/job.json")).unwrap(),
+            )
+            .unwrap();
+            let color = &normalized["expectations"][0]["assertions"][0]["color"];
+            assert_eq!(color["tolerance"], 185);
+            assert!(color[comparison].is_object());
+            assert_ne!(color["target"]["text"], "185");
         }
     }
 

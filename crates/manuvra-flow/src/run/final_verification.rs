@@ -402,4 +402,60 @@ mod tests {
     fn changed_advance_budget_failure_retains_preliminary_color_evidence() {
         changed_advance_failure_retains_preliminary_evidence(true);
     }
+
+    struct ErrorProvider(manuvra_jev::JevError);
+
+    impl manuvra_jev::Evaluator for ErrorProvider {
+        fn evaluate(
+            &self,
+            _: &serde_json::Value,
+            _: Instant,
+        ) -> Result<manuvra_jev::Evaluation, manuvra_jev::JevError> {
+            Err(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn preliminary_provider_error_evidence_matches_the_terminal_stop() {
+        for error in [
+            manuvra_jev::JevError::Deadline,
+            manuvra_jev::JevError::ModelChanged,
+            manuvra_jev::JevError::InvalidResponse("Amount is classified".into()),
+        ] {
+            let job = mixed_color_job(2);
+            let redactor = Redactor::for_job_with_provider_key(&job, None).unwrap();
+            let browser = FakeBrowser::new([color_page(185)]);
+            let values = Values::new(&job);
+            let mut policy = Policy::new(&job.options, "http://127.0.0.1:4351/");
+            let mut artifacts = RunArtifacts::new(&job, &redactor);
+            let VerificationProgress::Stop(stop) = verify_final(
+                &job,
+                &redactor,
+                &browser,
+                &ErrorProvider(error.clone()),
+                &values,
+                &mut policy,
+                &mut artifacts,
+            ) else {
+                panic!("failed provider result cannot complete verification");
+            };
+            assert_eq!(stop.state, RunState::Blocked);
+            let record = artifacts.verification.as_ref().unwrap();
+            assert_eq!(record["provider"]["reason"]["code"], stop.code, "{error}");
+            assert_eq!(record["provider"]["attempted"], true);
+            assert_eq!(record["provider"]["failed"], true);
+            assert_eq!(
+                artifacts.expectation_verdicts[0].result,
+                VerdictResult::Satisfied
+            );
+            assert_eq!(
+                artifacts.expectation_verdicts[1].result,
+                VerdictResult::NotRun
+            );
+            assert!(!record.to_string().contains("Amount"));
+            assert!(!artifacts.caller_assisted);
+            assert!(artifacts.escalation.is_none());
+            assert_eq!(browser.dispatched(), 0);
+        }
+    }
 }

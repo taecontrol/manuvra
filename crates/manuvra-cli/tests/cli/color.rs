@@ -403,6 +403,12 @@ fn color_cli_classified_scopes_and_canonical_channel_numerals_publish_complete_e
             185,
         ),
         (
+            "<!doctype html><p>Ready</p><p style='color:#b91c1c'>Amount \"quoted</p>".to_owned(),
+            json!({"text":"Amount \"quoted"}),
+            "185",
+            0,
+        ),
+        (
             COLOR_FIXTURE.to_owned(),
             json!({"text":"$0.00","container":"Checking"}),
             "Checking",
