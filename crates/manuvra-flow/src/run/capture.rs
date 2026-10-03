@@ -319,6 +319,86 @@ mod tests {
     use crate::run::tests::support::*;
     use manuvra_chrome::{Element, FocusAnchor, Rect};
 
+    struct PaintChangingBrowser {
+        before: Observation,
+        after: Observation,
+    }
+
+    impl BrowserPage for PaintChangingBrowser {
+        fn capture_redacted_page(
+            &self,
+            _sensitive: &[String],
+        ) -> Result<CapturedPage, BrowserError> {
+            captured(self.before.clone())
+        }
+
+        fn capture_redacted_matching_page(
+            &self,
+            _sensitive: &[String],
+            unchanged: &dyn Fn(&Observation, &Observation) -> bool,
+        ) -> Result<CapturedPage, BrowserError> {
+            if unchanged(&self.before, &self.after) {
+                captured(self.before.clone())
+            } else {
+                captured(self.after.clone())
+            }
+        }
+
+        fn observe_page(&self) -> Result<Observation, BrowserError> {
+            Ok(self.after.clone())
+        }
+    }
+
+    #[test]
+    fn painted_text_capture_retries_when_presence_or_absence_changes_during_the_screenshot() {
+        for (kind, expected) in [
+            ("text_visible", DoneResult::NotSatisfied),
+            ("text_absent", DoneResult::Satisfied),
+        ] {
+            let mut job = job("Ready");
+            job.steps[0].done_when = serde_json::from_value(json!([{
+                kind:"Amount","include_aria_hidden":true
+            }]))
+            .unwrap();
+            let mut before = observed("Ready");
+            before.painted_text = Some(manuvra_chrome::PaintedTextObservation {
+                viewport: manuvra_chrome::TextInventory {
+                    accessible: "Ready".into(),
+                    painted_aria_hidden: "Amount".into(),
+                    complete: true,
+                },
+                dialogs: BTreeMap::new(),
+            });
+            let mut after = before.clone();
+            after
+                .painted_text
+                .as_mut()
+                .unwrap()
+                .viewport
+                .painted_aria_hidden
+                .clear();
+            let browser = PaintChangingBrowser { before, after };
+            let assertions = done_assertions(&job.steps[0].done_when);
+            let captured = capture_step(
+                &browser,
+                &Redactor::for_job(&job).unwrap(),
+                assertions,
+                0,
+                1,
+            )
+            .unwrap();
+            assert_eq!(
+                crate::verification::evaluate_assertions(assertions, &captured.raw, &job.values)
+                    .outcome,
+                expected
+            );
+            assert_eq!(
+                captured.artifact.1["painted_text"]["viewport"]["painted_aria_hidden"],
+                ""
+            );
+        }
+    }
+
     #[test]
     fn unreadable_hover_rules_are_evidence_only_and_leave_done_coverage_intact() {
         let job = job("Ready");

@@ -129,9 +129,15 @@ fn painted_text_incompleteness_cannot_prove_a_missing_match_or_change_defaults()
         ("text_visible", "Missing", DoneResult::Unknown),
         ("text_absent", "Missing", DoneResult::Unknown),
     ] {
+        let (actual, evidence) = check(json!({kind:text,"include_aria_hidden":true}), &observed);
+        assert_eq!(actual, wanted);
         assert_eq!(
-            check(json!({kind:text,"include_aria_hidden":true}), &observed).0,
-            wanted
+            evidence["reason"],
+            if wanted == DoneResult::Unknown {
+                json!("incomplete_coverage")
+            } else {
+                Value::Null
+            }
         );
     }
     assert_eq!(
@@ -290,6 +296,99 @@ fn unique_dialog_requires_a_unique_inventory_in_the_selected_observation() {
             )
             .0,
             DoneResult::Satisfied
+        );
+    }
+    wire["painted_text"]["viewport"]["complete"] = json!(false);
+    wire["painted_text"]["dialogs"] = json!({"Details":inventory("", "$0.00", true)});
+    let observed = serde_json::from_value(wire).unwrap();
+    assert_eq!(
+        check(
+            json!({"text_absent":"Missing","scope":{"dialog":"Details"},"include_aria_hidden":true}),
+            &observed
+        )
+        .0,
+        DoneResult::Satisfied
+    );
+}
+
+#[test]
+fn painted_text_does_not_change_natural_provider_requests_or_numeric_proof() {
+    use crate::run::{ScriptedProvider, Turn};
+
+    let job: manuvra_contract::Job = serde_json::from_value(json!({
+        "schema_version":1,"target":{"kind":"browser","url":"http://example.test/"},
+        "context":{"journey":"Text","revision":"fixture","environment":"synthetic","actor":"owner","authority":"observe"},
+        "steps":[{"id":"ready","goal":"Observe Ready","done_when":[{"text_visible":"Ready"}]}],
+        "expectations":[{"id":"natural","claim":"Balance $0.00"}]
+    })).unwrap();
+    let mut baseline = page("Ready", "$0.00", true);
+    let mut added = baseline.clone();
+    baseline.painted_text = None;
+    added.painted_text.as_mut().unwrap().viewport.accessible = "Balance $0.00".into();
+    let provider = ScriptedProvider::new([Turn::verdict(0.95), Turn::verdict(0.95)]);
+    for observed in [&baseline, &added] {
+        let report = verify(
+            &job.expectations,
+            observed,
+            &Values::new(&job),
+            &provider,
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(report.outcome, DoneResult::NotSatisfied);
+        assert_eq!(report.verdicts[0].noul, Some(0.95));
+        assert!(!report.verdicts[0].numeric_checks[0].present);
+    }
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], requests[1]);
+}
+
+#[test]
+fn text_protocol_literals_do_not_make_redacted_checks_fail_the_leak_scan() {
+    use crate::evidence::{Redactor, redacted_assertion_checks};
+
+    let mut observed = page("Ready", "Amount", true);
+    observed.dialogs = vec!["Details".into()];
+    observed.dialog_texts = BTreeMap::from([("Details".into(), "Amount".into())]);
+    let assertions: Vec<Assertion> = serde_json::from_value(json!([
+        {"text_visible":"Amount","include_aria_hidden":true},
+        {"text_visible":"Amount","scope":{"dialog":"Details"}},
+        {"text_absent":"Amount","scope":{"dialog":"Missing"},"include_aria_hidden":true}
+    ]))
+    .unwrap();
+    let checks = assertion_checks(&assertions, &observed);
+    for literal in [
+        "painted_text",
+        "include_aria_hidden",
+        "searched_channels",
+        "matched_channel",
+        "dialog_text",
+        "ambiguous_or_missing_scope",
+    ] {
+        let mut job = crate::run::parse_job(json!({
+            "schema_version":1,"target":{"kind":"browser","url":"http://example.test/"},
+            "context":{"journey":"Text","revision":"fixture","environment":"synthetic","actor":"owner","authority":"observe"},
+            "steps":[{"id":"ready","goal":"Observe Ready","done_when":[{"text_visible":"Ready"}]}]
+        }));
+        job.values.insert(
+            "collision".into(),
+            manuvra_contract::JobValue {
+                value: literal.into(),
+                description: "classified protocol collision".into(),
+                formats: None,
+                secret: true,
+            },
+        );
+        let redactor = Redactor::for_job(&job).unwrap();
+        let exported = json!({
+            "painted_text":observed.painted_text,
+            "assertion_checks":redacted_assertion_checks(&checks, &redactor)
+        });
+        assert!(exported.to_string().contains(literal), "{literal}");
+        assert!(
+            !redactor.contains_export_leak(exported.to_string().as_bytes()),
+            "{literal}"
         );
     }
 }

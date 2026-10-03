@@ -120,24 +120,95 @@ fn painted_text_is_bounded_independently_of_the_color_owner_limit() {
     );
     assert_eq!(many["colors_complete"], false);
     browser.close().unwrap();
-    let large = "x".repeat(8001);
-    let server = FixtureServer::with_body(&format!(
-        "<!doctype html><p>Ready</p><dialog open aria-label='Details' style='position:static'><span aria-hidden='true' style='font:1px system-ui'>{large}</span></dialog>"
-    ));
-    let mut browser = launch_headless();
-    browser.navigate(&server.url()).unwrap();
-    let limited = snapshot(&browser);
-    for inventory in [
-        &limited["painted_text"]["viewport"],
-        &limited["painted_text"]["dialogs"]["Details"],
+    for (attributes, channel) in [
+        ("aria-hidden='true'", "painted_aria_hidden"),
+        ("", "accessible"),
     ] {
-        assert_eq!(inventory["complete"], false);
-        assert_eq!(
-            inventory["painted_aria_hidden"].as_str().unwrap().len(),
-            8000
-        );
+        let large = "x".repeat(8001);
+        let server = FixtureServer::with_body(&format!(
+            "<!doctype html><p>Ready</p><dialog open aria-label='Details' style='position:static'><span {attributes} style='font:1px system-ui'>{large}</span></dialog>"
+        ));
+        let mut browser = launch_headless();
+        browser.navigate(&server.url()).unwrap();
+        let limited = snapshot(&browser);
+        for inventory in [
+            &limited["painted_text"]["viewport"],
+            &limited["painted_text"]["dialogs"]["Details"],
+        ] {
+            assert_eq!(inventory["complete"], false);
+            assert_eq!(inventory[channel].as_str().unwrap().len(), 8000);
+        }
+        browser.close().unwrap();
     }
-    browser.close().unwrap();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn painted_text_respects_embedding_clips_and_native_normalization_failures() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    for (body, complete, retained) in [
+        (
+            r#"<iframe aria-hidden="true" style="width:300px;height:100px;border:0;clip-path:inset(100%)" srcdoc="<p>Amount</p>"></iframe>"#,
+            true,
+            false,
+        ),
+        (
+            r#"<div style="clip-path:inset(100%)"><iframe aria-hidden="true" srcdoc="<p>Amount</p>"></iframe></div>"#,
+            true,
+            false,
+        ),
+        (
+            r#"<div style="height:1px;overflow:hidden"><iframe aria-hidden="true" style="margin-top:40px" srcdoc="<p>Amount</p>"></iframe></div>"#,
+            true,
+            false,
+        ),
+        (
+            r#"<iframe aria-hidden="true" style="clip-path:circle(10px)" srcdoc="<p>Amount</p>"></iframe>"#,
+            false,
+            false,
+        ),
+        (
+            r#"<p aria-hidden="true">Amount</p><script>window.OffscreenCanvas=undefined</script>"#,
+            false,
+            false,
+        ),
+        (
+            r#"<div id="shadow" inert></div><script>shadow.attachShadow({mode:'open'}).innerHTML='<p aria-hidden=true>Amount</p>'</script>"#,
+            true,
+            false,
+        ),
+        (
+            r#"<div id="shadow" style="opacity:0"></div><script>shadow.attachShadow({mode:'open'}).innerHTML='<p aria-hidden=true>Amount</p>'</script>"#,
+            true,
+            false,
+        ),
+        (
+            r#"<div id="slotted"><span>Amount</span></div><script>slotted.attachShadow({mode:'open'}).innerHTML='<div aria-hidden=true style="height:1px;overflow:hidden"><div style="margin-top:40px"><slot></slot></div></div>'</script>"#,
+            true,
+            false,
+        ),
+        (
+            r#"<script type="application/json" aria-hidden="true" style="display:block">"Amount"</script>"#,
+            true,
+            false,
+        ),
+    ] {
+        let server =
+            FixtureServer::with_body(&format!("<!doctype html><body><p>Ready</p>{body}</body>"));
+        let mut browser = launch_headless();
+        browser.navigate(&server.url()).unwrap();
+        let observed = snapshot(&browser);
+        let viewport = &observed["painted_text"]["viewport"];
+        assert_eq!(viewport["complete"], complete, "{body}: {observed}");
+        for channel in ["accessible", "painted_aria_hidden"] {
+            assert_eq!(
+                viewport[channel].as_str().unwrap().contains("Amount"),
+                retained,
+                "{body}: {observed}"
+            );
+        }
+        browser.close().unwrap();
+    }
 }
 
 #[test]
@@ -167,7 +238,7 @@ fn bare_shadow_and_assigned_text_follow_their_painted_parent() {
     let server = FixtureServer::with_body(
         "<!doctype html><p>Ready</p><div id='bare' aria-hidden='true'></div><div id='assigned'>Assigned amount</div><div id='inert'>Inert assigned amount</div><script>
         bare.attachShadow({mode:'open'}).textContent='Bare shadow amount';
-        assigned.attachShadow({mode:'open'}).innerHTML='<div aria-hidden=true><slot></slot></div>';
+        assigned.attachShadow({mode:'open'}).innerHTML='<div aria-hidden=true><slot></slot><slot></slot></div>';
         inert.attachShadow({mode:'open'}).innerHTML='<div inert><slot></slot></div>';
         </script>",
     );
@@ -180,6 +251,13 @@ fn bare_shadow_and_assigned_text_follow_their_painted_parent() {
     let hidden = viewport["painted_aria_hidden"].as_str().unwrap();
     assert!(hidden.contains("Bare shadow amount"));
     assert!(hidden.contains("Assigned amount"));
+    assert_eq!(
+        hidden
+            .lines()
+            .filter(|line| *line == "Assigned amount")
+            .count(),
+        1
+    );
     assert!(!accessible.contains("Assigned amount"));
     assert!(!accessible.contains("Inert assigned amount"));
     assert!(!hidden.contains("Inert assigned amount"));

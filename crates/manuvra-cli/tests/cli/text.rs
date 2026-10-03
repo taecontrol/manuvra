@@ -10,6 +10,7 @@ fn invoke(temp: &TempDir, args: &[&str]) -> (i32, Value) {
         .env_remove("TYPESAFE_API_KEY")
         .output()
         .unwrap();
+    assert!(output.stderr.is_empty(), "{output:?}");
     (output.status.code().unwrap(), one_object(&output))
 }
 
@@ -80,6 +81,24 @@ fn terminal_read_only(result: &Value) {
     assert_eq!(result["cleanup"]["browser"], "closed");
     assert_eq!(result["cleanup"]["profile"], "removed");
     assert_complete_artifacts(result);
+}
+
+fn assert_no_classified_state(root: &Path, sensitive: &str) {
+    for entry in fs::read_dir(root).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            assert_no_classified_state(&path, sensitive);
+        } else if path.is_file() {
+            let bytes = fs::read(&path).unwrap();
+            assert!(
+                !bytes
+                    .windows(sensitive.len())
+                    .any(|chunk| chunk == sensitive.as_bytes()),
+                "classified text leaked in {}",
+                path.display()
+            );
+        }
+    }
 }
 
 #[test]
@@ -176,6 +195,71 @@ fn text_cli_step_and_final_checks_share_channels_and_classified_text_is_redacted
     let observation = artifact(&result, "observation");
     assert!(observation.get("painted_text").is_some());
     assert!(!result.to_string().contains("$0.00"));
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn text_cli_classified_accessible_and_dialog_sources_are_redacted() {
+    let http = HttpFixture::with_body(TEXT_FIXTURE);
+    for (kind, text, dialog, state, channel) in [
+        ("text_visible", "$1.00", None, "passed", "accessible"),
+        (
+            "text_visible",
+            "$20.00",
+            Some("Month details"),
+            "passed",
+            "painted_aria_hidden",
+        ),
+        (
+            "text_absent",
+            "$20.00",
+            Some("Month details"),
+            "failed",
+            "painted_aria_hidden",
+        ),
+    ] {
+        let temp = hosted_temp();
+        let mut assertion = json!({kind:text,"include_aria_hidden":true});
+        let mut done = json!({"text_visible":text,"include_aria_hidden":true});
+        if let Some(dialog) = dialog {
+            assertion["scope"] = json!({"dialog":dialog});
+            done["scope"] = json!({"dialog":dialog});
+        }
+        let mut wire = job(&http.url(), assertion);
+        wire["steps"][0]["done_when"] = json!([done]);
+        wire["values"] =
+            json!({"marker":{"value":text,"description":"classified amount","secret":true}});
+        if let Some(dialog) = dialog {
+            wire["values"]["dialog"] =
+                json!({"value":dialog,"description":"classified scope","secret":true});
+        }
+        let (_, result) = run(&temp, &wire);
+        assert_eq!(result["state"], state, "{kind}: {result}");
+        terminal_read_only(&result);
+        let verification = artifact(&result, "verification");
+        assert_eq!(
+            verification["expectations"][0]["assertion_checks"][0]["text"]["matched_channel"],
+            channel
+        );
+        let manifest: Value = serde_json::from_slice(
+            &fs::read(result["evidence"]["manifest"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        for sensitive in std::iter::once(text).chain(dialog) {
+            assert!(!result.to_string().contains(sensitive));
+            assert_no_classified_state(&temp.path().join("state"), sensitive);
+            for artifact in manifest["artifacts"].as_array().unwrap() {
+                let bytes = fs::read(artifact["path"].as_str().unwrap()).unwrap();
+                assert!(
+                    !bytes
+                        .windows(sensitive.len())
+                        .any(|chunk| chunk == sensitive.as_bytes()),
+                    "classified text leaked in {}",
+                    artifact["role"]
+                );
+            }
+        }
+    }
 }
 
 #[test]
