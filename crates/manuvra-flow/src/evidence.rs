@@ -188,43 +188,23 @@ impl Redactor {
         if !self.contains_raw_export_leak(bytes) {
             return false;
         }
-        let Some(keys) = self.scanned_json_keys(bytes) else {
+        let Some(keys) = scanned_json_keys(bytes, |quoted| self.contains_raw_export_leak(quoted))
+        else {
             return true;
         };
         export_without_color_channels(bytes, keys)
             .is_none_or(|export| self.contains_raw_export_leak(&export))
     }
 
-    /// Retain the raw string scan and count keys so parsing cannot hide duplicate fields.
-    fn scanned_json_keys(&self, bytes: &[u8]) -> Option<usize> {
-        let mut start = None;
-        let mut escaped = false;
-        let mut keys = 0;
-        for (offset, byte) in bytes.iter().enumerate() {
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            match byte {
-                b'\\' if start.is_some() => escaped = true,
-                b'"' => match start.take() {
-                    Some(start) => {
-                        if self.contains_raw_export_leak(&bytes[start..offset]) {
-                            return None;
-                        }
-                        keys += usize::from(
-                            bytes[offset + 1..]
-                                .iter()
-                                .find(|byte| !byte.is_ascii_whitespace())
-                                == Some(&b':'),
-                        );
-                    }
-                    None => start = Some(offset + 1),
-                },
-                _ => {}
-            }
+    /// The publisher supplies the artifact path relative to its owned run directory.
+    pub fn contains_artifact_leak(&self, relative_path: &Path, bytes: &[u8]) -> bool {
+        if relative_path != Path::new("manifest.json") {
+            return self.contains_export_leak(bytes);
         }
-        Some(keys)
+        self.contains_raw_export_leak(bytes)
+            && self.contains_export_leak(
+                &export_without_manifest_digests(bytes).unwrap_or_else(|| bytes.to_vec()),
+            )
     }
 
     fn contains_raw_export_leak(&self, bytes: &[u8]) -> bool {
@@ -237,6 +217,56 @@ impl Redactor {
                         .any(|window| window == secret.as_bytes())
             })
     }
+}
+
+/// Retain original quoted bytes and count keys so parsing cannot hide duplicate fields.
+fn scanned_json_keys(bytes: &[u8], mut leaks: impl FnMut(&[u8]) -> bool) -> Option<usize> {
+    let mut start = None;
+    let mut escaped = false;
+    let mut keys = 0;
+    for (offset, byte) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match byte {
+            b'\\' if start.is_some() => escaped = true,
+            b'"' => match start.take() {
+                Some(start) => {
+                    if leaks(&bytes[start..offset]) {
+                        return None;
+                    }
+                    keys += usize::from(
+                        bytes[offset + 1..]
+                            .iter()
+                            .find(|byte| !byte.is_ascii_whitespace())
+                            == Some(&b':'),
+                    );
+                }
+                None => start = Some(offset + 1),
+            },
+            _ => {}
+        }
+    }
+    Some(keys)
+}
+
+fn export_without_manifest_digests(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut value: Value = serde_json::from_slice(bytes).ok()?;
+    let manifest: Manifest = serde_json::from_value(value.clone()).ok()?;
+    if manifest.artifacts.is_empty()
+        || !manifest
+            .artifacts
+            .iter()
+            .all(|artifact| valid_artifact_digest(&artifact.digest))
+        || json_key_count(&value) != scanned_json_keys(bytes, |_| false)?
+    {
+        return None;
+    }
+    for artifact in value.get_mut("artifacts")?.as_array_mut()? {
+        artifact["digest"] = Value::Null;
+    }
+    serde_json::to_vec(&value).ok()
 }
 
 /// Canonical color channels are owned numeric facts, even when a classified text happens to
@@ -1306,7 +1336,8 @@ fn reject_leaks(directory: &Path, redactor: &Redactor) -> Result<(), String> {
                 continue;
             }
             let bytes = fs::read(&path).map_err(|e| e.to_string())?;
-            if redactor.contains_export_leak(&bytes) {
+            let relative = path.strip_prefix(directory).map_err(|e| e.to_string())?;
+            if redactor.contains_artifact_leak(relative, &bytes) {
                 return Err(format!("evidence leak scan rejected {}", path.display()));
             }
         }
@@ -1716,6 +1747,65 @@ mod tests {
             );
             assert!(redactor.contains_export_leak(duplicate_numbers.as_bytes()));
         }
+    }
+
+    #[test]
+    fn run_owned_manifest_digests_do_not_collide_with_classified_values() {
+        let temporary = TempDir::new().unwrap();
+        let mut job = test_job(true);
+        job.values.get_mut("marker").unwrap().value = "185".into();
+        let redactor = Redactor::for_job_with_provider_key(&job, None).unwrap();
+        let manifest = json!({
+            "schema_version":1, "run_id":"r_digest", "complete":true,
+            "artifacts":[{"role":"result","path":"result.json","digest":format!("185{}", "0".repeat(61)),"complete":true}]
+        });
+        fs::write(
+            temporary.path().join("manifest.json"),
+            pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        reject_leaks(temporary.path(), &redactor)
+            .expect("owned SHA256 digits cannot prevent redacted evidence publication");
+        assert!(redactor.contains_export_leak(&pretty(&manifest).unwrap()));
+        for path in ["result.json", "nested/manifest.json"] {
+            assert!(redactor.contains_artifact_leak(Path::new(path), &pretty(&manifest).unwrap()));
+        }
+        for field in ["run_id", "artifacts/0/path", "artifacts/0/role", "caller"] {
+            let mut leaked = manifest.clone();
+            if field == "caller" {
+                leaked[field] = json!("185");
+            } else {
+                *leaked.pointer_mut(&format!("/{field}")).unwrap() = json!("185");
+            }
+            assert!(
+                redactor
+                    .contains_artifact_leak(Path::new("manifest.json"), &pretty(&leaked).unwrap())
+            );
+        }
+        for invalid in ["185".to_owned(), format!("185{}", "g".repeat(61))] {
+            let mut malformed = manifest.clone();
+            malformed["artifacts"][0]["digest"] = json!(invalid);
+            assert!(
+                redactor.contains_artifact_leak(
+                    Path::new("manifest.json"),
+                    &pretty(&malformed).unwrap()
+                )
+            );
+        }
+        let bytes = pretty(&manifest).unwrap();
+        let mut malformed = bytes.clone();
+        malformed.extend_from_slice(b" trailing data");
+        assert!(redactor.contains_artifact_leak(Path::new("manifest.json"), &malformed));
+        let duplicate = String::from_utf8(bytes.clone()).unwrap().replacen(
+            '{',
+            r#"{"caller":"185","caller":"safe","#,
+            1,
+        );
+        assert!(redactor.contains_artifact_leak(Path::new("manifest.json"), duplicate.as_bytes()));
+        assert_eq!(
+            fs::read(temporary.path().join("manifest.json")).unwrap(),
+            bytes
+        );
     }
 
     #[cfg(unix)]
