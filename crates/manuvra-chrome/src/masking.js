@@ -1,7 +1,7 @@
 (values) => {
   window.__manuvraRemoveMasks?.();
   // A channel can join retained nodes across roots; raw ranges cannot prove that assembly.
-  const masks = [], matched = new Set(), animations = new Map(); let unverifiable = values.some(value => value.includes('\n'));
+  const masks = [], matched = new Set(); let unverifiable = values.some(value => value.includes('\n'));
   const painted = (element) => element.checkVisibility({checkVisibilityCSS: true});
   const hasArea = (rect) => rect.width > 0 && rect.height > 0;
   const shown = (element) => painted(element) && hasArea(element.getBoundingClientRect());
@@ -26,8 +26,7 @@
     // Documents omit shadow-tree effects; visited roots also reveal sibling layout motion.
     for (const {root} of contexts) {
       if (!documents.has(root.ownerDocument || root)) continue;
-      if (!animations.has(root)) animations.set(root,root.getAnimations());
-      if (animations.get(root).some(animation => running(animation) && !independentAnimation(animation, lineage))) return false;
+      if (root.getAnimations().some(animation => running(animation) && !independentAnimation(animation, lineage))) return false;
     }
     return true;
   };
