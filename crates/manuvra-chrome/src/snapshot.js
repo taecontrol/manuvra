@@ -330,10 +330,12 @@
   };
   const colorAnimations = new Map();
   const colorCaptureStable = element => {
-    const lineage=colorAncestors(element), owners=new Set(lineage);
-    for (const owner of new Set(lineage.map(node=>node.ownerDocument))) {
-      if (!colorAnimations.has(owner)) colorAnimations.set(owner,owner.getAnimations());
-      for (const animation of colorAnimations.get(owner)) {
+    const lineage=colorAncestors(element), owners=new Set(lineage), documents=new Set(lineage.map(node=>node.ownerDocument));
+    // Each observed document and shadow root owns a separate native animation inventory.
+    for (const {root} of contexts) {
+      if (!documents.has(root.ownerDocument || root)) continue;
+      if (!colorAnimations.has(root)) colorAnimations.set(root,root.getAnimations());
+      for (const animation of colorAnimations.get(root)) {
         if ((!animation.pending && animation.playState!=='running') || !owners.has(animation.effect?.target)) continue;
         // Background-only effects do not change foreground or paint eligibility. Unknown effects do.
         const frames=animation.effect?.getKeyframes?.();
