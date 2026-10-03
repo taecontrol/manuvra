@@ -61,6 +61,7 @@ fn color_contract_rejects_invalid_targets_comparisons_and_tolerances() {
     for color in [
         json!({"target":{},"equals":"#b91c1c"}),
         json!({"target":{"text":"  "},"equals":"#b91c1c"}),
+        json!({"target":{"text":"\u{feff}"},"equals":"#b91c1c"}),
         json!({"target":{"text":"amount","name":"amount"},"equals":"#b91c1c"}),
         json!({"target":{"text":"amount","role":"button"},"equals":"#b91c1c"}),
         json!({"target":{"name":"amount","container":" "},"equals":"#b91c1c"}),

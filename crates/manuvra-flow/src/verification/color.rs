@@ -163,9 +163,10 @@ fn owner<'a>(
 
 fn matches_target(target: &ColorTarget, owner: &ColorObservation) -> bool {
     match target {
-        ColorTarget::Text(target) => owner.text.as_deref().is_some_and(|text| {
-            text == target.text.split_whitespace().collect::<Vec<_>>().join(" ")
-        }),
+        ColorTarget::Text(target) => owner
+            .text
+            .as_deref()
+            .is_some_and(|text| text == target.normalized_text()),
         ColorTarget::Name(target) => {
             owner
                 .name

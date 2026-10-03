@@ -73,6 +73,34 @@ pub struct NamedColorTarget {
     pub container: Option<String>,
 }
 
+impl TextColorTarget {
+    /// Match the browser's ECMAScript `\s` collapse and trim for a single text segment.
+    pub fn normalized_text(&self) -> String {
+        self.text
+            .split(color_text_space)
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+fn color_text_space(character: char) -> bool {
+    // ECMAScript WhiteSpace + LineTerminator; NEL is excluded and BOM is included.
+    matches!(
+        character,
+        '\u{0009}'..='\u{000d}'
+            | '\u{0020}'
+            | '\u{00a0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200a}'
+            | '\u{2028}'..='\u{2029}'
+            | '\u{202f}'
+            | '\u{205f}'
+            | '\u{3000}'
+            | '\u{feff}'
+    )
+}
+
 impl ColorCheck {
     pub fn target(&self) -> &ColorTarget {
         match self {
@@ -147,7 +175,7 @@ impl ColorTarget {
     }
 
     fn validate(&self) -> Result<(), ValidationError> {
-        validate_nonempty("color target", self.subject())?;
+        self.validate_subject()?;
         validate_optional(&self.dialog(), |name| {
             validate_nonempty("color dialog", name)
         })?;
@@ -158,6 +186,16 @@ impl ColorTarget {
             validate_optional(&target.role, |role| validate_nonempty("color role", role))?;
         }
         Ok(())
+    }
+
+    fn validate_subject(&self) -> Result<(), ValidationError> {
+        match self {
+            Self::Text(target) if target.normalized_text().is_empty() => {
+                Err(ValidationError::new("color target must not be empty"))
+            }
+            Self::Text(_) => Ok(()),
+            Self::Name(target) => validate_nonempty("color target", &target.name),
+        }
     }
 }
 

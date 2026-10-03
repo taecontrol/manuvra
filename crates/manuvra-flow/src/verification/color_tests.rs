@@ -43,6 +43,25 @@ fn color_text_normalizes_requested_whitespace_but_preserves_case() {
 }
 
 #[test]
+fn color_text_uses_the_browser_unicode_whitespace_set() {
+    for (requested, painted) in [
+        ("Amount\u{85}line", "Amount\u{85}line"),
+        ("Amount\u{feff}line", "Amount line"),
+    ] {
+        let observed = page(vec![color(painted, [185, 28, 28, 255], 1)]);
+        assert_eq!(
+            verify_color(
+                json!({"target":{"text":requested},"equals":"#b91c1c"}),
+                &observed
+            )
+            .outcome,
+            DoneResult::Satisfied,
+            "{requested:?}"
+        );
+    }
+}
+
+#[test]
 fn color_names_ignore_case_and_enforce_the_requested_role() {
     let mut control = color("", [31, 41, 55, 255], 1);
     control["text"] = Value::Null;

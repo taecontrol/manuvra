@@ -305,6 +305,26 @@ fn color_cli_exact_text_case_whitespace_named_roles_and_literal_alpha() {
 
 #[test]
 #[ignore = "requires the local Chromium executable"]
+fn color_cli_unicode_text_targets_match_painted_segments_without_a_provider() {
+    for text in ["Amount\u{85}line", "Amount\u{feff}line"] {
+        let body = format!(
+            "<!doctype html><meta charset='utf-8'><p>Ready</p><p style='color:#b91c1c'>{text}</p>"
+        );
+        let http = HttpFixture::with_body(&body);
+        let temp = hosted_temp();
+        let job = color_job(
+            &http.url(),
+            json!([{"color":{"target":{"text":text},"equals":"#b91c1c"}}]),
+        );
+        let (exit, result) = run(&temp, &job);
+        assert_eq!(exit, 0, "{text:?}: {result}");
+        assert_eq!(result["state"], "passed");
+        assert_read_only(&result);
+    }
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
 fn color_cli_duplicate_owners_in_shadow_and_frame_contexts_remain_unresolved() {
     let http = HttpFixture::with_body(&COLOR_FIXTURE.replace("Frame amount", "Shadow amount"));
     let temp = hosted_temp();
@@ -333,23 +353,31 @@ fn color_cli_duplicate_owners_in_shadow_and_frame_contexts_remain_unresolved() {
 #[test]
 #[ignore = "requires the local Chromium executable"]
 fn color_cli_classified_scopes_and_canonical_channel_numerals_publish_complete_evidence() {
-    for (body, target, secret) in [
+    for (body, target, secret, tolerance) in [
         (
             "<!doctype html><p>Ready</p><p style='color:#b91c1c'>185</p>".to_owned(),
             json!({"text":"185"}),
             "185",
+            0,
+        ),
+        (
+            "<!doctype html><p>Ready</p><p style='color:#b91c1c'>185</p>".to_owned(),
+            json!({"text":"185"}),
+            "185",
+            185,
         ),
         (
             COLOR_FIXTURE.to_owned(),
             json!({"text":"$0.00","container":"Checking"}),
             "Checking",
+            0,
         ),
     ] {
         let http = HttpFixture::with_body(&body);
         let temp = hosted_temp();
         let mut job = color_job(
             &http.url(),
-            json!([{"color":{"target":target,"equals":"#b91c1c"}}]),
+            json!([{"color":{"target":target,"equals":"#b91c1c","tolerance":tolerance}}]),
         );
         job["values"] =
             json!({"marker":{"value":secret,"description":"classified value","secret":true}});
