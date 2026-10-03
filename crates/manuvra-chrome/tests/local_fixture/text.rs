@@ -467,3 +467,77 @@ fn classified_node_joined_shadow_text_is_withheld_when_assembly_is_unverifiable(
     );
     browser.close().unwrap();
 }
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn classified_masks_paint_opaque_rectangles_despite_page_styles() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    for (name, css) in [
+        ("clipped", "div{clip-path:inset(0 100% 0 0)!important}"),
+        ("rounded", "div{border-radius:50%!important}"),
+        ("transparent", "[data-manuvra-mask]{opacity:0!important}"),
+        ("translucent", "[data-manuvra-mask]{opacity:.25!important}"),
+        ("hidden", "[data-manuvra-mask]{visibility:hidden!important}"),
+        (
+            "masked",
+            "div{mask-image:linear-gradient(transparent,transparent)!important}",
+        ),
+        ("blended", "div{mix-blend-mode:screen!important}"),
+    ] {
+        // SVG provides an independent opaque-paint oracle, unaffected by the page's div rules.
+        let body = format!(
+            r#"<!doctype html><style>{css}</style><p>Ready</p>
+<span id='bare' aria-hidden='true' style='font:32px monospace'></span>
+<script>
+const root=bare.attachShadow({{mode:'open'}});root.textContent='bare-shadow-secret';
+if(location.search) {{
+  const range=document.createRange();range.selectNodeContents(root.firstChild);
+  const ns='http://www.w3.org/2000/svg', panel=document.createElementNS(ns,'svg');
+  panel.setAttribute('width',innerWidth);panel.setAttribute('height',innerHeight);
+  Object.assign(panel.style,{{position:'fixed',left:'0',top:'0',zIndex:'2147483647',pointerEvents:'none'}});
+  for(const rect of range.getClientRects()) {{
+    const box=document.createElementNS(ns,'rect');
+    box.setAttribute('x',Math.floor(rect.left));box.setAttribute('y',Math.floor(rect.top));
+    box.setAttribute('width',Math.ceil(rect.right)-Math.floor(rect.left));
+    box.setAttribute('height',Math.ceil(rect.bottom)-Math.floor(rect.top));
+    box.setAttribute('fill','black');panel.append(box);
+  }}
+  document.documentElement.append(panel);
+}}
+</script>"#
+        );
+        let server = FixtureServer::with_body(&body);
+        let mut browser = launch_headless();
+        browser.navigate(&server.url()).unwrap();
+        let plain = browser.capture().unwrap();
+        let masked = browser
+            .capture_redacted(&["bare-shadow-secret".into()])
+            .unwrap();
+        assert!(masked.redaction.verifies(1), "{name}");
+        assert_eq!(masked.redaction.matched_values, 1, "{name}");
+        browser
+            .navigate(&format!("{}?reference=1", server.url()))
+            .unwrap();
+        let reference = browser.capture().unwrap();
+        if let Some(directory) = std::env::var_os("MANUVRA_FIXTURE_EVIDENCE") {
+            let directory = PathBuf::from(directory);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                directory.join(format!("mask-{name}.png")),
+                &masked.screenshot.bytes,
+            )
+            .unwrap();
+            std::fs::write(
+                directory.join(format!("mask-{name}-reference.png")),
+                &reference.screenshot.bytes,
+            )
+            .unwrap();
+        }
+        assert_ne!(plain.screenshot.bytes, reference.screenshot.bytes, "{name}");
+        assert!(
+            masked.screenshot.bytes == reference.screenshot.bytes,
+            "{name}: a verified mask must paint the complete opaque reference rectangle"
+        );
+        browser.close().unwrap();
+    }
+}

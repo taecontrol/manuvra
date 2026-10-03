@@ -276,25 +276,29 @@ fn colorless_capture_and_stable_color_targets_allow_unrelated_color_animation() 
 #[test]
 #[ignore = "requires the local Chromium executable"]
 fn color_cli_requested_color_animation_cannot_publish_unfenced_final_evidence() {
-    let http = HttpFixture::with_body(
-        "<!doctype html><style>@keyframes pulse{from{color:#b91c1c}to{color:#001122}}#target{animation:pulse 1s linear infinite alternate}</style><h1>Ready</h1><p id=target>Amount</p>",
-    );
-    let color = json!({"color":{"target":{"text":"Amount"},"equals":"#b91c1c","tolerance":255}});
-    let mut step_job = color_job(&http.url(), json!([{"text_visible":"Ready"}]));
-    step_job["steps"][0]["done_when"] = json!([color.clone()]);
-    let final_job = color_job(&http.url(), json!([color]));
-    for job in [step_job, final_job] {
-        let temp = hosted_temp();
-        let (exit, result) = run(&temp, &job);
-        assert_eq!(exit, 3, "{job}: {result}");
-        assert_eq!(result["state"], "blocked");
-        assert_eq!(result["reason"]["code"], "browser_control_failed");
-        assert_eq!(result["verdict"]["expectations"][0]["result"], "not_run");
-        assert_eq!(result["verdict"]["caller_assisted"], false);
-        viewport::assert_no_step_input(&result);
-        assert_complete_artifacts(&result);
-        assert_eq!(result["cleanup"]["browser"], "closed");
-        assert_eq!(result["cleanup"]["profile"], "removed");
+    // A slow effect keeps the sampled RGB equal while its foreground still animates.
+    for duration in ["1000000s", "1s"] {
+        let http = HttpFixture::with_body(&format!(
+            "<!doctype html><style>@keyframes pulse{{from{{color:#b91c1c}}to{{color:#001122}}}}#target{{animation:pulse {duration} linear infinite alternate}}</style><h1>Ready</h1><p id=target>Amount</p>"
+        ));
+        let color =
+            json!({"color":{"target":{"text":"Amount"},"equals":"#b91c1c","tolerance":255}});
+        let mut step_job = color_job(&http.url(), json!([{"text_visible":"Ready"}]));
+        step_job["steps"][0]["done_when"] = json!([color.clone()]);
+        let final_job = color_job(&http.url(), json!([color]));
+        for job in [step_job, final_job] {
+            let temp = hosted_temp();
+            let (exit, result) = run(&temp, &job);
+            assert_eq!(exit, 3, "{job}: {result}");
+            assert_eq!(result["state"], "blocked");
+            assert_eq!(result["reason"]["code"], "browser_control_failed");
+            assert_eq!(result["verdict"]["expectations"][0]["result"], "not_run");
+            assert_eq!(result["verdict"]["caller_assisted"], false);
+            viewport::assert_no_step_input(&result);
+            assert_complete_artifacts(&result);
+            assert_eq!(result["cleanup"]["browser"], "closed");
+            assert_eq!(result["cleanup"]["profile"], "removed");
+        }
     }
 }
 
