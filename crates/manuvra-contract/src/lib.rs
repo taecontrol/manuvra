@@ -578,6 +578,11 @@ impl Job {
         self.steps
             .iter()
             .find_map(|step| step.first_missing_value(&self.values))
+            .or_else(|| {
+                self.expectations
+                    .iter()
+                    .find_map(|expectation| expectation.first_missing_value(&self.values))
+            })
     }
 
     fn expectation_ids(&self) -> impl Iterator<Item = &str> {
@@ -722,13 +727,20 @@ impl DoneCondition {
         let Self::Structured(assertions) = self else {
             return None;
         };
-        assertions.iter().find_map(|assertion| match assertion {
-            Assertion::FieldEqualsValue(field) if !values.contains_key(&field.equals_value) => {
-                Some(&field.equals_value)
-            }
-            _ => None,
-        })
+        first_missing_assertion_value(assertions, values)
     }
+}
+
+fn first_missing_assertion_value<'a>(
+    assertions: &'a [Assertion],
+    values: &BTreeMap<String, JobValue>,
+) -> Option<&'a String> {
+    assertions.iter().find_map(|assertion| match assertion {
+        Assertion::FieldEqualsValue(field) if !values.contains_key(&field.equals_value) => {
+            Some(&field.equals_value)
+        }
+        _ => None,
+    })
 }
 
 impl Assertion {
@@ -766,6 +778,16 @@ impl Assertion {
 }
 
 impl Expectation {
+    fn first_missing_value(&self, values: &BTreeMap<String, JobValue>) -> Option<MissingValue> {
+        let Self::Structured(expectation) = self else {
+            return None;
+        };
+        first_missing_assertion_value(&expectation.assertions, values).map(|name| MissingValue {
+            value_name: name.clone(),
+            step_id: expectation.id.clone(),
+        })
+    }
+
     pub fn id(&self) -> &str {
         match self {
             Self::NaturalLanguage(expectation) => &expectation.id,
@@ -1233,6 +1255,47 @@ mod tests {
             Some(MissingValue {
                 value_name: "account_name".into(),
                 step_id: "name".into()
+            })
+        );
+    }
+
+    #[test]
+    fn resolves_final_equality_references_after_steps_in_job_order() {
+        let mut wire = valid_job();
+        wire["expectations"] = json!([
+            {"id":"natural","claim":"The account exists"},
+            {"id":"first-final","assertions":[
+                {"field":"Account name","equals_value":"account_name"},
+                {"field":"Account type","equals_value":"account_type"}
+            ]},
+            {"id":"later-final","assertions":[{"field":"Currency","equals_value":"currency"}]}
+        ]);
+        assert_eq!(
+            parse(&wire).unwrap().first_missing_value(),
+            Some(MissingValue {
+                value_name: "account_type".into(),
+                step_id: "first-final".into(),
+            })
+        );
+        wire["values"]["account_type"] = json!({"value":"Cash","description":"Account type"});
+        assert_eq!(
+            parse(&wire).unwrap().first_missing_value(),
+            Some(MissingValue {
+                value_name: "currency".into(),
+                step_id: "later-final".into(),
+            })
+        );
+        wire["values"]["currency"] = json!({"value":"USD","description":"Currency"});
+        assert_eq!(parse(&wire).unwrap().first_missing_value(), None);
+        wire["values"]
+            .as_object_mut()
+            .unwrap()
+            .remove("account_name");
+        assert_eq!(
+            parse(&wire).unwrap().first_missing_value(),
+            Some(MissingValue {
+                value_name: "account_name".into(),
+                step_id: "name".into(),
             })
         );
     }
