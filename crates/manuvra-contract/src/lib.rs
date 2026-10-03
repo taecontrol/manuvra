@@ -9,6 +9,15 @@ pub const SCHEMA_VERSION: u32 = 1;
 
 mod color;
 pub use color::*;
+mod text;
+pub use text::*;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AssertionCheck {
+    Color(ColorCheckEvidence),
+    Text(TextCheckEvidence),
+}
 
 #[cfg(test)]
 mod color_tests;
@@ -183,6 +192,8 @@ pub enum Assertion {
 #[serde(deny_unknown_fields)]
 pub struct TextVisible {
     pub text_visible: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub include_aria_hidden: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<AssertionScope>,
 }
@@ -191,6 +202,8 @@ pub struct TextVisible {
 #[serde(deny_unknown_fields)]
 pub struct TextAbsent {
     pub text_absent: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub include_aria_hidden: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<AssertionScope>,
 }
@@ -1098,10 +1111,12 @@ mod tests {
         let expected = [
             Assertion::TextVisible(TextVisible {
                 text_visible: "Saved".into(),
+                include_aria_hidden: false,
                 scope: Some(AssertionScope::Viewport(ViewportScope::Viewport)),
             }),
             Assertion::TextAbsent(TextAbsent {
                 text_absent: "Error".into(),
+                include_aria_hidden: false,
                 scope: Some(AssertionScope::Dialog(DialogScope {
                     dialog: "Create".into(),
                 })),

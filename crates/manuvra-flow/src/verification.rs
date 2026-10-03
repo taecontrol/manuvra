@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 mod color;
+mod text;
 
 #[cfg(test)]
 #[path = "verification/color_tests.rs"]
@@ -393,20 +394,44 @@ pub struct DoneReport {
     pub assertion_checks: Vec<AssertionCheck>,
 }
 
-pub fn color_assertion_checks(
+pub fn assertion_checks(
     assertions: &[Assertion],
     observation: &Observation,
 ) -> Vec<AssertionCheck> {
     assertions
         .iter()
-        .filter_map(|assertion| match assertion {
-            Assertion::Color(assertion) => Some(AssertionCheck::Color(color::evaluate(
-                &assertion.color,
-                observation,
-            ))),
-            _ => None,
-        })
+        .filter_map(|assertion| assertion_evidence(assertion, observation))
         .collect()
+}
+
+fn assertion_evidence(assertion: &Assertion, observation: &Observation) -> Option<AssertionCheck> {
+    let check = match assertion {
+        Assertion::Color(assertion) => {
+            AssertionCheck::Color(color::evaluate(&assertion.color, observation))
+        }
+        Assertion::TextVisible(assertion) => AssertionCheck::Text(text::evaluate(
+            manuvra_contract::TextAssertion::Visible(assertion.clone()),
+            observation,
+        )),
+        Assertion::TextAbsent(assertion) => AssertionCheck::Text(text::evaluate(
+            manuvra_contract::TextAssertion::Absent(assertion.clone()),
+            observation,
+        )),
+        _ => return None,
+    };
+    Some(check)
+}
+
+fn evidence_outcome(check: &AssertionCheck) -> DoneResult {
+    let result = match check {
+        AssertionCheck::Color(check) => check.result,
+        AssertionCheck::Text(check) => check.result,
+    };
+    match result {
+        VerdictResult::Satisfied => DoneResult::Satisfied,
+        VerdictResult::NotSatisfied => DoneResult::NotSatisfied,
+        VerdictResult::Unresolved | VerdictResult::NotRun => DoneResult::Unknown,
+    }
 }
 
 pub fn evaluate_assertions(
@@ -418,10 +443,9 @@ pub fn evaluate_assertions(
     let mut not_satisfied = false;
     let mut assertion_checks = Vec::new();
     for assertion in assertions {
-        let result = if let Assertion::Color(assertion) = assertion {
-            let check = color::evaluate(&assertion.color, observation);
-            let result = color::outcome(check.result);
-            assertion_checks.push(AssertionCheck::Color(check));
+        let result = if let Some(check) = assertion_evidence(assertion, observation) {
+            let result = evidence_outcome(&check);
+            assertion_checks.push(check);
             result
         } else {
             check_assertion(assertion, observation, values)
@@ -460,13 +484,11 @@ fn check_assertion(
 
 fn check_page_assertion(assertion: &Assertion, observation: &Observation) -> DoneResult {
     match assertion {
-        Assertion::TextVisible(wanted) => text_visible(observation, wanted),
-        Assertion::TextAbsent(wanted) => text_absent(observation, wanted),
         Assertion::DialogOpen(dialog) => dialog_open(observation, &dialog.dialog_open),
         Assertion::DialogClosed(dialog) => dialog_closed(observation, &dialog.dialog_closed),
         Assertion::UrlContains(url) => truth(observation.url.contains(&url.url_contains)),
-        // The dispatcher routes field and focus assertions before this branch.
-        _ => unreachable!("field assertions are checked before page assertions"),
+        // Text, color, field, and focus assertions are routed before this branch.
+        _ => unreachable!("non-page assertions were already routed"),
     }
 }
 
@@ -516,32 +538,6 @@ fn matches_identity(
         && wanted_role.is_none_or(|wanted| role.eq_ignore_ascii_case(wanted))
         && wanted_dialog
             .is_none_or(|wanted| dialog.is_some_and(|actual| actual.eq_ignore_ascii_case(wanted)))
-}
-
-fn text_visible(observation: &Observation, wanted: &manuvra_contract::TextVisible) -> DoneResult {
-    let Some(text) = scoped_text(observation, wanted.scope.as_ref()) else {
-        return DoneResult::Unknown;
-    };
-    if text.contains(&wanted.text_visible) {
-        DoneResult::Satisfied
-    } else if scope_complete(observation, wanted.scope.as_ref()) {
-        DoneResult::NotSatisfied
-    } else {
-        DoneResult::Unknown
-    }
-}
-
-fn text_absent(observation: &Observation, wanted: &manuvra_contract::TextAbsent) -> DoneResult {
-    let Some(text) = scoped_text(observation, wanted.scope.as_ref()) else {
-        return DoneResult::Unknown;
-    };
-    if text.contains(&wanted.text_absent) {
-        DoneResult::NotSatisfied
-    } else if scope_complete(observation, wanted.scope.as_ref()) {
-        DoneResult::Satisfied
-    } else {
-        DoneResult::Unknown
-    }
 }
 
 fn field_nonempty(
@@ -799,6 +795,7 @@ mod tests {
             focus_anchor: None,
             visible_text: "Saved Create account".into(),
             covered_text: "Hidden background".into(),
+            painted_text: None,
             colors: Vec::new(),
             colors_complete: false,
             color_scopes: Vec::new(),
@@ -1190,10 +1187,12 @@ mod tests {
         let assertions = vec![
             Assertion::TextVisible(TextVisible {
                 text_visible: "Saved".into(),
+                include_aria_hidden: false,
                 scope: None,
             }),
             Assertion::TextAbsent(TextAbsent {
                 text_absent: "Missing".into(),
+                include_aria_hidden: false,
                 scope: None,
             }),
             Assertion::FieldNonempty(FieldNonempty {
@@ -1240,6 +1239,7 @@ mod tests {
         );
         let covered = Assertion::TextVisible(TextVisible {
             text_visible: "Hidden background".into(),
+            include_aria_hidden: false,
             scope: None,
         });
         assert_eq!(
@@ -1253,6 +1253,7 @@ mod tests {
         let mut observed = observation();
         let absent = Assertion::TextAbsent(TextAbsent {
             text_absent: "Missing".into(),
+            include_aria_hidden: false,
             scope: None,
         });
         observed.coverage.gaps.push("cross_origin_frame".into());
@@ -1279,6 +1280,7 @@ mod tests {
         });
         let visible = Assertion::TextVisible(TextVisible {
             text_visible: "Saved".into(),
+            include_aria_hidden: false,
             scope: Some(scoped),
         });
         assert_eq!(
@@ -1297,10 +1299,12 @@ mod tests {
         ]);
         let viewport = Assertion::TextVisible(TextVisible {
             text_visible: "Beyond the retained prefix".into(),
+            include_aria_hidden: false,
             scope: None,
         });
         let dialog = Assertion::TextAbsent(TextAbsent {
             text_absent: "Beyond the retained dialog prefix".into(),
+            include_aria_hidden: false,
             scope: Some(AssertionScope::Dialog(manuvra_contract::DialogScope {
                 dialog: "Create account".into(),
             })),
@@ -1338,12 +1342,14 @@ mod tests {
             }),
             Assertion::TextVisible(TextVisible {
                 text_visible: "Opening balance".into(),
+                include_aria_hidden: false,
                 scope: Some(AssertionScope::Dialog(manuvra_contract::DialogScope {
                     dialog: "Create account".into(),
                 })),
             }),
             Assertion::TextAbsent(TextAbsent {
                 text_absent: "Review wallet".into(),
+                include_aria_hidden: false,
                 scope: Some(AssertionScope::Viewport(
                     manuvra_contract::ViewportScope::Viewport,
                 )),
@@ -1374,6 +1380,7 @@ mod tests {
             }),
             Assertion::TextVisible(TextVisible {
                 text_visible: "Review wallet".into(),
+                include_aria_hidden: false,
                 scope: None,
             }),
         ];

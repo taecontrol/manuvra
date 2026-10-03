@@ -203,3 +203,93 @@ fn false_painted_text_checks_short_circuit_natural_verification_without_a_provid
     assert_eq!(report.verdicts[0].result, VerdictResult::NotRun);
     assert_eq!(report.record["provider"], Value::Null);
 }
+
+#[test]
+fn painted_text_requires_traversal_but_ignores_legacy_channel_truncation() {
+    let baseline = serde_json::to_value(page("Ready", "$0.00", true)).unwrap();
+    for (field, value) in [
+        ("viewport_complete", json!(false)),
+        ("open_shadow_roots", json!(false)),
+        ("slots", json!(false)),
+        ("same_origin_frames", json!(false)),
+        ("gaps", json!(["closed_shadow_root"])),
+        ("gaps", json!(["canvas"])),
+        ("gaps", json!(["generated_content"])),
+        (
+            "gaps",
+            json!(["covered_text_truncated", "cross_origin_frame"]),
+        ),
+    ] {
+        let mut wire = baseline.clone();
+        wire["coverage"][field] = value;
+        let observed = serde_json::from_value(wire).unwrap();
+        for kind in ["text_visible", "text_absent"] {
+            assert_eq!(
+                check(
+                    json!({kind:"Missing","include_aria_hidden":true}),
+                    &observed
+                )
+                .0,
+                DoneResult::Unknown
+            );
+        }
+        assert_eq!(
+            check(
+                json!({"text_visible":"$0.00","include_aria_hidden":true}),
+                &observed
+            )
+            .0,
+            DoneResult::Satisfied
+        );
+    }
+    for gap in [
+        "visible_text_truncated",
+        "covered_text_truncated",
+        "dialog_text_truncated",
+    ] {
+        let mut wire = baseline.clone();
+        wire["coverage"]["viewport_complete"] = json!(false);
+        wire["coverage"]["gaps"] = json!([gap]);
+        let observed = serde_json::from_value(wire).unwrap();
+        assert_eq!(
+            check(
+                json!({"text_absent":"Missing","include_aria_hidden":true,"scope":"viewport"}),
+                &observed
+            )
+            .0,
+            DoneResult::Satisfied
+        );
+        assert_eq!(
+            check(json!({"text_absent":"Missing"}), &observed).0,
+            DoneResult::Unknown
+        );
+    }
+}
+
+#[test]
+fn unique_dialog_requires_a_unique_inventory_in_the_selected_observation() {
+    let mut wire = serde_json::to_value(page("Ready", "$0.00", true)).unwrap();
+    wire["dialogs"] = json!(["Details"]);
+    wire["dialog_texts"] = json!({"Details":"Legacy amount"});
+    for inventories in [
+        json!({}),
+        json!({"Details":inventory("", "$0.00", true),"DETAILS":inventory("", "$0.00", true)}),
+    ] {
+        wire["painted_text"]["dialogs"] = inventories;
+        let observed = serde_json::from_value(wire.clone()).unwrap();
+        let (outcome, evidence) = check(
+            json!({"text_absent":"Missing","scope":{"dialog":"Details"},"include_aria_hidden":true}),
+            &observed,
+        );
+        assert_eq!(outcome, DoneResult::Unknown);
+        assert_eq!(evidence["reason"], "incomplete_coverage");
+        assert_eq!(
+            check(
+                json!({"text_visible":"Legacy amount","scope":{"dialog":"Details"}}),
+                &observed
+            )
+            .0,
+            DoneResult::Satisfied
+        );
+    }
+}

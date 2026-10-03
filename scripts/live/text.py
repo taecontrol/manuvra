@@ -120,9 +120,9 @@ def artifacts(value):
     return result
 
 
-def terminal(case, value, state, channel=None, secret=False):
+def terminal(case, value, state, channel=None, secret=False, assisted=False):
     assert value['state'] == state and value['terminal'], value
-    assert not value['verdict']['caller_assisted'], value
+    assert value['verdict']['caller_assisted'] == assisted, value
     assert value['cleanup']['browser'] == 'closed' and value['cleanup']['profile'] == 'removed', value
     records = artifacts(value)
     verification = json.loads(records['verification'][0])
@@ -135,7 +135,7 @@ def terminal(case, value, state, channel=None, secret=False):
     if secret:
         assert all(b'$0.00' not in body for bodies in records.values() for body in bodies), 'classified amount leaked'
     SUMMARY.append({'case': case, 'state': state, 'channel': channel, 'provider_calls': 0,
-        'mutations': 0, 'caller_assisted': False, 'manifest': value['evidence']['manifest'],
+        'mutations': 0, 'caller_assisted': assisted, 'manifest': value['evidence']['manifest'],
         'digests_verified': True, 'cleanup': value['cleanup']})
     return verification
 
@@ -170,7 +170,7 @@ def matrix():
     write(path, {'schema_version': 1, 'escalation_id': value['escalation']['id'], 'disposition': {'kind': 'retry_observation'}})
     value = settle('retry', command('retry', 'resume', ['resume', value['run_id'], '--request-id',
         f'resume-retry-{ROOT.name}', '--input', str(path)]))
-    terminal('retry', value, 'passed', 'painted_aria_hidden')
+    terminal('retry', value, 'passed', 'painted_aria_hidden', assisted=True)
 
 
 if __name__ == '__main__':

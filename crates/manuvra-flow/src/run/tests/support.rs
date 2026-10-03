@@ -637,6 +637,7 @@ pub(crate) fn observed(text: &str) -> Observation {
         focus_anchor: None,
         visible_text: text.into(),
         covered_text: String::new(),
+        painted_text: None,
         colors: Vec::new(),
         colors_complete: false,
         color_scopes: Vec::new(),

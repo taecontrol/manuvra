@@ -12,8 +12,9 @@ pub use input::{
 };
 pub use observation::{
     ActiveDescendant, ColorChannel, ColorObservation, ColorScope, ColorScopeKind, ComputedColor,
-    Coverage, Element, FocusAnchor, FocusSurface, HoverRegion, Observation, Overlay, Rect,
-    ScrollPosition, ScrollRegion, ScrollTarget, SelectOption, ViewportState,
+    Coverage, Element, FocusAnchor, FocusSurface, HoverRegion, Observation, Overlay,
+    PaintedTextObservation, Rect, ScrollPosition, ScrollRegion, ScrollTarget, SelectOption,
+    TextInventory, ViewportState,
 };
 pub use owned::{
     BrowserConfig, BrowserError, BrowserProvenance, CapturedPage, OwnedBrowser, ProvenanceViewport,

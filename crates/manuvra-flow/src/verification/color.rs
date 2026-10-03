@@ -1,5 +1,5 @@
 //! Unique-owner resolution and foreground comparisons. Browser identities never leave here.
-use super::{DoneResult, viewport_complete};
+use super::viewport_complete;
 use manuvra_chrome::{ColorObservation, ColorScope, ColorScopeKind, Observation};
 use manuvra_contract::{
     ColorChannel, ColorCheck, ColorCheckEvidence, ColorComparator, ColorFailure, ColorTarget,
@@ -78,14 +78,6 @@ fn compare(
         VerdictResult::Satisfied
     } else {
         VerdictResult::NotSatisfied
-    }
-}
-
-pub(super) fn outcome(result: VerdictResult) -> DoneResult {
-    match result {
-        VerdictResult::Satisfied => DoneResult::Satisfied,
-        VerdictResult::NotSatisfied => DoneResult::NotSatisfied,
-        VerdictResult::Unresolved | VerdictResult::NotRun => DoneResult::Unknown,
     }
 }
 

@@ -193,12 +193,6 @@ impl ColorTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum AssertionCheck {
-    Color(ColorCheckEvidence),
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ColorCheckEvidence {
     pub target: ColorTargetEvidence,
     #[serde(skip_serializing_if = "Option::is_none")]

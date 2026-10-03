@@ -4,7 +4,10 @@ use serde_json::{Value, json};
 const TEXT_FIXTURE: &str = include_str!("../../../../tests/browser/text.html");
 
 fn snapshot(browser: &OwnedBrowser) -> Value {
-    serde_json::to_value(browser.observe().unwrap()).unwrap()
+    let observation = browser.observe().unwrap();
+    let mut wire = serde_json::to_value(&observation).unwrap();
+    wire["colors_complete"] = json!(observation.colors_complete);
+    wire
 }
 
 #[test]
@@ -134,5 +137,51 @@ fn painted_text_is_bounded_independently_of_the_color_owner_limit() {
             8000
         );
     }
+    browser.close().unwrap();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn painted_text_truncation_keeps_unicode_valid_without_breaking_default_observation() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let prefix = "x".repeat(7999);
+    let server = FixtureServer::with_body(&format!(
+        "<!doctype html><meta charset='utf-8'><p>Ready</p><span inert>I</span><span aria-hidden='true' style='font:1px system-ui'>{prefix}🔥</span>"
+    ));
+    let mut browser = launch_headless();
+    browser.navigate(&server.url()).unwrap();
+    let observed = snapshot(&browser);
+    assert_eq!(observed["visible_text"], "Ready");
+    assert_eq!(observed["painted_text"]["viewport"]["complete"], false);
+    assert_eq!(
+        observed["painted_text"]["viewport"]["painted_aria_hidden"],
+        prefix
+    );
+    browser.close().unwrap();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn bare_shadow_and_assigned_text_follow_their_painted_parent() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(
+        "<!doctype html><p>Ready</p><div id='bare' aria-hidden='true'></div><div id='assigned'>Assigned amount</div><div id='inert'>Inert assigned amount</div><script>
+        bare.attachShadow({mode:'open'}).textContent='Bare shadow amount';
+        assigned.attachShadow({mode:'open'}).innerHTML='<div aria-hidden=true><slot></slot></div>';
+        inert.attachShadow({mode:'open'}).innerHTML='<div inert><slot></slot></div>';
+        </script>",
+    );
+    let mut browser = launch_headless();
+    browser.navigate(&server.url()).unwrap();
+    let observed = snapshot(&browser);
+    let viewport = &observed["painted_text"]["viewport"];
+    assert_eq!(viewport["complete"], true);
+    let accessible = viewport["accessible"].as_str().unwrap();
+    let hidden = viewport["painted_aria_hidden"].as_str().unwrap();
+    assert!(hidden.contains("Bare shadow amount"));
+    assert!(hidden.contains("Assigned amount"));
+    assert!(!accessible.contains("Assigned amount"));
+    assert!(!accessible.contains("Inert assigned amount"));
+    assert!(!hidden.contains("Inert assigned amount"));
     browser.close().unwrap();
 }

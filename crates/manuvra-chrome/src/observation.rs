@@ -19,6 +19,9 @@ pub struct Observation {
     pub visible_text: String,
     #[serde(default)]
     pub covered_text: String,
+    /// Strict painted text for explicit opt-in checks; absent in older observations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub painted_text: Option<PaintedTextObservation>,
     #[serde(default)]
     pub dialog_texts: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -47,6 +50,21 @@ pub struct Observation {
     /// CSSOM hover rules could not be read. Detection-only; not a coverage gap.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hover_rules_unreadable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaintedTextObservation {
+    pub viewport: TextInventory,
+    #[serde(default)]
+    pub dialogs: BTreeMap<String, TextInventory>,
+}
+
+/// Bounded text channels whose completeness does not change legacy coverage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextInventory {
+    pub accessible: String,
+    pub painted_aria_hidden: String,
+    pub complete: bool,
 }
 
 /// An exact painted text segment or indexed control and its own computed foreground color.

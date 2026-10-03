@@ -73,6 +73,7 @@ fn incomplete_painted_text_allows_only_retry_or_abort_and_retry_reads_fresh_text
     assert!(!machine.verification_complete);
     assert!(!machine.artifacts.caller_assisted);
     dispose(&mut machine, retry(), &browser, &NoProvider, &mut journal);
+    drive(&mut machine, &browser, &NoProvider, &mut journal);
     assert!(machine.verification_complete);
     assert_eq!(
         machine.artifacts.expectation_verdicts[0].result,

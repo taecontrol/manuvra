@@ -63,17 +63,22 @@ fn capture_assertions(
     sensitive: &[String],
     assertions: &[Assertion],
 ) -> Result<CapturedPage, BrowserError> {
-    if !assertions
-        .iter()
-        .any(|assertion| matches!(assertion, Assertion::Color(_)))
-    {
+    if !assertions.iter().any(needs_painted_fence) {
         return browser.capture_redacted_page(sensitive);
     }
-    let facts = |observation: &Observation| {
-        crate::verification::color_assertion_checks(assertions, observation)
-    };
+    let facts =
+        |observation: &Observation| crate::verification::assertion_checks(assertions, observation);
     browser
         .capture_redacted_matching_page(sensitive, &|before, after| facts(before) == facts(after))
+}
+
+fn needs_painted_fence(assertion: &Assertion) -> bool {
+    match assertion {
+        Assertion::Color(_) => true,
+        Assertion::TextVisible(wanted) => wanted.include_aria_hidden,
+        Assertion::TextAbsent(wanted) => wanted.include_aria_hidden,
+        _ => false,
+    }
 }
 
 pub(super) fn done_assertions(done: &DoneCondition) -> &[Assertion] {
@@ -185,8 +190,32 @@ fn redacted_observation(raw: &Observation, redactor: &Redactor) -> Result<Value,
         fields.extend(exported_hover_regions(raw, redactor));
         fields.extend(exported_scroll_regions(raw, redactor));
         fields.extend(exported_colors(raw, redactor));
+        if let Some(painted) = &raw.painted_text {
+            fields.insert(
+                "painted_text".into(),
+                exported_painted_text(painted, redactor),
+            );
+        }
     }
     Ok(exported)
+}
+
+fn exported_painted_text(
+    painted: &manuvra_chrome::PaintedTextObservation,
+    redactor: &Redactor,
+) -> Value {
+    let inventory = |text: &manuvra_chrome::TextInventory| {
+        json!({
+            "accessible":redactor.redact_external_text(&text.accessible),
+            "painted_aria_hidden":redactor.redact_external_text(&text.painted_aria_hidden),
+            "complete":text.complete,
+        })
+    };
+    json!({
+        "viewport":inventory(&painted.viewport),
+        "dialogs":painted.dialogs.iter().map(|(name,text)|
+            (redactor.redact_external_text(name),inventory(text))).collect::<BTreeMap<_,_>>(),
+    })
 }
 
 fn exported_colors(raw: &Observation, redactor: &Redactor) -> Vec<(String, Value)> {
@@ -274,7 +303,7 @@ pub(super) fn record_capture(
     let mut record =
         json!({"event":event,"step_id":redactor.redact_export_text(&step.id),"done":done});
     if let manuvra_contract::DoneCondition::Structured(assertions) = &step.done_when {
-        let checks = crate::verification::color_assertion_checks(assertions, &captured.raw);
+        let checks = crate::verification::assertion_checks(assertions, &captured.raw);
         if !checks.is_empty() {
             record["assertion_checks"] = json!(crate::evidence::redacted_assertion_checks(
                 &checks, redactor

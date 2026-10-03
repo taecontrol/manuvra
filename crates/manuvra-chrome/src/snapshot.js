@@ -591,6 +591,33 @@
   }));
 
   const TEXT_LIMIT = 8000;
+  // Text inventories have their own budget; the capped color-owner list cannot prove absence.
+  const textInventory = () => ({accessible:'',painted_aria_hidden:'',complete:true});
+  const viewportText = textInventory(), dialogTextInventories = new Map(dialogRecords.map(record=>[record.dialog,textInventory()]));
+  const seenPaintedTexts = new Set();
+  const appendPaintedText = (inventory, channel, value) => {
+    const separator = inventory[channel] ? '\n' : '', available = TEXT_LIMIT - inventory[channel].length;
+    const addition = separator + value;
+    // A UTF-16 cut through a surrogate pair would make the whole CDP JSON unreadable.
+    const retained = addition.slice(0, Math.max(0,available)).replace(/[\uD800-\uDBFF]$/, '');
+    inventory[channel] += retained;
+    if (addition.length > available) inventory.complete = false;
+  };
+  const addPaintedText = (node, element, context, value, rects) => {
+    if (seenPaintedTexts.has(node)) return;
+    seenPaintedTexts.add(node);
+    if (!colorEligible(element)) return;
+    const lineage = colorAncestors(element);
+    const inventories = [viewportText,...lineage.filter(node=>dialogTextInventories.has(node)).map(node=>dialogTextInventories.get(node))];
+    const paint = colorPaint(element,context,rects);
+    if (!paint.complete) { for (const inventory of inventories) inventory.complete = false; return; }
+    if (!paint.intersects) return;
+    const rgba = canonicalColor(viewOfElement(element).getComputedStyle(element).color);
+    if (!rgba) { for (const inventory of inventories) inventory.complete = false; return; }
+    if (rgba[3] === 0) return;
+    const channel = lineage.some(node=>node.matches?.('[aria-hidden="true"]')) ? 'painted_aria_hidden' : 'accessible';
+    for (const inventory of inventories) appendPaintedText(inventory,channel,value);
+  };
   const seenColorTexts = new Set();
   const visibleText = [], coveredText = []; let visibleLength = 0, coveredLength = 0;
   const appendText = (parts, value, kind, length) => {
@@ -606,6 +633,11 @@
     const walker = owner.createTreeWalker(context.root, NodeFilter.SHOW_TEXT), range = owner.createRange(); let current;
     while ((current = walker.nextNode())) {
       const value = current.textContent.replace(/\s+/g,' ').trim(), parent = current.parentElement;
+      const paintedParent = current.assignedSlot || parent || current.getRootNode()?.host;
+      if (value && paintedParent && !paintedParent.closest('script,style,noscript,template')) {
+        range.selectNodeContents(current);
+        addPaintedText(current,paintedParent,context,value,[...range.getClientRects()]);
+      }
       if (!value || !parent || parent.closest('script,style,noscript,template')) continue;
       range.selectNodeContents(current); const bounds = clippingRect(parent, context, true, true);
       const intersects = [...range.getClientRects()].some(r => r.width > 0 && r.height > 0 && polygonArea(clippedPolygon(rectPoints(r),bounds)) > 0);
@@ -668,5 +700,6 @@
     dialogTexts[record.title] = text.slice(0,TEXT_LIMIT);
   }
   const finalGaps = [...new Set(gaps)], truncated = finalGaps.some(gap => gap.endsWith('_truncated'));
-  return {document_id:String(performance.timeOrigin),url:location.href,route:location.pathname+location.search,title:document.title,dialogs,focused,focus_anchor:focusAnchor,visible_text:visibleText.join('\n'),covered_text:coveredText.join('\n'),dialog_texts:dialogTexts,elements,colors,colors_complete:colorsComplete,color_scopes:colorScopes,viewport:{width:innerWidth,height:innerHeight,scroll_x:scrollX,scroll_y:scrollY,document_height:document.documentElement.scrollHeight},coverage:{viewport_complete:!truncated,open_shadow_roots:true,slots:true,same_origin_frames:!finalGaps.includes('cross_origin_frame'),gaps:finalGaps},overlay:topOverlay?{node_id:nodeId(topOverlay.element),name:topOverlay.name}:null,scroll_regions:scrollRegions,scroll_regions_truncated:scrollNodes.length>REGION_LIMIT,hover_rules_unreadable:hoverRulesUnreadable,hover_regions:hoverRegions,hover_regions_truncated:regionRecords.size > REGION_LIMIT};
+  const paintedText = {viewport:viewportText,dialogs:Object.fromEntries(dialogRecords.map(record=>[record.title,dialogTextInventories.get(record.dialog)]))};
+  return {document_id:String(performance.timeOrigin),url:location.href,route:location.pathname+location.search,title:document.title,dialogs,focused,focus_anchor:focusAnchor,visible_text:visibleText.join('\n'),covered_text:coveredText.join('\n'),dialog_texts:dialogTexts,painted_text:paintedText,elements,colors,colors_complete:colorsComplete,color_scopes:colorScopes,viewport:{width:innerWidth,height:innerHeight,scroll_x:scrollX,scroll_y:scrollY,document_height:document.documentElement.scrollHeight},coverage:{viewport_complete:!truncated,open_shadow_roots:true,slots:true,same_origin_frames:!finalGaps.includes('cross_origin_frame'),gaps:finalGaps},overlay:topOverlay?{node_id:nodeId(topOverlay.element),name:topOverlay.name}:null,scroll_regions:scrollRegions,scroll_regions_truncated:scrollNodes.length>REGION_LIMIT,hover_rules_unreadable:hoverRulesUnreadable,hover_regions:hoverRegions,hover_regions_truncated:regionRecords.size > REGION_LIMIT};
 })()
