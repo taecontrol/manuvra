@@ -73,6 +73,10 @@ fn painted_text_inventory_follows_composed_ancestors_and_excludes_unpainted_cont
         );
     }
     assert!(hidden.contains("Amount spaced"));
+    assert!(
+        hidden.contains("Segment start\nSegment end"),
+        "normalized-empty painted segments must not change the searchable text: {snapshot}"
+    );
     browser.close().unwrap();
 }
 
