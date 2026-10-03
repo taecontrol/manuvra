@@ -594,7 +594,6 @@
   // Text inventories have their own budget; the capped color-owner list cannot prove absence.
   const textInventory = () => ({accessible:'',painted_aria_hidden:'',complete:true});
   const viewportText = textInventory(), dialogTextInventories = new Map(dialogRecords.map(record=>[record.dialog,textInventory()]));
-  const seenPaintedTexts = new Set();
   const appendPaintedText = (inventory, channel, value) => {
     const separator = inventory[channel] ? '\n' : '', available = TEXT_LIMIT - inventory[channel].length;
     const addition = separator + value;
@@ -603,9 +602,7 @@
     inventory[channel] += retained;
     if (addition.length > available) inventory.complete = false;
   };
-  const addPaintedText = (node, element, context, value, rects) => {
-    if (seenPaintedTexts.has(node)) return;
-    seenPaintedTexts.add(node);
+  const addPaintedText = (element, context, value, rects) => {
     if (!colorEligible(element)) return;
     const lineage = colorAncestors(element);
     const inventories = [viewportText,...lineage.filter(node=>dialogTextInventories.has(node)).map(node=>dialogTextInventories.get(node))];
@@ -636,7 +633,7 @@
       const paintedParent = current.assignedSlot || parent || current.getRootNode()?.host;
       if (value && paintedParent && !paintedParent.closest('script,style,noscript,template')) {
         range.selectNodeContents(current);
-        addPaintedText(current,paintedParent,context,value,[...range.getClientRects()]);
+        addPaintedText(paintedParent,context,value,[...range.getClientRects()]);
       }
       if (!value || !parent || parent.closest('script,style,noscript,template')) continue;
       range.selectNodeContents(current); const bounds = clippingRect(parent, context, true, true);

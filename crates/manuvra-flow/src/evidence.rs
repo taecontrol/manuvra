@@ -458,7 +458,6 @@ fn is_protocol_collision(value: &str) -> bool {
         "include_aria_hidden",
         "searched_channels",
         "matched_channel",
-        "dialog_text",
         "ambiguous_or_missing_scope",
         "paint_complete",
         "missing",
