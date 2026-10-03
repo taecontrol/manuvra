@@ -53,7 +53,8 @@
   // Text without layout (inside display:none, a hidden input, or head) is never painted;
   // a control's text is matched through the control itself.
   const laidOut = (node) => { const range = node.ownerDocument.createRange(); range.selectNodeContents(node); return range.getClientRects().length > 0; };
-  const unpaintedText = (node) => !node.parentElement || node.parentElement.closest('script,style,noscript,template,textarea,select') || !laidOut(node);
+  // A laid-out range also paints when its parent is boxless or the shadow root itself.
+  const unpaintedText = (node) => node.parentElement?.closest('script,style,noscript,template,textarea,select') || !laidOut(node);
   const boxless = (element) => !painted(element) && element.ownerDocument.defaultView.getComputedStyle(element).display !== 'contents';
 
   for (const context of contexts) {

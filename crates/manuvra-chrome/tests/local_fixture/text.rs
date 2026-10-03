@@ -263,3 +263,75 @@ fn bare_shadow_and_assigned_text_follow_their_painted_parent() {
     assert!(!hidden.contains("Inert assigned amount"));
     browser.close().unwrap();
 }
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn classified_bare_shadow_text_is_masked_in_the_screenshot() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let secret = "bare-shadow-secret";
+    let server = FixtureServer::with_body(
+        "<!doctype html><p>Ready</p><div id='bare' aria-hidden='true' style='font:20px system-ui'></div><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret'</script>",
+    );
+    let mut browser = launch_headless();
+    browser.navigate(&server.url()).unwrap();
+    let plain = browser.capture().unwrap();
+    let masked = browser.capture_redacted(&[secret.into()]).unwrap();
+    browser.close().unwrap();
+    if let Some(directory) = std::env::var_os("MANUVRA_FIXTURE_EVIDENCE") {
+        let directory = PathBuf::from(directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("painted-shadow-secret.png"),
+            &masked.screenshot.bytes,
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        masked
+            .observation
+            .painted_text
+            .as_ref()
+            .unwrap()
+            .viewport
+            .painted_aria_hidden,
+        secret
+    );
+    assert!(masked.redaction.verifies(1));
+    assert_eq!(masked.redaction.matched_values, 1);
+    assert!(masked.redaction.mask_count >= 1);
+    assert_ne!(plain.screenshot.bytes, masked.screenshot.bytes);
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn classified_boxless_and_assigned_text_is_masked_in_the_screenshot() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    for body in [
+        "<span aria-hidden='true' style='display:contents'>painted-secret</span>",
+        "<div id='assigned'>painted-secret</div><script>assigned.attachShadow({mode:'open'}).innerHTML='<span aria-hidden=true style=display:contents><slot></slot></span>'</script>",
+    ] {
+        let server = FixtureServer::with_body(&format!("<!doctype html><p>Ready</p>{body}"));
+        let mut browser = launch_headless();
+        browser.navigate(&server.url()).unwrap();
+        let plain = browser.capture().unwrap();
+        let masked = browser
+            .capture_redacted(&["painted-secret".into()])
+            .unwrap();
+        browser.close().unwrap();
+        assert!(
+            masked
+                .observation
+                .painted_text
+                .as_ref()
+                .unwrap()
+                .viewport
+                .painted_aria_hidden
+                .contains("painted-secret"),
+            "{body}"
+        );
+        assert!(masked.redaction.verifies(1));
+        assert_eq!(masked.redaction.matched_values, 1);
+        assert!(masked.redaction.mask_count >= 1);
+        assert_ne!(plain.screenshot.bytes, masked.screenshot.bytes);
+    }
+}
