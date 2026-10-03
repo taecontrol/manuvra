@@ -3,6 +3,47 @@ use serde_json::{Value, json};
 
 #[test]
 #[ignore = "requires the local Chromium executable"]
+fn classified_fixed_normalized_source_animation_triggered_by_masks_is_withheld() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(
+        "<!doctype html><style>@keyframes slide{from{transform:translateX(0)}to{transform:translateX(500px)}}#bare{display:inline-block;position:fixed}html:has(>div) #bare{animation:slide .1s linear infinite alternate}</style><p>Ready</p><span id='bare' aria-hidden='true'></span><script>bare.attachShadow({mode:'open'}).textContent='bare   shadow   secret'</script>",
+    );
+    let mut browser = launch_headless();
+    browser.navigate(&server.url()).unwrap();
+    let observed = browser.observe().unwrap();
+    assert!(
+        observed
+            .painted_text
+            .as_ref()
+            .unwrap()
+            .viewport
+            .painted_aria_hidden
+            .contains("bare shadow secret")
+    );
+    let result = browser.capture_redacted(&["bare shadow secret".into()]);
+    if let Ok(masked) = &result {
+        eprintln!(
+            "mask-triggered source animation proof {:?}",
+            masked.redaction
+        );
+        if let Some(directory) = std::env::var_os("MANUVRA_FIXTURE_EVIDENCE") {
+            let directory = PathBuf::from(directory);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                directory.join("fixed-normalized-mask-triggered-animation.png"),
+                &masked.screenshot.bytes,
+            )
+            .unwrap();
+        }
+    }
+    browser.close().unwrap();
+    assert!(
+        matches!(result, Err(BrowserError::Control(message)) if message == "redaction_unverifiable")
+    );
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
 fn classified_source_animation_triggered_by_masks_is_withheld() {
     let _serial = REAL_BROWSER.lock().unwrap();
     let server = FixtureServer::with_body(
@@ -415,6 +456,7 @@ fn classified_boxless_and_assigned_text_is_masked_in_the_screenshot() {
         r#"<iframe aria-hidden='true' style='border:0;transform:translate(20px,20px)' srcdoc='<span>painted-secret</span>'></iframe>"#,
         "<style>html{margin:50px;filter:opacity(1)}</style><span aria-hidden='true'>painted-secret</span>",
         "<style>@keyframes spin{to{transform:rotate(360deg)}}#unrelated{position:fixed;right:0;top:0;animation:spin 1s linear infinite}</style><span id='unrelated'>Spinner</span><span aria-hidden='true'>painted-secret</span>",
+        r#"<iframe style='width:120px;height:50px;border:0' srcdoc="<style>@keyframes grow{from{width:10px}to{width:60px}}span{display:inline-block;animation:grow 1s linear infinite alternate}</style><span>Spinner</span>"></iframe><span aria-hidden='true'>painted-secret</span>"#,
         "<div id='assigned'>painted-secret</div><script>assigned.attachShadow({mode:'open'}).innerHTML='<span aria-hidden=true style=display:contents><slot></slot></span>'</script>",
     ] {
         let server = FixtureServer::with_body(&format!("<!doctype html><p>Ready</p>{body}"));
