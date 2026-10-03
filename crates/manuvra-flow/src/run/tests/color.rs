@@ -185,3 +185,38 @@ fn structured_final_consumes_no_model_call_even_when_the_budget_is_used() {
     assert!(machine.artifacts.stop.is_none());
     assert!(!machine.artifacts.caller_assisted);
 }
+
+#[test]
+fn classified_color_protocol_words_preserve_typed_escalation_verdicts() {
+    for classified in ["color", "comparator", "unresolved"] {
+        let mut wire = serde_json::to_value(job(false)).unwrap();
+        wire["values"] =
+            json!({"marker":{"value":classified,"description":"classified text","secret":true}});
+        wire["expectations"][0]["assertions"][0]["color"]["target"]["text"] = json!(classified);
+        let job = parse_job(wire);
+        let mut snapshot = serde_json::to_value(page(Some([185, 28, 28, 255]))).unwrap();
+        snapshot["colors"][0]["text"] = json!(classified);
+        let mut duplicate = snapshot["colors"][0].clone();
+        duplicate["node_id"] = json!(2);
+        snapshot["colors"].as_array_mut().unwrap().push(duplicate);
+        let browser = FakeBrowser::new([serde_json::from_value(snapshot).unwrap()]);
+        let artifacts = driven(&job, &browser, &NoProvider, &mut MemoryJournal::default());
+        assert_eq!(
+            artifacts.stop.as_ref().unwrap().code,
+            "verification_uncertain"
+        );
+        let payload = &artifacts.escalations.last().unwrap().1;
+        let verdicts: Vec<manuvra_contract::ExpectationVerdict> =
+            serde_json::from_value(payload["expectations"].clone())
+                .expect("classified text cannot corrupt typed color fields or enum values");
+        assert_eq!(verdicts, artifacts.expectation_verdicts);
+        let redactor = Redactor::for_job(&job).unwrap();
+        let check = &payload["expectations"][0]["assertion_checks"][0]["color"];
+        assert_eq!(
+            check["target"]["selector"]["text"],
+            redactor.redact_export_text(classified)
+        );
+        assert_eq!(check["result"], "unresolved");
+        assert_eq!(check["comparator"], "equals");
+    }
+}

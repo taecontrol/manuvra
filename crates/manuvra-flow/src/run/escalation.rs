@@ -108,11 +108,10 @@ pub(super) fn escalate_verification(
     let id = format!("e_{}", artifacts.escalations.len() + 1);
     let stopped = stopped_at();
     let observation = latest_observation(artifacts);
-    let payload = redacted_value(
+    let mut payload = redacted_value(
         &json!({
             "id":id,
             "phase":"verification",
-            "expectations":artifacts.expectation_verdicts,
             "observation":observation,
             "verification":"verification/final.json",
             "gate_reason":reason,
@@ -120,6 +119,8 @@ pub(super) fn escalate_verification(
         }),
         redactor,
     );
+    // Verdicts already redact caller/page strings while preserving the typed protocol.
+    payload["expectations"] = json!(artifacts.expectation_verdicts);
     artifacts.escalations.push((id.clone(), payload));
     artifacts.escalation = Some(Escalation {
         id: id.clone(),
