@@ -3,6 +3,47 @@ use serde_json::{Value, json};
 
 #[test]
 #[ignore = "requires the local Chromium executable"]
+fn classified_source_animation_triggered_by_masks_is_withheld() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(
+        "<!doctype html><style>@keyframes slide{from{transform:translateX(0)}to{transform:translateX(500px)}}#bare{display:inline-block}html:has(>div) #bare{animation:slide .1s linear infinite alternate}</style><p>Ready</p><span id='bare' aria-hidden='true'></span><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret'</script>",
+    );
+    let mut browser = launch_headless();
+    browser.navigate(&server.url()).unwrap();
+    let observed = browser.observe().unwrap();
+    assert!(
+        observed
+            .painted_text
+            .as_ref()
+            .unwrap()
+            .viewport
+            .painted_aria_hidden
+            .contains("bare-shadow-secret")
+    );
+    let result = browser.capture_redacted(&["bare-shadow-secret".into()]);
+    if let Ok(masked) = &result {
+        eprintln!(
+            "mask-triggered source animation proof {:?}",
+            masked.redaction
+        );
+        if let Some(directory) = std::env::var_os("MANUVRA_FIXTURE_EVIDENCE") {
+            let directory = PathBuf::from(directory);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                directory.join("mask-triggered-animation.png"),
+                &masked.screenshot.bytes,
+            )
+            .unwrap();
+        }
+    }
+    browser.close().unwrap();
+    assert!(
+        matches!(result, Err(BrowserError::Control(message)) if message == "redaction_unverifiable")
+    );
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
 fn classified_shadow_animation_cannot_publish_unfenced_masking() {
     let _serial = REAL_BROWSER.lock().unwrap();
     let server = FixtureServer::with_body(
@@ -421,6 +462,8 @@ fn classified_shadow_text_with_unsupported_mask_geometry_is_withheld() {
         r#"<iframe aria-hidden='true' style='border:0;filter:drop-shadow(0 40px 0 black)' srcdoc="<span>bare-shadow-secret</span>"></iframe>"#,
         r#"<iframe aria-hidden='true' style='margin:100px;width:400px;height:200px;border:0;rotate:15deg' srcdoc="<span>bare-shadow-secret</span>"></iframe>"#,
         r#"<iframe aria-hidden='true' style='margin:100px;width:400px;height:200px;border:0;scale:2' srcdoc="<span>bare-shadow-secret</span>"></iframe>"#,
+        r#"<iframe aria-hidden='true' style='margin:100px;width:400px;height:200px;border:0;zoom:2' srcdoc="<span>bare-shadow-secret</span>"></iframe>"#,
+        "<span id='bare' aria-hidden='true' style='display:inline-block;margin-top:150px;margin-left:150px;font:32px monospace'></span><script>const shadow=bare.attachShadow({mode:'open'});shadow.textContent='bare-shadow-secret';const range=document.createRange();range.selectNodeContents(shadow.firstChild);const r=range.getBoundingClientRect();document.documentElement.style.transformOrigin=`${r.x+r.width/2}px ${r.y+r.height/2}px`;document.documentElement.style.transform='rotate(45deg)'</script>",
         "<div id='bare' aria-hidden='true' style='text-shadow:0 40px black'></div><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret'</script>",
         "<div id='bare' aria-hidden='true' style='filter:drop-shadow(0 40px 0 black)'></div><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret'</script>",
         "<style>@keyframes grow{from{width:0}to{width:500px}}#row{display:flex}#sibling{flex:none;animation:grow .1s linear infinite alternate}</style><div id='row'><div id='sibling'>Spacer</div><div id='bare' aria-hidden='true'></div></div><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret'</script>",
