@@ -125,6 +125,10 @@ Write each step as one visible transition. The `goal` says what the browser shou
 
 Values have stable names so Jev can select a value without inventing one. Mark sensitive values with `"secret": true`. Keep jobs that contain classified values outside the repository and restrict their file mode to `0600`.
 
+Text checks use case-sensitive substring matching. Add `"include_aria_hidden": true` to either `text_visible` or `text_absent` to search both accessible and painted `aria-hidden` text, for example `{"text_visible":"$0.00","include_aria_hidden":true}`. Accessible names alone do not count as text. Optional `"scope":{"dialog":"Month details"}` selects one uniquely named dialog, case-insensitively; otherwise the check searches the viewport. Channels are searched separately, with accessible text taking precedence when both match. Step traces and final `assertion_checks` record `searched_channels` and nullable `matched_channel`.
+
+Omitting the flag or setting it to false preserves existing results. Default dialog checks retain their `innerText` source (`dialog_text` in evidence), which can include aria-hidden and inert text. The explicit opt-in uses strict painted sources even inside dialogs: inert, hidden, zero-opacity, zero-alpha, fully clipped, and offscreen text cannot match. A retained match establishes presence despite incomplete coverage; without a match, missing inventories, truncation, traversal gaps, or unsupported paint geometry leave the check unresolved. Each painted channel is bounded to 8,000 characters per viewport or dialog.
+
 Final expectations can use the same structured assertions as `done_when`:
 
 ```json
@@ -137,7 +141,7 @@ Final expectations can use the same structured assertions as `done_when`:
 }
 ```
 
-Color checks read foreground `color` from a unique painted owner. Use `text` for one exact text segment after whitespace normalization, or `name` for an indexed control's accessible name (case-insensitive), with an optional `role`. Add `dialog` or `container` to either target to resolve repeated owners; the scope must also be unique. Painted `aria-hidden` text is eligible and its evidence channel is recorded. Existing text assertions retain their accessibility behavior.
+Color checks read foreground `color` from a unique painted owner. Use `text` for one exact text segment after whitespace normalization, or `name` for an indexed control's accessible name (case-insensitive), with an optional `role`. Add `dialog` or `container` to either target to resolve repeated owners; the scope must also be unique. Painted `aria-hidden` text is eligible and its evidence channel is recorded.
 
 Choose exactly one comparison: `equals` with `#RRGGBB` or `#RRGGBBAA`, `same_as` with another target, or `different_from` with another target. An optional integer `tolerance` from 0 to 255 defaults to zero and bounds the maximum RGBA channel difference. Computed colors use straight, clamped eight-bit sRGB with alpha quantized independently. Evidence retains both the raw computed color and canonical RGBA. Hidden, inert, clipped, offscreen, and zero-alpha owners cannot satisfy a check; ambiguity and incomplete or unsupported observations stay unresolved. Text split across descendants requires a different target.
 
@@ -206,6 +210,8 @@ Request ids are idempotency keys. Reusing an id with the same input recovers the
 
 Each run has a private directory beneath the requested evidence root. Its `manifest.json` lists every artifact by role, absolute path, SHA-256 digest, and completeness. Depending on the run, evidence includes the redacted job, provenance, checkpoints, observations, screenshots, decisions, step facts, action trace, escalations, dispositions, final verification, and cleanup state.
 
+When screenshot masking cannot be verified, Manuvra retains the redacted observation, withholds the PNG, and blocks the run as `redaction_unverifiable`.
+
 In `provenance.json`, `viewport.width` and `viewport.height` are the requested CSS dimensions, including the default 1120×780 when the Job omits a viewport. `viewport.initial_client_width` is the target's measured `document.documentElement.clientWidth` after the start URL settles and before Step input. It is an initial sample retained through later navigation and Run recovery, not a measurement of the current page or its descendant content. It is `null` when navigation fails before measurement; a failed or invalid width read blocks the Run before its Steps. A launch failure may have no viewport provenance.
 
 Linux replaces a previously published Evidence directory with an atomic directory exchange. macOS uses a portable backup-then-rename replacement, so an abrupt machine or process failure can temporarily leave the final Evidence path absent. Treat Evidence as complete only when the returned result and manifest both say it is complete and every listed Artifact verifies; recover the durable Run with `status` after an interrupted caller.
@@ -240,7 +246,9 @@ cargo install cargo-llvm-cov --version 0.9.0 --locked
 
 `make live-self-test` checks the live-suite harnesses against synthetic input without a provider key, browser, or Money checkout. CI runs it on Linux and macOS.
 
-The live suites use real Jev judgments and a real browser against synthetic fixtures. Each needs `TYPESAFE_API_KEY` exported in the environment and retains timestamped, redacted Evidence under `.work/live/`. `make live-all` runs every suite below in sequence.
+The live suites use a real browser against synthetic fixtures and retain timestamped, redacted Evidence under `.work/live/`. Suites with Jev judgments need `TYPESAFE_API_KEY` exported in the environment. `make live-all` runs every suite below in sequence.
+
+`make live-text` owns a disposable loopback fixture and needs no provider key or Money checkout. It proves default and opt-in presence/absence checks, dialog isolation and compatibility, exclusions, classified text, mixed structured checks, and fresh painted text after an observation retry. Its report records zero provider calls and mutations, assistance, manifest integrity, and cleanup under `.work/live/text/`.
 
 `make live-color` owns a loopback color fixture and needs no Money checkout. It proves exact matching and mismatching checks without a provider, painted classified text, unresolved duplicates, one Jev-driven theme change, and a CSS-only change before mixed-verification `advance`. Its report records provider calls, mutations, assistance, manifest integrity, and cleanup under `.work/live/color/`.
 

@@ -16,6 +16,10 @@ mod viewport;
 mod color;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "cli/text.rs"]
+mod text;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct HttpFixture {
     address: std::net::SocketAddr,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,

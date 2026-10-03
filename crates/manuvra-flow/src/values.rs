@@ -205,6 +205,7 @@ mod tests {
             }),
             visible_text: "raw-secret-742".into(),
             covered_text: "RAW SECRET".into(),
+            painted_text: None,
             colors: Vec::new(),
             colors_complete: false,
             color_scopes: Vec::new(),

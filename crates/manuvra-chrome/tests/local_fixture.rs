@@ -33,6 +33,9 @@ mod viewport;
 #[path = "local_fixture/color.rs"]
 mod color;
 
+#[path = "local_fixture/text.rs"]
+mod text;
+
 /// The owned browser's process group and profile, observed from outside the crate.
 struct BrowserLifecycle {
     process_group: i32,
@@ -1669,6 +1672,7 @@ const UNPAINTED_SECRET_PAGE: &str = r#"<!doctype html><title>hidden-secret</titl
 <textarea hidden>hidden-secret</textarea>
 <iframe hidden srcdoc="<p>hidden-secret</p>"></iframe>
 <canvas hidden></canvas>
+<div id='hidden-shadow' style='display:none'></div><script>document.querySelector('#hidden-shadow').attachShadow({mode:'open'}).textContent='hidden-secret'</script>
 <p>Shown: <span style="display: contents">shown-secret</span></p>"#;
 
 #[test]

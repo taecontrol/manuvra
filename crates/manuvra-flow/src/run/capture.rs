@@ -63,17 +63,25 @@ fn capture_assertions(
     sensitive: &[String],
     assertions: &[Assertion],
 ) -> Result<CapturedPage, BrowserError> {
-    if !assertions
-        .iter()
-        .any(|assertion| matches!(assertion, Assertion::Color(_)))
-    {
+    if !assertions.iter().any(needs_painted_fence) {
         return browser.capture_redacted_page(sensitive);
     }
-    let facts = |observation: &Observation| {
-        crate::verification::color_assertion_checks(assertions, observation)
-    };
-    browser
-        .capture_redacted_matching_page(sensitive, &|before, after| facts(before) == facts(after))
+    let facts =
+        |observation: &Observation| crate::verification::assertion_checks(assertions, observation);
+    browser.capture_redacted_matching_page(sensitive, &|before, after| {
+        crate::verification::capture_stable(assertions, before)
+            && crate::verification::capture_stable(assertions, after)
+            && facts(before) == facts(after)
+    })
+}
+
+fn needs_painted_fence(assertion: &Assertion) -> bool {
+    match assertion {
+        Assertion::Color(_) => true,
+        Assertion::TextVisible(wanted) => wanted.include_aria_hidden,
+        Assertion::TextAbsent(wanted) => wanted.include_aria_hidden,
+        _ => false,
+    }
 }
 
 pub(super) fn done_assertions(done: &DoneCondition) -> &[Assertion] {
@@ -185,8 +193,32 @@ fn redacted_observation(raw: &Observation, redactor: &Redactor) -> Result<Value,
         fields.extend(exported_hover_regions(raw, redactor));
         fields.extend(exported_scroll_regions(raw, redactor));
         fields.extend(exported_colors(raw, redactor));
+        if let Some(painted) = &raw.painted_text {
+            fields.insert(
+                "painted_text".into(),
+                exported_painted_text(painted, redactor),
+            );
+        }
     }
     Ok(exported)
+}
+
+fn exported_painted_text(
+    painted: &manuvra_chrome::PaintedTextObservation,
+    redactor: &Redactor,
+) -> Value {
+    let inventory = |text: &manuvra_chrome::TextInventory| {
+        json!({
+            "accessible":redactor.redact_external_text(&text.accessible),
+            "painted_aria_hidden":redactor.redact_external_text(&text.painted_aria_hidden),
+            "complete":text.complete,
+        })
+    };
+    json!({
+        "viewport":inventory(&painted.viewport),
+        "dialogs":painted.dialogs.iter().map(|(name,text)|
+            (redactor.redact_external_text(name),inventory(text))).collect::<BTreeMap<_,_>>(),
+    })
 }
 
 fn exported_colors(raw: &Observation, redactor: &Redactor) -> Vec<(String, Value)> {
@@ -274,7 +306,7 @@ pub(super) fn record_capture(
     let mut record =
         json!({"event":event,"step_id":redactor.redact_export_text(&step.id),"done":done});
     if let manuvra_contract::DoneCondition::Structured(assertions) = &step.done_when {
-        let checks = crate::verification::color_assertion_checks(assertions, &captured.raw);
+        let checks = crate::verification::assertion_checks(assertions, &captured.raw);
         if !checks.is_empty() {
             record["assertion_checks"] = json!(crate::evidence::redacted_assertion_checks(
                 &checks, redactor
@@ -289,6 +321,153 @@ mod tests {
     use super::*;
     use crate::run::tests::support::*;
     use manuvra_chrome::{Element, FocusAnchor, Rect};
+
+    struct ColorEffectChangingBrowser {
+        before: Observation,
+        after: Observation,
+    }
+
+    impl BrowserPage for ColorEffectChangingBrowser {
+        fn capture_redacted_page(&self, _: &[String]) -> Result<CapturedPage, BrowserError> {
+            captured(self.before.clone())
+        }
+
+        fn capture_redacted_matching_page(
+            &self,
+            _: &[String],
+            unchanged: &dyn Fn(&Observation, &Observation) -> bool,
+        ) -> Result<CapturedPage, BrowserError> {
+            if unchanged(&self.before, &self.after) {
+                captured(self.before.clone())
+            } else {
+                Err(BrowserError::Control(
+                    "page changed throughout screenshot fencing".into(),
+                ))
+            }
+        }
+
+        fn observe_page(&self) -> Result<Observation, BrowserError> {
+            Ok(self.after.clone())
+        }
+    }
+
+    fn color_effect_observation(stable: bool) -> Observation {
+        let mut wire = serde_json::to_value(observed("Ready")).unwrap();
+        wire["colors_complete"] = json!(true);
+        wire["colors"] = json!([{
+            "node_id":1,"context":"main","text":"Amount","name":null,"role":null,
+            "in_dialog":null,"container":null,"dialog_node_id":null,"container_node_id":null,
+            "channel":"accessible","capture_stable":stable,
+            "color":{"raw":"rgb(185, 28, 28)","rgba":[185,28,28,255]}
+        }]);
+        serde_json::from_value(wire).unwrap()
+    }
+
+    #[test]
+    fn selected_color_capture_requires_stability_before_and_after_the_screenshot() {
+        let job = job("Ready");
+        let assertions: Vec<Assertion> = serde_json::from_value(json!([
+            {"color":{"target":{"text":"Amount"},"equals":"#b91c1c"}}
+        ]))
+        .unwrap();
+        for (before, after) in [(false, true), (true, false)] {
+            let browser = ColorEffectChangingBrowser {
+                before: color_effect_observation(before),
+                after: color_effect_observation(after),
+            };
+            assert!(
+                capture_step(
+                    &browser,
+                    &Redactor::for_job(&job).unwrap(),
+                    &assertions,
+                    0,
+                    1,
+                )
+                .is_err(),
+                "foreground activity at either observation epoch invalidates the capture"
+            );
+        }
+    }
+
+    struct PaintChangingBrowser {
+        before: Observation,
+        after: Observation,
+    }
+
+    impl BrowserPage for PaintChangingBrowser {
+        fn capture_redacted_page(
+            &self,
+            _sensitive: &[String],
+        ) -> Result<CapturedPage, BrowserError> {
+            captured(self.before.clone())
+        }
+
+        fn capture_redacted_matching_page(
+            &self,
+            _sensitive: &[String],
+            unchanged: &dyn Fn(&Observation, &Observation) -> bool,
+        ) -> Result<CapturedPage, BrowserError> {
+            if unchanged(&self.before, &self.after) {
+                captured(self.before.clone())
+            } else {
+                captured(self.after.clone())
+            }
+        }
+
+        fn observe_page(&self) -> Result<Observation, BrowserError> {
+            Ok(self.after.clone())
+        }
+    }
+
+    #[test]
+    fn painted_text_capture_retries_when_presence_or_absence_changes_during_the_screenshot() {
+        for (kind, expected) in [
+            ("text_visible", DoneResult::NotSatisfied),
+            ("text_absent", DoneResult::Satisfied),
+        ] {
+            let mut job = job("Ready");
+            job.steps[0].done_when = serde_json::from_value(json!([{
+                kind:"Amount","include_aria_hidden":true
+            }]))
+            .unwrap();
+            let mut before = observed("Ready");
+            before.painted_text = Some(manuvra_chrome::PaintedTextObservation {
+                viewport: manuvra_chrome::TextInventory {
+                    accessible: "Ready".into(),
+                    painted_aria_hidden: "Amount".into(),
+                    complete: true,
+                },
+                dialogs: BTreeMap::new(),
+            });
+            let mut after = before.clone();
+            after
+                .painted_text
+                .as_mut()
+                .unwrap()
+                .viewport
+                .painted_aria_hidden
+                .clear();
+            let browser = PaintChangingBrowser { before, after };
+            let assertions = done_assertions(&job.steps[0].done_when);
+            let captured = capture_step(
+                &browser,
+                &Redactor::for_job(&job).unwrap(),
+                assertions,
+                0,
+                1,
+            )
+            .unwrap();
+            assert_eq!(
+                crate::verification::evaluate_assertions(assertions, &captured.raw, &job.values)
+                    .outcome,
+                expected
+            );
+            assert_eq!(
+                captured.artifact.1["painted_text"]["viewport"]["painted_aria_hidden"],
+                ""
+            );
+        }
+    }
 
     #[test]
     fn unreadable_hover_rules_are_evidence_only_and_leave_done_coverage_intact() {

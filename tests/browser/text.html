@@ -1,0 +1,27 @@
+<!doctype html><meta charset="utf-8"><title>Painted text fixture</title>
+<style>
+body{margin:8px;font:14px system-ui;color:#1f2937}main{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}p{margin:3px}button{font:inherit;padding:4px}iframe{width:250px;height:55px;border:0}dialog[open]{position:static;margin:0;padding:6px}.amount{color:#b91c1c}
+</style>
+<h1>Ready</h1><main>
+<button aria-label="September 2026, current month, $0.00"><span>September 2026</span><span class="amount" aria-hidden="true">$0.00</span></button>
+<p>Accessible $1.00</p><p>Both $2.00 <span aria-hidden="true">$2.00</span></p>
+<p inert aria-hidden="true">$3.00</p><p hidden aria-hidden="true">$4.00</p><p style="opacity:0" aria-hidden="true">$5.00</p>
+<p style="color:transparent" aria-hidden="true">$6.00</p><p style="position:absolute;top:10000px" aria-hidden="true">$7.00</p>
+<div style="height:1px;overflow:hidden"><p style="margin-top:40px" aria-hidden="true">$8.00</p></div>
+<div aria-hidden="true"><span aria-hidden="false">$9.00</span><button>Hidden control</button></div>
+<p><span style="display:contents" aria-hidden="true">$10.00</span></p>
+<div id="shadow" aria-hidden="true"></div><div id="slotted"><span slot="amount">$12.00</span></div>
+<iframe aria-hidden="true" srcdoc="<p>$13.00</p>"></iframe>
+<div inert><iframe aria-hidden="true" srcdoc="<p>$14.00</p>"></iframe></div>
+<iframe style="opacity:0" aria-hidden="true" srcdoc="<p>$15.00</p>"></iframe>
+<dialog open aria-label="Month details"><p aria-hidden="true">$20.00</p><p inert>$21.00</p><p>Inside $22.00</p><div id="dialog-shadow"></div></dialog>
+<dialog open aria-label="Other details"><p aria-hidden="true">$23.00</p></dialog>
+<button aria-label="Amount $30.00">May 2026</button>
+<p>Cross<span aria-hidden="true">Boundary</span></p><p aria-hidden="true">Amount   spaced</p>
+<p aria-hidden="true" style="white-space:pre">Segment start<span>   </span>Segment end</p>
+</main>
+<script>
+document.getElementById('shadow').attachShadow({mode:'open'}).innerHTML='<p>$11.00</p><button>Shadow hidden control</button>';
+document.getElementById('slotted').attachShadow({mode:'open'}).innerHTML='<section aria-hidden="true"><slot name="amount"></slot></section>';
+document.getElementById('dialog-shadow').attachShadow({mode:'open'}).innerHTML='<p aria-hidden="true">$24.00</p>';
+</script>

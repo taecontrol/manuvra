@@ -19,6 +19,9 @@ pub struct Observation {
     pub visible_text: String,
     #[serde(default)]
     pub covered_text: String,
+    /// Strict painted text for explicit opt-in checks; absent in older observations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub painted_text: Option<PaintedTextObservation>,
     #[serde(default)]
     pub dialog_texts: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -49,6 +52,21 @@ pub struct Observation {
     pub hover_rules_unreadable: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaintedTextObservation {
+    pub viewport: TextInventory,
+    #[serde(default)]
+    pub dialogs: BTreeMap<String, TextInventory>,
+}
+
+/// Bounded text channels whose completeness does not change legacy coverage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextInventory {
+    pub accessible: String,
+    pub painted_aria_hidden: String,
+    pub complete: bool,
+}
+
 /// An exact painted text segment or indexed control and its own computed foreground color.
 /// Identities only establish uniqueness inside the browser observation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -66,7 +84,14 @@ pub struct ColorObservation {
     /// False when a painted shape cannot be established from supported clip geometry.
     #[serde(default = "complete_paint")]
     pub paint_complete: bool,
+    /// False while an active effect can change this owner's foreground or paint eligibility.
+    #[serde(default = "complete_paint", skip_serializing_if = "is_true")]
+    pub capture_stable: bool,
     pub color: ComputedColor,
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 fn complete_paint() -> bool {

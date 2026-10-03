@@ -1,5 +1,30 @@
 use super::*;
 
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn color_cli_active_shadow_foreground_effect_cannot_publish_unfenced_evidence() {
+    let http = HttpFixture::with_body(
+        "<!doctype html><p>Ready</p><span id='host'><span>Amount</span></span><script>host.attachShadow({mode:'open'}).innerHTML='<style>@keyframes pulse{from{color:#b91c1c}to{color:black}}slot{animation:pulse 1000000s linear infinite}</style><slot></slot>'</script>",
+    );
+    let temp = hosted_temp();
+    let job = color_job(
+        &http.url(),
+        json!([
+            {"color":{"target":{"text":"Amount"},"equals":"#b91c1c","tolerance":255}}
+        ]),
+    );
+    let (exit, result) = run(&temp, &job);
+    assert_eq!(exit, 3, "{result}");
+    assert_eq!(result["state"], "blocked");
+    assert_eq!(result["reason"]["code"], "browser_control_failed");
+    assert_eq!(result["verdict"]["expectations"][0]["result"], "not_run");
+    assert_eq!(result["verdict"]["caller_assisted"], false);
+    viewport::assert_no_step_input(&result);
+    assert_complete_artifacts(&result);
+    assert_eq!(result["cleanup"]["browser"], "closed");
+    assert_eq!(result["cleanup"]["profile"], "removed");
+}
+
 const COLOR_FIXTURE: &str = include_str!("../../../../tests/browser/color.html");
 
 fn invoke(temp: &TempDir, args: &[&str]) -> (i32, Value) {
@@ -258,11 +283,13 @@ fn color_cli_scoped_shadow_owners_share_their_main_document_scopes() {
 #[ignore = "requires the local Chromium executable"]
 fn colorless_capture_and_stable_color_targets_allow_unrelated_color_animation() {
     let http = HttpFixture::with_body(
-        r#"<!doctype html><style>@keyframes pulse{from{color:black}to{color:white}}#pulse{animation:pulse 1s linear infinite alternate}</style><p id=pulse>Animated</p><p>Ready</p><p style='color:#b91c1c'>Amount</p>"#,
+        r#"<!doctype html><style>@keyframes pulse{from{color:black}to{color:white}}@keyframes surface{from{background-color:black}to{background-color:white}}#pulse{animation:pulse 1s linear infinite alternate}#background{color:#b91c1c;animation:surface 1s linear infinite alternate}#paused{color:#b91c1c;animation:pulse 1s linear infinite alternate;animation-play-state:paused}</style><p id=pulse>Animated</p><p>Ready</p><p style='color:#b91c1c'>Amount</p><p id=background>Background</p><p id=paused>Paused</p>"#,
     );
     for assertions in [
         json!([{"text_visible":"Ready"}]),
         json!([{"color":{"target":{"text":"Amount"},"equals":"#b91c1c"}}]),
+        json!([{"color":{"target":{"text":"Background"},"equals":"#b91c1c"}}]),
+        json!([{"color":{"target":{"text":"Paused"},"equals":"#000000"}}]),
     ] {
         let temp = hosted_temp();
         let mut job = color_job(&http.url(), assertions);
@@ -276,25 +303,33 @@ fn colorless_capture_and_stable_color_targets_allow_unrelated_color_animation() 
 #[test]
 #[ignore = "requires the local Chromium executable"]
 fn color_cli_requested_color_animation_cannot_publish_unfenced_final_evidence() {
-    let http = HttpFixture::with_body(
-        "<!doctype html><style>@keyframes pulse{from{color:#b91c1c}to{color:#001122}}#target{animation:pulse 1s linear infinite alternate}</style><h1>Ready</h1><p id=target>Amount</p>",
-    );
-    let color = json!({"color":{"target":{"text":"Amount"},"equals":"#b91c1c","tolerance":255}});
-    let mut step_job = color_job(&http.url(), json!([{"text_visible":"Ready"}]));
-    step_job["steps"][0]["done_when"] = json!([color.clone()]);
-    let final_job = color_job(&http.url(), json!([color]));
-    for job in [step_job, final_job] {
-        let temp = hosted_temp();
-        let (exit, result) = run(&temp, &job);
-        assert_eq!(exit, 3, "{job}: {result}");
-        assert_eq!(result["state"], "blocked");
-        assert_eq!(result["reason"]["code"], "browser_control_failed");
-        assert_eq!(result["verdict"]["expectations"][0]["result"], "not_run");
-        assert_eq!(result["verdict"]["caller_assisted"], false);
-        viewport::assert_no_step_input(&result);
-        assert_complete_artifacts(&result);
-        assert_eq!(result["cleanup"]["browser"], "closed");
-        assert_eq!(result["cleanup"]["profile"], "removed");
+    // A slow effect keeps the sampled RGB equal while its foreground still animates.
+    for duration in ["1000000s", "1s"] {
+        let http = HttpFixture::with_body(&format!(
+            "<!doctype html><style>@keyframes pulse{{from{{color:#b91c1c}}to{{color:#001122}}}}#target{{animation:pulse {duration} linear infinite alternate}}</style><h1>Ready</h1><p id=target>Amount</p><p style='color:#b91c1c'>Reference</p>"
+        ));
+        let color =
+            json!({"color":{"target":{"text":"Amount"},"equals":"#b91c1c","tolerance":255}});
+        let mut step_job = color_job(&http.url(), json!([{"text_visible":"Ready"}]));
+        step_job["steps"][0]["done_when"] = json!([color.clone()]);
+        let final_job = color_job(&http.url(), json!([color]));
+        let reference_job = color_job(
+            &http.url(),
+            json!([{"color":{"target":{"text":"Reference"},"same_as":{"text":"Amount"},"tolerance":255}}]),
+        );
+        for job in [step_job, final_job, reference_job] {
+            let temp = hosted_temp();
+            let (exit, result) = run(&temp, &job);
+            assert_eq!(exit, 3, "{job}: {result}");
+            assert_eq!(result["state"], "blocked");
+            assert_eq!(result["reason"]["code"], "browser_control_failed");
+            assert_eq!(result["verdict"]["expectations"][0]["result"], "not_run");
+            assert_eq!(result["verdict"]["caller_assisted"], false);
+            viewport::assert_no_step_input(&result);
+            assert_complete_artifacts(&result);
+            assert_eq!(result["cleanup"]["browser"], "closed");
+            assert_eq!(result["cleanup"]["profile"], "removed");
+        }
     }
 }
 

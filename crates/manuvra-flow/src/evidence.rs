@@ -368,15 +368,36 @@ pub(crate) fn redacted_assertion_checks(
         .iter()
         .cloned()
         .map(|mut assertion| {
-            let manuvra_contract::AssertionCheck::Color(check) = &mut assertion;
-            redact_color_target(&mut check.target, redactor);
-            if let Some(reference) = &mut check.reference {
-                redact_color_target(reference, redactor);
+            match &mut assertion {
+                manuvra_contract::AssertionCheck::Color(check) => {
+                    redact_color_target(&mut check.target, redactor);
+                    if let Some(reference) = &mut check.reference {
+                        redact_color_target(reference, redactor);
+                    }
+                    redact_optional_text(&mut check.equals, redactor);
+                }
+                manuvra_contract::AssertionCheck::Text(check) => {
+                    redact_text_assertion(&mut check.assertion, redactor);
+                }
             }
-            redact_optional_text(&mut check.equals, redactor);
             assertion
         })
         .collect()
+}
+
+fn redact_text_assertion(assertion: &mut manuvra_contract::TextAssertion, redactor: &Redactor) {
+    let (text, scope) = match assertion {
+        manuvra_contract::TextAssertion::Visible(wanted) => {
+            (&mut wanted.text_visible, &mut wanted.scope)
+        }
+        manuvra_contract::TextAssertion::Absent(wanted) => {
+            (&mut wanted.text_absent, &mut wanted.scope)
+        }
+    };
+    *text = redactor.redact_export_text(text);
+    if let Some(manuvra_contract::AssertionScope::Dialog(dialog)) = scope {
+        dialog.dialog = redactor.redact_export_text(&dialog.dialog);
+    }
 }
 
 fn redact_color_target(target: &mut manuvra_contract::ColorTargetEvidence, redactor: &Redactor) {
@@ -433,6 +454,11 @@ fn is_protocol_collision(value: &str) -> bool {
         "channel",
         "accessible",
         "painted_aria_hidden",
+        "painted_text",
+        "include_aria_hidden",
+        "searched_channels",
+        "matched_channel",
+        "ambiguous_or_missing_scope",
         "paint_complete",
         "missing",
         "ambiguous_owner",

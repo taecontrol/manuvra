@@ -216,6 +216,7 @@ fn empty_observation() -> Observation {
         focus_anchor: None,
         visible_text: String::new(),
         covered_text: String::new(),
+        painted_text: None,
         colors: Vec::new(),
         colors_complete: false,
         color_scopes: Vec::new(),

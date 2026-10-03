@@ -342,9 +342,9 @@ fn relevant_state_hash(
     use sha2::{Digest, Sha256};
 
     let mut state = relevant_state(observation);
-    let colors = crate::verification::color_assertion_checks(assertions, observation);
-    if !colors.is_empty() {
-        state["assertion_checks"] = json!(colors);
+    let checks = crate::verification::assertion_checks(assertions, observation);
+    if !checks.is_empty() {
+        state["assertion_checks"] = json!(checks);
     }
     hex::encode(Sha256::digest(state.to_string()))
 }

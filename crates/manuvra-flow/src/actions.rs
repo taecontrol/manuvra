@@ -617,6 +617,7 @@ mod tests {
             focus_anchor: None,
             visible_text: "".into(),
             covered_text: "".into(),
+            painted_text: None,
             colors: Vec::new(),
             colors_complete: false,
             color_scopes: Vec::new(),

@@ -1,11 +1,18 @@
 //! Unique-owner resolution and foreground comparisons. Browser identities never leave here.
-use super::{DoneResult, viewport_complete};
+use super::viewport_complete;
 use manuvra_chrome::{ColorObservation, ColorScope, ColorScopeKind, Observation};
 use manuvra_contract::{
     ColorChannel, ColorCheck, ColorCheckEvidence, ColorComparator, ColorFailure, ColorTarget,
     ColorTargetEvidence, VerdictResult,
 };
 use std::collections::BTreeMap;
+
+pub(super) fn capture_stable(check: &ColorCheck, observation: &Observation) -> bool {
+    std::iter::once(check.target())
+        .chain(check.reference())
+        .filter_map(|target| owner(target, observation).ok())
+        .all(|owner| owner.capture_stable)
+}
 
 pub(super) fn evaluate(check: &ColorCheck, observation: &Observation) -> ColorCheckEvidence {
     let target = resolve(check.target(), observation);
@@ -78,14 +85,6 @@ fn compare(
         VerdictResult::Satisfied
     } else {
         VerdictResult::NotSatisfied
-    }
-}
-
-pub(super) fn outcome(result: VerdictResult) -> DoneResult {
-    match result {
-        VerdictResult::Satisfied => DoneResult::Satisfied,
-        VerdictResult::NotSatisfied => DoneResult::NotSatisfied,
-        VerdictResult::Unresolved | VerdictResult::NotRun => DoneResult::Unknown,
     }
 }
 
