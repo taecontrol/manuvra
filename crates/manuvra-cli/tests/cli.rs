@@ -12,6 +12,10 @@ use tempfile::TempDir;
 mod viewport;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "cli/color.rs"]
+mod color;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct HttpFixture {
     address: std::net::SocketAddr,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,

@@ -125,6 +125,24 @@ Write each step as one visible transition. The `goal` says what the browser shou
 
 Values have stable names so Jev can select a value without inventing one. Mark sensitive values with `"secret": true`. Keep jobs that contain classified values outside the repository and restrict their file mode to `0600`.
 
+Final expectations can use the same structured assertions as `done_when`:
+
+```json
+{
+  "id": "negative-color",
+  "assertions": [
+    {"color": {"target": {"text": "-$12.34"}, "equals": "#b91c1c"}},
+    {"color": {"target": {"text": "-$12.34"}, "same_as": {"text": "Destructive reference"}}}
+  ]
+}
+```
+
+Color checks read foreground `color` from a unique painted owner. Use `text` for one exact text segment after whitespace normalization, or `name` for an indexed control's accessible name (case-insensitive), with an optional `role`. Add `dialog` or `container` to either target to resolve repeated owners; the scope must also be unique. Painted `aria-hidden` text is eligible and its evidence channel is recorded. Existing text assertions retain their accessibility behavior.
+
+Choose exactly one comparison: `equals` with `#RRGGBB` or `#RRGGBBAA`, `same_as` with another target, or `different_from` with another target. An optional integer `tolerance` from 0 to 255 defaults to zero and bounds the maximum RGBA channel difference. Computed colors use straight, clamped eight-bit sRGB with alpha quantized independently. Evidence retains both the raw computed color and canonical RGBA. Hidden, inert, clipped, offscreen, and zero-alpha owners cannot satisfy a check; ambiguity and incomplete or unsupported observations stay unresolved. Text split across descendants requires a different target.
+
+An expectation supplies either `assertions` or `claim` with optional `exact_literals`. Structured final checks are authoritative and use no provider calls or model-call budget. A false structured check ends verification before natural claims are judged; those claims remain `not_run`. Unresolved structured checks offer `retry_observation` and `abort`. Mixed verification can offer `advance` for natural claims only while all structured checks remain satisfied on a fresh observation.
+
 The [Manuvra skill](skills/manuvra/SKILL.md) contains the full job-authoring and recovery procedure for coding agents. The schemas printed by the installed binary remain the authority for accepted fields and limits.
 
 ## Start a run
@@ -223,6 +241,8 @@ cargo install cargo-llvm-cov --version 0.9.0 --locked
 `make live-self-test` checks the live-suite harnesses against synthetic input without a provider key, browser, or Money checkout. CI runs it on Linux and macOS.
 
 The live suites use real Jev judgments and a real browser against synthetic fixtures. Each needs `TYPESAFE_API_KEY` exported in the environment and retains timestamped, redacted Evidence under `.work/live/`. `make live-all` runs every suite below in sequence.
+
+`make live-color` owns a loopback color fixture and needs no Money checkout. It proves exact matching and mismatching checks without a provider, painted classified text, unresolved duplicates, one Jev-driven theme change, and a CSS-only change before mixed-verification `advance`. Its report records provider calls, mutations, assistance, manifest integrity, and cleanup under `.work/live/color/`.
 
 `make live` uses `/bin/bash`, builds a release binary, and runs the Money journey matrix against fresh fixtures. Set `MONEY_DIR` explicitly to a disposable Money checkout and provide `TYPESAFE_API_KEY` in the environment. The checkout must have its documented Node and pnpm application-driver dependencies ready. The command also requires `jq`, `grep`, `rg`, native `date`, `shasum`, and `nc`, Rust build tools, Google Chrome, and a headed desktop. On Linux the matrix requires `XDG_RUNTIME_DIR` and passes it to Manuvra. On macOS it requires `TMPDIR` and leaves `XDG_RUNTIME_DIR` unset so Manuvra exercises its private `TMPDIR` runtime fallback. It runs the create-unit, create-account, and record-transaction journeys three times each, one create-account journey whose account name is classified, and one forced escalation round trip. The classified Run must keep the name out of its results, state, and Evidence. It retains timestamped, redacted Evidence and a `report.json` under `.work/live/money-journey/`; the report records the source revision, release-binary digest, Bash version, Run classifications, application persistence checks, and cleanup results.
 

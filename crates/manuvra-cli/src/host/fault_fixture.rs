@@ -367,6 +367,9 @@ fn fault_observation() -> manuvra_flow::Observation {
         focus_anchor: None,
         visible_text: "Submit".into(),
         covered_text: String::new(),
+        colors: Vec::new(),
+        colors_complete: false,
+        color_scopes: Vec::new(),
         dialog_texts: BTreeMap::new(),
         elements: vec![manuvra_flow::Element {
             index: 1,

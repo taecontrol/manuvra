@@ -108,11 +108,10 @@ pub(super) fn escalate_verification(
     let id = format!("e_{}", artifacts.escalations.len() + 1);
     let stopped = stopped_at();
     let observation = latest_observation(artifacts);
-    let payload = redacted_value(
+    let mut payload = redacted_value(
         &json!({
             "id":id,
             "phase":"verification",
-            "expectations":artifacts.expectation_verdicts,
             "observation":observation,
             "verification":"verification/final.json",
             "gate_reason":reason,
@@ -120,6 +119,8 @@ pub(super) fn escalate_verification(
         }),
         redactor,
     );
+    // Verdicts already redact caller/page strings while preserving the typed protocol.
+    payload["expectations"] = json!(artifacts.expectation_verdicts);
     artifacts.escalations.push((id.clone(), payload));
     artifacts.escalation = Some(Escalation {
         id: id.clone(),
@@ -127,13 +128,22 @@ pub(super) fn escalate_verification(
         step_id: None,
         expires_at: stopped,
         payload: format!("escalations/{id}.json"),
-        dispositions: vec![
-            DispositionKind::Advance,
-            DispositionKind::RetryObservation,
-            DispositionKind::Abort,
-        ],
+        dispositions: verification_dispositions(artifacts),
     });
     Stop::uncertain(reason, BTreeMap::new())
+}
+
+fn verification_dispositions(artifacts: &RunArtifacts) -> Vec<DispositionKind> {
+    let mut dispositions = Vec::new();
+    if artifacts
+        .pending_verification
+        .as_ref()
+        .is_some_and(|pending| pending.attestable())
+    {
+        dispositions.push(DispositionKind::Advance);
+    }
+    dispositions.extend([DispositionKind::RetryObservation, DispositionKind::Abort]);
+    dispositions
 }
 
 /// When the run stopped on an escalation, in Unix milliseconds.
@@ -206,6 +216,9 @@ fn empty_observation() -> Observation {
         focus_anchor: None,
         visible_text: String::new(),
         covered_text: String::new(),
+        colors: Vec::new(),
+        colors_complete: false,
+        color_scopes: Vec::new(),
         dialog_texts: BTreeMap::new(),
         elements: Vec::new(),
         viewport: manuvra_chrome::ViewportState {

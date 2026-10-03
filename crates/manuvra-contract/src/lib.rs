@@ -7,6 +7,12 @@ use url::Url;
 
 pub const SCHEMA_VERSION: u32 = 1;
 
+mod color;
+pub use color::*;
+
+#[cfg(test)]
+mod color_tests;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SchemaVersion;
 
@@ -159,6 +165,7 @@ pub enum DoneCondition {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum Assertion {
+    Color(ColorAssertion),
     TextVisible(TextVisible),
     TextAbsent(TextAbsent),
     FieldNonempty(FieldNonempty),
@@ -256,11 +263,27 @@ pub struct UrlContains {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct Expectation {
+#[serde(untagged)]
+pub enum Expectation {
+    NaturalLanguage(NaturalExpectation),
+    Structured(StructuredExpectation),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NaturalExpectation {
     pub id: String,
     pub claim: String,
     #[serde(default)]
     pub exact_literals: Vec<ExactLiteral>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StructuredExpectation {
+    pub id: String,
+    #[schemars(length(min = 1))]
+    pub assertions: Vec<Assertion>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -381,6 +404,8 @@ pub struct ExpectationVerdict {
     pub noul: Option<f64>,
     #[serde(default)]
     pub numeric_checks: Vec<NumericCheck>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assertion_checks: Vec<AssertionCheck>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -553,12 +578,15 @@ impl Job {
         self.steps
             .iter()
             .find_map(|step| step.first_missing_value(&self.values))
+            .or_else(|| {
+                self.expectations
+                    .iter()
+                    .find_map(|expectation| expectation.first_missing_value(&self.values))
+            })
     }
 
     fn expectation_ids(&self) -> impl Iterator<Item = &str> {
-        self.expectations
-            .iter()
-            .map(|expectation| expectation.id.as_str())
+        self.expectations.iter().map(Expectation::id)
     }
 }
 
@@ -699,17 +727,27 @@ impl DoneCondition {
         let Self::Structured(assertions) = self else {
             return None;
         };
-        assertions.iter().find_map(|assertion| match assertion {
-            Assertion::FieldEqualsValue(field) if !values.contains_key(&field.equals_value) => {
-                Some(&field.equals_value)
-            }
-            _ => None,
-        })
+        first_missing_assertion_value(assertions, values)
     }
+}
+
+fn first_missing_assertion_value<'a>(
+    assertions: &'a [Assertion],
+    values: &BTreeMap<String, JobValue>,
+) -> Option<&'a String> {
+    assertions.iter().find_map(|assertion| match assertion {
+        Assertion::FieldEqualsValue(field) if !values.contains_key(&field.equals_value) => {
+            Some(&field.equals_value)
+        }
+        _ => None,
+    })
 }
 
 impl Assertion {
     fn validate(&self) -> Result<(), ValidationError> {
+        if let Self::Color(assertion) = self {
+            return assertion.color.validate();
+        }
         let (name, subject) = self.subject();
         validate_nonempty(name, subject)?;
         if let Self::FieldEqualsValue(value) = self {
@@ -720,19 +758,63 @@ impl Assertion {
 
     fn subject(&self) -> (&'static str, &str) {
         match self {
-            Self::TextVisible(value) => ("text_visible", &value.text_visible),
-            Self::TextAbsent(value) => ("text_absent", &value.text_absent),
             Self::FieldNonempty(FieldNonempty { field, .. })
             | Self::FieldEqualsValue(FieldEqualsValue { field, .. }) => ("field", field),
             Self::Focused(value) => ("focused", &value.focused),
+            _ => self.page_subject(),
+        }
+    }
+
+    fn page_subject(&self) -> (&'static str, &str) {
+        match self {
+            Self::TextVisible(value) => ("text_visible", &value.text_visible),
+            Self::TextAbsent(value) => ("text_absent", &value.text_absent),
             Self::DialogOpen(value) => ("dialog_open", &value.dialog_open),
             Self::DialogClosed(value) => ("dialog_closed", &value.dialog_closed),
             Self::UrlContains(value) => ("url_contains", &value.url_contains),
+            _ => unreachable!("color, field and focus assertions are validated separately"),
         }
     }
 }
 
 impl Expectation {
+    fn first_missing_value(&self, values: &BTreeMap<String, JobValue>) -> Option<MissingValue> {
+        let Self::Structured(expectation) = self else {
+            return None;
+        };
+        first_missing_assertion_value(&expectation.assertions, values).map(|name| MissingValue {
+            value_name: name.clone(),
+            step_id: expectation.id.clone(),
+        })
+    }
+
+    pub fn id(&self) -> &str {
+        match self {
+            Self::NaturalLanguage(expectation) => &expectation.id,
+            Self::Structured(expectation) => &expectation.id,
+        }
+    }
+
+    pub fn natural(&self) -> Option<&NaturalExpectation> {
+        match self {
+            Self::NaturalLanguage(expectation) => Some(expectation),
+            Self::Structured(_) => None,
+        }
+    }
+
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_nonempty("expectation.id", self.id())?;
+        match self {
+            Self::NaturalLanguage(expectation) => expectation.validate(),
+            Self::Structured(expectation) => {
+                validate_nonempty_assertions(&expectation.id, &expectation.assertions)?;
+                validate_all(expectation.assertions.iter().map(Assertion::validate))
+            }
+        }
+    }
+}
+
+impl NaturalExpectation {
     fn validate(&self) -> Result<(), ValidationError> {
         validate_nonempty("expectation.id", &self.id)?;
         validate_nonempty(&format!("expectation {} claim", self.id), &self.claim)?;
@@ -1173,6 +1255,47 @@ mod tests {
             Some(MissingValue {
                 value_name: "account_name".into(),
                 step_id: "name".into()
+            })
+        );
+    }
+
+    #[test]
+    fn resolves_final_equality_references_after_steps_in_job_order() {
+        let mut wire = valid_job();
+        wire["expectations"] = json!([
+            {"id":"natural","claim":"The account exists"},
+            {"id":"first-final","assertions":[
+                {"field":"Account name","equals_value":"account_name"},
+                {"field":"Account type","equals_value":"account_type"}
+            ]},
+            {"id":"later-final","assertions":[{"field":"Currency","equals_value":"currency"}]}
+        ]);
+        assert_eq!(
+            parse(&wire).unwrap().first_missing_value(),
+            Some(MissingValue {
+                value_name: "account_type".into(),
+                step_id: "first-final".into(),
+            })
+        );
+        wire["values"]["account_type"] = json!({"value":"Cash","description":"Account type"});
+        assert_eq!(
+            parse(&wire).unwrap().first_missing_value(),
+            Some(MissingValue {
+                value_name: "currency".into(),
+                step_id: "later-final".into(),
+            })
+        );
+        wire["values"]["currency"] = json!({"value":"USD","description":"Currency"});
+        assert_eq!(parse(&wire).unwrap().first_missing_value(), None);
+        wire["values"]
+            .as_object_mut()
+            .unwrap()
+            .remove("account_name");
+        assert_eq!(
+            parse(&wire).unwrap().first_missing_value(),
+            Some(MissingValue {
+                value_name: "account_name".into(),
+                step_id: "name".into(),
             })
         );
     }

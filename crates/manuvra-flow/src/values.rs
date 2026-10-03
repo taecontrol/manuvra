@@ -20,6 +20,10 @@ impl<'a> Values<'a> {
         self.values.get(name).map(|value| value.value.as_str())
     }
 
+    pub(crate) fn provided(&self) -> &'a BTreeMap<String, JobValue> {
+        self.values
+    }
+
     pub fn known_names(&self) -> Vec<String> {
         self.values.keys().cloned().collect()
     }
@@ -201,6 +205,9 @@ mod tests {
             }),
             visible_text: "raw-secret-742".into(),
             covered_text: "RAW SECRET".into(),
+            colors: Vec::new(),
+            colors_complete: false,
+            color_scopes: Vec::new(),
             dialog_texts: BTreeMap::new(),
             elements: vec![Element {
                 index: 1,

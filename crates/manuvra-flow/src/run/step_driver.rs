@@ -2,7 +2,9 @@
 //! under a permit until the step completes, stops, or escalates.
 
 use super::artifacts::{PendingEscalation, RunArtifacts, done_basis, record_step};
-use super::capture::{Captured, DriveBrowser, capture_step, record_capture, redacted_value};
+use super::capture::{
+    Captured, DriveBrowser, capture_step, done_assertions, record_capture, redacted_value,
+};
 use super::escalation::{escalate, natural_noul};
 use super::stops::{
     Stop, control_stop, policy_stop, provider_stop, step_detail, terminal_action_stop,
@@ -171,6 +173,7 @@ impl StepDriver<'_> {
         capture_step(
             self.browser,
             self.redactor,
+            done_assertions(&self.step.done_when),
             self.index + 1,
             self.observation_number,
         )

@@ -637,6 +637,9 @@ pub(crate) fn observed(text: &str) -> Observation {
         focus_anchor: None,
         visible_text: text.into(),
         covered_text: String::new(),
+        colors: Vec::new(),
+        colors_complete: false,
+        color_scopes: Vec::new(),
         dialog_texts: BTreeMap::new(),
         elements: Vec::new(),
         viewport: ViewportState {

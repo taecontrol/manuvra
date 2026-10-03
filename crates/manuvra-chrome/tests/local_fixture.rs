@@ -30,6 +30,9 @@ static REAL_BROWSER: Mutex<()> = Mutex::new(());
 #[path = "local_fixture/viewport.rs"]
 mod viewport;
 
+#[path = "local_fixture/color.rs"]
+mod color;
+
 /// The owned browser's process group and profile, observed from outside the crate.
 struct BrowserLifecycle {
     process_group: i32,
@@ -139,7 +142,7 @@ impl FixtureServer {
         Self::with_body(FIXTURE)
     }
 
-    fn with_body(body: &'static str) -> Self {
+    fn with_body(body: &str) -> Self {
         Self::serve(body, None)
     }
 
@@ -147,16 +150,17 @@ impl FixtureServer {
         Self::serve(body, Some((path, delay)))
     }
 
-    fn serve(body: &'static str, slow: Option<SlowPath>) -> Self {
+    fn serve(body: &str, slow: Option<SlowPath>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
+        let body = body.to_owned();
         let worker = thread::spawn(move || {
             while !worker_stop.load(Ordering::Relaxed) {
                 match listener.accept() {
-                    Ok((mut stream, _)) => serve_fixture(&mut stream, body, slow),
+                    Ok((mut stream, _)) => serve_fixture(&mut stream, &body, slow),
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
                     }

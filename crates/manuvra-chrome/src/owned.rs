@@ -21,6 +21,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::thread;
 use std::time::{Duration, Instant};
+
+type AppearanceFence<'a> = Option<&'a dyn Fn(&Observation, &Observation) -> bool>;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -280,23 +282,48 @@ impl OwnedBrowser {
     }
 
     pub fn capture(&self) -> Result<CapturedPage, BrowserError> {
-        self.capture_fenced(None)
+        self.capture_fenced(None, None)
     }
 
     pub fn capture_redacted(&self, sensitive: &[String]) -> Result<CapturedPage, BrowserError> {
+        self.capture_redacted_with_fence(sensitive, None)
+    }
+
+    /// Fences caller-selected appearance facts in addition to the document and screenshot.
+    /// Unrelated CSS animation must not prevent an otherwise stable capture.
+    pub fn capture_redacted_matching(
+        &self,
+        sensitive: &[String],
+        unchanged: &dyn Fn(&Observation, &Observation) -> bool,
+    ) -> Result<CapturedPage, BrowserError> {
+        self.capture_redacted_with_fence(sensitive, Some(unchanged))
+    }
+
+    fn capture_redacted_with_fence(
+        &self,
+        sensitive: &[String],
+        unchanged: AppearanceFence<'_>,
+    ) -> Result<CapturedPage, BrowserError> {
         if sensitive.is_empty() {
-            return self.capture();
+            return self.capture_fenced(None, unchanged);
         }
-        self.capture_fenced(Some(Masking {
-            expression: masking_script(sensitive)?,
-            values: sensitive.len(),
-        }))
+        self.capture_fenced(
+            Some(Masking {
+                expression: masking_script(sensitive)?,
+                values: sensitive.len(),
+            }),
+            unchanged,
+        )
     }
 
     /// Retries until the observation and screenshot come from one unchanged page.
-    fn capture_fenced(&self, masking: Option<Masking>) -> Result<CapturedPage, BrowserError> {
+    fn capture_fenced(
+        &self,
+        masking: Option<Masking>,
+        unchanged: AppearanceFence<'_>,
+    ) -> Result<CapturedPage, BrowserError> {
         for _ in 0..CAPTURE_ATTEMPTS {
-            if let Some(captured) = self.capture_once(masking.as_ref())? {
+            if let Some(captured) = self.capture_once(masking.as_ref(), unchanged)? {
                 return Ok(captured);
             }
             thread::sleep(QUIET_WINDOW);
@@ -311,6 +338,7 @@ impl OwnedBrowser {
     fn capture_once(
         &self,
         masking: Option<&Masking>,
+        unchanged: AppearanceFence<'_>,
     ) -> Result<Option<CapturedPage>, BrowserError> {
         let _mutations = DomMutationWatch::start(&self.client)?;
         let fence = self.client.cursor();
@@ -319,7 +347,7 @@ impl OwnedBrowser {
         let screenshot =
             page::capture_screenshot(&self.client, deadline(), Arc::new(AtomicBool::new(false)))
                 .map_err(|error| BrowserError::Control(error.to_string()))?;
-        if page_changed_since(&self.client, fence) {
+        if !self.capture_stable(&observation, fence, unchanged)? {
             return Ok(None);
         }
         Ok(Some(CapturedPage {
@@ -327,6 +355,21 @@ impl OwnedBrowser {
             screenshot,
             redaction: masks.proof.clone(),
         }))
+    }
+
+    fn capture_stable(
+        &self,
+        observation: &Observation,
+        fence: u64,
+        unchanged: AppearanceFence<'_>,
+    ) -> Result<bool, BrowserError> {
+        if let Some(unchanged) = unchanged {
+            let after = self.observe()?;
+            if observation.document_id != after.document_id || !unchanged(observation, &after) {
+                return Ok(false);
+            }
+        }
+        Ok(!page_changed_since(&self.client, fence))
     }
 
     /// Terminates the browser at most once, then removes its profile. A failed
@@ -1425,6 +1468,44 @@ mod tests {
             chrome.received("Runtime.evaluate")[0]["params"]["expression"],
             SNAPSHOT
         );
+    }
+
+    #[test]
+    fn capture_fence_rejects_color_only_changes_without_dom_events() {
+        let chrome = ScriptedChrome::start();
+        let mut snapshot = snapshot_value();
+        snapshot["colors_complete"] = json!(true);
+        snapshot["colors"] = json!([{"node_id":1,"context":"main","text":"Amount","name":null,"role":null,
+            "in_dialog":null,"container":null,"dialog_node_id":null,"container_node_id":null,
+            "channel":"accessible","color":{"raw":"rgb(185, 28, 28)","rgba":[185,28,28,255]}}]);
+        let before: Observation = serde_json::from_value(snapshot.clone()).unwrap();
+        chrome.reply_evaluation(SNAPSHOT, json!({"result":{"value":snapshot.clone()}}));
+        let browser = browser_with_client(chrome.connect_raw());
+        let fence = browser.client.cursor();
+        let unchanged = |before: &Observation, after: &Observation| before.colors == after.colors;
+        assert!(
+            browser
+                .capture_stable(&before, fence, Some(&unchanged))
+                .unwrap()
+        );
+        snapshot["colors"][0]["color"] = json!({"raw":"rgb(31, 41, 55)","rgba":[31,41,55,255]});
+        chrome.reply_evaluation(SNAPSHOT, json!({"result":{"value":snapshot}}));
+        assert!(
+            !browser
+                .capture_stable(&before, fence, Some(&unchanged))
+                .unwrap()
+        );
+        assert!(
+            !page_changed_since(&browser.client, fence),
+            "this must prove the appearance fence independently of DOM events"
+        );
+        chrome.reject("Runtime.evaluate");
+        assert!(
+            browser
+                .capture_stable(&before, fence, Some(&unchanged))
+                .is_err()
+        );
+        assert!(browser.capture_stable(&before, fence, None).unwrap());
     }
 
     #[test]

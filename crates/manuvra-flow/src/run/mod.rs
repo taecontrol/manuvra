@@ -98,7 +98,11 @@ fn target_url(job: &Job) -> &str {
 }
 
 #[cfg(test)]
+pub(crate) use tests::support::{NoProvider, ScriptedProvider, Turn, observed, parse_job};
+
+#[cfg(test)]
 mod tests {
+    mod color;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(super) mod live;
     pub(super) mod support;

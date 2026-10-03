@@ -96,8 +96,9 @@ impl HostedMachine<'_> {
             Ok(observation) => observation,
             Err(stop) => return self.end_with(stop),
         };
-        let prior_hash = relevant_state_hash(&pending.observation);
-        let current_hash = relevant_state_hash(&observation);
+        let assertions = super::capture::final_assertions(self.job);
+        let prior_hash = relevant_state_hash(&pending.observation, &assertions);
+        let current_hash = relevant_state_hash(&observation, &assertions);
         let identity_unchanged = pending.observation.document_id == observation.document_id;
         let facts_unchanged = prior_hash == current_hash;
         self.artifacts.trace.push(json!({
@@ -147,10 +148,12 @@ impl HostedMachine<'_> {
         self.artifacts.pending_verification = None;
         let report = match evaluate_final(
             self.job,
+            self.redactor,
             &observation,
             &self.values,
             evaluator,
             &mut self.policy,
+            &mut self.artifacts,
         ) {
             Ok(report) => report,
             Err(stop) => return self.end_with(stop),
@@ -209,8 +212,9 @@ impl HostedMachine<'_> {
         rationale: &str,
     ) -> Result<(), &'static str> {
         let step = &self.job.steps[self.index];
-        let prior_hash = relevant_state_hash(&pending.observation);
-        let current_hash = relevant_state_hash(current);
+        let assertions = super::capture::done_assertions(&step.done_when);
+        let prior_hash = relevant_state_hash(&pending.observation, assertions);
+        let current_hash = relevant_state_hash(current, assertions);
         let identity_unchanged = pending.observation.document_id == current.document_id;
         let facts_unchanged = prior_hash == current_hash;
         let permitted = advance_permitted(step, pending, rationale);
@@ -266,6 +270,7 @@ impl HostedMachine<'_> {
         let captured = capture_step(
             browser,
             self.redactor,
+            super::capture::done_assertions(&step.done_when),
             self.index + 1,
             self.artifacts.observations.len() + 1,
         )
@@ -330,10 +335,18 @@ pub(super) fn natural_condition_numeric_checks_satisfied(
     natural_numeric_literals_satisfied(condition, &pending.observation)
 }
 
-fn relevant_state_hash(observation: &Observation) -> String {
+fn relevant_state_hash(
+    observation: &Observation,
+    assertions: &[manuvra_contract::Assertion],
+) -> String {
     use sha2::{Digest, Sha256};
 
-    hex::encode(Sha256::digest(relevant_state(observation).to_string()))
+    let mut state = relevant_state(observation);
+    let colors = crate::verification::color_assertion_checks(assertions, observation);
+    if !colors.is_empty() {
+        state["assertion_checks"] = json!(colors);
+    }
+    hex::encode(Sha256::digest(state.to_string()))
 }
 
 /// The observed facts an attestation rests on. Hover regions are part of the observation the
@@ -443,7 +456,12 @@ mod tests {
     #[test]
     fn verification_attestation_rechecks_changed_facts_identity_and_focus() {
         let mut scoped = expectation_job();
-        scoped.expectations[0].exact_literals = vec![manuvra_contract::ExactLiteral {
+        let manuvra_contract::Expectation::NaturalLanguage(expectation) =
+            &mut scoped.expectations[0]
+        else {
+            panic!("natural expectation")
+        };
+        expectation.exact_literals = vec![manuvra_contract::ExactLiteral {
             literal: "12.34".into(),
             within_text: Some("Wallet".into()),
         }];
@@ -716,7 +734,7 @@ mod tests {
     #[test]
     fn relevant_state_without_hover_regions_hashes_as_before_hover_regions_existed() {
         assert_eq!(
-            relevant_state_hash(&observed("unchanged")),
+            relevant_state_hash(&observed("unchanged"), &[]),
             "d6eaad215cf80aaf06c0b26ea36d0d650848ac1cfb5ac198d8283893fcc8ab4d"
         );
     }

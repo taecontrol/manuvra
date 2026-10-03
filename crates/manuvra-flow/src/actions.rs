@@ -617,6 +617,9 @@ mod tests {
             focus_anchor: None,
             visible_text: "".into(),
             covered_text: "".into(),
+            colors: Vec::new(),
+            colors_complete: false,
+            color_scopes: Vec::new(),
             dialog_texts: BTreeMap::new(),
             elements: vec![Element {
                 index: 1,

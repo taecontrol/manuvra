@@ -1,0 +1,32 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Color paint eligibility</title>
+<style>
+  body { margin:8px; font:16px system-ui; }
+  iframe { width:250px; height:65px; border:0; }
+  .frames { display:grid; grid-template-columns:repeat(4,250px); }
+  dialog[open] { position:static; margin:0; width:auto; }
+</style>
+<h1>Ready</h1>
+<p><span style="display:contents;color:#b91c1c">Contents amount</span></p>
+<p><span style="display:contents;clip-path:inset(100%);color:#b91c1c">Boxless clip amount</span></p>
+<p><span style="clip-path:inset(0px);color:#b91c1c">Inline clip amount</span></p>
+<p style="clip-path:inset(100%);color:#b91c1c">Clip path amount</p>
+<p style="position:absolute;clip:rect(0px,0px,0px,0px);color:#b91c1c">Legacy clip amount</p>
+<p style="clip-path:circle(10px);color:#b91c1c">Unverifiable clip amount</p>
+<p style="clip-path:inset(0px 0px 0px 10px);color:#b91c1c">Partial clip amount</p>
+<fieldset aria-label="Filtered checking"><p style="color:#b91c1c">Scoped visible amount</p></fieldset>
+<fieldset aria-label="Filtered checking" style="clip-path:inset(100%)"><p>Clipped duplicate scope</p></fieldset>
+<div class="frames">
+  <iframe style="opacity:0" srcdoc="<p style='color:#b91c1c'>Opacity frame</p><button style='color:#b91c1c'>Opacity choice</button>"></iframe>
+  <iframe style="visibility:hidden" srcdoc="<p style='color:#b91c1c'>Hidden frame</p><button style='color:#b91c1c'>Hidden choice</button>"></iframe>
+  <iframe inert srcdoc="<p style='color:#b91c1c'>Inert frame</p><button style='color:#b91c1c'>Inert choice</button>"></iframe>
+  <div style="overflow:hidden;width:1px;height:1px"><iframe style="transform:translateX(50px)" srcdoc="<p style='color:#b91c1c'>Clipped frame</p><button style='color:#b91c1c'>Clipped choice</button>"></iframe></div>
+  <iframe aria-hidden="true" srcdoc="<p style='color:#b91c1c'>Painted hidden frame</p>"></iframe>
+</div>
+<dialog open aria-label="Shadow details"><fieldset aria-label="Shadow checking"><button>Main choice</button><div id="shadow"></div></fieldset></dialog>
+<fieldset aria-label="Direct checking" style="color:#b91c1c">$0.01<button>Checking choice</button></fieldset>
+<fieldset aria-label="Direct savings">$0.01<button>Savings choice</button></fieldset>
+<script>
+document.getElementById('shadow').attachShadow({mode:'open'}).innerHTML='<p style="color:#b91c1c">Scoped shadow amount</p><button aria-label="Scoped shadow choice" style="color:#b91c1c">Choose</button>';
+</script>

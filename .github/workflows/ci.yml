@@ -142,6 +142,9 @@ jobs:
         run: |
           cargo test --locked -p manuvra-cli --test cli viewport:: -- --ignored --nocapture --test-threads=1
           python3 scripts/verify-viewport-capture.py "$MANUVRA_FIXTURE_EVIDENCE"
+      - name: Verify foreground assertions through the CLI
+        run: |
+          cargo test --locked -p manuvra-cli --test cli color:: -- --ignored --nocapture --test-threads=1
       - name: Retain browser fixture captures
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -191,6 +194,9 @@ jobs:
         run: |
           cargo test --locked -p manuvra-cli --test cli viewport:: -- --ignored --nocapture --test-threads=1
           python3 scripts/verify-viewport-capture.py "$MANUVRA_FIXTURE_EVIDENCE"
+      - name: Verify foreground assertions through the CLI
+        run: |
+          cargo test --locked -p manuvra-cli --test cli color:: -- --ignored --nocapture --test-threads=1
       - name: Retain browser fixture captures
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

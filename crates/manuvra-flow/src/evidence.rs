@@ -185,6 +185,29 @@ impl Redactor {
     /// Whether exported bytes contain a classified value, either raw or in the escaped form JSON
     /// serialization gives a value containing quotes, backslashes, or control characters.
     pub fn contains_export_leak(&self, bytes: &[u8]) -> bool {
+        if !self.contains_raw_export_leak(bytes) {
+            return false;
+        }
+        let Some(keys) = scanned_json_keys(bytes, |quoted| self.contains_raw_export_leak(quoted))
+        else {
+            return true;
+        };
+        export_without_color_numbers(bytes, keys)
+            .is_none_or(|export| self.contains_raw_export_leak(&export))
+    }
+
+    /// The publisher supplies the artifact path relative to its owned run directory.
+    pub fn contains_artifact_leak(&self, relative_path: &Path, bytes: &[u8]) -> bool {
+        if relative_path != Path::new("manifest.json") {
+            return self.contains_export_leak(bytes);
+        }
+        self.contains_raw_export_leak(bytes)
+            && self.contains_export_leak(
+                &export_without_manifest_digests(bytes).unwrap_or_else(|| bytes.to_vec()),
+            )
+    }
+
+    fn contains_raw_export_leak(&self, bytes: &[u8]) -> bool {
         self.leak_scan_values()
             .flat_map(|secret| [secret.to_owned(), json_escaped(secret)])
             .any(|secret| {
@@ -196,6 +219,194 @@ impl Redactor {
     }
 }
 
+/// Retain original quoted bytes and count keys so parsing cannot hide duplicate fields.
+fn scanned_json_keys(bytes: &[u8], mut leaks: impl FnMut(&[u8]) -> bool) -> Option<usize> {
+    let mut start = None;
+    let mut escaped = false;
+    let mut keys = 0;
+    for (offset, byte) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match byte {
+            b'\\' if start.is_some() => escaped = true,
+            b'"' => keys += scan_json_quote(bytes, offset, &mut start, &mut leaks)?,
+            _ => {}
+        }
+    }
+    Some(keys)
+}
+
+fn scan_json_quote(
+    bytes: &[u8],
+    offset: usize,
+    quote_start: &mut Option<usize>,
+    leaks: &mut impl FnMut(&[u8]) -> bool,
+) -> Option<usize> {
+    match quote_start.take() {
+        Some(start) => {
+            if leaks(&bytes[start..offset]) {
+                return None;
+            }
+            Some(usize::from(
+                bytes[offset + 1..]
+                    .iter()
+                    .find(|byte| !byte.is_ascii_whitespace())
+                    == Some(&b':'),
+            ))
+        }
+        None => {
+            *quote_start = Some(offset + 1);
+            Some(0)
+        }
+    }
+}
+
+fn export_without_manifest_digests(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut value: Value = serde_json::from_slice(bytes).ok()?;
+    let manifest: Manifest = serde_json::from_value(value.clone()).ok()?;
+    if !can_omit_manifest_digests(bytes, &value, &manifest) {
+        return None;
+    }
+    for artifact in value.get_mut("artifacts")?.as_array_mut()? {
+        artifact["digest"] = Value::Null;
+    }
+    serde_json::to_vec(&value).ok()
+}
+
+fn can_omit_manifest_digests(bytes: &[u8], value: &Value, manifest: &Manifest) -> bool {
+    !manifest.artifacts.is_empty()
+        && manifest
+            .artifacts
+            .iter()
+            .all(|artifact| valid_artifact_digest(&artifact.digest))
+        && Some(json_key_count(value)) == scanned_json_keys(bytes, |_| false)
+}
+
+/// Color channels and tolerances are owned numeric facts, even when classified text happens to
+/// contain the same digits. Strip only those typed facts from the scan, preserving every string
+/// and key. Invalid JSON and non-JSON evidence retain the original byte scan.
+fn export_without_color_numbers(bytes: &[u8], keys: usize) -> Option<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut changed = false;
+    let mut parsed_keys = 0;
+    for value in serde_json::Deserializer::from_slice(bytes).into_iter::<Value>() {
+        let mut value = value.ok()?;
+        parsed_keys += json_key_count(&value);
+        changed |= omit_color_numbers(&mut value);
+        serde_json::to_writer(&mut output, &value).ok()?;
+        output.push(b'\n');
+    }
+    (changed && parsed_keys == keys).then_some(output)
+}
+
+fn json_key_count(value: &Value) -> usize {
+    match value {
+        Value::Object(fields) => fields.len() + fields.values().map(json_key_count).sum::<usize>(),
+        Value::Array(items) => items.iter().map(json_key_count).sum(),
+        _ => 0,
+    }
+}
+
+fn omit_color_numbers(value: &mut Value) -> bool {
+    match value {
+        Value::Object(fields) => {
+            let own = fields
+                .get_mut("color")
+                .is_some_and(omit_typed_color_numbers);
+            fields
+                .values_mut()
+                .fold(own, |changed, item| omit_color_numbers(item) | changed)
+        }
+        Value::Array(items) => items
+            .iter_mut()
+            .fold(false, |changed, item| omit_color_numbers(item) | changed),
+        _ => false,
+    }
+}
+
+fn omit_typed_color_numbers(color: &mut Value) -> bool {
+    if serde_json::from_value::<manuvra_contract::ColorCheckEvidence>(color.clone()).is_ok() {
+        let mut changed = omit_tolerance(color) | omit_rgba(&mut color["target"]);
+        if let Some(reference) = color.get_mut("reference") {
+            changed |= omit_rgba(reference);
+        }
+        changed
+    } else if serde_json::from_value::<manuvra_chrome::ComputedColor>(color.clone()).is_ok() {
+        omit_rgba(color)
+    } else if serde_json::from_value::<manuvra_contract::ColorCheck>(color.clone()).is_ok() {
+        // Job admission already validated caller strings that classification may now mask.
+        omit_tolerance(color)
+    } else {
+        false
+    }
+}
+
+fn omit_tolerance(color: &mut Value) -> bool {
+    let Some(tolerance @ Value::Number(_)) = color.get_mut("tolerance") else {
+        return false;
+    };
+    *tolerance = Value::Null;
+    true
+}
+
+fn omit_rgba(color: &mut Value) -> bool {
+    let Some(rgba @ Value::Array(_)) = color.get_mut("rgba") else {
+        return false;
+    };
+    *rgba = Value::Null;
+    true
+}
+
+/// Redact caller and page strings while retaining the typed protocol and numeric color facts.
+pub(crate) fn redacted_assertion_checks(
+    checks: &[manuvra_contract::AssertionCheck],
+    redactor: &Redactor,
+) -> Vec<manuvra_contract::AssertionCheck> {
+    checks
+        .iter()
+        .cloned()
+        .map(|mut assertion| {
+            let manuvra_contract::AssertionCheck::Color(check) = &mut assertion;
+            redact_color_target(&mut check.target, redactor);
+            if let Some(reference) = &mut check.reference {
+                redact_color_target(reference, redactor);
+            }
+            redact_optional_text(&mut check.equals, redactor);
+            assertion
+        })
+        .collect()
+}
+
+fn redact_color_target(target: &mut manuvra_contract::ColorTargetEvidence, redactor: &Redactor) {
+    let (subject, dialog, container) = match &mut target.selector {
+        manuvra_contract::ColorTarget::Text(selector) => (
+            &mut selector.text,
+            &mut selector.dialog,
+            &mut selector.container,
+        ),
+        manuvra_contract::ColorTarget::Name(selector) => {
+            redact_optional_text(&mut selector.role, redactor);
+            (
+                &mut selector.name,
+                &mut selector.dialog,
+                &mut selector.container,
+            )
+        }
+    };
+    *subject = redactor.redact_export_text(subject);
+    for text in [dialog, container, &mut target.raw] {
+        redact_optional_text(text, redactor);
+    }
+}
+
+fn redact_optional_text(text: &mut Option<String>, redactor: &Redactor) {
+    if let Some(text) = text {
+        *text = redactor.redact_export_text(text);
+    }
+}
+
 /// A value as it appears inside a serialized JSON string, without the surrounding quotes.
 fn json_escaped(value: &str) -> String {
     let quoted = Value::String(value.to_owned()).to_string();
@@ -204,6 +415,31 @@ fn json_escaped(value: &str) -> String {
 
 fn is_protocol_collision(value: &str) -> bool {
     const OWNED_VOCABULARY: &[&str] = &[
+        "color",
+        "colors",
+        "colors_complete",
+        "color_scopes",
+        "assertions",
+        "assertion_checks",
+        "selector",
+        "same_as",
+        "different_from",
+        "equals",
+        "tolerance",
+        "comparator",
+        "reference",
+        "raw",
+        "rgba",
+        "channel",
+        "accessible",
+        "painted_aria_hidden",
+        "paint_complete",
+        "missing",
+        "ambiguous_owner",
+        "ambiguous_scope",
+        "incomplete_coverage",
+        "unsupported_color",
+        "transparent",
         "scroll_regions",
         "scroll_regions_truncated",
         "can_scroll",
@@ -363,6 +599,7 @@ fn is_protocol_collision(value: &str) -> bool {
         "not_satisfied",
         "unresolved",
         "not_run",
+        "attempted",
         "structured",
         "headed",
         "headless",
@@ -1125,13 +1362,20 @@ fn reject_leaks(directory: &Path, redactor: &Redactor) -> Result<(), String> {
                 pending.push(path);
                 continue;
             }
-            let bytes = fs::read(&path).map_err(|e| e.to_string())?;
-            if redactor.contains_export_leak(&bytes) {
-                return Err(format!("evidence leak scan rejected {}", path.display()));
-            }
+            reject_artifact_leak(directory, &path, redactor)?;
         }
     }
     Ok(())
+}
+
+fn reject_artifact_leak(directory: &Path, path: &Path, redactor: &Redactor) -> Result<(), String> {
+    let bytes = fs::read(path).map_err(|e| e.to_string())?;
+    let relative = path.strip_prefix(directory).map_err(|e| e.to_string())?;
+    if redactor.contains_artifact_leak(relative, &bytes) {
+        Err(format!("evidence leak scan rejected {}", path.display()))
+    } else {
+        Ok(())
+    }
 }
 
 pub fn redacted_job(job: &Job, redactor: &Redactor) -> Result<Value, String> {
@@ -1476,6 +1720,213 @@ mod tests {
                 .join("r_verify/verification/final.json")
         );
         assert!(artifact.complete);
+    }
+
+    #[test]
+    fn canonical_color_channels_do_not_hide_classified_string_leaks() {
+        for (classified, text) in [("185", "185"), ("255", "255"), ("185", "Amount \"quoted")] {
+            let temporary = TempDir::new().unwrap();
+            let mut job = test_job(true);
+            job.values.get_mut("marker").unwrap().value = classified.into();
+            let redactor = Redactor::for_job_with_provider_key(&job, None).unwrap();
+            let raw = redactor.redact_export_text("rgb(185, 28, 28)");
+            let subject = redactor.redact_export_text(text);
+            let check = json!({"color":{
+                "target":{"selector":{"text":subject},"channel":"accessible","raw":raw,"rgba":[185,28,28,255]},
+                "comparator":"equals","equals":"#b91c1c","tolerance":0,"result":"satisfied"
+            }});
+            let mut evidence = bundle("safe", b"png".to_vec());
+            evidence.observations[0].1 = json!({"colors":[{
+                "text":subject,"channel":"accessible","color":{"raw":raw,"rgba":[185,28,28,255]}
+            }]});
+            let verdict = json!({"id":"amount","result":"satisfied","noul":null,"numeric_checks":[],"assertion_checks":[check.clone()]});
+            evidence.verification = Some(
+                json!({"phase":"verification","expectations":[verdict.clone()],"provider":null}),
+            );
+            evidence.result["verdict"] = json!({"expectations":[verdict]});
+            evidence.trace =
+                vec![json!({"event":"observation","assertion_checks":[check.clone()]})];
+            publish(temporary.path(), "r_color", evidence, &redactor).expect(
+                "owned canonical color numbers cannot prevent redacted evidence publication",
+            );
+            let final_record: Value = serde_json::from_slice(
+                &fs::read(temporary.path().join("r_color/verification/final.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                final_record["expectations"][0]["assertion_checks"][0]["color"]["target"]["rgba"],
+                json!([185, 28, 28, 255])
+            );
+            assert_eq!(
+                final_record["expectations"][0]["assertion_checks"][0]["color"]["target"]["selector"]
+                    ["text"],
+                subject
+            );
+            for mut leaked in [
+                json!({"text":classified,"assertion_checks":[check.clone()]}),
+                json!({classified:"classified object key","assertion_checks":[check.clone()]}),
+                json!({"color":{"raw":classified,"rgba":[185,28,28,255]}}),
+                json!({"color":{"raw":"safe","rgba":[classified,28,28,255]}}),
+                json!({"other_numbers":[185,28,28,255]}),
+            ] {
+                assert!(redactor.contains_export_leak(leaked.to_string().as_bytes()));
+                // Invalid JSON must retain the raw byte scan as well.
+                leaked["extra"] = json!(classified);
+                let malformed = format!("{} trailing data", leaked);
+                assert!(redactor.contains_export_leak(malformed.as_bytes()));
+            }
+            assert!(redactor.contains_export_leak(format!("plain {classified}").as_bytes()));
+            let duplicate_keys = format!(
+                r#"{{"text":"{classified}","text":"safe","color":{{"raw":"safe","rgba":[185,28,28,255]}}}}"#
+            );
+            assert!(redactor.contains_export_leak(duplicate_keys.as_bytes()));
+            let duplicate_numbers = format!(
+                r#"{{"other":{classified},"other":0,"color":{{"raw":"safe","rgba":[185,28,28,255]}}}}"#
+            );
+            assert!(redactor.contains_export_leak(duplicate_numbers.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn run_owned_manifest_digests_do_not_collide_with_classified_values() {
+        let temporary = TempDir::new().unwrap();
+        let mut job = test_job(true);
+        job.values.get_mut("marker").unwrap().value = "185".into();
+        let redactor = Redactor::for_job_with_provider_key(&job, None).unwrap();
+        let manifest = json!({
+            "schema_version":1, "run_id":"r_digest", "complete":true,
+            "artifacts":[{"role":"result","path":"result.json","digest":format!("185{}", "0".repeat(61)),"complete":true}]
+        });
+        fs::write(
+            temporary.path().join("manifest.json"),
+            pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        reject_leaks(temporary.path(), &redactor)
+            .expect("owned SHA256 digits cannot prevent redacted evidence publication");
+        assert!(redactor.contains_export_leak(&pretty(&manifest).unwrap()));
+        for path in ["result.json", "nested/manifest.json"] {
+            assert!(redactor.contains_artifact_leak(Path::new(path), &pretty(&manifest).unwrap()));
+        }
+        for field in ["run_id", "artifacts/0/path", "artifacts/0/role", "caller"] {
+            let mut leaked = manifest.clone();
+            if field == "caller" {
+                leaked[field] = json!("185");
+            } else {
+                *leaked.pointer_mut(&format!("/{field}")).unwrap() = json!("185");
+            }
+            assert!(
+                redactor
+                    .contains_artifact_leak(Path::new("manifest.json"), &pretty(&leaked).unwrap())
+            );
+        }
+        for invalid in ["185".to_owned(), format!("185{}", "g".repeat(61))] {
+            let mut malformed = manifest.clone();
+            malformed["artifacts"][0]["digest"] = json!(invalid);
+            assert!(
+                redactor.contains_artifact_leak(
+                    Path::new("manifest.json"),
+                    &pretty(&malformed).unwrap()
+                )
+            );
+        }
+        let bytes = pretty(&manifest).unwrap();
+        let mut malformed = bytes.clone();
+        malformed.extend_from_slice(b" trailing data");
+        assert!(redactor.contains_artifact_leak(Path::new("manifest.json"), &malformed));
+        let duplicate = String::from_utf8(bytes.clone()).unwrap().replacen(
+            '{',
+            r#"{"caller":"185","caller":"safe","#,
+            1,
+        );
+        assert!(redactor.contains_artifact_leak(Path::new("manifest.json"), duplicate.as_bytes()));
+        assert_eq!(
+            fs::read(temporary.path().join("manifest.json")).unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn typed_color_tolerances_do_not_collide_with_classified_text() {
+        for literal in ["#b91c1c", "#185185"] {
+            let temporary = TempDir::new().unwrap();
+            let mut wire = serde_json::to_value(test_job(true)).unwrap();
+            wire["values"]["marker"]["value"] = json!("185");
+            wire["expectations"] = json!([{"id":"amount","assertions":[{
+                "color":{"target":{"text":"185"},"equals":literal,"tolerance":185}
+            }]}]);
+            let job = Job::parse(&serde_json::to_vec(&wire).unwrap()).unwrap();
+            let redactor = Redactor::for_job_with_provider_key(&job, None).unwrap();
+            let normalized = redacted_job(&job, &redactor).unwrap();
+            let check = json!({"color":{
+                "target":{"selector":{"text":redactor.redact_export_text("185")},"channel":"accessible","raw":"rgb(12, 28, 28)","rgba":[12,28,28,255]},
+                "comparator":"equals","equals":redactor.redact_export_text(literal),"tolerance":185,"result":"satisfied"
+            }});
+            let mut evidence = bundle("safe", b"png".to_vec());
+            evidence.job = normalized.clone();
+            evidence.verification = Some(json!({"phase":"verification","expectations":[{
+                "id":"amount","result":"satisfied","noul":null,"numeric_checks":[],"assertion_checks":[check.clone()]
+            }],"provider":null}));
+            publish(temporary.path(), "r_tolerance", evidence, &redactor).expect(
+                "a valid color tolerance must retain its numeric value in redacted evidence",
+            );
+            let final_record: Value = serde_json::from_slice(
+                &fs::read(temporary.path().join("r_tolerance/verification/final.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                final_record["expectations"][0]["assertion_checks"][0]["color"]["tolerance"],
+                185
+            );
+            assert_eq!(
+                normalized["expectations"][0]["assertions"][0]["color"]["tolerance"],
+                185
+            );
+            for leaked in [
+                json!({"text":"185","assertion_checks":[check.clone()]}),
+                json!({"tolerance":185,"assertion_checks":[check.clone()]}),
+                json!({"color":{"tolerance":185}}),
+                json!({"color":{"target":{"text":"safe"},"equals":"#b91c1c","tolerance":"185"}}),
+                json!({"color":{"target":{"text":"safe"},"equals":"#b91c1c","tolerance":185.0}}),
+                json!({"color":{"target":{"text":"safe"},"equals":"#b91c1c","tolerance":3185}}),
+                json!({"color":{"target":{"text":"safe"},"equals":"#b91c1c","tolerance":185,"unknown":true}}),
+            ] {
+                assert!(redactor.contains_export_leak(leaked.to_string().as_bytes()));
+            }
+            let malformed = format!("{check} trailing data");
+            assert!(redactor.contains_export_leak(malformed.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn relative_color_tolerances_publish_redacted_normalized_jobs() {
+        for comparison in ["same_as", "different_from"] {
+            let temporary = TempDir::new().unwrap();
+            let mut wire = serde_json::to_value(test_job(true)).unwrap();
+            wire["values"]["marker"]["value"] = json!("185");
+            let mut color = json!({"target":{"text":"185"},"tolerance":185});
+            color[comparison] = json!({"text":"Reference"});
+            wire["expectations"] = json!([{"id":"relative","assertions":[{"color":color}]}]);
+            let job = Job::parse(&serde_json::to_vec(&wire).unwrap()).unwrap();
+            let redactor = Redactor::for_job_with_provider_key(&job, None).unwrap();
+            let mut evidence = bundle("safe", b"png".to_vec());
+            evidence.job = redacted_job(&job, &redactor).unwrap();
+            publish(temporary.path(), "r_relative", evidence, &redactor)
+                .expect("relative assertions preserve typed tolerances after redaction");
+            let manifest: Value = serde_json::from_slice(
+                &fs::read(temporary.path().join("r_relative/manifest.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(manifest["complete"], true);
+            let normalized: Value = serde_json::from_slice(
+                &fs::read(temporary.path().join("r_relative/job.json")).unwrap(),
+            )
+            .unwrap();
+            let color = &normalized["expectations"][0]["assertions"][0]["color"];
+            assert_eq!(color["tolerance"], 185);
+            assert!(color[comparison].is_object());
+            assert_ne!(color["target"]["text"], "185");
+        }
     }
 
     #[cfg(unix)]

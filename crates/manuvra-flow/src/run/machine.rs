@@ -170,7 +170,7 @@ fn publish_active_checkpoint(
         "verdict":{
             "overall":VerdictResult::Unresolved,
             "steps":artifacts.verdicts,
-            "expectations":job.expectations.iter().map(|expectation| json!({"id":redactor.redact_export_text(&expectation.id),"result":"not_run","numeric_checks":[]})).collect::<Vec<_>>(),
+            "expectations":job.expectations.iter().map(|expectation| json!({"id":redactor.redact_export_text(expectation.id()),"result":"not_run","numeric_checks":[]})).collect::<Vec<_>>(),
             "caller_assisted":artifacts.caller_assisted
         },
         "evidence":{"manifest":manifest,"complete":false},

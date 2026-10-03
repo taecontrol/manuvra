@@ -6,11 +6,19 @@ use crate::actions;
 use crate::evidence::Redactor;
 use crate::verification::DoneResult;
 use manuvra_chrome::{BrowserError, CapturedPage, Observation};
+use manuvra_contract::{Assertion, DoneCondition, Expectation, Job};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 pub(super) trait BrowserPage {
     fn capture_redacted_page(&self, sensitive: &[String]) -> Result<CapturedPage, BrowserError>;
+    fn capture_redacted_matching_page(
+        &self,
+        sensitive: &[String],
+        _unchanged: &dyn Fn(&Observation, &Observation) -> bool,
+    ) -> Result<CapturedPage, BrowserError> {
+        self.capture_redacted_page(sensitive)
+    }
     fn observe_page(&self) -> Result<Observation, BrowserError>;
 }
 
@@ -26,12 +34,14 @@ pub(super) struct Captured {
 pub(super) fn capture_step(
     browser: &(impl BrowserPage + ?Sized),
     redactor: &Redactor,
+    assertions: &[Assertion],
     step: usize,
     attempt: usize,
 ) -> Result<Captured, String> {
     let name = format!("o_{step:04}_{attempt}");
     let sensitive = redactor.sensitive_values();
-    match browser.capture_redacted_page(&sensitive) {
+    let captured = capture_assertions(browser, &sensitive, assertions);
+    match captured {
         Ok(captured) if captured.redaction.verifies(sensitive.len()) => {
             let observation = redacted_observation(&captured.observation, redactor)?;
             Ok(Captured {
@@ -46,6 +56,41 @@ pub(super) fn capture_step(
         }
         Err(error) => Err(redactor.redact_external_text(&error.to_string())),
     }
+}
+
+fn capture_assertions(
+    browser: &(impl BrowserPage + ?Sized),
+    sensitive: &[String],
+    assertions: &[Assertion],
+) -> Result<CapturedPage, BrowserError> {
+    if !assertions
+        .iter()
+        .any(|assertion| matches!(assertion, Assertion::Color(_)))
+    {
+        return browser.capture_redacted_page(sensitive);
+    }
+    let facts = |observation: &Observation| {
+        crate::verification::color_assertion_checks(assertions, observation)
+    };
+    browser
+        .capture_redacted_matching_page(sensitive, &|before, after| facts(before) == facts(after))
+}
+
+pub(super) fn done_assertions(done: &DoneCondition) -> &[Assertion] {
+    match done {
+        DoneCondition::Structured(assertions) => assertions,
+        DoneCondition::NaturalLanguage(_) => &[],
+    }
+}
+
+pub(super) fn final_assertions(job: &Job) -> Vec<Assertion> {
+    job.expectations
+        .iter()
+        .flat_map(|expectation| match expectation {
+            Expectation::Structured(expectation) => expectation.assertions.clone(),
+            Expectation::NaturalLanguage(_) => Vec::new(),
+        })
+        .collect()
 }
 
 fn withheld_capture(
@@ -139,8 +184,26 @@ fn redacted_observation(raw: &Observation, redactor: &Redactor) -> Result<Value,
     if let Value::Object(fields) = &mut exported {
         fields.extend(exported_hover_regions(raw, redactor));
         fields.extend(exported_scroll_regions(raw, redactor));
+        fields.extend(exported_colors(raw, redactor));
     }
     Ok(exported)
+}
+
+fn exported_colors(raw: &Observation, redactor: &Redactor) -> Vec<(String, Value)> {
+    if !raw.colors_complete && raw.colors.is_empty() && raw.color_scopes.is_empty() {
+        return Vec::new();
+    }
+    let redact = |text: &str| redactor.redact_external_text(text);
+    let optional = |text: &Option<String>| text.as_deref().map(redact);
+    vec![
+        ("colors_complete".into(), json!(raw.colors_complete)),
+        ("colors".into(), json!(raw.colors.iter().map(|color| json!({
+            "text":optional(&color.text),"name":optional(&color.name),"role":optional(&color.role),
+            "in_dialog":optional(&color.in_dialog),"container":optional(&color.container),"channel":color.channel,"paint_complete":color.paint_complete,
+            "color":{"raw":redact(&color.color.raw),"rgba":color.color.rgba}
+        })).collect::<Vec<_>>())),
+        ("color_scopes".into(), json!(raw.color_scopes.iter().map(|scope| json!({"name":redact(&scope.name),"kind":scope.kind})).collect::<Vec<_>>())),
+    ]
 }
 
 fn exported_scroll_regions(raw: &Observation, redactor: &Redactor) -> Vec<(String, Value)> {
@@ -208,9 +271,17 @@ pub(super) fn record_capture(
     done: DoneResult,
 ) {
     artifacts.observations.push(captured.artifact.clone());
-    artifacts
-        .trace
-        .push(json!({"event":event,"step_id":redactor.redact_export_text(&step.id),"done":done}));
+    let mut record =
+        json!({"event":event,"step_id":redactor.redact_export_text(&step.id),"done":done});
+    if let manuvra_contract::DoneCondition::Structured(assertions) = &step.done_when {
+        let checks = crate::verification::color_assertion_checks(assertions, &captured.raw);
+        if !checks.is_empty() {
+            record["assertion_checks"] = json!(crate::evidence::redacted_assertion_checks(
+                &checks, redactor
+            ));
+        }
+    }
+    artifacts.trace.push(record);
 }
 
 #[cfg(test)]

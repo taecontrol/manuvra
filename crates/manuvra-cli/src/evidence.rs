@@ -156,8 +156,12 @@ fn expected_evidence(
         ],
     };
     let manifest_bytes = pretty_json(&manifest)?;
-    for bytes in [&job_bytes, &result_bytes, &manifest_bytes] {
-        if redactor.contains_export_leak(bytes) {
+    for (path, bytes) in [
+        ("job.json", &job_bytes),
+        ("result.json", &result_bytes),
+        ("manifest.json", &manifest_bytes),
+    ] {
+        if redactor.contains_artifact_leak(Path::new(path), bytes) {
             return Err("evidence leak scan rejected blocked-run export".into());
         }
     }
@@ -284,10 +288,11 @@ fn blocked_result(
                 .expectations
                 .iter()
                 .map(|expectation| ExpectationVerdict {
-                    id: redactor.redact_export_text(&expectation.id),
+                    id: redactor.redact_export_text(expectation.id()),
                     result: VerdictResult::NotRun,
                     noul: None,
                     numeric_checks: Vec::new(),
+                    assertion_checks: Vec::new(),
                 })
                 .collect(),
             caller_assisted: false,
@@ -350,6 +355,51 @@ fn sync_directory(path: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn blocked_export_retains_owned_digests_that_contain_classified_digits() {
+        let temporary = TempDir::new().unwrap();
+        let mut job = Job::parse(
+            &serde_json::to_vec(&json!({
+                "schema_version":1,
+                "target":{"kind":"browser","url":"http://127.0.0.1/"},
+                "context":{"journey":"j","revision":"r","environment":"e","actor":"a","authority":"a"},
+                "values":{"marker":{"value":"185","description":"classified numeral","secret":true}},
+                "steps":[{"id":"s","goal":"g","requires_values":["missing"],"done_when":[{"text_visible":"Ready"}]}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let redactor = Redactor::for_job_with_provider_key(&job, None).unwrap();
+        // Select a deterministic accepted job whose owned artifact hash contains the short secret.
+        (0..1000)
+            .find(|revision| {
+                job.context.revision = format!("candidate-{revision}");
+                hex::encode(Sha256::digest(redacted_job_bytes(&job, &redactor).unwrap()))
+                    .contains("185")
+            })
+            .expect("the fixed fixture set includes a classified-digit hash collision");
+        let published = publish(
+            temporary.path(),
+            "q_digest",
+            "r_digest",
+            &job,
+            BlockedStop::missing_value("missing".into(), "s".into()),
+            &redactor,
+        )
+        .expect("a blocked run must still publish its own complete evidence");
+        assert_eq!(published.result["reason"]["code"], "missing_value");
+        let manifest: Manifest = serde_json::from_slice(
+            &fs::read(temporary.path().join("r_digest/manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(manifest.complete);
+        assert!(manifest.artifacts[0].digest.contains("185"));
+        for artifact in manifest.artifacts {
+            let bytes = fs::read(&artifact.path).unwrap();
+            assert_eq!(artifact.digest, hex::encode(Sha256::digest(bytes)));
+        }
+    }
 
     #[test]
     fn uncommitted_staged_result_is_never_a_published_run() {
