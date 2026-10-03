@@ -231,42 +231,57 @@ fn scanned_json_keys(bytes: &[u8], mut leaks: impl FnMut(&[u8]) -> bool) -> Opti
         }
         match byte {
             b'\\' if start.is_some() => escaped = true,
-            b'"' => match start.take() {
-                Some(start) => {
-                    if leaks(&bytes[start..offset]) {
-                        return None;
-                    }
-                    keys += usize::from(
-                        bytes[offset + 1..]
-                            .iter()
-                            .find(|byte| !byte.is_ascii_whitespace())
-                            == Some(&b':'),
-                    );
-                }
-                None => start = Some(offset + 1),
-            },
+            b'"' => keys += scan_json_quote(bytes, offset, &mut start, &mut leaks)?,
             _ => {}
         }
     }
     Some(keys)
 }
 
+fn scan_json_quote(
+    bytes: &[u8],
+    offset: usize,
+    quote_start: &mut Option<usize>,
+    leaks: &mut impl FnMut(&[u8]) -> bool,
+) -> Option<usize> {
+    match quote_start.take() {
+        Some(start) => {
+            if leaks(&bytes[start..offset]) {
+                return None;
+            }
+            Some(usize::from(
+                bytes[offset + 1..]
+                    .iter()
+                    .find(|byte| !byte.is_ascii_whitespace())
+                    == Some(&b':'),
+            ))
+        }
+        None => {
+            *quote_start = Some(offset + 1);
+            Some(0)
+        }
+    }
+}
+
 fn export_without_manifest_digests(bytes: &[u8]) -> Option<Vec<u8>> {
     let mut value: Value = serde_json::from_slice(bytes).ok()?;
     let manifest: Manifest = serde_json::from_value(value.clone()).ok()?;
-    if manifest.artifacts.is_empty()
-        || !manifest
-            .artifacts
-            .iter()
-            .all(|artifact| valid_artifact_digest(&artifact.digest))
-        || json_key_count(&value) != scanned_json_keys(bytes, |_| false)?
-    {
+    if !can_omit_manifest_digests(bytes, &value, &manifest) {
         return None;
     }
     for artifact in value.get_mut("artifacts")?.as_array_mut()? {
         artifact["digest"] = Value::Null;
     }
     serde_json::to_vec(&value).ok()
+}
+
+fn can_omit_manifest_digests(bytes: &[u8], value: &Value, manifest: &Manifest) -> bool {
+    !manifest.artifacts.is_empty()
+        && manifest
+            .artifacts
+            .iter()
+            .all(|artifact| valid_artifact_digest(&artifact.digest))
+        && Some(json_key_count(value)) == scanned_json_keys(bytes, |_| false)
 }
 
 /// Color channels and tolerances are owned numeric facts, even when classified text happens to
@@ -1347,14 +1362,20 @@ fn reject_leaks(directory: &Path, redactor: &Redactor) -> Result<(), String> {
                 pending.push(path);
                 continue;
             }
-            let bytes = fs::read(&path).map_err(|e| e.to_string())?;
-            let relative = path.strip_prefix(directory).map_err(|e| e.to_string())?;
-            if redactor.contains_artifact_leak(relative, &bytes) {
-                return Err(format!("evidence leak scan rejected {}", path.display()));
-            }
+            reject_artifact_leak(directory, &path, redactor)?;
         }
     }
     Ok(())
+}
+
+fn reject_artifact_leak(directory: &Path, path: &Path, redactor: &Redactor) -> Result<(), String> {
+    let bytes = fs::read(path).map_err(|e| e.to_string())?;
+    let relative = path.strip_prefix(directory).map_err(|e| e.to_string())?;
+    if redactor.contains_artifact_leak(relative, &bytes) {
+        Err(format!("evidence leak scan rejected {}", path.display()))
+    } else {
+        Ok(())
+    }
 }
 
 pub fn redacted_job(job: &Job, redactor: &Redactor) -> Result<Value, String> {
