@@ -185,6 +185,49 @@ impl Redactor {
     /// Whether exported bytes contain a classified value, either raw or in the escaped form JSON
     /// serialization gives a value containing quotes, backslashes, or control characters.
     pub fn contains_export_leak(&self, bytes: &[u8]) -> bool {
+        if !self.contains_raw_export_leak(bytes) {
+            return false;
+        }
+        let Some(keys) = self.scanned_json_keys(bytes) else {
+            return true;
+        };
+        export_without_color_channels(bytes, keys)
+            .is_none_or(|export| self.contains_raw_export_leak(&export))
+    }
+
+    /// Retain the raw string scan and count keys so parsing cannot hide duplicate fields.
+    fn scanned_json_keys(&self, bytes: &[u8]) -> Option<usize> {
+        let mut start = None;
+        let mut escaped = false;
+        let mut keys = 0;
+        for (offset, byte) in bytes.iter().enumerate() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match byte {
+                b'\\' if start.is_some() => escaped = true,
+                b'"' => match start.take() {
+                    Some(start) => {
+                        if self.contains_raw_export_leak(&bytes[start..offset]) {
+                            return None;
+                        }
+                        keys += usize::from(
+                            bytes[offset + 1..]
+                                .iter()
+                                .find(|byte| !byte.is_ascii_whitespace())
+                                == Some(&b':'),
+                        );
+                    }
+                    None => start = Some(offset + 1),
+                },
+                _ => {}
+            }
+        }
+        Some(keys)
+    }
+
+    fn contains_raw_export_leak(&self, bytes: &[u8]) -> bool {
         self.leak_scan_values()
             .flat_map(|secret| [secret.to_owned(), json_escaped(secret)])
             .any(|secret| {
@@ -194,6 +237,70 @@ impl Redactor {
                         .any(|window| window == secret.as_bytes())
             })
     }
+}
+
+/// Canonical color channels are owned numeric facts, even when a classified text happens to
+/// contain the same digits. Strip only those typed facts from the scan, preserving every string
+/// and key. Invalid JSON and non-JSON evidence retain the original byte scan.
+fn export_without_color_channels(bytes: &[u8], keys: usize) -> Option<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut changed = false;
+    let mut parsed_keys = 0;
+    for value in serde_json::Deserializer::from_slice(bytes).into_iter::<Value>() {
+        let mut value = value.ok()?;
+        parsed_keys += json_key_count(&value);
+        changed |= omit_color_channels(&mut value);
+        serde_json::to_writer(&mut output, &value).ok()?;
+        output.push(b'\n');
+    }
+    (changed && parsed_keys == keys).then_some(output)
+}
+
+fn json_key_count(value: &Value) -> usize {
+    match value {
+        Value::Object(fields) => fields.len() + fields.values().map(json_key_count).sum::<usize>(),
+        Value::Array(items) => items.iter().map(json_key_count).sum(),
+        _ => 0,
+    }
+}
+
+fn omit_color_channels(value: &mut Value) -> bool {
+    match value {
+        Value::Object(fields) => {
+            let own = fields
+                .get_mut("color")
+                .is_some_and(omit_typed_color_channels);
+            fields
+                .values_mut()
+                .fold(own, |changed, item| omit_color_channels(item) | changed)
+        }
+        Value::Array(items) => items
+            .iter_mut()
+            .fold(false, |changed, item| omit_color_channels(item) | changed),
+        _ => false,
+    }
+}
+
+fn omit_typed_color_channels(color: &mut Value) -> bool {
+    if serde_json::from_value::<manuvra_contract::ColorCheckEvidence>(color.clone()).is_ok() {
+        let mut changed = omit_rgba(&mut color["target"]);
+        if let Some(reference) = color.get_mut("reference") {
+            changed |= omit_rgba(reference);
+        }
+        changed
+    } else if serde_json::from_value::<manuvra_chrome::ComputedColor>(color.clone()).is_ok() {
+        omit_rgba(color)
+    } else {
+        false
+    }
+}
+
+fn omit_rgba(color: &mut Value) -> bool {
+    let Some(rgba @ Value::Array(_)) = color.get_mut("rgba") else {
+        return false;
+    };
+    *rgba = Value::Null;
+    true
 }
 
 /// Redact caller and page strings while retaining the typed protocol and numeric color facts.
@@ -270,6 +377,7 @@ fn is_protocol_collision(value: &str) -> bool {
         "channel",
         "accessible",
         "painted_aria_hidden",
+        "paint_complete",
         "missing",
         "ambiguous_owner",
         "ambiguous_scope",
@@ -1548,6 +1656,66 @@ mod tests {
                 .join("r_verify/verification/final.json")
         );
         assert!(artifact.complete);
+    }
+
+    #[test]
+    fn canonical_color_channels_do_not_hide_classified_string_leaks() {
+        for classified in ["185", "255"] {
+            let temporary = TempDir::new().unwrap();
+            let mut job = test_job(true);
+            job.values.get_mut("marker").unwrap().value = classified.into();
+            let redactor = Redactor::for_job_with_provider_key(&job, None).unwrap();
+            let raw = redactor.redact_export_text("rgb(185, 28, 28)");
+            let subject = redactor.redact_export_text(classified);
+            let check = json!({"color":{
+                "target":{"selector":{"text":subject},"channel":"accessible","raw":raw,"rgba":[185,28,28,255]},
+                "comparator":"equals","equals":"#b91c1c","tolerance":0,"result":"satisfied"
+            }});
+            let mut evidence = bundle("safe", b"png".to_vec());
+            evidence.observations[0].1 = json!({"colors":[{
+                "text":subject,"channel":"accessible","color":{"raw":raw,"rgba":[185,28,28,255]}
+            }]});
+            let verdict = json!({"id":"amount","result":"satisfied","noul":null,"numeric_checks":[],"assertion_checks":[check.clone()]});
+            evidence.verification = Some(
+                json!({"phase":"verification","expectations":[verdict.clone()],"provider":null}),
+            );
+            evidence.result["verdict"] = json!({"expectations":[verdict]});
+            evidence.trace =
+                vec![json!({"event":"observation","assertion_checks":[check.clone()]})];
+            publish(temporary.path(), "r_color", evidence, &redactor).expect(
+                "owned canonical color numbers cannot prevent redacted evidence publication",
+            );
+            let final_record: Value = serde_json::from_slice(
+                &fs::read(temporary.path().join("r_color/verification/final.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                final_record["expectations"][0]["assertion_checks"][0]["color"]["target"]["rgba"],
+                json!([185, 28, 28, 255])
+            );
+            for mut leaked in [
+                json!({"text":classified,"assertion_checks":[check.clone()]}),
+                json!({classified:"classified object key","assertion_checks":[check.clone()]}),
+                json!({"color":{"raw":classified,"rgba":[185,28,28,255]}}),
+                json!({"color":{"raw":"safe","rgba":[classified,28,28,255]}}),
+                json!({"other_numbers":[185,28,28,255]}),
+            ] {
+                assert!(redactor.contains_export_leak(leaked.to_string().as_bytes()));
+                // Invalid JSON must retain the raw byte scan as well.
+                leaked["extra"] = json!(classified);
+                let malformed = format!("{} trailing data", leaked);
+                assert!(redactor.contains_export_leak(malformed.as_bytes()));
+            }
+            assert!(redactor.contains_export_leak(format!("plain {classified}").as_bytes()));
+            let duplicate_keys = format!(
+                r#"{{"text":"{classified}","text":"safe","color":{{"raw":"safe","rgba":[185,28,28,255]}}}}"#
+            );
+            assert!(redactor.contains_export_leak(duplicate_keys.as_bytes()));
+            let duplicate_numbers = format!(
+                r#"{{"other":{classified},"other":0,"color":{{"raw":"safe","rgba":[185,28,28,255]}}}}"#
+            );
+            assert!(redactor.contains_export_leak(duplicate_numbers.as_bytes()));
+        }
     }
 
     #[cfg(unix)]
