@@ -1,4 +1,30 @@
 use super::*;
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn capture_stability_tracks_effects_through_composed_ancestors() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    for body in [
+        "<div style='animation:pulse 1000000s linear infinite'><span>Amount</span></div>",
+        "<span id='host' style='animation:pulse 1000000s linear infinite'></span><script>host.attachShadow({mode:'open'}).innerHTML='<span>Amount</span>'</script>",
+        "<span id='host'><span>Amount</span></span><script>host.attachShadow({mode:'open'}).innerHTML='<style>@keyframes pulse{from{color:#b91c1c}to{color:black}}slot{animation:pulse 1000000s linear infinite}</style><slot></slot>'</script>",
+        "<iframe style='animation:fade 1000000s linear infinite' srcdoc='<span>Amount</span>'></iframe>",
+    ] {
+        let server = FixtureServer::with_body(&format!(
+            "<!doctype html><style>@keyframes pulse{{from{{color:#b91c1c}}to{{color:black}}}}@keyframes fade{{from{{opacity:1}}to{{opacity:0}}}}</style><p>Ready</p>{body}"
+        ));
+        let mut browser = launch_headless();
+        browser.navigate(&server.url()).unwrap();
+        let observed = browser.observe().unwrap();
+        let owner = observed
+            .colors
+            .iter()
+            .find(|owner| owner.text.as_deref() == Some("Amount"))
+            .unwrap();
+        assert!(!owner.capture_stable, "{body}");
+        browser.close().unwrap();
+    }
+}
 use serde_json::{Value, json};
 
 const COLOR_FIXTURE: &str = include_str!("../../../../tests/browser/color.html");

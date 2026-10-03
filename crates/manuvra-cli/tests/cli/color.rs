@@ -1,5 +1,30 @@
 use super::*;
 
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn color_cli_active_shadow_foreground_effect_cannot_publish_unfenced_evidence() {
+    let http = HttpFixture::with_body(
+        "<!doctype html><p>Ready</p><span id='host'><span>Amount</span></span><script>host.attachShadow({mode:'open'}).innerHTML='<style>@keyframes pulse{from{color:#b91c1c}to{color:black}}slot{animation:pulse 1000000s linear infinite}</style><slot></slot>'</script>",
+    );
+    let temp = hosted_temp();
+    let job = color_job(
+        &http.url(),
+        json!([
+            {"color":{"target":{"text":"Amount"},"equals":"#b91c1c","tolerance":255}}
+        ]),
+    );
+    let (exit, result) = run(&temp, &job);
+    assert_eq!(exit, 3, "{result}");
+    assert_eq!(result["state"], "blocked");
+    assert_eq!(result["reason"]["code"], "browser_control_failed");
+    assert_eq!(result["verdict"]["expectations"][0]["result"], "not_run");
+    assert_eq!(result["verdict"]["caller_assisted"], false);
+    viewport::assert_no_step_input(&result);
+    assert_complete_artifacts(&result);
+    assert_eq!(result["cleanup"]["browser"], "closed");
+    assert_eq!(result["cleanup"]["profile"], "removed");
+}
+
 const COLOR_FIXTURE: &str = include_str!("../../../../tests/browser/color.html");
 
 fn invoke(temp: &TempDir, args: &[&str]) -> (i32, Value) {

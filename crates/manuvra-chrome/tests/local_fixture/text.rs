@@ -3,6 +3,44 @@ use serde_json::{Value, json};
 
 #[test]
 #[ignore = "requires the local Chromium executable"]
+fn classified_shadow_animation_cannot_publish_unfenced_masking() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(
+        "<!doctype html><p>Ready</p><span id='host'></span><script>host.attachShadow({mode:'open'}).innerHTML='<style>@keyframes slide{from{transform:translateX(0)}to{transform:translateX(500px)}}#bare{display:block;animation:slide .1s linear infinite alternate}</style><span id=bare aria-hidden=true>bare-shadow-secret</span>'</script>",
+    );
+    let mut browser = launch_headless();
+    browser.navigate(&server.url()).unwrap();
+    let observed = browser.observe().unwrap();
+    assert!(
+        observed
+            .painted_text
+            .as_ref()
+            .unwrap()
+            .viewport
+            .painted_aria_hidden
+            .contains("bare-shadow-secret")
+    );
+    let result = browser.capture_redacted(&["bare-shadow-secret".into()]);
+    if let Ok(masked) = &result {
+        eprintln!("shadow animation proof {:?}", masked.redaction);
+        if let Some(directory) = std::env::var_os("MANUVRA_FIXTURE_EVIDENCE") {
+            let directory = PathBuf::from(directory);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                directory.join("shadow-animation-masked.png"),
+                &masked.screenshot.bytes,
+            )
+            .unwrap();
+        }
+    }
+    browser.close().unwrap();
+    assert!(
+        matches!(result, Err(BrowserError::Control(message)) if message == "redaction_unverifiable")
+    );
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
 fn classified_shadow_text_with_reflected_paint_is_withheld() {
     let _serial = REAL_BROWSER.lock().unwrap();
     let server = FixtureServer::with_body(
