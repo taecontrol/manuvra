@@ -164,7 +164,7 @@ def assess_case(case):
     except (OSError,ValueError,KeyError):
         provenance={}
     row['browser_provenance']=provenance
-    if provenance.get('display_mode')!='headless' or provenance.get('viewport')!={'width':1280,'height':metadata['height']}:
+    if provenance.get('display_mode')!='headless' or provenance.get('viewport')!={'width':1280,'height':metadata['height'],'initial_client_width':1280}:
         fail_row(row,'browser_configuration_mismatch')
     row.update(metadata,models=models,first_draw_scroll_choices=first,case=str(case))
     write_json(case/'row.json',row)

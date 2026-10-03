@@ -11,7 +11,6 @@ use serde_json::Value;
 pub(super) struct StartedBrowser {
     pub(super) browser: OwnedBrowser,
     target_url: String,
-    pub(super) provenance: Value,
 }
 
 pub(super) enum StartupFailure {
@@ -28,16 +27,16 @@ pub(super) struct AfterLaunchFailure {
 impl StartedBrowser {
     pub(super) fn launch(config: BrowserConfig, target_url: &str) -> Result<Self, StartupFailure> {
         OwnedBrowser::launch(config)
-            .map(|browser| {
-                let provenance = serde_json::to_value(browser.provenance())
-                    .expect("browser provenance contains only serializable fields");
-                Self {
-                    browser,
-                    target_url: target_url.into(),
-                    provenance,
-                }
+            .map(|browser| Self {
+                browser,
+                target_url: target_url.into(),
             })
             .map_err(StartupFailure::Launch)
+    }
+
+    pub(super) fn provenance(&self) -> Value {
+        serde_json::to_value(self.browser.provenance())
+            .expect("browser provenance contains only serializable fields")
     }
     pub(super) fn navigate(mut self) -> Result<Self, StartupFailure> {
         self.browser
@@ -49,7 +48,7 @@ impl StartedBrowser {
     fn after_launch_failure(&mut self, error: BrowserError) -> StartupFailure {
         StartupFailure::AfterLaunch(Box::new(AfterLaunchFailure {
             error,
-            provenance: self.provenance.clone(),
+            provenance: self.provenance(),
             cleanup: cleanup_started_browser(&mut self.browser),
         }))
     }

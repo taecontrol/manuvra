@@ -39,15 +39,18 @@ fn run_with_browser(
     let started = StartedBrowser::launch(browser_config(job, &config), target_url(job))
         .and_then(StartedBrowser::navigate);
     match started {
-        Ok(started) => finish_browser_run(
-            job,
-            config,
-            redactor,
-            started.browser,
-            started.provenance,
-            provider_key,
-            control,
-        ),
+        Ok(started) => {
+            let provenance = started.provenance();
+            finish_browser_run(
+                job,
+                config,
+                redactor,
+                started.browser,
+                provenance,
+                provider_key,
+                control,
+            )
+        }
         Err(StartupFailure::Launch(error)) => publish_browser_error(job, config, redactor, error),
         Err(StartupFailure::AfterLaunch(failure)) => publish_browser_error_with_provenance(
             job,
@@ -751,7 +754,9 @@ mod tests {
     #[test]
     fn caller_execute_round_trip_publishes_assisted_terminal_evidence() {
         let job = force_stop(mutation_job());
-        let mut browser = FakeBrowser::new([text_field(""), text_field(""), text_field("Wanted")])
+        let mut later_page = text_field("Wanted");
+        later_page.viewport.width = 640;
+        let mut browser = FakeBrowser::new([text_field(""), text_field(""), later_page])
             .dispatching([typed("Wanted")]);
         let control = ScriptedControl::answering([execute("c_1")]);
 
@@ -769,6 +774,18 @@ mod tests {
         let checkpoints = control.checkpoints();
         assert_eq!(checkpoints[0]["state"], "uncertain");
         assert_eq!(checkpoints[0]["terminal"], false);
+        let viewport = json!({"width":1120,"height":780,"initial_client_width":375});
+        let provenance = control.checkpoint_provenance();
+        assert_eq!(provenance[0]["viewport"], viewport);
+        assert!(
+            provenance
+                .iter()
+                .all(|sample| sample["viewport"] == viewport)
+        );
+        let final_provenance: Value =
+            serde_json::from_slice(&std::fs::read(run.artifact("provenance.json")).unwrap())
+                .unwrap();
+        assert_eq!(final_provenance["viewport"], viewport);
         assert!(
             checkpoints
                 .iter()

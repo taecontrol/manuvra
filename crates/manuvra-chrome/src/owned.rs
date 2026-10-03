@@ -143,6 +143,7 @@ const COVERAGE_PROBE: &str = r#"(() => {
 const START_TIMEOUT: Duration = Duration::from_secs(15);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const QUIET_WINDOW: Duration = Duration::from_millis(150);
+const PROFILE_REMOVAL_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub struct BrowserConfig {
@@ -165,6 +166,9 @@ pub struct BrowserProvenance {
 pub struct ProvenanceViewport {
     pub width: u16,
     pub height: u16,
+    /// Root client width after the first completed navigation, in CSS pixels.
+    #[serde(default)]
+    pub initial_client_width: Option<u32>,
 }
 
 pub struct CapturedPage {
@@ -226,11 +230,23 @@ impl OwnedBrowser {
         &self.provenance
     }
 
-    pub fn navigate(&self, url: &str) -> Result<(), BrowserError> {
+    pub fn navigate(&mut self, url: &str) -> Result<(), BrowserError> {
         let fence = self.client.cursor();
         let navigated = command(&self.client, "Page.navigate", json!({"url": url}))?;
         require_committed_navigation(&navigated)?;
-        wait_for_document(&self.client, fence)
+        wait_for_document(&self.client, fence)?;
+        self.record_initial_client_width()
+    }
+
+    fn record_initial_client_width(&mut self) -> Result<(), BrowserError> {
+        if self.provenance.viewport.initial_client_width.is_none() {
+            let value = evaluate(&self.client, "document.documentElement.clientWidth")?;
+            let width = serde_json::from_value::<u32>(value).map_err(|_| {
+                BrowserError::InvalidObservation("initial client width is invalid".into())
+            })?;
+            self.provenance.viewport.initial_client_width = Some(width);
+        }
+        Ok(())
     }
 
     pub fn observe(&self) -> Result<Observation, BrowserError> {
@@ -322,7 +338,7 @@ impl OwnedBrowser {
             self.lifecycle = Lifecycle::Terminated;
         }
         if self.lifecycle == Lifecycle::Terminated {
-            fs::remove_dir_all(&self.profile)
+            retry_profile_removal(|| fs::remove_dir_all(&self.profile))
                 .map_err(|error| BrowserError::Control(safe_error(&error.to_string())))?;
             self.lifecycle = Lifecycle::Closed;
         }
@@ -335,6 +351,21 @@ enum Lifecycle {
     Running,
     Terminated,
     Closed,
+}
+
+fn retry_profile_removal(mut remove: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
+    let deadline = Instant::now() + PROFILE_REMOVAL_TIMEOUT;
+    loop {
+        match remove() {
+            Err(error)
+                if error.raw_os_error() == Some(libc::ENOTEMPTY) && Instant::now() < deadline =>
+            {
+                // A Chromium descendant may finish a profile write after the leader exits.
+                thread::sleep(Duration::from_millis(20));
+            }
+            result => return result,
+        }
+    }
 }
 
 fn require_committed_navigation(navigated: &Value) -> Result<(), BrowserError> {
@@ -537,6 +568,7 @@ impl StartingBrowser {
                 viewport: ProvenanceViewport {
                     width: prepared.config.width,
                     height: prepared.config.height,
+                    initial_client_width: None,
                 },
                 display_mode: display_mode(prepared.config.headless).into(),
             },
@@ -621,6 +653,7 @@ fn browser_command(binary: &Path, profile: &Path, config: &BrowserConfig) -> Com
         // Manuvra dispatches, including controls revealed only under @media (hover: hover).
         command
             .arg("--headless=new")
+            .arg("--hide-scrollbars")
             .arg("--disable-gpu")
             .arg("--blink-settings=primaryHoverType=2,availableHoverTypes=2,primaryPointerType=4,availablePointerTypes=4");
     }
@@ -1110,6 +1143,11 @@ mod tests {
             json!({"enabled":true})
         );
         assert_eq!(browser.provenance().viewport.width, 800);
+        assert_eq!(
+            serde_json::to_value(browser.provenance()).unwrap()["viewport"]
+                .get("initial_client_width"),
+            Some(&Value::Null)
+        );
         assert_eq!(browser.provenance().browser_version, "Chromium Test");
         browser.close().unwrap();
         assert!(!profile.exists());
@@ -1160,6 +1198,97 @@ mod tests {
         };
         let command = browser_command(Path::new("/browser"), temporary.path(), &config);
         assert!(command.get_args().any(|arg| arg == "--blink-settings=primaryHoverType=2,availableHoverTypes=2,primaryPointerType=4,availablePointerTypes=4"));
+        assert!(command.get_args().any(|arg| arg == "--hide-scrollbars"));
+    }
+
+    #[test]
+    fn viewport_provenance_records_literal_width_once_after_navigation_settles() {
+        for width in [0, 375, u32::MAX] {
+            let chrome = ScriptedChrome::start();
+            chrome.reply("Page.navigate", json!({"frameId":"main"}));
+            chrome.reply("Runtime.evaluate", json!({"result":{"value":"loading"}}));
+            chrome.reply("Runtime.evaluate", json!({"result":{"value":"complete"}}));
+            chrome.reply_evaluation(
+                "document.documentElement.clientWidth",
+                json!({"result":{"value":width}}),
+            );
+            let mut browser = browser_with_client(chrome.connect_raw());
+            browser.navigate("http://example.test/initial").unwrap();
+            assert_eq!(
+                serde_json::to_value(browser.provenance()).unwrap()["viewport"],
+                json!({"width":800,"height":600,"initial_client_width":width})
+            );
+            chrome.reply_evaluation(
+                "document.documentElement.clientWidth",
+                json!({"result":{"value":640}}),
+            );
+            browser.navigate("http://example.test/later").unwrap();
+            assert_eq!(
+                serde_json::to_value(browser.provenance()).unwrap()["viewport"]["initial_client_width"],
+                width
+            );
+            let evaluations = chrome.received("Runtime.evaluate");
+            let width_index = evaluations
+                .iter()
+                .position(|command| {
+                    command["params"]["expression"] == "document.documentElement.clientWidth"
+                })
+                .unwrap();
+            assert!(
+                width_index >= 2,
+                "measure only after loading becomes complete"
+            );
+            assert!(
+                evaluations[..width_index]
+                    .iter()
+                    .all(|command| command["params"]["expression"] == "document.readyState")
+            );
+            let times = chrome.received_times("Runtime.evaluate");
+            assert!(
+                times[width_index].duration_since(times[1]) >= QUIET_WINDOW,
+                "measure only after the completed document becomes quiet"
+            );
+            assert_eq!(
+                evaluations
+                    .iter()
+                    .filter(|command| command["params"]["expression"]
+                        == "document.documentElement.clientWidth")
+                    .count(),
+                1
+            );
+            browser.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn viewport_navigation_rejects_invalid_or_failed_initial_width_reads() {
+        for reply in [
+            json!({"result":{"value":null}}),
+            json!({"result":{"value":"375"}}),
+            json!({"result":{"value":true}}),
+            json!({"result":{"value":-1}}),
+            json!({"result":{"value":1.5}}),
+            json!({"result":{"value":4_294_967_296_u64}}),
+            json!({"exceptionDetails":{"text":"unavailable"}}),
+        ] {
+            let chrome = ScriptedChrome::start();
+            chrome.reply("Page.navigate", json!({"frameId":"main"}));
+            chrome.reply_evaluation(
+                "document.readyState",
+                json!({"result":{"value":"complete"}}),
+            );
+            chrome.reply_evaluation("document.documentElement.clientWidth", reply.clone());
+            let mut browser = browser_with_client(chrome.connect_raw());
+            assert!(browser.navigate("http://example.test/").is_err(), "{reply}");
+            assert_eq!(
+                serde_json::to_value(browser.provenance()).unwrap()["viewport"]
+                    .get("initial_client_width"),
+                Some(&Value::Null)
+            );
+            let profile = browser.profile.clone();
+            browser.close().unwrap();
+            assert!(!profile.exists());
+        }
     }
 
     #[test]
@@ -1177,6 +1306,53 @@ mod tests {
             serde_json::from_str::<Vec<String>>(argument).unwrap(),
             values,
             "the argument is a JSON array literal holding exactly the values"
+        );
+    }
+
+    #[test]
+    fn profile_removal_retries_only_concurrent_directory_writes_within_its_deadline() {
+        for (errors, expected_calls, expected_error) in [
+            (
+                vec![Some(libc::ENOTEMPTY), Some(libc::ENOTEMPTY), None],
+                3,
+                None,
+            ),
+            (vec![None], 1, None),
+            (vec![Some(libc::EACCES)], 1, Some(libc::EACCES)),
+            (vec![Some(libc::ENOENT)], 1, Some(libc::ENOENT)),
+            (
+                vec![Some(libc::ENOTEMPTY), Some(libc::EACCES)],
+                2,
+                Some(libc::EACCES),
+            ),
+        ] {
+            let mut calls = 0;
+            let result = retry_profile_removal(|| {
+                let error = errors[calls.min(errors.len() - 1)];
+                calls += 1;
+                error.map_or(Ok(()), |code| Err(std::io::Error::from_raw_os_error(code)))
+            });
+            assert_eq!(
+                result.err().and_then(|error| error.raw_os_error()),
+                expected_error
+            );
+            assert_eq!(calls, expected_calls);
+        }
+        let started = Instant::now();
+        let mut calls = 0;
+        let result = retry_profile_removal(|| {
+            calls += 1;
+            Err(std::io::Error::from_raw_os_error(libc::ENOTEMPTY))
+        });
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOTEMPTY));
+        assert!(calls > 1, "transient writes receive bounded retries");
+        assert!(
+            calls <= 150,
+            "cleanup retries must be paced rather than spinning"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the production cleanup budget must bound a persistent writer"
         );
     }
 
@@ -1204,7 +1380,7 @@ mod tests {
             "Page.navigate",
             json!({"frameId":"main","errorText":"net::ERR_CONNECTION_REFUSED"}),
         );
-        let browser = browser_with_client(chrome.connect_raw());
+        let mut browser = browser_with_client(chrome.connect_raw());
         assert!(matches!(
             browser.navigate("http://127.0.0.1:9/"),
             Err(BrowserError::Control(message)) if message == "navigation failed: net::ERR_CONNECTION_REFUSED"
@@ -1299,11 +1475,15 @@ mod tests {
             json!({"data":base64::Engine::encode(&base64::engine::general_purpose::STANDARD,&png)}),
         );
         let client = chrome.connect_raw();
-        let browser = browser_with_client(client);
+        let mut browser = browser_with_client(client);
         assert_eq!(browser.observe().unwrap().title, "Fixture");
         assert_eq!(browser.capture().unwrap().screenshot.width, 1);
         assert_eq!(browser.capture_redacted(&[]).unwrap().screenshot.height, 1);
         chrome.reply("Runtime.evaluate", json!({"result":{"value":"complete"}}));
+        chrome.reply_evaluation(
+            "document.documentElement.clientWidth",
+            json!({"result":{"value":800}}),
+        );
         chrome.push_event("DOM.childNodeInserted", json!({}));
         browser.navigate("http://example.test/").unwrap();
         assert!(matches!(
@@ -1686,6 +1866,7 @@ mod tests {
                 viewport: ProvenanceViewport {
                     width: 800,
                     height: 600,
+                    initial_client_width: None,
                 },
                 display_mode: "headless".into(),
             },

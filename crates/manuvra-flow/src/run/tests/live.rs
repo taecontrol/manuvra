@@ -160,7 +160,7 @@ pub(crate) struct LiveBrowser {
 
 impl LiveBrowser {
     pub(crate) fn open(url: &str) -> Self {
-        let browser = OwnedBrowser::launch(BrowserConfig {
+        let mut browser = OwnedBrowser::launch(BrowserConfig {
             explicit_binary: None,
             headless: true,
             width: 1120,

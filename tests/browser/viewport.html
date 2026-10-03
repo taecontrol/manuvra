@@ -1,0 +1,63 @@
+<!doctype html>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Viewport fixture</title>
+<script>
+  const mode = new URL(location.href).searchParams.get('mode');
+  if (mode === 'no-meta') document.querySelector('meta[name=viewport]').remove();
+</script>
+<style>
+  * { box-sizing: border-box; }
+  html { font: 16px system-ui; background: #f4f6fa; color: #152238; }
+  body { margin: 0; }
+  main { padding: 12px; min-height: 2200px; }
+  h1 { font-size: 25px; }
+  p { line-height: 1.5; }
+  .row { display: flex; flex-wrap: wrap; gap: 16px; }
+  .row button { flex: 0 0 175px; height: 44px; border: 0; border-radius: 6px; background: #254e92; color: white; font: inherit; }
+  #nested { height: 150px; overflow: auto; background: white; border: 1px solid #a3b3c7; margin-top: 24px; }
+  #nested div { padding: 12px; height: 600px; }
+  .mouse-only { display: none; }
+  @media (hover: hover) and (pointer: fine) { .mouse-only { display: block; } }
+  #facts { position: fixed; bottom: 8px; left: 8px; width: 280px; height: 24px; font-size: 10px; }
+  html.stable { scrollbar-gutter: stable both-edges; }
+  html.custom::-webkit-scrollbar, .custom #nested::-webkit-scrollbar { width: 22px; }
+  html.custom::-webkit-scrollbar-thumb, .custom #nested::-webkit-scrollbar-thumb { background: #506080; }
+</style>
+<main>
+  <h1>Phone-width validation</h1>
+  <p>The two controls occupy one line at a full 390px layout width.</p>
+  <div class="row"><button>Save account</button><button>Cancel</button></div>
+  <p class="mouse-only">Mouse hover controls available</p>
+  <section id="nested" aria-label="Nested content"><div>Nested scroll region<br>More content below</div></section>
+  <button id="extend">Extend document</button>
+  <button id="horizontal">Scroll horizontally</button>
+</main>
+<input id="facts" aria-label="Viewport facts" readonly>
+<script>
+  const root = document.documentElement;
+  const main = document.querySelector('main');
+  const nested = document.getElementById('nested');
+  const facts = document.getElementById('facts');
+  const buttons = [...document.querySelectorAll('.row button')];
+  if (mode === 'short') main.style.minHeight = '0';
+  if (mode === 'stable' || mode === 'custom') root.className = mode;
+  if (mode === 'overflow') main.style.width = '600px';
+  if (mode === 'mismatch') Object.defineProperty(root, 'clientWidth', {get: () => 375});
+  function measure() {
+    facts.value = JSON.stringify({
+      client_width: root.clientWidth, inner_width: innerWidth, scale: visualViewport.scale,
+      device_scale: devicePixelRatio, wrapped: buttons[0].getBoundingClientRect().top !== buttons[1].getBoundingClientRect().top,
+      hover: matchMedia('(hover:hover)').matches, fine_pointer: matchMedia('(pointer:fine)').matches,
+      touch_points: navigator.maxTouchPoints, gutter: getComputedStyle(root).scrollbarGutter,
+      content_width: root.scrollWidth, nested_width: nested.getBoundingClientRect().width,
+      nested_client_width: nested.clientWidth, nested_scroll_top: nested.scrollTop,
+      scroll_x: scrollX, scroll_y: scrollY
+    });
+  }
+  document.getElementById('extend').onclick = () => { main.style.minHeight = '2200px'; measure(); };
+  document.getElementById('horizontal').onclick = () => { scrollTo(120, 0); measure(); };
+  addEventListener('resize', measure);
+  addEventListener('scroll', measure);
+  nested.addEventListener('scroll', measure);
+  measure();
+</script>

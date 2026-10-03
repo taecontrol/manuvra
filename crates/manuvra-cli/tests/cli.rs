@@ -7,16 +7,27 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
-#[cfg(target_os = "macos")]
-struct DarwinHttpFixture {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "cli/viewport.rs"]
+mod viewport;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct HttpFixture {
     address: std::net::SocketAddr,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
-#[cfg(target_os = "macos")]
-impl DarwinHttpFixture {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl HttpFixture {
+    #[cfg(target_os = "macos")]
     fn start() -> Self {
+        Self::with_body(
+            r#"<!doctype html><title>Darwin hosted fixture</title><main>Ready <button id=activate onclick="document.querySelector('output').textContent='Activated'">Activate</button> <output>Idle</output></main>"#,
+        )
+    }
+
+    fn with_body(body: &str) -> Self {
         use std::io::{Read, Write};
         use std::sync::atomic::Ordering;
 
@@ -25,20 +36,26 @@ impl DarwinHttpFixture {
         let address = listener.local_addr().unwrap();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_stop = stop.clone();
+        let body = body.to_owned();
         let worker = std::thread::spawn(move || {
             while !worker_stop.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(1)));
-                        let mut request = [0_u8; 4096];
-                        let _ = stream.read(&mut request);
-                        let body = b"<!doctype html><title>Darwin hosted fixture</title><main>Ready <button id=activate onclick=\"document.querySelector('output').textContent='Activated'\">Activate</button> <output>Idle</output></main>";
+                        let mut request = Vec::new();
+                        let mut chunk = [0_u8; 4096];
+                        while !request.windows(4).any(|end| end == b"\r\n\r\n") {
+                            match stream.read(&mut chunk) {
+                                Ok(0) | Err(_) => break,
+                                Ok(read) => request.extend_from_slice(&chunk[..read]),
+                            }
+                        }
                         let response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                             body.len()
                         );
                         let _ = stream.write_all(response.as_bytes());
-                        let _ = stream.write_all(body);
+                        let _ = stream.write_all(body.as_bytes());
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -59,11 +76,10 @@ impl DarwinHttpFixture {
     }
 }
 
-#[cfg(target_os = "macos")]
-impl Drop for DarwinHttpFixture {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Drop for HttpFixture {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
-
         self.stop.store(true, Ordering::SeqCst);
         let _ = std::net::TcpStream::connect(self.address);
         if let Some(worker) = self.worker.take() {
@@ -1639,7 +1655,7 @@ fn hosted_temp() -> TempDir {
 }
 
 #[cfg(target_os = "macos")]
-fn public_darwin_forced_job(http: &DarwinHttpFixture, pause_timeout_ms: u64) -> Value {
+fn public_darwin_forced_job(http: &HttpFixture, pause_timeout_ms: u64) -> Value {
     json!({
         "schema_version":1,
         "target":{"kind":"browser","url":http.url()},
@@ -1676,7 +1692,7 @@ fn public_darwin_forced_job(http: &DarwinHttpFixture, pause_timeout_ms: u64) -> 
 #[cfg(target_os = "macos")]
 fn start_public_darwin_forced_run(
     temporary: &TempDir,
-    http: &DarwinHttpFixture,
+    http: &HttpFixture,
     request_id: &str,
     pause_timeout_ms: u64,
 ) -> Value {
@@ -1722,7 +1738,7 @@ fn start_public_darwin_forced_run(
     result
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn assert_complete_artifacts(result: &Value) {
     assert_eq!(result["evidence"]["complete"], true);
     let manifest_path = PathBuf::from(result["evidence"]["manifest"].as_str().unwrap());
@@ -1739,7 +1755,7 @@ fn assert_complete_artifacts(result: &Value) {
 #[test]
 fn public_darwin_run_recovers_by_run_and_request_id_with_owned_chrome() {
     let temporary = hosted_temp();
-    let http = DarwinHttpFixture::start();
+    let http = HttpFixture::start();
     let url = http.url();
     let job = json!({
         "schema_version":1,
@@ -1875,7 +1891,7 @@ fn public_darwin_forced_disposition_revalidates_and_finishes_same_run() {
         .filter(|key| !key.is_empty())
         .expect("TYPESAFE_API_KEY is required");
     let temporary = hosted_temp();
-    let http = DarwinHttpFixture::start();
+    let http = HttpFixture::start();
     let state = temporary.path().join("state");
     let runtime = temporary.path().join("runtime");
     let evidence = temporary.path().join("evidence");
@@ -2006,7 +2022,7 @@ fn public_darwin_abort_and_expiry_close_owned_chrome() {
         .filter(|key| !key.is_empty())
         .expect("TYPESAFE_API_KEY is required");
     let abort_temp = hosted_temp();
-    let abort_http = DarwinHttpFixture::start();
+    let abort_http = HttpFixture::start();
     let abort_state = abort_temp.path().join("state");
     let abort_runtime = abort_temp.path().join("runtime");
     let abort_initial =
@@ -2069,7 +2085,7 @@ fn public_darwin_abort_and_expiry_close_owned_chrome() {
     );
 
     let expiry_temp = hosted_temp();
-    let expiry_http = DarwinHttpFixture::start();
+    let expiry_http = HttpFixture::start();
     let expiry_state = expiry_temp.path().join("state");
     let expiry_runtime = expiry_temp.path().join("runtime");
     let expiry_initial =
