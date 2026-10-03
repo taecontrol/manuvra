@@ -283,3 +283,101 @@ fn text_cli_dialog_default_retains_inert_text_but_opt_in_uses_strict_paint() {
         );
     }
 }
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn text_cli_unverifiable_masks_block_with_redacted_observations_and_no_png() {
+    for (body, secret) in [
+        (
+            "<dialog id='d' aria-label='Details'><div id='bare' aria-hidden='true'></div></dialog><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret';d.showModal()</script>",
+            "bare-shadow-secret",
+        ),
+        (
+            r#"<iframe aria-hidden='true' style='width:300px;height:100px;border:0;transform:scale(2);transform-origin:0 0' srcdoc="<div id='bare' aria-hidden='true'></div><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret'</script>"></iframe>"#,
+            "bare-shadow-secret",
+        ),
+        (
+            "<style>html{zoom:2}</style><div id='bare' aria-hidden='true'></div><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret'</script>",
+            "bare-shadow-secret",
+        ),
+        (
+            "<div id='bare' aria-hidden='true'></div><script>bare.attachShadow({mode:'open'}).innerHTML='First<span>Second</span>'</script>",
+            "First\nSecond",
+        ),
+        (
+            "<style>@keyframes slide{from{transform:translateX(0)}to{transform:translateX(500px)}}#bare{animation:slide .1s linear infinite alternate}</style><div id='bare' aria-hidden='true'></div><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret'</script>",
+            "bare-shadow-secret",
+        ),
+        (
+            "<div id='bare' aria-hidden='true' style='text-shadow:0 40px black'></div><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret'</script>",
+            "bare-shadow-secret",
+        ),
+        (
+            "<div id='bare' aria-hidden='true' style='filter:drop-shadow(0 40px 0 black)'></div><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret'</script>",
+            "bare-shadow-secret",
+        ),
+        (
+            "<style>@keyframes grow{from{width:0}to{width:500px}}#row{display:flex}#sibling{flex:none;animation:grow .1s linear infinite alternate}</style><div id='row'><div id='sibling'>Spacer</div><div id='bare' aria-hidden='true'></div></div><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret'</script>",
+            "bare-shadow-secret",
+        ),
+    ] {
+        let http = HttpFixture::with_body(&format!("<!doctype html><p>Ready</p>{body}"));
+        let temp = hosted_temp();
+        let assertion = json!({"text_visible":secret,"include_aria_hidden":true});
+        let mut wire = job(&http.url(), assertion.clone());
+        wire["steps"][0]["done_when"] = json!([assertion]);
+        wire["values"] = json!({"marker":{"value":secret,"description":"classified painted text","secret":true}});
+        let (_, result) = run(&temp, &wire);
+        assert_eq!(result["state"], "blocked", "{body}: {result}");
+        assert_eq!(result["reason"]["code"], "redaction_unverifiable");
+        assert_eq!(result["verdict"]["overall"], "unresolved");
+        assert_eq!(result["verdict"]["steps"][0]["result"], "not_run");
+        viewport::assert_no_step_input(&result);
+        assert_eq!(result["verdict"]["caller_assisted"], false);
+        assert_eq!(result["cleanup"]["browser"], "closed");
+        assert_eq!(result["cleanup"]["profile"], "removed");
+        assert_complete_artifacts(&result);
+        assert_no_classified_state(&temp.path().join("state"), secret);
+        let manifest: Value = serde_json::from_slice(
+            &fs::read(result["evidence"]["manifest"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        let mut observations = 0;
+        let mut retained_text_check = false;
+        for artifact in manifest["artifacts"].as_array().unwrap() {
+            let path = Path::new(artifact["path"].as_str().unwrap());
+            assert_ne!(
+                path.extension().and_then(|extension| extension.to_str()),
+                Some("png")
+            );
+            let bytes = fs::read(path).unwrap();
+            if artifact["role"] == "trace" {
+                retained_text_check = String::from_utf8(bytes.clone())
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                    .any(|entry| {
+                        entry["assertion_checks"][0]["text"]["result"] == "satisfied"
+                            && entry["assertion_checks"][0]["text"]["matched_channel"]
+                                == "painted_aria_hidden"
+                    });
+            }
+            if path.extension().and_then(|extension| extension.to_str()) == Some("json") {
+                let exported: Value = serde_json::from_slice(&bytes).unwrap();
+                assert!(!exported.to_string().contains(secret));
+                if artifact["role"] == "observation" {
+                    observations += 1;
+                    assert_eq!(exported["screenshot"]["withheld"], "redaction_unverifiable");
+                    assert!(
+                        exported["painted_text"]["viewport"]["painted_aria_hidden"]
+                            .as_str()
+                            .unwrap()
+                            .contains("<masked:")
+                    );
+                }
+            }
+        }
+        assert!(observations >= 1);
+        assert!(retained_text_check);
+    }
+}

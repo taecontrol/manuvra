@@ -312,6 +312,9 @@ fn classified_boxless_and_assigned_text_is_masked_in_the_screenshot() {
     let _serial = REAL_BROWSER.lock().unwrap();
     for body in [
         "<span aria-hidden='true' style='display:contents'>painted-secret</span>",
+        r#"<iframe aria-hidden='true' style='border:0;transform:translate(20px,20px)' srcdoc='<span>painted-secret</span>'></iframe>"#,
+        "<style>html{margin:50px;filter:opacity(1)}</style><span aria-hidden='true'>painted-secret</span>",
+        "<style>@keyframes spin{to{transform:rotate(360deg)}}#unrelated{position:fixed;right:0;top:0;animation:spin 1s linear infinite}</style><span id='unrelated'>Spinner</span><span aria-hidden='true'>painted-secret</span>",
         "<div id='assigned'>painted-secret</div><script>assigned.attachShadow({mode:'open'}).innerHTML='<span aria-hidden=true style=display:contents><slot></slot></span>'</script>",
     ] {
         let server = FixtureServer::with_body(&format!("<!doctype html><p>Ready</p>{body}"));
@@ -338,4 +341,129 @@ fn classified_boxless_and_assigned_text_is_masked_in_the_screenshot() {
         assert!(masked.redaction.mask_count >= 1);
         assert_ne!(plain.screenshot.bytes, masked.screenshot.bytes);
     }
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn classified_shadow_text_with_unsupported_mask_geometry_is_withheld() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    for body in [
+        "<dialog id='d' aria-label='Details'><div id='bare' aria-hidden='true'></div></dialog><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret';d.showModal()</script>",
+        "<div id='p' popover><div id='bare' aria-hidden='true'></div></div><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret';p.showPopover()</script>",
+        r#"<iframe aria-hidden='true' style='width:300px;height:100px;border:0;transform:scale(2);transform-origin:0 0' srcdoc="<div id='bare' aria-hidden='true'></div><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret'</script>"></iframe>"#,
+        "<style>html{zoom:2}</style><div id='bare' aria-hidden='true'></div><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret'</script>",
+        "<style>html{transform:translate(50px,50px)}</style><div id='bare' aria-hidden='true'></div><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret'</script>",
+        "<style>html{margin:50px;contain:paint}</style><div id='bare' aria-hidden='true'></div><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret'</script>",
+        "<style>html{margin:50px;will-change:transform}</style><div id='bare' aria-hidden='true'></div><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret'</script>",
+        "<style>[data-manuvra-mask]{opacity:0!important}</style><div id='bare' aria-hidden='true'></div><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret'</script>",
+        "<style>[data-manuvra-mask]{opacity:.25!important}</style><div id='bare' aria-hidden='true'></div><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret'</script>",
+        "<style>[data-manuvra-mask]{visibility:hidden!important}</style><div id='bare' aria-hidden='true'></div><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret'</script>",
+        "<style>@keyframes slide{from{transform:translateX(0)}to{transform:translateX(500px)}}#bare{animation:slide .1s linear infinite alternate}</style><div id='bare' aria-hidden='true'></div><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret'</script>",
+        "<div id='bare' aria-hidden='true' style='text-shadow:0 40px black'></div><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret'</script>",
+        "<div id='bare' aria-hidden='true' style='filter:drop-shadow(0 40px 0 black)'></div><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret'</script>",
+        "<style>@keyframes grow{from{width:0}to{width:500px}}#row{display:flex}#sibling{flex:none;animation:grow .1s linear infinite alternate}</style><div id='row'><div id='sibling'>Spacer</div><div id='bare' aria-hidden='true'></div></div><script>bare.attachShadow({mode:'open'}).textContent='bare-shadow-secret'</script>",
+    ] {
+        let server = FixtureServer::with_body(&format!("<!doctype html><p>Ready</p>{body}"));
+        let mut browser = launch_headless();
+        browser.navigate(&server.url()).unwrap();
+        let observed = browser.observe().unwrap();
+        assert!(
+            observed
+                .painted_text
+                .as_ref()
+                .unwrap()
+                .viewport
+                .painted_aria_hidden
+                .contains("bare-shadow-secret"),
+            "{body}"
+        );
+        assert!(
+            matches!(browser.capture_redacted(&["bare-shadow-secret".into()]), Err(BrowserError::Control(message)) if message == "redaction_unverifiable"),
+            "{body}"
+        );
+        browser.close().unwrap();
+    }
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn classified_normalized_shadow_text_masks_the_complete_raw_range() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(
+        r#"<!doctype html><meta charset='utf-8'><p>Ready</p><div id='bare' aria-hidden='true' style='font:20px system-ui'></div><p id='result'>Mask pending</p><script>
+const root = bare.attachShadow({mode:'open'});
+root.textContent='🔥prefix   bare   shadow   secret   suffix';
+const text=root.firstChild, masks=new Map();
+new MutationObserver(records=>{
+  for(const record of records) {
+    for(const node of record.addedNodes) if(node.hasAttribute?.('data-manuvra-mask')) masks.set(node,node.getBoundingClientRect());
+    for(const node of record.removedNodes) if(masks.has(node)) {
+      const mask=masks.get(node);masks.delete(node);
+      const range=document.createRange(), start=text.textContent.indexOf('bare');
+      range.setStart(text,start);range.setEnd(text,start+'bare   shadow   secret'.length);
+      const rect=range.getBoundingClientRect();
+      const covered=mask.left<=rect.left && mask.top<=rect.top && mask.right>=rect.right && mask.bottom>=rect.bottom;
+      result.textContent=`Complete normalized mask: ${covered}`;
+    }
+  }
+}).observe(document.documentElement,{childList:true});
+</script>"#,
+    );
+    let mut browser = launch_headless();
+    browser.navigate(&server.url()).unwrap();
+    let captured = browser
+        .capture_redacted(&["bare shadow secret".into()])
+        .unwrap();
+    assert!(
+        captured
+            .observation
+            .painted_text
+            .as_ref()
+            .unwrap()
+            .viewport
+            .painted_aria_hidden
+            .contains("bare shadow secret")
+    );
+    assert!(captured.redaction.verifies(1));
+    assert_eq!(captured.redaction.matched_values, 1);
+    assert!(captured.redaction.mask_count >= 1);
+    assert!(has_line(
+        &browser.observe().unwrap(),
+        "Complete normalized mask: true"
+    ));
+    if let Some(directory) = std::env::var_os("MANUVRA_FIXTURE_EVIDENCE") {
+        let directory = PathBuf::from(directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("normalized-shadow-secret.png"),
+            &captured.screenshot.bytes,
+        )
+        .unwrap();
+    }
+    browser.close().unwrap();
+}
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn classified_node_joined_shadow_text_is_withheld_when_assembly_is_unverifiable() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    let server = FixtureServer::with_body(
+        "<!doctype html><p>Ready</p><div id='bare' aria-hidden='true'></div><script>bare.attachShadow({mode:'open'}).innerHTML='First<span>Second</span>'</script>",
+    );
+    let mut browser = launch_headless();
+    browser.navigate(&server.url()).unwrap();
+    let observed = browser.observe().unwrap();
+    assert_eq!(
+        observed
+            .painted_text
+            .as_ref()
+            .unwrap()
+            .viewport
+            .painted_aria_hidden,
+        "First\nSecond"
+    );
+    assert!(
+        matches!(browser.capture_redacted(&["First\nSecond".into()]), Err(BrowserError::Control(message)) if message == "redaction_unverifiable")
+    );
+    browser.close().unwrap();
 }

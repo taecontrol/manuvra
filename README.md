@@ -210,6 +210,8 @@ Request ids are idempotency keys. Reusing an id with the same input recovers the
 
 Each run has a private directory beneath the requested evidence root. Its `manifest.json` lists every artifact by role, absolute path, SHA-256 digest, and completeness. Depending on the run, evidence includes the redacted job, provenance, checkpoints, observations, screenshots, decisions, step facts, action trace, escalations, dispositions, final verification, and cleanup state.
 
+When screenshot masking cannot be verified, Manuvra retains the redacted observation, withholds the PNG, and blocks the run as `redaction_unverifiable`.
+
 In `provenance.json`, `viewport.width` and `viewport.height` are the requested CSS dimensions, including the default 1120×780 when the Job omits a viewport. `viewport.initial_client_width` is the target's measured `document.documentElement.clientWidth` after the start URL settles and before Step input. It is an initial sample retained through later navigation and Run recovery, not a measurement of the current page or its descendant content. It is `null` when navigation fails before measurement; a failed or invalid width read blocks the Run before its Steps. A launch failure may have no viewport provenance.
 
 Linux replaces a previously published Evidence directory with an atomic directory exchange. macOS uses a portable backup-then-rename replacement, so an abrupt machine or process failure can temporarily leave the final Evidence path absent. Treat Evidence as complete only when the returned result and manifest both say it is complete and every listed Artifact verifies; recover the durable Run with `status` after an interrupted caller.
