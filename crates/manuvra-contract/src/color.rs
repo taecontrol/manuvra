@@ -153,13 +153,6 @@ impl ExactColor {
 }
 
 impl ColorTarget {
-    pub fn subject(&self) -> &str {
-        match self {
-            Self::Text(target) => &target.text,
-            Self::Name(target) => &target.name,
-        }
-    }
-
     pub fn dialog(&self) -> Option<&str> {
         match self {
             Self::Text(target) => target.dialog.as_deref(),
