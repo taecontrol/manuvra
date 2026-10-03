@@ -230,8 +230,7 @@ mod tests {
         };
         assert_eq!(stop.code, "budget_exhausted");
         let stop = capture_verification_advance(&job, &redactor, &browser, &policy, &mut artifacts)
-            .err()
-            .expect("advance cannot attest an observation after the active budget expires");
+            .expect_err("advance cannot attest an observation after the active budget expires");
         assert_eq!(stop.code, "budget_exhausted");
         assert_eq!(browser.dispatched(), 0);
     }
