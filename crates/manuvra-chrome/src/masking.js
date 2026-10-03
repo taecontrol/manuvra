@@ -21,7 +21,7 @@
       lineage.add(owner); documents.add(owner.ownerDocument);
       const css = owner.ownerDocument.defaultView.getComputedStyle(owner);
       // The root's filter also composites the masks; a lower filter can paint outside them.
-      if (css.textShadow !== 'none' || css.filter !== 'none' && owner !== document.documentElement) return false;
+      if (css.textShadow !== 'none' || css.webkitBoxReflect !== 'none' || css.filter !== 'none' && owner !== document.documentElement) return false;
     }
     for (const owner of documents) if (owner.getAnimations().some(animation => running(animation) && !independentAnimation(animation, lineage))) return false;
     return true;
