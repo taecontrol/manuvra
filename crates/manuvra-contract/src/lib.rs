@@ -13,6 +13,9 @@ pub use color::*;
 #[cfg(test)]
 mod color_tests;
 
+#[cfg(test)]
+mod text_tests;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SchemaVersion;
 

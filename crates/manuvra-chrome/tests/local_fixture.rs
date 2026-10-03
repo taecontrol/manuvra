@@ -33,6 +33,9 @@ mod viewport;
 #[path = "local_fixture/color.rs"]
 mod color;
 
+#[path = "local_fixture/text.rs"]
+mod text;
+
 /// The owned browser's process group and profile, observed from outside the crate.
 struct BrowserLifecycle {
     process_group: i32,

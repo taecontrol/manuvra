@@ -1,4 +1,4 @@
-.PHONY: fmt lint test crap live live-all live-color live-hover live-keyboard live-natural-done live-observation live-resume-dispositions live-run-lifecycle live-self-test live-scroll live-money-scroll
+.PHONY: fmt lint test crap live live-all live-color live-text live-hover live-keyboard live-natural-done live-observation live-resume-dispositions live-run-lifecycle live-self-test live-scroll live-money-scroll
 
 CRAP_REPORT ?= target/crap-report.json
 CRAP_GATE_MANIFEST := tools/crap-gate/Cargo.toml
@@ -37,6 +37,9 @@ live:
 live-color:
 	python3 scripts/live/color.py
 
+live-text:
+	python3 scripts/live/text.py
+
 live-hover:
 	bash scripts/live/hover-reveal.sh
 
@@ -63,6 +66,7 @@ live-run-lifecycle:
 
 # Sequential even under -j: the Money suites share fixture port 4351.
 live-all:
+	$(MAKE) live-text
 	$(MAKE) live-color
 	$(MAKE) live
 	$(MAKE) live-observation

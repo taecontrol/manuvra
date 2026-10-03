@@ -106,6 +106,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(super) mod live;
     pub(super) mod support;
+    mod text;
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[test]
