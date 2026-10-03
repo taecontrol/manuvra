@@ -249,3 +249,67 @@ fn color_clip_geometry_preserves_unverifiable_owners_and_excludes_clipped_scopes
     );
     browser.close().unwrap();
 }
+
+#[test]
+#[ignore = "requires the local Chromium executable"]
+fn color_paint_checks_contents_frames_percentage_and_affine_clips() {
+    let _serial = REAL_BROWSER.lock().unwrap();
+    for (body, owners, scopes) in [
+        (
+            r#"<p><span style="display:contents;visibility:hidden;color:#b91c1c">Amount</span></p>"#,
+            0,
+            0,
+        ),
+        (
+            r#"<p style="opacity:0"><span style="display:contents;color:#b91c1c">Amount</span></p>"#,
+            0,
+            0,
+        ),
+        (
+            r#"<iframe style="width:300px;height:100px;border:0;clip-path:inset(100%)" srcdoc="<p style='color:#b91c1c'>Amount</p>"></iframe>"#,
+            0,
+            0,
+        ),
+        (
+            r#"<div style="position:relative;width:600px;height:400px;clip-path:inset(100%)"><p style="position:absolute;left:300px;top:150px;margin:0;color:#b91c1c">Amount</p></div>"#,
+            0,
+            0,
+        ),
+        (
+            r#"<div style="zoom:2;width:200px;clip-path:inset(0px 0px 0px 100px)"><p style="margin:0;padding-left:120px;color:#b91c1c">Amount</p></div>"#,
+            1,
+            0,
+        ),
+        (
+            r#"<fieldset aria-label="Checking"><p style="color:#b91c1c">Amount</p></fieldset><iframe style="opacity:0;width:400px;height:100px;border:0" srcdoc="<fieldset aria-label=Checking><p>Other</p></fieldset>"></iframe>"#,
+            1,
+            1,
+        ),
+    ] {
+        let fixture = format!(
+            "<!doctype html><body style='margin:40px;font:16px system-ui'><h1>Ready</h1>{body}</body>"
+        );
+        let server = FixtureServer::with_body(&fixture);
+        let mut browser = launch_headless();
+        browser.navigate(&server.url()).unwrap();
+        let snapshot = observation(&browser);
+        assert_eq!(snapshot["colors_complete"], true, "{body}: {snapshot}");
+        let matches = text(&snapshot, "Amount");
+        assert_eq!(matches.len(), owners, "{body}: {snapshot}");
+        if let Some(owner) = matches.first() {
+            assert_eq!(owner["paint_complete"], true);
+            assert_eq!(owner["color"]["rgba"], json!([185, 28, 28, 255]));
+        }
+        assert_eq!(
+            snapshot["color_scopes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|scope| scope["name"] == "Checking")
+                .count(),
+            scopes,
+            "{body}: {snapshot}"
+        );
+        browser.close().unwrap();
+    }
+}
